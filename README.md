@@ -5,6 +5,7 @@
 DSH Box is a lightweight desktop shell built with [Tauri 2](https://tauri.app) that installs, launches, and manages independent DSH **Containers** — each with its own DSH version, profile, plugins, skills, workspace, and logs — and renders them in an embedded WebView.
 
 ---
+<img width="1920" height="983" alt="image" src="https://github.com/user-attachments/assets/26a17954-b864-43f4-ba19-36f85db738ae" />
 
 ## Highlights
 
