@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 box-foundation = { path = "../box-foundation" }
 git2 = "0.20"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"

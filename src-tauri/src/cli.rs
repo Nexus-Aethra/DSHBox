@@ -1,6 +1,6 @@
 use box_containers::scan_containers;
 use box_dsh_versions::version_directory;
-use box_foundation::read_config;
+use box_foundation::{read_config, suppress_console_window};
 use serde_json::Value;
 use std::{env, fs, path::PathBuf, process::Command};
 
@@ -130,7 +130,9 @@ fn plugin_command(arguments: &[String]) -> Result<(), String> {
             });
             let pnpm = runtime.join("pnpm/node_modules/pnpm/bin/pnpm.cjs");
             let source = version_directory(&root, &version);
-            let status = Command::new(node)
+            let mut command = Command::new(node);
+            suppress_console_window(&mut command);
+            let status = command
                 .arg(pnpm)
                 .args([
                     "--dir",

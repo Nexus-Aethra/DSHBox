@@ -1,6 +1,6 @@
 //! Local single-user control plane shared by the DSH Box desktop app and server.
 
-use box_foundation::{config_path, now_seconds, BoxResult};
+use box_foundation::{config_path, now_seconds, suppress_console_window, BoxResult};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -98,7 +98,9 @@ pub fn service_status() -> ServiceStatus {
     }
     #[cfg(target_os = "windows")]
     {
-        let running = Command::new("schtasks")
+        let mut command = Command::new("schtasks");
+        suppress_console_window(&mut command);
+        let running = command
             .args(["/Query", "/TN", "dshboxd", "/FO", "LIST"])
             .output()
             .map(|output| output.status.success())
@@ -145,7 +147,9 @@ pub fn install_user_service(executable: &std::path::Path) -> BoxResult<()> {
     #[cfg(target_os = "windows")]
     {
         let task = format!("\"{}\" --service", executable.display());
-        let output = Command::new("schtasks")
+        let mut create = Command::new("schtasks");
+        suppress_console_window(&mut create);
+        let output = create
             .args([
                 "/Create", "/TN", "dshboxd", "/TR", &task, "/SC", "ONLOGON", "/RL", "LIMITED", "/F",
             ])
@@ -154,9 +158,9 @@ pub fn install_user_service(executable: &std::path::Path) -> BoxResult<()> {
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).into_owned());
         }
-        let _ = Command::new("schtasks")
-            .args(["/Run", "/TN", "dshboxd"])
-            .output();
+        let mut run = Command::new("schtasks");
+        suppress_console_window(&mut run);
+        let _ = run.args(["/Run", "/TN", "dshboxd"]).output();
         return Ok(());
     }
     #[allow(unreachable_code)]
@@ -177,10 +181,12 @@ pub fn restart_user_service() -> BoxResult<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("schtasks")
-            .args(["/End", "/TN", "dshboxd"])
-            .output();
-        let output = Command::new("schtasks")
+        let mut end = Command::new("schtasks");
+        suppress_console_window(&mut end);
+        let _ = end.args(["/End", "/TN", "dshboxd"]).output();
+        let mut run = Command::new("schtasks");
+        suppress_console_window(&mut run);
+        let output = run
             .args(["/Run", "/TN", "dshboxd"])
             .output()
             .map_err(|error| error.to_string())?;
@@ -228,7 +234,9 @@ fn run_systemctl(args: &[&str]) -> BoxResult<()> {
 
 #[cfg(target_os = "windows")]
 fn run_schtasks(args: &[&str]) -> BoxResult<()> {
-    let output = Command::new("schtasks")
+    let mut command = Command::new("schtasks");
+    suppress_console_window(&mut command);
+    let output = command
         .args(args)
         .output()
         .map_err(|error| error.to_string())?;

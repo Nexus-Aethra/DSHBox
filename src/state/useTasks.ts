@@ -1,0 +1,63 @@
+import { useEffect, useRef, useState } from 'react'
+import { boxApi } from '../shared/api/box-api'
+import type { TaskRecord } from '../shared/types/domain'
+
+export type TaskRefreshers = {
+  onVersionsChanged: () => void
+  onContainersChanged: () => void
+  onRepositoryChanged: () => void
+  onBundlesChanged: () => void
+  onContainerDetailsChanged: (containerId: string) => Promise<void>
+}
+
+export function useTasks(refreshers: TaskRefreshers, onError: (message: string | null) => void) {
+  const [tasks, setTasks] = useState<TaskRecord[]>([])
+  const [taskLogs, setTaskLogs] = useState<Record<string, string>>({})
+  const [taskPanelOpen, setTaskPanelOpen] = useState(false)
+
+  // Keep the latest callbacks without re-subscribing to the event bus on
+  // every render; the listeners below run for the lifetime of the page.
+  const refreshersRef = useRef(refreshers)
+  refreshersRef.current = refreshers
+
+  useEffect(() => {
+    void boxApi.listTasks().then(setTasks).catch(() => undefined)
+    const update = (task: TaskRecord) => setTasks((current) => [task, ...current.filter((item) => item.id !== task.id)])
+    const refreshForTask = (task: TaskRecord) => {
+      if (task.status !== 'succeeded') return
+      const current = refreshersRef.current
+      if (task.kind === 'dsh-version-install' || task.kind === 'dsh-catalog-refresh') current.onVersionsChanged()
+      if (task.kind.startsWith('container-')) current.onContainersChanged()
+      if ((task.kind === 'container-extension-add' || task.kind === 'container-extension-copy' || task.kind === 'container-bundle-install') && task.resourceKeys.some((key) => key.startsWith('container:'))) {
+        const containerId = task.resourceKeys.find((key) => key.startsWith('container:'))?.slice('container:'.length)
+        if (containerId !== undefined) void current.onContainerDetailsChanged(containerId).catch((reason: unknown) => { onError(String(reason)) })
+      }
+      if (task.kind === 'repository-extension-import' || task.kind === 'repository-extension-export' || task.kind === 'workspace-extension-import' || task.kind === 'bundle-import') {
+        current.onRepositoryChanged()
+        if (task.kind === 'bundle-import') current.onBundlesChanged()
+      }
+    }
+    const taskEvents = ['task://created', 'task://updated', 'task://finished'].map((event) => boxApi.listenTask<TaskRecord>(event, (payload) => { update(payload); refreshForTask(payload) }))
+    const logEvent = boxApi.listenTask<{ taskId: string; line: string }>('task://log', (payload) => setTaskLogs((current) => payload.taskId in current ? { ...current, [payload.taskId]: `${current[payload.taskId]}${current[payload.taskId] ? '\n' : ''}${payload.line}` } : current))
+    const unlisteners = Promise.all([...taskEvents, logEvent])
+    return () => { void unlisteners.then((items) => items.forEach((unlisten) => unlisten())) }
+  }, [])
+
+  async function cancelTask(id: string): Promise<void> {
+    try { await boxApi.cancelTask(id); onError(null) } catch (reason) { onError(String(reason)) }
+  }
+
+  async function retryTask(id: string): Promise<void> {
+    try { await boxApi.retryTask(id); onError(null) } catch (reason) { onError(String(reason)) }
+  }
+
+  async function deleteTask(id: string): Promise<void> {
+    try { await boxApi.deleteTask(id); setTasks(await boxApi.listTasks()); onError(null) } catch (reason) { onError(String(reason)) }
+  }
+
+  async function showTaskLog(id: string): Promise<void> {
+    try { const content = await boxApi.readTaskLog(id); setTaskLogs((current) => ({ ...current, [id]: content })); setTaskPanelOpen(true) } catch (reason) { onError(String(reason)) }
+  }
+
+  return { tasks, taskLogs, taskPanelOpen, setTaskPanelOpen, cancelTask, retryTask, deleteTask, showTaskLog }
+}

@@ -1,9 +1,9 @@
 {
   "nodeVersion": "v24.11.1",
-  "pnpmVersion": "11.21.0",
+  "pnpmVersion": "11.7.0",
   "pnpm": {
-    "url": "https://registry.npmjs.org/pnpm/-/pnpm-11.21.0.tgz",
-    "integrity": "sha512-UhcFvOaJkk6scvWjWHEi82JonvZXHlW6gAdv1jfBETLs/62ib61Op5xIW/3b/T1aKlsFgFp36JPeceyKbMo7sQ=="
+    "url": "https://registry.npmjs.org/pnpm/-/pnpm-11.7.0.tgz",
+    "integrity": "sha512-GcyFLBIMcSV2DyRD7mvgyltA+fUFmN4aCaHxd1A+AQ5Xwjx3ZG4B52HeWb+HT7IqM5jDOrlpH8E+uUa28PTWIA=="
   },
   "node": {
     "linux-x64": { "url": "https://nodejs.org/dist/v24.11.1/node-v24.11.1-linux-x64.tar.xz", "sha256": "60e3b0a8500819514aca603487c254298cd776de0698d3cd08f11dba5b8289a8" },

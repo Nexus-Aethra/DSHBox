@@ -66,7 +66,7 @@ pub(crate) fn install_dsh_version_with_cancel(
     fs::create_dir_all(destination.parent().ok_or("invalid DSH destination")?)
         .map_err(|error| format!("cannot create DSH destination: {error}"))?;
     let commit = match shallow_clone_with_cancel(
-        DSH_REPOSITORY,
+        &mirror_url(DSH_REPOSITORY, config.github_mirror.as_deref()),
         &destination,
         (version != "latest").then_some(version.as_str()),
         cancelled,

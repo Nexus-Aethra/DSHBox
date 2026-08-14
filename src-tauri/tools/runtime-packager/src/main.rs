@@ -81,6 +81,14 @@ fn main() -> Result<(), String> {
         "package",
     )?;
     let windows = target.starts_with("win-");
+    // pnpm's own `runDepsStatusCheck` re-spawns itself; with the ESM entry it
+    // reuses the current node executable instead of resolving a bare `pnpm`
+    // command from PATH (which would fail without a system install).
+    let pnpm_entry = if output.join("pnpm/node_modules/pnpm/bin/pnpm.mjs").is_file() {
+        "pnpm/node_modules/pnpm/bin/pnpm.mjs"
+    } else {
+        "pnpm/node_modules/pnpm/bin/pnpm.cjs"
+    };
     let manifest = Manifest {
         target,
         node_version: lock.node_version,
@@ -99,8 +107,9 @@ fn main() -> Result<(), String> {
         } else {
             "node/lib/node_modules/npm/bin/npm-cli.js".into()
         },
-        pnpm_entry: "pnpm/node_modules/pnpm/bin/pnpm.cjs".into(),
+        pnpm_entry: pnpm_entry.into(),
     };
+    install_command_shims(&output, windows)?;
     fs::write(
         output.join("runtime-manifest.json"),
         serde_json::to_vec_pretty(&manifest).map_err(stringify)?,
@@ -123,6 +132,36 @@ fn args() -> Result<Option<String>, String> {
         })
         .transpose()?)
 }
+
+/// Writes `pnpm`/`npm` command shims next to the bundled runtime so scripts
+/// and pnpm's own dependency-status check can resolve the commands from PATH
+/// without a system Node/npm/pnpm install. The desktop app prepends these
+/// directories to PATH when spawning tools.
+fn install_command_shims(output: &Path, windows: bool) -> Result<(), String> {
+    let node_entry = if windows { "node.exe" } else { "bin/node" };
+    if windows {
+        fs::write(
+            output.join("pnpm/pnpm.cmd"),
+            "@echo off\r\n\"%~dp0..\\node\\node.exe\" \"%~dp0node_modules\\pnpm\\bin\\pnpm.cjs\" %*\r\n",
+        )
+        .map_err(stringify)?;
+        fs::write(
+            output.join("node/npm.cmd"),
+            "@echo off\r\n\"%~dp0node.exe\" \"%~dp0node_modules\\npm\\bin\\npm-cli.js\" %*\r\n",
+        )
+        .map_err(stringify)?;
+    } else {
+        fs::write(
+            output.join("pnpm/pnpm"),
+            format!(
+                "#!/bin/sh\nexec \"$(dirname \"$0\")/../{node_entry}\" \"$(dirname \"$0\")/node_modules/pnpm/bin/pnpm.cjs\" \"$@\"\n"
+            ),
+        )
+        .map_err(stringify)?;
+    }
+    Ok(())
+}
+
 fn stringify(error: impl std::fmt::Display) -> String {
     error.to_string()
 }

@@ -1,0 +1,118 @@
+import { useEffect, useState } from 'react'
+import { pickText } from '../i18n'
+import { boxApi } from '../shared/api/box-api'
+import type { BoxConfig, DshVersion, Language, ServerServiceStatus, ToolchainStatus } from '../shared/types/domain'
+
+export const INITIAL_CONFIG: BoxConfig = { runtimeDirectory: null, selectedDshVersion: null, language: 'en', toolchainSources: {}, githubMirror: null, npmRegistry: null }
+
+/** npm registry presets shown in Settings; `__custom__` reveals a free-form input. */
+export const NPM_REGISTRY_PRESETS = [
+  { value: '', label: 'Default (npmjs)' },
+  { value: 'https://registry.npmmirror.com', label: 'npmmirror (China)' },
+  { value: 'https://mirrors.cloud.tencent.com/npm/', label: 'Tencent Cloud' },
+  { value: 'https://repo.huaweicloud.com/repository/npm/', label: 'Huawei Cloud' },
+  { value: '__custom__', label: 'Custom…' },
+]
+
+export function useSettings(onError: (message: string | null) => void) {
+  const [config, setConfig] = useState<BoxConfig>(INITIAL_CONFIG)
+  const [loading, setLoading] = useState(true)
+  const [toolchains, setToolchains] = useState<ToolchainStatus[]>([])
+  const [detecting, setDetecting] = useState(false)
+  const [expandedToolchain, setExpandedToolchain] = useState<string | null>(null)
+  const [dshVersions, setDshVersions] = useState<DshVersion[]>([])
+  const [loadingVersions, setLoadingVersions] = useState(false)
+  const [installingVersion, setInstallingVersion] = useState<string | null>(null)
+  const [installedDshVersions, setInstalledDshVersions] = useState<string[]>([])
+  const [githubMirror, setGithubMirror] = useState('')
+  const [npmRegistry, setNpmRegistry] = useState('')
+  const [npmRegistryCustom, setNpmRegistryCustom] = useState('')
+  const [savingMirror, setSavingMirror] = useState(false)
+  const [serverService, setServerService] = useState<ServerServiceStatus | null>(null)
+
+  useEffect(() => {
+    void boxApi.loadConfig().then(setConfig).catch((reason: unknown) => { onError(String(reason)) }).finally(() => { setLoading(false) })
+    void refreshToolchains()
+    void boxApi.getServerServiceStatus().then(setServerService).catch(() => undefined)
+    // Load the data for the default section up front: the nav buttons only
+    // fetch when clicked, so without this the first page stays empty until
+    // the user switches away and back.
+    void loadInstalledDshVersions()
+  }, [])
+
+  // Keep the mirror settings form in sync when the saved config changes.
+  useEffect(() => {
+    setGithubMirror(config.githubMirror ?? '')
+    setNpmRegistry(config.npmRegistry ?? '')
+    setNpmRegistryCustom(config.npmRegistry ?? '')
+  }, [config.githubMirror, config.npmRegistry])
+
+  async function refreshToolchains(): Promise<void> {
+    setDetecting(true)
+    try { setToolchains(await boxApi.detectToolchains()) } catch (reason) { onError(String(reason)) } finally { setDetecting(false) }
+  }
+
+  async function loadDshVersions(): Promise<void> {
+    setLoadingVersions(true)
+    try { setDshVersions(await boxApi.listDshVersions()); onError(null) } catch (reason) { onError(String(reason)) } finally { setLoadingVersions(false) }
+  }
+
+  async function installDshVersion(version: string): Promise<void> {
+    setInstallingVersion(version)
+    try { await boxApi.enqueueDshVersionInstall(version); onError(null) } catch (reason) { onError(String(reason)) } finally { setInstallingVersion(null) }
+  }
+
+  async function refreshDshCatalog(): Promise<void> {
+    try { await boxApi.enqueueDshCatalogRefresh(); onError(null) } catch (reason) { onError(String(reason)) }
+  }
+
+  async function uninstallDshVersion(version: string): Promise<void> {
+    if (!window.confirm(`Uninstall DSH ${version}?`)) return
+    try { setConfig(await boxApi.uninstallDshVersion(version)); await loadDshVersions(); onError(null) } catch (reason) { onError(String(reason)) }
+  }
+
+  async function loadInstalledDshVersions(): Promise<void> {
+    try { const versions = await boxApi.listInstalledDshVersions(); setInstalledDshVersions(versions) } catch (reason) { onError(String(reason)) }
+  }
+
+  async function chooseRuntimeDirectory(): Promise<void> {
+    try {
+      const text = pickText(config.language)
+      const selected = await boxApi.chooseDirectory(text.chooseTitle)
+      if (selected === null || Array.isArray(selected)) return
+      setConfig(await boxApi.saveRuntimeDirectory(selected))
+      onError(null)
+    } catch (reason) { onError(String(reason)) }
+  }
+
+  async function changeLanguage(language: Language): Promise<void> {
+    try {
+      setConfig(await boxApi.saveLanguage(language))
+      onError(null)
+    } catch (reason) { onError(String(reason)) }
+  }
+
+  async function saveMirrorSettings(): Promise<void> {
+    setSavingMirror(true)
+    try {
+      const registry = npmRegistry === '__custom__' ? npmRegistryCustom.trim() : npmRegistry
+      const config = await boxApi.saveMirrorSettings(githubMirror.trim() || null, registry || null)
+      setConfig(config)
+      setNpmRegistry(registry)
+      onError(null)
+    } catch (reason) { onError(String(reason)) } finally { setSavingMirror(false) }
+  }
+
+  async function restartServerService(): Promise<void> {
+    try { await boxApi.restartServerService(); setServerService(await boxApi.getServerServiceStatus()); onError(null) } catch (reason) { onError(String(reason)) }
+  }
+
+  return {
+    config, setConfig, loading, toolchains, detecting, expandedToolchain, setExpandedToolchain,
+    dshVersions, loadingVersions, installingVersion, installedDshVersions, setInstalledDshVersions,
+    githubMirror, setGithubMirror, npmRegistry, setNpmRegistry, npmRegistryCustom, setNpmRegistryCustom,
+    savingMirror, serverService, refreshToolchains, loadDshVersions, installDshVersion,
+    refreshDshCatalog, uninstallDshVersion, loadInstalledDshVersions, chooseRuntimeDirectory,
+    changeLanguage, saveMirrorSettings, restartServerService,
+  }
+}

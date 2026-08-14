@@ -1,5 +1,6 @@
 //! Toolchain identifiers and feature-level dependency contracts.
 
+use box_foundation::suppress_console_window;
 use serde::{Deserialize, Serialize};
 use std::{env, path::PathBuf, process::Command};
 
@@ -41,7 +42,9 @@ pub fn find_system_binary(id: &str) -> Option<PathBuf> {
 }
 
 pub fn command_version(binary: PathBuf) -> Option<String> {
-    Command::new(binary)
+    let mut command = Command::new(binary);
+    suppress_console_window(&mut command);
+    command
         .arg("--version")
         .output()
         .ok()

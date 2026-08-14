@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs,
+    env, fs,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -19,6 +19,15 @@ pub struct BoxConfig {
     pub language: String,
     #[serde(default)]
     pub toolchain_sources: BTreeMap<String, String>,
+    /// Optional GitHub mirror prefix (e.g. `https://gh-proxy.com`). When set,
+    /// GitHub URLs are rewritten as `<mirror>/<original-url>` for the version
+    /// catalog, runtime clones, and extension imports.
+    #[serde(default)]
+    pub github_mirror: Option<String>,
+    /// Optional npm registry (e.g. `https://registry.npmmirror.com`). When
+    /// set, spawned pnpm/npm toolchains receive `npm_config_registry`.
+    #[serde(default)]
+    pub npm_registry: Option<String>,
 }
 
 fn default_language() -> String {
@@ -32,6 +41,8 @@ impl Default for BoxConfig {
             selected_dsh_version: None,
             language: default_language(),
             toolchain_sources: BTreeMap::new(),
+            github_mirror: None,
+            npm_registry: None,
         }
     }
 }
@@ -83,6 +94,13 @@ pub fn read_config() -> BoxResult<BoxConfig> {
     )
     .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
     config.toolchain_sources.remove("git");
+    if let Some(directory) = config.runtime_directory.take() {
+        // Heal configurations persisted before drive-root normalization so
+        // legacy `D:` values never reach downstream path joins.
+        config.runtime_directory = normalize_runtime_directory(&directory)
+            .ok()
+            .or(Some(directory));
+    }
     Ok(config)
 }
 pub fn write_config(config: &BoxConfig) -> BoxResult<()> {
@@ -95,11 +113,99 @@ pub fn write_config(config: &BoxConfig) -> BoxResult<()> {
     )
     .map_err(|error| error.to_string())
 }
+/// Resolves a user-selected directory to a canonical absolute path suitable
+/// for persistence. Windows drive roots (`D:`) are drive-relative: joining
+/// them with child names yields `D:containers`, which resolves against each
+/// child process's current drive and crashes bundled Node/pnpm. Normalize
+/// before saving so every later `PathBuf::join` stays on an absolute root.
+/// Existing relative entries are resolved against the current directory.
+pub fn normalize_runtime_directory(directory: &str) -> BoxResult<String> {
+    let mut selected = PathBuf::from(directory);
+    #[cfg(windows)]
+    if drive_root(&selected) {
+        selected.push("\\");
+    }
+    if !selected.is_absolute() {
+        selected = env::current_dir()
+            .map_err(|error| error.to_string())?
+            .join(selected);
+    }
+    let canonical = fs::canonicalize(&selected).map_err(|error| {
+        format!(
+            "cannot resolve runtime directory {}: {error}",
+            selected.display()
+        )
+    })?;
+    Ok(strip_verbatim_prefix(&canonical.to_string_lossy()))
+}
+
+/// True for drive-relative roots like `D:`, where a bare trailing colon makes
+/// every joined path resolve against the drive's current directory.
+#[cfg(windows)]
+fn drive_root(path: &PathBuf) -> bool {
+    let bytes = path.to_string_lossy();
+    let bytes = bytes.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// `std::fs::canonicalize` returns verbatim `\\?\` prefixed paths on Windows.
+/// Strip the prefix so stored and displayed paths stay ordinary while they
+/// remain absolute for every resolver.
+///
+/// Public because Tauri's `resource_dir()` also returns verbatim paths on
+/// Windows, and bundled Node crashes with `EISDIR lstat 'D:'` when handed a
+/// verbatim entry script, so spawned tool paths must be stripped too.
+pub fn strip_verbatim_prefix(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        path.strip_prefix("\\\\?\\UNC\\")
+            .map(|rest| format!("\\\\{rest}"))
+            .or_else(|| path.strip_prefix("\\\\?\\").map(str::to_owned))
+            .unwrap_or_else(|| path.to_owned())
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_owned()
+    }
+}
+
 pub fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Rewrites a URL through a user-configured mirror prefix. The mirror is used
+/// verbatim as the prefix (e.g. `https://gh-proxy.com`), so the caller must
+/// supply a mirror that supports prefix-style rewriting of the target host.
+/// An empty or absent mirror leaves the URL unchanged.
+pub fn mirror_url(url: &str, mirror: Option<&str>) -> String {
+    match mirror.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(mirror) => format!("{}/{}", mirror.trim_end_matches('/'), url),
+        None => url.to_owned(),
+    }
+}
+
+/// Normalizes a user-entered mirror/registry value: trims whitespace and maps
+/// an empty string to `None`, so clearing the field disables the setting.
+pub fn normalize_optional_url(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Prevents a child process from opening a console window on Windows. The
+/// desktop app is a GUI process without a console; spawned console children
+/// (node, pnpm, schtasks, ...) would otherwise each pop a black terminal
+/// window. No-op on other platforms.
+pub fn suppress_console_window(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
 }
 pub fn is_safe_identifier(value: &str) -> bool {
     value == "latest"
@@ -107,4 +213,71 @@ pub fn is_safe_identifier(value: &str) -> bool {
             && value.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
             }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn drive_root_normalizes_to_absolute() {
+        // `C:` must become a rooted path, never a drive-relative one that
+        // later joins (`C:containers`) resolve against each child's drive.
+        #[cfg(windows)]
+        {
+            let drive = env::temp_dir()
+                .to_string_lossy()
+                .chars()
+                .next()
+                .expect("temp dir starts with a drive letter")
+                .to_string();
+            let input = format!("{drive}:");
+            let result = normalize_runtime_directory(&input).unwrap();
+            let path = PathBuf::from(&result);
+            assert!(path.is_absolute(), "must be absolute: {result}");
+            assert!(!result.ends_with(':'), "must not stay drive-relative: {result}");
+        }
+        #[cfg(not(windows))]
+        {
+            let result = normalize_runtime_directory(".").unwrap();
+            assert!(PathBuf::from(&result).is_absolute());
+        }
+    }
+
+    #[test]
+    fn existing_absolute_path_is_canonicalized() {
+        let temp = env::temp_dir().join("dsh-box-normalize-preserve");
+        fs::create_dir_all(&temp).unwrap();
+        let input = temp.to_string_lossy().into_owned();
+        let result = normalize_runtime_directory(&input).unwrap();
+        let mut expected = fs::canonicalize(&temp).unwrap();
+        #[cfg(windows)]
+        {
+            // The stored value intentionally drops the verbatim prefix that
+            // `std::fs::canonicalize` adds on Windows.
+            expected = PathBuf::from(without_verbatim(&expected));
+        }
+        assert_eq!(
+            PathBuf::from(&result),
+            expected,
+            "stored path must match the canonical path"
+        );
+        fs::remove_dir_all(&temp).ok();
+    }
+
+    #[cfg(windows)]
+    fn without_verbatim(path: &Path) -> String {
+        let text = path.to_string_lossy();
+        text.strip_prefix("\\\\?\\UNC\\")
+            .map(|rest| format!("\\\\{rest}"))
+            .or_else(|| text.strip_prefix("\\\\?\\").map(str::to_owned))
+            .unwrap_or_else(|| text.into_owned())
+    }
+
+    #[test]
+    fn nonexistent_directory_is_rejected() {
+        let missing = env::temp_dir().join("dsh-box-normalize-missing-xyz");
+        assert!(normalize_runtime_directory(&missing.to_string_lossy()).is_err());
+    }
 }

@@ -1,6 +1,6 @@
 //! Controlled execution primitives for feature crates. Tauri is intentionally absent.
 
-use box_foundation::BoxResult;
+use box_foundation::{suppress_console_window, BoxResult};
 use git2::{build::RepoBuilder, FetchOptions, RemoteCallbacks};
 use std::{
     path::Path,
@@ -26,6 +26,7 @@ impl ProcessRunner for NativeProcessRunner {
         working_directory: Option<&Path>,
     ) -> BoxResult<Output> {
         let mut command = Command::new(executable);
+        suppress_console_window(&mut command);
         command.args(arguments);
         if let Some(directory) = working_directory {
             command.current_dir(directory);
@@ -41,12 +42,80 @@ pub fn shallow_clone(url: &str, destination: &Path, revision: Option<&str>) -> B
     shallow_clone_with_cancel(url, destination, revision, || false)
 }
 
-/// Clone a public revision and stop the libgit2 transfer when cancellation is requested.
-pub fn shallow_clone_with_cancel(
+/// Best-effort detection of the user's HTTP proxy for git transfers.
+/// libgit2 ignores Windows system proxy settings, so without this a clone of
+/// github.com just times out whenever the machine only reaches the internet
+/// through a local proxy (common in mainland China). Standard environment
+/// variables win; otherwise the WinINET per-user proxy is read.
+pub fn detect_proxy_url() -> Option<String> {
+    for key in [
+        "https_proxy",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "HTTP_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim().to_owned();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+        let settings = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
+            .ok()?;
+        let enabled: u32 = settings.get_value("ProxyEnable").ok()?;
+        if enabled == 0 {
+            return None;
+        }
+        let server: String = settings.get_value("ProxyServer").ok()?;
+        // ProxyServer is either "host:port" or a per-protocol list like
+        // "http=host:port;https=host:port"; prefer the https entry.
+        let mut plain = None;
+        for part in server.split(';') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(rest) = part.strip_prefix("https=") {
+                return Some(with_http_scheme(rest));
+            }
+            if let Some(rest) = part.strip_prefix("http=") {
+                plain = Some(with_http_scheme(rest));
+            }
+            if !part.contains('=') && plain.is_none() {
+                plain = Some(with_http_scheme(part));
+            }
+        }
+        plain
+    }
+    #[cfg(not(target_os = "windows"))]
+    None
+}
+
+fn with_http_scheme(server: &str) -> String {
+    let server = server.trim();
+    if server.starts_with("http://")
+        || server.starts_with("https://")
+        || server.starts_with("socks5://")
+    {
+        server.to_owned()
+    } else {
+        format!("http://{server}")
+    }
+}
+
+fn clone_once(
     url: &str,
     destination: &Path,
     revision: Option<&str>,
-    cancelled: impl Fn() -> bool + Send + 'static,
+    cancelled: std::sync::Arc<std::sync::Mutex<dyn Fn() -> bool + Send>>,
+    proxy_url: Option<&str>,
 ) -> BoxResult<String> {
     let mut fetch = FetchOptions::new();
     // libgit2's local transport does not implement shallow fetches. Local
@@ -55,8 +124,28 @@ pub fn shallow_clone_with_cancel(
         fetch.depth(1);
     }
     let mut callbacks = RemoteCallbacks::new();
-    callbacks.transfer_progress(move |_| !cancelled());
+    let cancelled_for_progress = std::sync::Arc::clone(&cancelled);
+    callbacks.transfer_progress(move |_| {
+        // A poisoned lock means the owning thread panicked; keep going.
+        cancelled_for_progress
+            .lock()
+            .map(|guard| !guard())
+            .unwrap_or(true)
+    });
     fetch.remote_callbacks(callbacks);
+    if !Path::new(url).is_dir() {
+        let mut proxy = git2::ProxyOptions::new();
+        match proxy_url {
+            Some(proxy_url) => {
+                proxy.url(proxy_url);
+            }
+            // Fall back to libgit2's own detection (environment variables).
+            None => {
+                proxy.auto();
+            }
+        }
+        fetch.proxy_options(proxy);
+    }
     let mut builder = RepoBuilder::new();
     builder.fetch_options(fetch);
     if let Some(revision) = revision {
@@ -71,6 +160,44 @@ pub fn shallow_clone_with_cancel(
         .peel_to_commit()
         .map_err(|error| format!("cannot resolve cloned commit: {error}"))?;
     Ok(commit.id().to_string())
+}
+
+/// Clone a public revision and stop the libgit2 transfer when cancellation is requested.
+/// Local paths never go through a proxy. Remote clones try the detected system
+/// proxy first and fall back to a direct connection, so machines with or
+/// without a proxy both work without configuration.
+pub fn shallow_clone_with_cancel(
+    url: &str,
+    destination: &Path,
+    revision: Option<&str>,
+    cancelled: impl Fn() -> bool + Send + 'static,
+) -> BoxResult<String> {
+    // Mutex<dyn Fn> is Sync as long as the closure is Send, so callers do not
+    // have to hand us a Sync closure; the guard is only ever held briefly.
+    let cancelled: std::sync::Arc<std::sync::Mutex<dyn Fn() -> bool + Send>> =
+        std::sync::Arc::new(std::sync::Mutex::new(cancelled));
+    if Path::new(url).is_dir() {
+        return clone_once(url, destination, revision, cancelled, None);
+    }
+    let proxy = detect_proxy_url();
+    if let Some(proxy_url) = proxy.as_deref() {
+        match clone_once(url, destination, revision, std::sync::Arc::clone(&cancelled), Some(proxy_url)) {
+            Ok(commit) => return Ok(commit),
+            Err(error) => {
+                // The proxy may be stale or blocking git; retry directly
+                // (Option::None falls back to libgit2's own detection, which
+                // is a plain connection when no proxy env vars are set).
+                let _ = std::fs::remove_dir_all(destination);
+                if let Ok(commit) =
+                    clone_once(url, destination, revision, std::sync::Arc::clone(&cancelled), None)
+                {
+                    return Ok(commit);
+                }
+                return Err(error);
+            }
+        }
+    }
+    clone_once(url, destination, revision, cancelled, None)
 }
 
 /// Best-effort cleanup after a failed checkout.

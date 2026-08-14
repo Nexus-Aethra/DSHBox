@@ -1,4 +1,4 @@
-//! Framework-independent task state, locks, and persistence for DSH Box.
+﻿//! Framework-independent task state, locks, and persistence for DSH Box.
 
 use box_foundation::{now_seconds, BoxPaths, BoxResult};
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,118 @@ pub struct TaskRecord {
 
 pub trait TaskExecutor: Send + 'static {
     fn execute(self: Box<Self>, task: TaskRecord) -> BoxResult<()>;
+}
+
+/// How a running task reports progress to the host UI. The host implements
+/// this trait (typically by forwarding to a tauri `Emitter`) so the scheduler
+/// crate never needs to depend on a GUI framework.
+pub trait TaskNotifier: Send + Sync {
+    fn stage(&self, task_id: &str, stage: &str, progress: u8);
+    fn log(&self, task_id: &str, line: &str);
+}
+
+/// Execution-time context handed to a task worker: cancel queries plus
+/// progress and log reporting. Owned and cloneable so workers can move it
+/// into background threads (log forwarding) or `'static` cancellation
+/// closures without touching the GUI framework.
+#[derive(Clone)]
+pub struct TaskContext {
+    pub manager: TaskManager,
+    pub paths: BoxPaths,
+    pub notifier: std::sync::Arc<dyn TaskNotifier>,
+    pub task_id: String,
+}
+
+impl TaskContext {
+    pub fn cancelled(&self) -> bool {
+        self.manager
+            .task(&self.task_id)
+            .map(|task| task.cancel_requested)
+            .unwrap_or(true)
+    }
+
+    pub fn check_cancelled(&self) -> BoxResult<()> {
+        if self.cancelled() {
+            Err("task cancelled".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn update(&self, stage: impl Into<String>, progress: u8) {
+        let stage = stage.into();
+        let _ = self
+            .manager
+            .update(&self.paths, &self.task_id, &stage, progress);
+        self.notifier.stage(&self.task_id, &stage, progress);
+    }
+
+    /// Appends a timestamped line to the task's log file.
+    pub fn append_log(&self, message: &str) {
+        if let Ok(task) = self.manager.task(&self.task_id) {
+            let line = format!("[{}] {message}\n", now_seconds());
+            let _ = fs::OpenOptions::new()
+                .append(true)
+                .open(&task.log_path)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
+        }
+    }
+
+    pub fn log(&self, message: &str) {
+        self.append_log(message);
+        self.notifier.log(&self.task_id, message);
+    }
+}
+
+/// Generic task runner: polls until the resource locks and the concurrency
+/// limit admit the task, runs the worker with a `TaskContext`, then persists
+/// the final state. The host is expected to wrap this in a background thread.
+pub fn run_queued<F>(
+    manager: &TaskManager,
+    paths: &BoxPaths,
+    notifier: std::sync::Arc<dyn TaskNotifier>,
+    task_id: &str,
+    work: F,
+) where
+    F: FnOnce(&TaskContext) -> BoxResult<()> + Send + 'static,
+{
+    loop {
+        match manager.try_start(paths, task_id) {
+            Ok(Some(task)) if task.status == "cancelled" => {
+                notifier.log(task_id, "cancelled before execution");
+                return;
+            }
+            Ok(Some(task)) => {
+                notifier.stage(task_id, &task.stage, task.progress);
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(_) => return,
+        }
+    }
+    let context = TaskContext {
+        manager: manager.clone(),
+        paths: paths.clone(),
+        notifier: notifier.clone(),
+        task_id: task_id.to_owned(),
+    };
+    notifier.log(task_id, "worker started");
+    let result = work(&context);
+    let final_task = manager.finish(paths, task_id, &result).ok();
+    if let Some(task) = &final_task {
+        notifier.stage(task_id, &task.stage, task.progress);
+    }
+    let final_status = final_task
+        .map(|task| task.status)
+        .unwrap_or_else(|| "failed".to_owned());
+    notifier.log(
+        task_id,
+        match final_status.as_str() {
+            "succeeded" => "completed",
+            "cancelled" => "cancelled after the active operation returned",
+            _ => "failed; inspect the error summary",
+        },
+    );
 }
 
 #[derive(Default)]
@@ -133,6 +245,24 @@ impl TaskManager {
         }
         drop(state);
         self.persist(paths)
+    }
+    /// Removes a finished task record and its log file. Tasks that are
+    /// queued, running, or waiting for input stay protected so resource
+    /// locks and the concurrency counter never go stale.
+    pub fn remove(&self, paths: &BoxPaths, id: &str) -> BoxResult<Option<TaskRecord>> {
+        let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
+        let task = match state.tasks.get(id) {
+            Some(task) => task.clone(),
+            None => return Ok(None),
+        };
+        if matches!(task.status.as_str(), "queued" | "running" | "waiting_input") {
+            return Err("cannot delete a task that is still running".to_owned());
+        }
+        state.tasks.remove(id);
+        drop(state);
+        let _ = fs::remove_file(&task.log_path);
+        self.persist(paths)?;
+        Ok(Some(task))
     }
     /// Marks a queued task running only when its resource locks and the global
     /// concurrency limit permit execution.
@@ -245,7 +375,7 @@ impl TaskManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, fs};
+    use std::{env, fs, path::Path};
 
     fn paths(name: &str) -> BoxPaths {
         let root = env::temp_dir().join(format!("dsh-box-scheduler-{name}-{}", now_seconds()));
@@ -348,6 +478,37 @@ mod tests {
     }
 
     #[test]
+    fn remove_deletes_finished_tasks_but_keeps_running_ones() {
+        let paths = paths("remove");
+        let manager = TaskManager::default();
+        let finished = manager
+            .enqueue(
+                &paths,
+                "finished",
+                vec!["a".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        manager.finish(&paths, &finished.id, &Ok(())).unwrap();
+        let running = manager
+            .enqueue(
+                &paths,
+                "running",
+                vec!["b".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        manager.try_start(&paths, &running.id).unwrap().unwrap();
+        // Finished tasks can be removed, together with their log file.
+        let removed = manager.remove(&paths, &finished.id).unwrap().unwrap();
+        assert!(!Path::new(&removed.log_path).exists());
+        assert!(manager.task(&finished.id).is_err());
+        // Running tasks stay protected so locks never go stale.
+        assert!(manager.remove(&paths, &running.id).is_err());
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
+    #[test]
     fn same_resource_waits_until_the_first_task_finishes() {
         let paths = paths("lock");
         let manager = TaskManager::default();
@@ -371,6 +532,117 @@ mod tests {
         assert!(manager.try_start(&paths, &second.id).unwrap().is_none());
         manager.finish(&paths, &first.id, &Ok(())).unwrap();
         assert!(manager.try_start(&paths, &second.id).unwrap().is_some());
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
+    #[derive(Default)]
+    struct RecordingNotifier {
+        stages: std::sync::Mutex<Vec<(String, u8)>>,
+        logs: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl TaskNotifier for RecordingNotifier {
+        fn stage(&self, task_id: &str, stage: &str, progress: u8) {
+            self.stages
+                .lock()
+                .unwrap()
+                .push((format!("{task_id}:{stage}"), progress));
+        }
+        fn log(&self, task_id: &str, line: &str) {
+            self.logs
+                .lock()
+                .unwrap()
+                .push(format!("{task_id}:{line}"));
+        }
+    }
+
+    #[test]
+    fn run_queued_executes_work_and_reports_progress() {
+        let paths = paths("run");
+        let manager = TaskManager::default();
+        let task = manager
+            .enqueue(&paths, "test", vec!["r".to_owned()], serde_json::json!({}))
+            .unwrap();
+        let notifier = std::sync::Arc::new(RecordingNotifier::default());
+        run_queued(&manager, &paths, notifier.clone(), &task.id, |context| {
+            context.update("Working", 50);
+            context.log("half way");
+            context.check_cancelled()?;
+            Ok(())
+        });
+        let finished = manager.task(&task.id).unwrap();
+        assert_eq!(finished.status, "succeeded");
+        assert_eq!(finished.progress, 100);
+        assert!(notifier
+            .stages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(stage, progress)| stage == &format!("{}:Working", task.id) && *progress == 50));
+        assert!(notifier
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("half way")));
+        assert!(notifier
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("completed")));
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
+    #[test]
+    fn run_queued_reports_failure_and_releases_the_resource() {
+        let paths = paths("run-fail");
+        let manager = TaskManager::default();
+        let task = manager
+            .enqueue(&paths, "test", vec!["r".to_owned()], serde_json::json!({}))
+            .unwrap();
+        let notifier = std::sync::Arc::new(RecordingNotifier::default());
+        run_queued(&manager, &paths, notifier.clone(), &task.id, |_| {
+            Err("boom".to_owned())
+        });
+        assert_eq!(manager.task(&task.id).unwrap().status, "failed");
+        assert_eq!(
+            manager.task(&task.id).unwrap().error.as_deref(),
+            Some("boom")
+        );
+        assert!(manager.resource_idle("r").unwrap());
+        assert!(notifier
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("failed; inspect")));
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
+    #[test]
+    fn run_queued_skips_work_for_a_cancelled_task() {
+        let paths = paths("run-cancel");
+        let manager = TaskManager::default();
+        let task = manager
+            .enqueue(&paths, "test", vec!["r".to_owned()], serde_json::json!({}))
+            .unwrap();
+        manager.request_cancel(&paths, &task.id).unwrap();
+        let notifier = std::sync::Arc::new(RecordingNotifier::default());
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran = executed.clone();
+        run_queued(&manager, &paths, notifier.clone(), &task.id, move |_| {
+            ran.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+        assert!(!executed.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(manager.task(&task.id).unwrap().status, "cancelled");
+        assert!(notifier
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("cancelled before execution")));
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 }

@@ -1,1 +1,1 @@
-{"main-capability":{"identifier":"main-capability","description":"Allow the main DSH Box window to open a user-selected directory.","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open"]}}
+{"main-capability":{"identifier":"main-capability","description":"Allow the main DSH Box window to open a user-selected directory.","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","dialog:allow-save"]}}

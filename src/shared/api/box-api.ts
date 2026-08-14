@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import type { BoxConfig, ContainerExtensions, DshContainer, DshVersion, Language, ResourceSnapshot, ResourceState, ServerServiceStatus, TaskRecord, ToolchainStatus, WorkspaceExtension } from '../types/domain'
+import type { BoxConfig, ContainerExtensions, DshContainer, DshVersion, ExtensionBundle, Language, ResourceSnapshot, ResourceState, ServerServiceStatus, TaskRecord, ToolchainStatus, WorkspaceExtension } from '../types/domain'
 
 type ToolchainPayload = { id: string; name: string; managedVersion: string | null }
 
@@ -10,12 +10,14 @@ export const boxApi = {
   loadConfig: () => invoke<BoxConfig>('load_config'),
   saveRuntimeDirectory: (directory: string) => invoke<BoxConfig>('save_runtime_directory', { directory }),
   saveLanguage: (language: Language) => invoke<BoxConfig>('save_language', { language }),
+  saveMirrorSettings: (githubMirror: string | null, npmRegistry: string | null) => invoke<BoxConfig>('save_mirror_settings', { githubMirror, npmRegistry }),
   getServerServiceStatus: () => invoke<ServerServiceStatus>('get_server_service_status'),
   restartServerService: () => invoke<void>('restart_server_service'),
   detectToolchains: async () => (await invoke<ToolchainPayload[]>('detect_toolchains')).map(({ id, name, managedVersion }) => ({ id, name, version: managedVersion })),
   listDshVersions: () => invoke<DshVersion[]>('list_dsh_versions'),
   enqueueDshCatalogRefresh: () => invoke<TaskRecord>('enqueue_dsh_catalog_refresh'),
   enqueueDshVersionInstall: (version: string) => invoke<TaskRecord>('enqueue_dsh_version_install', { version }),
+  openDshFrontBrowser: (id: string) => invoke<void>('open_dsh_front_browser', { id }),
   uninstallDshVersion: (version: string) => invoke<BoxConfig>('uninstall_dsh_version', { version }),
   listInstalledDshVersions: () => invoke<string[]>('list_installed_dsh_versions'),
   createContainer: (name: string, version: string, profile: string) => invoke<DshContainer>('create_dsh_container', { request: { name, version, profile } }),
@@ -29,6 +31,12 @@ export const boxApi = {
   enqueueWorkspaceExtensionImport: (id: string, relativePath: string) => invoke<TaskRecord>('enqueue_workspace_extension_import', { request: { id, relativePath } }),
   enqueueContainerExtensionCopy: (id: string, profile: string | null, repositoryId: string) => invoke<TaskRecord>('enqueue_container_extension_copy', { request: { id, profile, repositoryId } }),
   enqueueRepositoryExtensionExport: (repositoryId: string, destination: string) => invoke<TaskRecord>('enqueue_repository_extension_export', { request: { repositoryId, destination } }),
+  enqueueBundleExport: (id: string, destination: string, mode: string) => invoke<TaskRecord>('enqueue_bundle_export', { id, destination, mode }),
+  enqueueBundleImport: (archive: string, conflict: string) => invoke<TaskRecord>('enqueue_bundle_import', { request: { archive, conflict } }),
+  enqueueContainerBundleInstall: (id: string, profile: string, bundleId: string, conflict: string) => invoke<TaskRecord>('enqueue_container_bundle_install', { request: { id, profile, bundleId, conflict } }),
+  listExtensionBundles: () => invoke<ExtensionBundle[]>('list_extension_bundles'),
+  createExtensionBundle: (name: string, repositoryIds: string[]) => invoke<ExtensionBundle>('create_extension_bundle', { name, repositoryIds }),
+  deleteExtensionBundle: (id: string) => invoke<void>('delete_extension_bundle', { id }),
   removeRepositoryExtension: (id: string) => invoke<void>('remove_repository_extension', { id }),
   enqueuePluginExport: (sourceContainerId: string, sourcePath: string, destination: string) => invoke<TaskRecord>('enqueue_plugin_export', { request: { sourceContainerId, sourcePath, destination } }),
   removeRepositoryPlugin: (id: string, profile: string, name: string) => invoke<void>('remove_repository_plugin', { id, profile, name }),
@@ -42,6 +50,7 @@ export const boxApi = {
   openContainer: (id: string) => invoke<void>('open_dsh_front', { id }),
   listTasks: () => invoke<TaskRecord[]>('list_tasks'),
   cancelTask: (id: string) => invoke<void>('cancel_task', { id }),
+  deleteTask: (id: string) => invoke<void>('delete_task', { id }),
   retryTask: (id: string) => invoke<TaskRecord>('retry_task', { id }),
   readTaskLog: (id: string) => invoke<string>('read_task_log', { id }),
   readContainerLog: (id: string, log: 'host' | 'rebuild' | 'webview') => invoke<string>('read_container_log', { id, log }),

@@ -1,5 +1,7 @@
 //! Read-only discovery of per-container DSH profiles, plugins, and skills.
 
+pub mod transfer;
+
 use box_containers::DshContainer;
 use box_foundation::now_seconds;
 use serde::{Deserialize, Serialize};
@@ -45,6 +47,11 @@ pub struct RepositoryExtension {
     pub source_path: String,
     pub imported_at: u64,
     pub diagnostic: Option<String>,
+    /// Original import source (GitHub URL, directory, or archive path). Quick
+    /// bundle exports use this to keep GitHub entries as URLs instead of
+    /// embedding their content.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// A valid extension candidate found inside one Container workspace.
@@ -133,6 +140,85 @@ pub fn write_repository_index(runtime: &Path, entries: &[RepositoryExtension]) -
     let path = repository_index_path(runtime);
     fs::create_dir_all(path.parent().ok_or("repository index has no parent")?).map_err(|error| error.to_string())?;
     fs::write(path, serde_json::to_string_pretty(entries).map_err(|error| error.to_string())?).map_err(|error| error.to_string())
+}
+
+/// One entry inside an exported extension bundle.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleEntry {
+    /// Repository id the entry was picked from; quick exports keep GitHub
+    /// entries as URLs while full exports embed their content.
+    pub repository_id: String,
+    pub kind: ExtensionKind,
+    pub name: String,
+    pub version: Option<String>,
+    /// Original import source of the entry (GitHub URL or local path).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Content size in bytes of the entry directory (0 when unavailable).
+    pub size: u64,
+    #[serde(default)]
+    pub diagnostic: Option<String>,
+}
+
+/// A named, persisted collection of repository extensions mixed across
+/// plugins and skills, exported as a single tarball.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionBundle {
+    pub id: String,
+    pub name: String,
+    pub entries: Vec<BundleEntry>,
+    pub created_at: u64,
+}
+
+pub fn bundles_path(runtime: &Path) -> PathBuf {
+    runtime.join("state").join("bundles.json")
+}
+
+pub fn read_bundles(runtime: &Path) -> Vec<ExtensionBundle> {
+    fs::read_to_string(bundles_path(runtime))
+        .ok()
+        .and_then(|source| serde_json::from_str(&source).ok())
+        .unwrap_or_default()
+}
+
+pub fn write_bundles(runtime: &Path, bundles: &[ExtensionBundle]) -> Result<(), String> {
+    let path = bundles_path(runtime);
+    fs::create_dir_all(path.parent().ok_or("bundle state has no parent")?).map_err(|error| error.to_string())?;
+    fs::write(path, serde_json::to_string_pretty(bundles).map_err(|error| error.to_string())?).map_err(|error| error.to_string())
+}
+
+/// Total size of a directory tree in bytes, skipping the same noisy folders
+/// that are never packaged (VCS, dependencies, build output).
+pub fn directory_size(root: &Path) -> u64 {
+    fn visit(current: &Path, total: &mut u64) {
+        let Ok(entries) = fs::read_dir(current) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            if matches!(
+                name.to_str(),
+                Some(".git" | "node_modules" | "dist" | "build" | ".cache" | ".dsh")
+            ) {
+                continue;
+            }
+            let path = entry.path();
+            if let Ok(kind) = entry.file_type() {
+                if kind.is_dir() {
+                    visit(&path, total);
+                } else if kind.is_file() {
+                    if let Ok(metadata) = entry.metadata() {
+                        *total += metadata.len();
+                    }
+                }
+            }
+        }
+    }
+    let mut total = 0;
+    visit(root, &mut total);
+    total
 }
 
 /// Stable content digest excluding dependency and VCS directories.

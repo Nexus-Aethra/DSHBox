@@ -146,14 +146,36 @@ The app did start and wrote `%LOCALAPPDATA%\\dshbox\\logs\\desktop.log`, but Tau
 
 ### Open issue: Node `EISDIR lstat 'D:'` on a real Windows machine
 
-After installing the fixed build, a real Windows machine reported this crash from the bundled Node:
+RESOLVED in code (native Windows build pending user verification). The crash came from a drive-relative runtime directory: the first-run picker could persist `D:` (drive root) verbatim, and every `PathBuf::join` below it yielded `D:containers`-style paths that resolve against each child process's current drive, crashing bundled Node with `EISDIR lstat 'D:'` inside `Module._findPath`.
 
-```text
-Error: EISDIR: illegal operation on a directory, lstat 'D:'
-  at Object.realpathSync ... at Module._findPath ... resolveMainPath
-```
+Fix, all in the current worktree:
 
-`Module._findPath` means a Node process received a drive-relative path (`D:`) as its entry or module request. The leading suspect is a drive-relative runtime directory: if the first-run directory picker stores `D:` instead of `D:\\`, every `PathBuf::join` below it yields drive-relative paths (`D:instances`, `D:runtimes`, ...), which resolve against each child process's current drive and crash inside DSH/pnpm. `save_runtime_directory` in `src-tauri/src/desktop/app/commands/config.rs` currently stores the dialog string as-is and must normalize Windows drive roots (and prefer canonical absolute paths) before persisting. Verification is pending: capture the affected machine's `~/.dsh-box/config.json` `runtimeDirectory` value and the full `desktop.log`.
+- `box-foundation` gained `normalize_runtime_directory`: canonicalizes via `fs::canonicalize`, treats a bare Windows drive root (`D:`) as rooted (`D:\`), resolves relative entries against the current directory, and strips the verbatim `\\?\` prefix `canonicalize` adds on Windows.
+- `save_runtime_directory` (`src-tauri/src/desktop/app/commands/config.rs`) persists the normalized value instead of the raw dialog string.
+- `read_config` defensively re-normalizes any legacy `runtimeDirectory` value on load, healing configs already written with `D:`.
+- Three unit tests cover drive-root normalization, canonicalization, and rejection of nonexistent directories.
+
+Second root cause found on the real machine (same EISDIR stack): Tauri's `resource_dir()` returns verbatim `\\?\` prefixed paths on Windows, and bundled Node crashes with `EISDIR lstat 'D:'` when a verbatim entry script (`\\?\D:\...\pnpm.cjs`) reaches `Module._findPath`. Fixed in `initialize_bundled_runtime` and `bundled_server_path` by stripping the prefix via the new public `box_foundation::strip_verbatim_prefix`.
+
+Third fix: pnpm 11 auto-downloads the project's pinned `packageManager` version when it differs from the bundled pnpm (DSH pins `pnpm@11.7.0`), stalling startup. Resolved by aligning the bundled pnpm to the pinned version: `runtime-lock.json` now pins pnpm 11.7.0 (matching deepseek-harness's `packageManager`), so no switch/download occurs.
+
+Fourth fix: pnpm's own `runDepsStatusCheck` re-spawns a bare `pnpm` command (or reuses `node <pnpm.mjs>` when the ESM entry is used); DSH build scripts also call bare `npm`/`pnpm`. The bundled runtime previously shipped no command shims and was not on PATH, so Windows failed with "'pnpm' is not recognized". The runtime now records `pnpm.mjs` as the pnpm entry (when present) so pnpm re-spawns itself through the bundled node, and `runtime-packager` writes `pnpm.cmd`/`npm.cmd` (Windows) and `pnpm` (Unix) shims next to the runtime; `command_for_toolchain` prepends those directories to PATH for every spawned tool. `start_dsh_container_with_task` also now runs `pnpm install` before the first frontend build when the fresh checkout has no `node_modules`.
+
+Fifth fix: every spawned console child (node, pnpm, npm, schtasks) popped a black terminal window because the GUI process has no console and `CREATE_NO_WINDOW` was not set. `box_foundation::suppress_console_window` now sets the flag on all `Command` spawn sites: `command_for_toolchain` and the npm version probe in `app.rs`, `cli.rs` plugin add, `box-runtime::NativeProcessRunner`, `box-toolchains::command_version`, and the schtasks calls in `box-server-core`.
+
+Sixth fix: the PATH prepend in `command_for_toolchain` derived the pnpm bin dir from `runtime.pnpm.parent()`, but after switching the pnpm entry to `pnpm.mjs` that parent is `pnpm/node_modules/pnpm/bin` (no `pnpm.cmd`), so bare `pnpm` still failed in DSH build scripts while bare `npm` worked. The bin dirs are now derived from the node executable's parent (`runtime/<target>/node` and sibling `runtime/<target>/pnpm`). Verified end-to-end: `pnpm run build` (including its `npm run build:lib && npm run build:web` nesting) succeeds with the bundled runtime on PATH.
+
+Seventh fix: long installs/builds looked stuck because pnpm output only went to the log file, not the task log the UI shows. `spawn_forwarding_log` now spawns with piped stdout/stderr and forwards every line to both the log file and the task's live log (`task://log`), for the first-run install, the DSH build, and the rebuild flow.
+
+Eighth fix: "open container" produced a black, unclosable window with `dshbox.exe` hanging (Windows Application Hang 1002). `open_dsh_front` now dispatches `WebviewWindowBuilder::build()` through `run_on_main_thread`, adds `--disable-gpu-compositing`, and builds the window with `WebviewUrl::App` then jumps to the DSH host URL via `window.eval("location.href=...")` because wry 0.55 on Windows silently skips the initial navigation of `WebviewUrl::External` windows (diagnosed live: zero TCP connections from WebView2 to the host, zero renderer CPU, while the same URL renders perfectly in a normal browser). A 15-second window-title probe falls back to the system browser via `webbrowser::open`, and the container details Logs tab has a manual "Open in browser" button (`open_dsh_front_browser`).
+
+Ninth fix (Windows WebView2 black window): superseded by the eval-based approach in the Eighth fix entry above — the intermediate attempt used an explicit `window.navigate(url)` after build, which still failed on this machine. The 15-second window-title probe and browser fallback described there remain valid.
+
+Tenth fix (critical): after the dev-deploy shortcut (`scripts/dev-deploy.ps1` runs plain `cargo build` instead of `tauri build`), the app showed `ERR_CONNECTION_REFUSED` on its own main window. Root cause: tauri's `is_dev()` is `!cfg!(feature = "custom-protocol")`; the tauri CLI passes `--features custom-protocol` during `tauri build`, but plain `cargo build` does not, so the binary ran in dev mode and navigated the main window to `devUrl` (`http://localhost:1420`, no vite server running) instead of serving the embedded frontend. Fix: added `custom-protocol = ["tauri/custom-protocol"]` to `src-tauri/Cargo.toml` features and `--features custom-protocol` to `dev-deploy.ps1`. Any future manual release build of the desktop binary must include this feature.
+
+Tenth feature: mirror settings in Settings > General — `githubMirror` (free-form prefix applied to GitHub tags API, runtime clones, extension imports) and `npmRegistry` (preset dropdown: npmjs/npmmirror/Tencent/Huawei + custom, applied to spawned pnpm/npm via `npm_config_registry`). Saved through `save_mirror_settings` into `BoxConfig`.
+
+Verification is pending: install the newly built native Windows installer, set the runtime directory, and confirm `~/.dsh-box/config.json` stores an absolute path while DSH/pnpm sessions start cleanly.
 
 ### Windows service limitation
 
@@ -210,7 +232,15 @@ The current session successfully ran `pnpm run build`, `cargo check --workspace`
 
 ## Progress log
 
-- 2026-08-14: Fixed the Windows startup root cause (platform-aware npm entry in the runtime manifest), removed duplicate root-level `dshboxd.exe` from the installer by moving the sidecar into `crates/dshboxd`, trimmed redundant runtime files, and hardened startup logging. Rebuilt `dshbox_0.1.0_x64-setup.exe`: 33 MB, 2266 files, only `runtime/win-x64` and `server/win-x64` resources. Committed and pushed on `init`. Remaining: the `EISDIR lstat 'D:'` issue above.
+- 2026-08-14: Fixed the drive-relative runtime directory root cause behind `EISDIR lstat 'D:'`. Added `normalize_runtime_directory` to `box-foundation` (canonicalize + drive-root handling + verbatim-prefix stripping), applied it in `save_runtime_directory` and defensively in `read_config`, with 3 unit tests. Also fixed local Windows dev bootstrap: `pnpm-workspace.yaml` lacked the required `packages` field, so pnpm failed with "packages field missing or empty"; added `packages: []` and used the project-pinned pnpm 11.21.0. Built a native Windows MSVC NSIS installer for manual verification.
+- 2026-08-14: Second EISDIR root cause on the real machine: Tauri `resource_dir()` returns `\\?\`-prefixed paths and bundled Node crashes on verbatim entry scripts. Stripped the prefix for the bundled runtime and sidecar paths (`strip_verbatim_prefix` in `box-foundation`, applied in `initialize_bundled_runtime`/`bundled_server_path`).
+- 2026-08-14: Aligned bundled pnpm to the DSH project's pinned version (11.7.0) in `runtime-lock.json` so pnpm 11's automatic `packageManager` version download/switch never fires (it stalled startup). Added a first-run `pnpm install` before the DSH frontend build.
+- 2026-08-14: Fixed bare `pnpm`/`npm` resolution for bundled-tool spawned processes: runtime manifest now uses the `pnpm.mjs` ESM entry (pnpm re-spawns itself through bundled node instead of a PATH lookup), `runtime-packager` writes `pnpm.cmd`/`npm.cmd` (Windows) and `pnpm` (Unix) command shims, and `command_for_toolchain` prepends the bundled bin directories to PATH. This unblocks pnpm's dependency-status check and DSH build scripts (`npm run build:lib`, `pnpm --filter ...`).
+- 2026-08-14: Suppressed the black console windows that every spawned child (node/pnpm/npm/schtasks) opened on Windows: added `box_foundation::suppress_console_window` (`CREATE_NO_WINDOW`) and applied it to all `Command` spawn sites across `app.rs`, `cli.rs`, `box-runtime`, `box-toolchains`, and `box-server-core`.
+- 2026-08-14: Fixed the PATH-prepend bin-dir bug in `command_for_toolchain` (pnpm dir was derived from the `pnpm.mjs` entry's parent, which has no `pnpm.cmd`); bin dirs now come from the node executable's sibling layout. Verified `pnpm run build` end-to-end with the bundled runtime. Also added `spawn_forwarding_log` so install/build output streams live to the task log the UI renders (progress instead of looking stuck).
+- 2026-08-14: Fixed the black unclosable DSH window hang (Application Hang 1002): `open_dsh_front` now builds the WebView window on the main thread via `run_on_main_thread` (IPC-thread window creation blocked the message pump) and adds `--disable-gpu-compositing` for WebView2 black screens; open failures are logged to `desktop.log`.
+- 2026-08-14: Root-caused the persistent black DSH window: wry 0.55 on Windows silently skips the initial navigation of `WebviewUrl::External` windows (WebView idle, no TCP connections to the host). `open_dsh_front` now re-navigates explicitly via `window.navigate()` and falls back to the system browser after a 15s window-title probe; added `open_dsh_front_browser` command + "Open in browser" button on the container Logs tab (webbrowser crate).
+- 2026-08-14: Added mirror settings (Settings > General): `githubMirror` free-form prefix for GitHub tags/clones/imports and `npmRegistry` preset dropdown (npmjs/npmmirror/Tencent/Huawei/custom) applied via `npm_config_registry` to spawned pnpm/npm.
 
 ## Recommended next work
 
