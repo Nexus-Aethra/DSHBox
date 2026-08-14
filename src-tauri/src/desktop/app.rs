@@ -33,7 +33,7 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -164,6 +164,10 @@ pub(crate) struct NodeRelease {
 pub(crate) struct ManagedHost {
     child: Child,
     url: String,
+    /// Descendant pids of the host process tree, collected after launch. The
+    /// pnpm wrapper's tsx layer exits quickly, orphaning the node host from
+    /// the tree `taskkill /T` walks, so Stop kills these recorded pids too.
+    tree: Arc<Mutex<Vec<u32>>>,
 }
 
 #[derive(Default)]

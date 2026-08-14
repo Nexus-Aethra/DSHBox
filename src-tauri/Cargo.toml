@@ -53,6 +53,9 @@ box-extensions = { path = "crates/box-extensions" }
 box-state = { path = "crates/box-state" }
 box-server-core = { path = "crates/box-server-core" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.45", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+
 [[bin]]
 name = "dshbox"
 path = "src/main.rs"

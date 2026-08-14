@@ -168,7 +168,28 @@ pub(crate) fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             "tray-restart-daemon" => {
                 let _ = restart_user_service();
             }
-            "tray-quit" => app.exit(0),
+            "tray-quit" => {
+                // app.exit() does not wait for children: leave the hosts
+                // running and their node processes keep the container ports
+                // alive after the UI is gone. Stop them before exiting.
+                let manager = app.state::<ContainerManager>();
+                let hosts = manager
+                    .running
+                    .lock()
+                    .map(|mut running| std::mem::take(&mut *running).into_iter().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                for (_, mut host) in hosts {
+                    kill_process_tree(host.child.id());
+                    let _ = host.child.wait();
+                    let descendants = host
+                        .tree
+                        .lock()
+                        .map(|tree| tree.clone())
+                        .unwrap_or_default();
+                    kill_pids(&descendants);
+                }
+                app.exit(0);
+            }
             _ => {}
         })
         .build(app)?;

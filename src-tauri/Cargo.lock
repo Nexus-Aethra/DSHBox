@@ -838,6 +838,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "uuid",
  "webbrowser",
+ "windows-sys 0.45.0",
  "xz2",
 ]
 

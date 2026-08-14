@@ -259,6 +259,15 @@ pub(crate) fn start_dsh_container_with_task(
             available
         });
         if ready {
+            // Record the host's descendant pids right after launch: the tsx
+            // intermediate exits quickly and orphans the node host, so Stop
+            // needs these pids to finish the tree kill.
+            let tree = Arc::new(Mutex::new(Vec::new()));
+            let collector_tree = tree.clone();
+            let root_pid = child.id();
+            std::thread::spawn(move || {
+                collect_process_descendants(root_pid, collector_tree, Duration::from_secs(2));
+            });
             manager
                 .running
                 .lock()
@@ -268,6 +277,7 @@ pub(crate) fn start_dsh_container_with_task(
                     ManagedHost {
                         child,
                         url: url.clone(),
+                        tree,
                     },
                 );
             if let Some(task) = task {
@@ -307,7 +317,9 @@ pub(crate) fn start_dsh_container_with_task(
 pub(crate) fn kill_process_tree(pid: u32) {
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("taskkill")
+        let mut command = std::process::Command::new("taskkill");
+        suppress_console_window(&mut command);
+        let _ = command
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output();
     }
@@ -319,6 +331,119 @@ pub(crate) fn kill_process_tree(pid: u32) {
             .args(["-TERM", &pid.to_string()])
             .status();
     }
+}
+
+/// Terminates every recorded descendant in one suppressed call where
+/// possible, used to sweep the orphans re-parented when the pnpm launcher's
+/// tsx layer exits. Sweeping one taskkill invocation per pid would flash a
+/// console window each time.
+pub(crate) fn kill_pids(pids: &[u32]) {
+    if pids.is_empty() {
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = std::process::Command::new("taskkill");
+        suppress_console_window(&mut command);
+        let mut args = vec!["/F".to_owned()];
+        for pid in pids {
+            args.push("/PID".to_owned());
+            args.push(pid.to_string());
+        }
+        let _ = command.args(args).output();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        for &pid in pids {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
+    }
+}
+
+/// Watches the process table for a short window and records every descendant
+/// of `root` into `tree`. The pnpm launcher's tsx intermediate exits quickly,
+/// orphaning the node host from the tree `taskkill /T` walks; recording the
+/// actual pids lets Stop finish the job.
+fn collect_process_descendants(root: u32, tree: Arc<Mutex<Vec<u32>>>, total: Duration) {
+    let started = std::time::Instant::now();
+    while started.elapsed() < total {
+        let procs = process_table();
+        if let Ok(mut guard) = tree.lock() {
+            let mut frontier = vec![root];
+            while let Some(parent) = frontier.pop() {
+                for &(pid, ppid) in &procs {
+                    if pid != root && ppid == parent && !guard.contains(&pid) {
+                        guard.push(pid);
+                        frontier.push(pid);
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Snapshot of (pid, parent pid) pairs for every process on the system.
+#[cfg(target_os = "windows")]
+fn process_table() -> Vec<(u32, u32)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    let mut table = Vec::new();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return table;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                table.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    table
+}
+
+/// Snapshot of (pid, parent pid) pairs read from `/proc` (Linux). macOS has
+/// no /proc, so the read fails and the table stays empty — a safe no-op that
+/// keeps the old single-process kill behavior there.
+#[cfg(not(target_os = "windows"))]
+fn process_table() -> Vec<(u32, u32)> {
+    let mut table = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return table;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // stat format: pid (comm) state ppid ...; comm may contain spaces.
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let Some(ppid) = stat[close + 1..]
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        table.push((pid, ppid));
+    }
+    table
 }
 
 #[tauri::command]
@@ -335,6 +460,14 @@ pub(crate) fn stop_dsh_container(
     if let Some(mut host) = host {
         kill_process_tree(host.child.id());
         let _ = host.child.wait();
+        // The tsx intermediate exits early and orphans the node host, so the
+        // taskkill /T tree walk misses it; sweep the recorded descendants.
+        let descendants = host
+            .tree
+            .lock()
+            .map(|tree| tree.clone())
+            .unwrap_or_default();
+        kill_pids(&descendants);
     }
     // The DSH window stays interactive as long as it is alive, so close it
     // together with the host: a stopped container should not be usable.
@@ -344,6 +477,25 @@ pub(crate) fn stop_dsh_container(
         }
     }
     Ok(())
+}
+
+/// Best-effort display name for a container window title, falling back to
+/// the container id when the metadata cannot be read.
+fn container_display_name(id: &str) -> String {
+    let Ok(config) = read_config() else {
+        return id.to_owned();
+    };
+    let Some(root) = config.runtime_directory else {
+        return id.to_owned();
+    };
+    let Ok(metadata) = fs::read_to_string(container_directory(&root, id).join("container.json"))
+    else {
+        return id.to_owned();
+    };
+    serde_json::from_str::<serde_json::Value>(&metadata)
+        .ok()
+        .and_then(|value| value["name"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| id.to_owned())
 }
 
 #[tauri::command]
@@ -367,10 +519,26 @@ pub(crate) async fn open_dsh_front(
         .ok_or("DSH host is not running")?;
     write_startup_log(&format!("open_dsh_front called for {id}: {url}"));
     let label = format!("dsh-front-{id}");
+    let window_title = format!("{} - DSH", container_display_name(&id));
     if let Some(window) = app.get_webview_window(&label) {
         write_startup_log("open_dsh_front: window exists, showing");
         window.show().map_err(|error| error.to_string())?;
         window.set_focus().map_err(|error| error.to_string())?;
+        // A reused window may still show the previous host's URL: Stop closes
+        // the window best-effort, and a close that lags (or is dropped) leaves
+        // the stale page on screen while the old host process is already gone.
+        // Force a navigation whenever the current URL differs, otherwise the
+        // page keeps fetching the dead port and reports "Failed to fetch".
+        let stale = window
+            .url()
+            .map(|current| current.as_str() != url.as_str())
+            .unwrap_or(true);
+        if stale {
+            let target: tauri::Url = url
+                .parse()
+                .map_err(|error| format!("DSH front invalid url {url}: {error}"))?;
+            let _ = window.navigate(target);
+        }
         return Ok(());
     }
     let probe_app = app.clone();
@@ -389,7 +557,7 @@ pub(crate) async fn open_dsh_front(
         label,
         WebviewUrl::External(target),
     )
-    .title("DSH")
+    .title(&window_title)
     .build()
     .map_err(|error| {
         write_startup_log(&format!("DSH front open failed: {error}"));
@@ -417,12 +585,12 @@ pub(crate) async fn open_dsh_front(
             if let Some(window) = retry_app_inner.get_webview_window(&retry_label) {
                 let _ = window.show();
                 let _ = window.set_focus();
-                // Only re-trigger the navigation while the window still
-                // shows the default title: a loaded page has replaced it,
-                // and navigating again would needlessly reload the app.
+                // Only re-trigger the navigation while the window has not
+                // reached the target URL yet: a loaded page would just be
+                // reloaded needlessly.
                 let still_blank = window
-                    .title()
-                    .map(|title| title == "DSH")
+                    .url()
+                    .map(|current| current.as_str() != retry_url.as_str())
                     .unwrap_or(true);
                 if still_blank {
                     if let Ok(target) = retry_url.parse() {
@@ -443,11 +611,16 @@ pub(crate) async fn open_dsh_front(
         std::thread::sleep(Duration::from_secs(15));
         let loaded = probe_app
             .get_webview_window(&probe_label)
-            .map(|window| window.title().map(|title| title != "DSH").unwrap_or(false))
+            .map(|window| {
+                window
+                    .url()
+                    .map(|current| current.as_str() == probe_url.as_str())
+                    .unwrap_or(false)
+            })
             .unwrap_or(false);
         if !loaded {
             write_startup_log(&format!(
-                "DSH front title still default after 15s ({probe_url})"
+                "DSH front did not reach {probe_url} after 15s"
             ));
         }
     });
