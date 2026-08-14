@@ -12,6 +12,6 @@ for (const [command, args] of [
   ['pnpm', ['server:prepare']],
   ['pnpm', ['tauri', 'build', '--bundles', 'nsis', '--target', 'x86_64-pc-windows-gnu', '--config', 'src-tauri/tauri.windows.conf.json']],
 ]) {
-  const result = spawnSync(command, args, { stdio: 'inherit', env: environment })
+  const result = spawnSync(command, args, { stdio: 'inherit', env: environment, shell: true })
   if (result.status !== 0) process.exit(result.status ?? 1)
 }
