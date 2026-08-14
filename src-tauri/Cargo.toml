@@ -1,0 +1,53 @@
+[package]
+name = "dshbox"
+version = "0.1.0"
+description = "Managed DeepSeek Harness desktop runtime"
+authors = ["Nexus-Aethra"]
+edition = "2021"
+default-run = "dshbox"
+
+[workspace]
+members = [
+  "crates/box-foundation",
+  "crates/box-scheduler",
+  "crates/box-runtime",
+  "crates/box-toolchains",
+  "crates/box-dsh-versions",
+  "crates/box-containers",
+  "crates/box-extensions",
+  "crates/box-state",
+  "crates/box-server-core",
+  "tools/runtime-packager",
+]
+resolver = "2"
+
+[build-dependencies]
+tauri-build = { version = "2.4.1", features = [] }
+
+[dependencies]
+dirs = "6.0.0"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.18", features = ["v4"] }
+tar = "0.4"
+tauri = { version = "2.10.2", features = [] }
+tauri-plugin-dialog = "2.4.0"
+xz2 = "0.1"
+box-foundation = { path = "crates/box-foundation" }
+box-scheduler = { path = "crates/box-scheduler" }
+box-runtime = { path = "crates/box-runtime" }
+box-toolchains = { path = "crates/box-toolchains" }
+box-dsh-versions = { path = "crates/box-dsh-versions" }
+box-containers = { path = "crates/box-containers" }
+box-extensions = { path = "crates/box-extensions" }
+box-state = { path = "crates/box-state" }
+box-server-core = { path = "crates/box-server-core" }
+
+[[bin]]
+name = "dshbox"
+path = "src/main.rs"
+
+[[bin]]
+name = "dshboxd"
+path = "src/server/main.rs"

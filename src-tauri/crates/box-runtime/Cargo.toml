@@ -1,0 +1,8 @@
+[package]
+name = "box-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+box-foundation = { path = "../box-foundation" }
+git2 = "0.20"

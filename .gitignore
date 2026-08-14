@@ -1,0 +1,10 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/resources/runtime/
+src-tauri/resources/server/
+!src-tauri/resources/
+!src-tauri/resources/runtime/
+!src-tauri/resources/runtime/.gitkeep
+!src-tauri/resources/server/
+!src-tauri/resources/server/.gitkeep

@@ -1,0 +1,10 @@
+[package]
+name = "box-extensions"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+box-containers = { path = "../box-containers" }
+box-foundation = { path = "../box-foundation" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

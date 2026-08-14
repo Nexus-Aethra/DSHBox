@@ -1,0 +1,11 @@
+[package]
+name = "box-containers"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+box-foundation = { path = "../box-foundation" }
+box-runtime = { path = "../box-runtime" }
+box-scheduler = { path = "../box-scheduler" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

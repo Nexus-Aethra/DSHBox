@@ -1,0 +1,30 @@
+{
+  "name": "dshbox",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "runtime:prepare": "node scripts/prepare-runtime.mjs",
+    "server:prepare": "node scripts/prepare-server.mjs",
+    "bundle:linux": "DSH_BOX_RUNTIME_TARGET=linux-x64 pnpm runtime:prepare && pnpm server:prepare && pnpm tauri build --bundles deb",
+    "bundle:windows": "DSH_BOX_RUNTIME_TARGET=win-x64 pnpm runtime:prepare && pnpm server:prepare && pnpm tauri build --bundles nsis",
+    "bundle:macos": "DSH_BOX_RUNTIME_TARGET=macos-arm64 pnpm runtime:prepare && pnpm server:prepare && pnpm tauri build --bundles dmg",
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.10.1",
+    "@tauri-apps/plugin-dialog": "^2.4.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.10.1",
+    "@types/react": "^18.3.1",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
+  }
+}

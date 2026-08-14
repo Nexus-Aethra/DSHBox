@@ -1,0 +1,10 @@
+[package]
+name = "box-dsh-versions"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+box-foundation = { path = "../box-foundation" }
+box-runtime = { path = "../box-runtime" }
+box-toolchains = { path = "../box-toolchains" }
+serde = { version = "1.0", features = ["derive"] }
