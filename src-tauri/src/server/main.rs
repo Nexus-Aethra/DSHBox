@@ -18,6 +18,12 @@ fn main() {
 #[cfg(unix)]
 fn run() {
     let endpoint = default_endpoint().expect("server endpoint");
+    fs::create_dir_all(
+        endpoint
+            .parent()
+            .expect("server endpoint has a parent directory"),
+    )
+    .expect("create DSH Box server directory");
     if endpoint.exists() {
         let _ = fs::remove_file(&endpoint);
     }

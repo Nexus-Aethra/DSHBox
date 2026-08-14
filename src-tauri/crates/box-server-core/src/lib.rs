@@ -127,7 +127,7 @@ pub fn install_user_service(executable: &std::path::Path) -> BoxResult<()> {
         fs::create_dir_all(unit.parent().ok_or("invalid systemd unit path")?)
             .map_err(|error| error.to_string())?;
         let quoted = executable.to_string_lossy().replace('"', "\\\"");
-        fs::write(&unit, format!("[Unit]\nDescription=dshbox daemon\nAfter=default.target\n\n[Service]\nType=simple\nExecStart=\"{quoted}\" --service\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n")).map_err(|error| error.to_string())?;
+        fs::write(&unit, format!("[Unit]\nDescription=dshbox daemon\nAfter=default.target\nStartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\nType=simple\nExecStart=\"{quoted}\" --service\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n")).map_err(|error| error.to_string())?;
         for args in [
             vec!["--user", "daemon-reload"],
             vec!["--user", "enable", "--now", "dshboxd.service"],
@@ -191,4 +191,82 @@ pub fn restart_user_service() -> BoxResult<()> {
     }
     #[allow(unreachable_code)]
     Err("background service is not supported for this platform".to_owned())
+}
+
+/// Starts the per-user daemon without opening a desktop window.
+pub fn start_user_service() -> BoxResult<()> {
+    #[cfg(target_os = "linux")]
+    return run_systemctl(&["--user", "start", "dshboxd.service"]);
+    #[cfg(target_os = "windows")]
+    return run_schtasks(&["/Run", "/TN", "dshboxd"]);
+    #[allow(unreachable_code)]
+    Err("background service is not supported for this platform".to_owned())
+}
+
+/// Stops the per-user daemon while keeping the desktop tray application open.
+pub fn stop_user_service() -> BoxResult<()> {
+    #[cfg(target_os = "linux")]
+    return run_systemctl(&["--user", "stop", "dshboxd.service"]);
+    #[cfg(target_os = "windows")]
+    return run_schtasks(&["/End", "/TN", "dshboxd"]);
+    #[allow(unreachable_code)]
+    Err("background service is not supported for this platform".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn run_systemctl(args: &[&str]) -> BoxResult<()> {
+    let output = Command::new("systemctl")
+        .args(args)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_schtasks(args: &[&str]) -> BoxResult<()> {
+    let output = Command::new("schtasks")
+        .args(args)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+}
+
+/// Registers the UI in the graphical user's login session so its tray menu is available.
+pub fn install_tray_autostart(executable: &std::path::Path) -> BoxResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let home = dirs::home_dir().ok_or("cannot determine home directory")?;
+        let entry = home.join(".config/autostart/dshbox-tray.desktop");
+        fs::create_dir_all(entry.parent().ok_or("invalid autostart path")?)
+            .map_err(|error| error.to_string())?;
+        let quoted = executable.to_string_lossy().replace('"', "\\\"");
+        fs::write(&entry, format!("[Desktop Entry]\nType=Application\nName=dshbox\nComment=DSH Box tray controls\nExec=\"{quoted}\" --tray\nTerminal=false\nX-GNOME-Autostart-enabled=true\n")).map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let command = format!("\"{}\" --tray", executable.display());
+        return run_schtasks(&[
+            "/Create",
+            "/TN",
+            "dshbox-tray",
+            "/TR",
+            &command,
+            "/SC",
+            "ONLOGON",
+            "/RL",
+            "LIMITED",
+            "/F",
+        ]);
+    }
+    #[allow(unreachable_code)]
+    Ok(())
 }

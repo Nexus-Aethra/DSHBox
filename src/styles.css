@@ -64,11 +64,16 @@ h1 { font-size: clamp(32px, 4vw, 44px); line-height: 1.08; letter-spacing: -.04e
 .container-meta { color: #737a83; font-size: 12px; margin: 5px 0 0; }
 .container-detail-summary { color: #626973; display: flex; flex-wrap: wrap; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; gap: 9px 18px; margin: -16px 0 28px; }
 .extensions-section { margin-top: 28px; }
+.extension-tabs { border-bottom: 1px solid #e6e8eb; display: flex; gap: 16px; }
+.extension-tabs button { background: transparent; border: 0; border-bottom: 2px solid transparent; color: #737a83; cursor: pointer; font-size: 13px; padding: 9px 2px; }
+.extension-tabs button.active { border-bottom-color: #2864dc; color: #1f2329; font-weight: 650; }
 .extensions-section h2 { font-size: 18px; letter-spacing: -.02em; margin: 0; }
 .extensions-heading { align-items: center; display: flex; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
 .extensions-heading label { align-items: center; color: #626973; display: flex; font-size: 12px; gap: 8px; }
 .extensions-heading select, .profile-create input { background: #fff; border: 1px solid #dce0e5; border-radius: 8px; color: #1f2329; font: inherit; padding: 8px 9px; }
 .profile-create { display: flex; gap: 8px; margin: 0 0 12px; }
+.extension-import { display: flex; gap: 8px; margin: 0 0 12px; }
+.extension-import input { background: #fff; border: 1px solid #dce0e5; border-radius: 8px; color: #1f2329; flex: 1; font: inherit; min-width: 0; padding: 8px 9px; }
 .profile-create input { flex: 1; min-width: 0; }
 .extension-list { border: 1px solid #e6e8eb; border-radius: 12px; overflow: hidden; }
 .extension-row { align-items: flex-start; display: flex; gap: 20px; justify-content: space-between; padding: 14px 16px; }
@@ -77,6 +82,9 @@ h1 { font-size: clamp(32px, 4vw, 44px); line-height: 1.08; letter-spacing: -.04e
 .extension-row p { color: #737a83; font-size: 12px; margin: 5px 0 0; }
 .extension-row > div:last-child { max-width: 48%; text-align: right; }
 .extension-row code { color: #3d444d; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.plugin-repo-actions { align-items: flex-end; display: grid; gap: 8px; justify-items: end; }
+.plugin-repo-actions label { align-items: center; color: #626973; display: flex; font-size: 12px; gap: 6px; }
+.plugin-repo-actions select, .plugin-repo-actions input { border: 1px solid #dce0e5; border-radius: 7px; font: inherit; max-width: 155px; padding: 6px 7px; }
 .extension-source { color: #2864dc; font-size: 11px; font-weight: 650; }
 .empty-extension { color: #737a83; font-size: 13px; margin: 0; padding: 16px; }
 .extension-diagnostics { background: #fff8f2; border: 1px solid #f5d9bd; border-radius: 10px; color: #8a4b16; font-size: 12px; margin-top: 24px; padding: 12px 14px; }
@@ -136,4 +144,4 @@ code.missing { color: #b42318; }
 .task-status { font-size: 11px; font-weight: 650; text-transform: capitalize; }
 .task-status.running { color: #2864dc; }.task-status.succeeded { color: #29734d; }.task-status.failed, .task-status.cancelled, .task-status.interrupted { color: #b42318; }
 .task-log { margin-top: 24px; }.task-log > div { align-items: center; display: flex; justify-content: space-between; margin-bottom: 8px; }.task-log pre { background: #15191f; border-radius: 8px; color: #dce3eb; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; max-height: 260px; overflow: auto; padding: 12px; white-space: pre-wrap; }
-@media (max-width: 640px) { .app-shell { padding: 18px 20px 48px; } .topbar { align-items: flex-start; gap: 12px; flex-direction: column; } .navigation { width: 100%; overflow-x: auto; } .nav-item { padding: 8px 9px; white-space: nowrap; } .workspace, .onboarding { padding: 58px 0 34px; } .card, .toolchain-row { align-items: flex-start; flex-direction: column; } .toolchain-actions { width: 100%; justify-content: space-between; } .settings-layout { grid-template-columns: 1fr; gap: 16px; } .settings-sidebar { border-bottom: 1px solid #e6e8eb; border-right: 0; display: flex; padding: 0 0 12px; } .settings-row { align-items: flex-start; flex-direction: column; } .extensions-heading, .extension-row { align-items: flex-start; flex-direction: column; } .extension-row > div:last-child { max-width: 100%; text-align: left; } }
+@media (max-width: 640px) { .app-shell { padding: 18px 20px 48px; } .topbar { align-items: flex-start; gap: 12px; flex-direction: column; } .navigation { width: 100%; overflow-x: auto; } .nav-item { padding: 8px 9px; white-space: nowrap; } .workspace, .onboarding { padding: 58px 0 34px; } .card, .toolchain-row { align-items: flex-start; flex-direction: column; } .toolchain-actions { width: 100%; justify-content: space-between; } .settings-layout { grid-template-columns: 1fr; gap: 16px; } .settings-sidebar { border-bottom: 1px solid #e6e8eb; border-right: 0; display: flex; padding: 0 0 12px; } .settings-row { align-items: flex-start; flex-direction: column; } .extensions-heading, .extension-row, .extension-import { align-items: flex-start; flex-direction: column; } .extension-row > div:last-child { max-width: 100%; text-align: left; } .extension-import input { width: 100%; } }

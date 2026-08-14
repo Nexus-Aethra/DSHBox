@@ -6,7 +6,9 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 pub fn run() -> Option<i32> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
-    if arguments.is_empty() || arguments.len() == 1 && arguments[0] == "ui" {
+    if arguments.is_empty()
+        || arguments.len() == 1 && matches!(arguments[0].as_str(), "ui" | "--tray")
+    {
         return None;
     }
     let result = match arguments[0].as_str() {
@@ -135,10 +137,10 @@ fn plugin_command(arguments: &[String]) -> Result<(), String> {
                     source.to_string_lossy().as_ref(),
                     "dsh",
                     "plugin",
-                    "add",
-                    spec,
                     "--profile",
                     &profile,
+                    "add",
+                    spec,
                 ])
                 .env("DSH_HOME", directory.join("profile"))
                 .status()

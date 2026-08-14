@@ -10,6 +10,76 @@ use std::{
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtensionKind {
+    Plugin,
+    Skill,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionRecord {
+    pub kind: ExtensionKind,
+    pub name: String,
+    pub source_kind: String,
+    pub source: String,
+    pub profile: Option<String>,
+    pub path: String,
+    pub installed_at: u64,
+}
+
+pub fn detect_extension_kind(directory: &Path) -> Result<ExtensionKind, String> {
+    if directory.join("SKILL.md").is_file() {
+        return Ok(ExtensionKind::Skill);
+    }
+    let manifest = directory.join("package.json");
+    let value: Value = serde_json::from_str(
+        &fs::read_to_string(&manifest)
+            .map_err(|_| "extension has neither SKILL.md nor package.json".to_owned())?,
+    )
+    .map_err(|error| format!("cannot parse plugin package.json: {error}"))?;
+    if value
+        .pointer("/dsh/bundle/patch")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        Ok(ExtensionKind::Plugin)
+    } else {
+        Err("package.json does not declare dsh.bundle.patch".to_owned())
+    }
+}
+
+pub fn extension_records_path(container: &DshContainer) -> PathBuf {
+    PathBuf::from(&container.directory).join("state/extensions.json")
+}
+
+pub fn read_extension_records(container: &DshContainer) -> Vec<ExtensionRecord> {
+    fs::read_to_string(extension_records_path(container))
+        .ok()
+        .and_then(|source| serde_json::from_str(&source).ok())
+        .unwrap_or_default()
+}
+
+pub fn write_extension_record(
+    container: &DshContainer,
+    record: ExtensionRecord,
+) -> Result<(), String> {
+    let path = extension_records_path(container);
+    fs::create_dir_all(path.parent().ok_or("extension registry has no parent")?)
+        .map_err(|error| error.to_string())?;
+    let mut records = read_extension_records(container);
+    records.retain(|item| {
+        !(item.kind == record.kind && item.name == record.name && item.profile == record.profile)
+    });
+    records.push(record);
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&records).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtensionPlugin {
     pub name: String,
@@ -312,6 +382,27 @@ mod tests {
         );
         assert!(found.profiles[0].plugins[1].diagnostic.is_some());
         assert_eq!(found.skills[0].name, "demo");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn detects_skill_and_dsh_plugin_roots() {
+        let root = std::env::temp_dir().join(format!("dshbox-detect-test-{}", now_seconds()));
+        let skill = root.join("skill");
+        let plugin = root.join("plugin");
+        fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: skill\n---\n").unwrap();
+        fs::write(
+            plugin.join("package.json"),
+            r#"{"dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_extension_kind(&skill).unwrap(), ExtensionKind::Skill);
+        assert_eq!(
+            detect_extension_kind(&plugin).unwrap(),
+            ExtensionKind::Plugin
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -2,11 +2,12 @@ import { useEffect, useState } from 'react'
 import { boxApi } from './shared/api/box-api'
 import type { BoxConfig, ContainerExtensions, DshContainer, DshVersion, Language, ServerServiceStatus, TaskRecord, ToolchainStatus } from './shared/types/domain'
 import { ContainerDetails } from './features/container-details/ContainerDetails'
+import { PluginRepo } from './features/plugin-repo/PluginRepo'
 import { TaskPanel } from './features/tasks/TaskPanel'
 import { ToolchainRow } from './features/toolchains/ToolchainRow'
 import { LanguageSwitch } from './shared/ui/LanguageSwitch'
 import { DirectoryCard, Workspace } from './shared/ui/Workspace'
-type Section = 'versions' | 'container' | 'settings'
+type Section = 'versions' | 'container' | 'pluginRepo' | 'settings'
 type SettingsPane = 'general' | 'toolchains'
 
 const INITIAL_CONFIG: BoxConfig = { runtimeDirectory: null, selectedDshVersion: null, language: 'en', toolchainSources: {} }
@@ -21,7 +22,8 @@ const COPY = {
     containerTitle: 'DSH Container', notConfigured: 'Not configured', language: 'Language', storage: 'Local storage', toolchainSettings: 'Runtime', general: 'General', saved: 'Saved', service: 'Background service', restartService: 'Restart service', serviceRunning: 'Running', serviceStopped: 'Not running',
     installedVersions: 'DSH version', containerName: 'Container name', namePlaceholder: 'My DSH workspace', containerProfile: 'Profile', profilePlaceholder: 'web', createContainer: 'Create container', creating: 'Creating…', noInstalledVersion: 'Install a DSH version first.',
     containers: 'Containers', start: 'Start', stop: 'Stop', open: 'Open', moreActions: 'More actions', rebuild: 'Rebuild', remove: 'Delete', running: 'Running', stopped: 'Stopped',
-    containerDetails: 'Container details', back: 'Back', activeProfile: 'Active profile', profiles: 'Profiles', addProfile: 'Add profile', plugins: 'Plugins', skills: 'Skills', noPlugins: 'No enabled plugins in this profile.', noSkills: 'No container skills.', containerSkill: 'Container Skill', diagnostics: 'Diagnostics', version: 'DSH version', path: 'Path',
+    containerDetails: 'Container details', back: 'Back', activeProfile: 'Active profile', profiles: 'Profiles', addProfile: 'Add profile', plugins: 'Plugins', skills: 'Skills', noPlugins: 'No enabled plugins in this profile.', noSkills: 'No container skills.', containerSkill: 'Container Skill', diagnostics: 'Diagnostics', version: 'DSH version', path: 'Path', addExtension: 'Add', extensionSource: 'GitHub URL or local tarball path', browseArchive: 'Choose tarball', adding: 'Queued…',
+    pluginRepo: 'Plugin Repository', pluginRepoNote: 'Plugins imported by your DSH Box containers. Export them or install a copy into another container.', noRepositoryPlugins: 'No imported plugins yet.', exportPlugin: 'Export tarball', installTo: 'Install to', profile: 'Profile', exporting: 'Exporting…',
     tasks: 'Tasks', taskRunning: 'running', recentTasks: 'Recent', cancel: 'Cancel', retry: 'Retry', viewLog: 'View log', close: 'Close',
   },
   'zh-CN': {
@@ -33,7 +35,8 @@ const COPY = {
     containerTitle: 'DSH 容器', notConfigured: '尚未配置', language: '语言', storage: '本地存储', toolchainSettings: '运行时', general: '通用', saved: '已保存', service: '后台服务', restartService: '重启服务', serviceRunning: '运行中', serviceStopped: '未运行',
     installedVersions: 'DSH 版本', containerName: '容器名称', namePlaceholder: '我的 DSH 工作区', containerProfile: 'Profile', profilePlaceholder: 'web', createContainer: '创建容器', creating: '正在创建…', noInstalledVersion: '请先安装一个 DSH 版本。',
     containers: '容器列表', start: '启动', stop: '停止', open: '进入使用', moreActions: '更多操作', rebuild: '重新构建', remove: '删除', running: '运行中', stopped: '已停止',
-    containerDetails: 'Container 详情', back: '返回', activeProfile: '当前 Profile', profiles: 'Profiles', addProfile: '新增 Profile', plugins: '插件', skills: '技能', noPlugins: '这个 Profile 没有启用插件。', noSkills: '没有 Container 专属 Skill。', containerSkill: 'Container Skill', diagnostics: '诊断信息', version: 'DSH 版本', path: '路径',
+    containerDetails: 'Container 详情', back: '返回', activeProfile: '当前 Profile', profiles: 'Profiles', addProfile: '新增 Profile', plugins: '插件', skills: '技能', noPlugins: '这个 Profile 没有启用插件。', noSkills: '没有 Container 专属 Skill。', containerSkill: 'Container Skill', diagnostics: '诊断信息', version: 'DSH 版本', path: '路径', addExtension: '添加', extensionSource: 'GitHub URL 或本地 tarball 路径', browseArchive: '选择 tarball', adding: '已加入任务…',
+    pluginRepo: '插件仓库', pluginRepoNote: '汇总当前 DSH Box Container 已导入的插件，可导出 tarball 或安装副本到其他 Container。', noRepositoryPlugins: '暂时没有已导入的插件。', exportPlugin: '导出 tarball', installTo: '安装到', profile: 'Profile', exporting: '正在导出…',
     tasks: '任务', taskRunning: '进行中', recentTasks: '最近任务', cancel: '取消', retry: '重试', viewLog: '查看日志', close: '关闭',
   },
 } as const
@@ -59,6 +62,7 @@ export function App() {
   const [containers, setContainers] = useState<DshContainer[]>([])
   const [selectedContainer, setSelectedContainer] = useState<DshContainer | null>(null)
   const [containerDetails, setContainerDetails] = useState<ContainerExtensions | null>(null)
+  const [repositoryDetails, setRepositoryDetails] = useState<Record<string, ContainerExtensions>>({})
   const [containerMenuId, setContainerMenuId] = useState<string | null>(null)
   const [tasks, setTasks] = useState<TaskRecord[]>([])
   const [taskPanelOpen, setTaskPanelOpen] = useState(false)
@@ -80,12 +84,15 @@ export function App() {
       if (task.status !== 'succeeded') return
       if (task.kind === 'dsh-version-install' || task.kind === 'dsh-catalog-refresh') { void loadDshVersions(); void loadInstalledDshVersions() }
       if (task.kind.startsWith('container-')) void loadContainers()
+      if (task.kind === 'container-extension-add' && selectedContainer !== null && task.resourceKeys.includes(`container:${selectedContainer.id}`)) {
+        void refreshSelectedContainer(selectedContainer.id).catch((reason: unknown) => { setError(String(reason)) })
+      }
     }
     const taskEvents = ['task://created', 'task://updated', 'task://finished'].map((event) => boxApi.listenTask<TaskRecord>(event, (payload) => { update(payload); refreshForTask(payload) }))
     const logEvent = boxApi.listenTask<{ taskId: string; line: string }>('task://log', (payload) => setTaskLog((current) => current?.id === payload.taskId ? { ...current, content: `${current.content}${current.content ? '\n' : ''}${payload.line}` } : current))
     const unlisteners = Promise.all([...taskEvents, logEvent])
     return () => { void unlisteners.then((items) => items.forEach((unlisten) => unlisten())) }
-  }, [])
+  }, [selectedContainer])
 
   async function refreshToolchains(): Promise<void> {
     setDetecting(true)
@@ -124,6 +131,7 @@ export function App() {
   async function loadContainers(): Promise<void> {
     try { setContainers(await boxApi.listContainers()) } catch (reason) { setError(String(reason)) }
   }
+  async function loadPluginRepository(): Promise<void> { try { const snapshot = await boxApi.listResourceStates(); setRepositoryDetails(snapshot.containerExtensions); setContainers(snapshot.containers) } catch (reason) { setError(String(reason)) } }
 
   async function showContainerDetails(container: DshContainer): Promise<void> {
     setSelectedContainer(container); setContainerDetails(null)
@@ -141,6 +149,15 @@ export function App() {
     if (selectedContainer === null) return
     try { await boxApi.setContainerProfile(selectedContainer.id, profile); await refreshSelectedContainer(selectedContainer.id); setError(null) } catch (reason) { setError(String(reason)) }
   }
+  async function addContainerExtension(profile: string, source: string): Promise<void> {
+    if (selectedContainer === null) return
+    try { await boxApi.enqueueContainerExtensionAdd(selectedContainer.id, profile, source); setError(null) } catch (reason) { setError(String(reason)) }
+  }
+  async function chooseExtensionArchive(): Promise<string | null> {
+    try { const selected = await boxApi.chooseExtensionArchive(text.browseArchive); return typeof selected === 'string' ? selected : null } catch (reason) { setError(String(reason)); return null }
+  }
+  async function installRepositoryPlugin(id: string, profile: string, source: string): Promise<void> { try { await boxApi.enqueueContainerExtensionAdd(id, profile, source); setError(null) } catch (reason) { setError(String(reason)) } }
+  async function exportRepositoryPlugin(sourceContainerId: string, sourcePath: string, name: string): Promise<void> { try { const selected = await boxApi.choosePluginExport(text.exportPlugin, `${name.replaceAll('/', '-')}.tar.gz`); if (typeof selected === 'string') await boxApi.enqueuePluginExport(sourceContainerId, sourcePath, selected); setError(null) } catch (reason) { setError(String(reason)) } }
 
   async function toggleContainer(container: DshContainer): Promise<void> {
     try {
@@ -201,15 +218,16 @@ export function App() {
     <header className="topbar">
       <div className="brand">DSH Box</div>
       <nav className="navigation" aria-label="Workspace sections">
-        {(['versions', 'container'] as const).map((item) => <button key={item} type="button" className={item === section ? 'nav-item active' : 'nav-item'} onClick={() => { setSection(item); if (item === 'versions') { void loadDshVersions(); void refreshDshCatalog() } if (item === 'container') { void loadInstalledDshVersions(); void loadContainers() } }}>{text[item]}</button>)}
+        {(['versions', 'container', 'pluginRepo'] as const).map((item) => <button key={item} type="button" className={item === section ? 'nav-item active' : 'nav-item'} onClick={() => { setSection(item); if (item === 'versions') { void loadDshVersions(); void refreshDshCatalog() } if (item === 'container') { void loadInstalledDshVersions(); void loadContainers() } if (item === 'pluginRepo') void loadPluginRepository() }}>{text[item]}</button>)}
       </nav>
       <div className="topbar-actions"><button type="button" className="task-button" onClick={() => { setTaskPanelOpen(true) }}>{text.tasks}{tasks.filter((task) => task.status === 'queued' || task.status === 'running').length > 0 && <span>{tasks.filter((task) => task.status === 'queued' || task.status === 'running').length}</span>}</button><button type="button" className={section === 'settings' ? 'settings-button active' : 'settings-button'} onClick={() => { setSection('settings') }}>{text.settings}</button></div>
     </header>
     {section === 'versions' && <section className="workspace"><div className="workspace-heading"><div><p className="eyebrow">VERSIONS</p><h1>{text.versionTitle}</h1></div><button type="button" className="secondary" onClick={() => { void refreshDshCatalog() }}>{tasks.some((task) => task.kind === 'dsh-catalog-refresh' && (task.status === 'queued' || task.status === 'running')) ? '…' : text.loadVersions}</button></div><p className="workspace-note">{text.versionNote}</p>{dshVersions.length > 0 && <div className="version-list">{dshVersions.map((version) => { const task = activeTaskFor(`runtime:${version.name}`); return <section key={version.name} className="version-row"><code>{version.name}</code>{version.installed ? <div className="version-actions"><span className="installed">{text.installed}</span><button type="button" className="secondary" disabled={task !== undefined} onClick={() => { void uninstallDshVersion(version.name) }}>{text.uninstall}</button></div> : <button type="button" className="primary" disabled={task !== undefined || installingVersion !== null} onClick={() => { void installDshVersion(version.name) }}>{task !== undefined || installingVersion === version.name ? text.installing : text.install}</button>}</section> })}</div>}{dshVersions.length === 0 && !loadingVersions && <section className="card empty-card"><span>{text.noVersion}</span><button type="button" className="primary" onClick={() => { void refreshDshCatalog() }}>{text.loadVersions}</button></section>}{error !== null && <p className="error" role="alert">{error}</p>}</section>}
-    {section === 'container' && selectedContainer !== null && <ContainerDetails container={selectedContainer} details={containerDetails} text={text} onBack={() => { setSelectedContainer(null); setContainerDetails(null) }} onAddProfile={addContainerProfile} onSelectProfile={setContainerProfile} />}
+    {section === 'container' && selectedContainer !== null && <ContainerDetails container={selectedContainer} details={containerDetails} text={text} onBack={() => { setSelectedContainer(null); setContainerDetails(null) }} onAddProfile={addContainerProfile} onSelectProfile={setContainerProfile} onAddExtension={addContainerExtension} onChooseArchive={chooseExtensionArchive} />}
     {section === 'container' && selectedContainer === null && !creatingContainerView && <section className="workspace"><div className="workspace-heading"><div><p className="eyebrow">CONTAINER</p><h1>{text.containerTitle}</h1></div><button type="button" className="create-icon" aria-label={text.createContainer} title={text.createContainer} onClick={() => { setCreatingContainerView(true) }}>+</button></div><div className="version-list container-list">{containers.map((container) => { const task = activeTaskFor(`container:${container.id}`); const busy = task !== undefined; const running = container.status === 'running'; return <section key={container.id} className="version-row"><button type="button" className="container-summary" onClick={() => { void showContainerDetails(container) }}><strong>{container.name}</strong><p className="container-meta">{container.version} · {container.profile} · {busy ? task.stage : running ? text.running : text.stopped}</p></button><div className="container-actions"><button type="button" className={running ? 'icon-action running' : 'icon-action'} aria-label={running ? text.stop : text.start} title={running ? text.stop : text.start} disabled={busy} onClick={() => { void toggleContainer(container) }}>{running ? <span aria-hidden="true" className="pause-icon" /> : <span aria-hidden="true" className="play-icon" />}</button><button type="button" className="icon-action" aria-label={text.open} title={text.open} disabled={!running || busy} onClick={() => { void openContainer(container) }}><span aria-hidden="true" className="open-icon">↗</span></button><div className="container-menu-wrap"><button type="button" className="icon-action" aria-label={text.moreActions} title={text.moreActions} disabled={busy} aria-expanded={containerMenuId === container.id} onClick={() => { setContainerMenuId((current) => current === container.id ? null : container.id) }}><span aria-hidden="true" className="more-icon">•••</span></button>{containerMenuId === container.id && <div className="container-menu" role="menu"><button type="button" role="menuitem" onClick={() => { setContainerMenuId(null); void rebuildContainer(container) }}>{text.rebuild}</button><button type="button" role="menuitem" className="danger-menu-item" onClick={() => { void deleteContainer(container) }}>{text.remove}</button></div>}</div></div></section> })}</div>{error !== null && <p className="error" role="alert">{error}</p>}</section>}
     {section === 'container' && selectedContainer === null && creatingContainerView && <section className="workspace create-container-view"><button type="button" className="back-button" onClick={() => { setCreatingContainerView(false) }}>←</button><p className="eyebrow">CONTAINER</p><h1>{text.createContainer}</h1><section className="create-form"><label><span>{text.containerName}</span><input value={containerName} placeholder={text.namePlaceholder} onChange={(event) => { setContainerName(event.target.value) }} autoFocus /></label><label><span>{text.containerProfile}</span><input value={containerProfile} placeholder={text.profilePlaceholder} onChange={(event) => { setNewContainerProfile(event.target.value) }} required /></label><label><span>{text.installedVersions}</span>{installedDshVersions.length > 0 ? <select value={containerVersion} onChange={(event) => { setContainerVersion(event.target.value) }}>{installedDshVersions.map((version) => <option key={version} value={version}>{version}</option>)}</select> : <p className="field-help">{text.noInstalledVersion}</p>}</label><button type="button" className="primary" disabled={!containerName.trim() || !containerProfile.trim() || !containerVersion || creatingContainer} onClick={() => { void createContainer() }}>{creatingContainer ? text.creating : text.createContainer}</button></section>{error !== null && <p className="error" role="alert">{error}</p>}</section>}
     {section === 'settings' && <section className="workspace"><p className="eyebrow">SETTINGS</p><h1>{text.settings}</h1><div className="settings-layout"><nav className="settings-sidebar" aria-label={text.settings}><button type="button" className={settingsPane === 'general' ? 'active' : ''} onClick={() => { setSettingsPane('general') }}>{text.general}</button><button type="button" className={settingsPane === 'toolchains' ? 'active' : ''} onClick={() => { setSettingsPane('toolchains'); void refreshToolchains() }}>{text.toolchainSettings}</button></nav><div className="settings-content">{settingsPane === 'general' ? <div className="settings-list"><section className="settings-row"><div><p className="label">{text.storage}</p><p className="path">{config.runtimeDirectory}</p></div><button type="button" className="secondary" onClick={() => { void chooseRuntimeDirectory() }}>{text.changeDirectory}</button></section><section className="settings-row"><div><p className="label">{text.service}</p><p className="path">{serverService?.supported ? `${serverService.running ? text.serviceRunning : text.serviceStopped} · ${serverService.detail}` : serverService?.detail ?? text.notConfigured}</p></div>{serverService?.supported && <button type="button" className="secondary" onClick={() => { void restartServerService() }}>{text.restartService}</button>}</section><section className="settings-row"><p className="label solo-label">{text.language}</p><LanguageSwitch language={config.language} onChange={changeLanguage} /></section></div> : <section className="runtime-settings"><div className="workspace-heading"><div><p className="eyebrow">RUNTIME</p><h2>{text.toolchainTitle}</h2></div><button type="button" className="secondary" onClick={() => { void refreshToolchains() }}>{detecting ? '…' : text.refresh}</button></div><p className="workspace-note">{text.toolchainNote}</p><div className="toolchain-list">{toolchains.map((toolchain) => <ToolchainRow key={toolchain.id} toolchain={toolchain} runtimeLabel={text.managed} notFound={text.notFound} expanded={expandedToolchain === toolchain.id} onToggle={() => { setExpandedToolchain(expandedToolchain === toolchain.id ? null : toolchain.id) }} />)}</div></section>}</div></div>{error !== null && <p className="error" role="alert">{error}</p>}</section>}
+    {section === 'pluginRepo' && <PluginRepo containers={containers} details={repositoryDetails} text={text} onInstall={installRepositoryPlugin} onExport={exportRepositoryPlugin} />}
     {taskPanelOpen && <TaskPanel tasks={tasks} log={taskLog} text={text} onClose={() => { setTaskPanelOpen(false); setTaskLog(null) }} onCancel={cancelTask} onRetry={retryTask} onLog={showTaskLog} />}
   </main>
 }

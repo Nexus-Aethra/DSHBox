@@ -824,6 +824,7 @@ dependencies = [
  "box-state",
  "box-toolchains",
  "dirs",
+ "flate2",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
