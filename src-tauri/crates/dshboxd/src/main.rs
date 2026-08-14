@@ -1,4 +1,6 @@
+#[cfg(unix)]
 use box_server_core::{default_endpoint, remove_discovery, write_discovery};
+#[cfg(unix)]
 use std::{
     fs,
     io::{BufRead, BufReader, Write},

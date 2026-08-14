@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import type { BoxConfig, ContainerExtensions, DshContainer, DshVersion, Language, ResourceSnapshot, ResourceState, ServerServiceStatus, TaskRecord, ToolchainStatus } from '../types/domain'
+import type { BoxConfig, ContainerExtensions, DshContainer, DshVersion, Language, ResourceSnapshot, ResourceState, ServerServiceStatus, TaskRecord, ToolchainStatus, WorkspaceExtension } from '../types/domain'
 
 type ToolchainPayload = { id: string; name: string; managedVersion: string | null }
 
@@ -24,7 +24,14 @@ export const boxApi = {
   addContainerProfile: (id: string, profile: string) => invoke<DshContainer>('add_dsh_container_profile', { id, profile }),
   setContainerProfile: (id: string, profile: string) => invoke<DshContainer>('set_dsh_container_profile', { id, profile }),
   enqueueContainerExtensionAdd: (id: string, profile: string, source: string) => invoke<TaskRecord>('enqueue_container_extension_add', { request: { id, profile, source } }),
+  enqueueRepositoryExtensionImport: (source: string) => invoke<TaskRecord>('enqueue_repository_extension_import', { request: { source } }),
+  scanContainerWorkspaceExtensions: (id: string) => invoke<WorkspaceExtension[]>('scan_container_workspace_extensions', { id }),
+  enqueueWorkspaceExtensionImport: (id: string, relativePath: string) => invoke<TaskRecord>('enqueue_workspace_extension_import', { request: { id, relativePath } }),
+  enqueueContainerExtensionCopy: (id: string, profile: string | null, repositoryId: string) => invoke<TaskRecord>('enqueue_container_extension_copy', { request: { id, profile, repositoryId } }),
+  enqueueRepositoryExtensionExport: (repositoryId: string, destination: string) => invoke<TaskRecord>('enqueue_repository_extension_export', { request: { repositoryId, destination } }),
+  removeRepositoryExtension: (id: string) => invoke<void>('remove_repository_extension', { id }),
   enqueuePluginExport: (sourceContainerId: string, sourcePath: string, destination: string) => invoke<TaskRecord>('enqueue_plugin_export', { request: { sourceContainerId, sourcePath, destination } }),
+  removeRepositoryPlugin: (id: string, profile: string, name: string) => invoke<void>('remove_repository_plugin', { id, profile, name }),
   listResourceStates: () => invoke<ResourceSnapshot>('list_resource_states'),
   getResourceState: (key: string) => invoke<ResourceState | null>('get_resource_state', { key }),
   refreshResourceState: () => invoke<ResourceSnapshot>('refresh_resource_state'),
@@ -37,6 +44,7 @@ export const boxApi = {
   cancelTask: (id: string) => invoke<void>('cancel_task', { id }),
   retryTask: (id: string) => invoke<TaskRecord>('retry_task', { id }),
   readTaskLog: (id: string) => invoke<string>('read_task_log', { id }),
+  readContainerLog: (id: string, log: 'host' | 'rebuild' | 'webview') => invoke<string>('read_container_log', { id, log }),
   chooseDirectory: (title: string) => open({ directory: true, multiple: false, title }),
   chooseExtensionArchive: (title: string) => open({ multiple: false, title, filters: [{ name: 'Tar archives', extensions: ['tar', 'tgz', 'gz', 'xz'] }] }),
   choosePluginExport: (title: string, defaultPath: string) => save({ title, defaultPath, filters: [{ name: 'Tarball', extensions: ['tar.gz'] }] }),

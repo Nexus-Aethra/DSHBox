@@ -1,0 +1,12 @@
+[package]
+name = "dshboxd"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dshboxd"
+path = "src/main.rs"
+
+[dependencies]
+box-server-core = { path = "../box-server-core" }
+serde_json = "1.0"

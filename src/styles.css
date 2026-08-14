@@ -82,13 +82,26 @@ h1 { font-size: clamp(32px, 4vw, 44px); line-height: 1.08; letter-spacing: -.04e
 .extension-row p { color: #737a83; font-size: 12px; margin: 5px 0 0; }
 .extension-row > div:last-child { max-width: 48%; text-align: right; }
 .extension-row code { color: #3d444d; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
-.plugin-repo-actions { align-items: flex-end; display: grid; gap: 8px; justify-items: end; }
+.plugin-repo-actions, .extension-row-actions { align-items: center; display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
 .plugin-repo-actions label { align-items: center; color: #626973; display: flex; font-size: 12px; gap: 6px; }
 .plugin-repo-actions select, .plugin-repo-actions input { border: 1px solid #dce0e5; border-radius: 7px; font: inherit; max-width: 155px; padding: 6px 7px; }
+.plugin-repo-import { align-items: center; display: flex; gap: 8px; margin: 0 0 24px; }
+.plugin-repo-import input { background: #fff; border: 1px solid #dce0e5; border-radius: 8px; flex: 1; font: inherit; min-width: 0; padding: 8px 9px; }
+.plugin-repo-list { border: 0; border-radius: 0; }
+.plugin-repo-list .extension-row { gap: 16px; padding: 12px 0; }
+.plugin-repo-list .extension-row > div:first-child { max-width: min(760px, 72%); }
+.plugin-repo-list .extension-row p { line-height: 1.35; }
+.workspace-extension-discovery { border-top: 1px solid #e6e8eb; display: grid; gap: 8px; margin: 16px 0; padding-top: 14px; }
+.workspace-extension-row { align-items: center; display: flex; gap: 12px; justify-content: space-between; }
+.workspace-extension-row p { color: #737a83; font-size: 12px; margin: 3px 0 0; }
+.plugin-repo-list .empty-extension { padding: 0; }
 .extension-source { color: #2864dc; font-size: 11px; font-weight: 650; }
 .empty-extension { color: #737a83; font-size: 13px; margin: 0; padding: 16px; }
 .extension-diagnostics { background: #fff8f2; border: 1px solid #f5d9bd; border-radius: 10px; color: #8a4b16; font-size: 12px; margin-top: 24px; padding: 12px 14px; }
 .extension-diagnostics p { margin: 6px 0 0; }
+.log-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.active-log { background: #eef3ff; border-color: #b9cdf5; color: #1d56c5; }
+.container-log { background: #181b20; border-radius: 10px; color: #d9e1ea; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; max-height: 440px; min-height: 180px; overflow: auto; padding: 14px; white-space: pre-wrap; word-break: break-word; }
 .toolchain-row { align-items: center; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 14px 20px; padding: 14px 20px; }
 .toolchain-row + .toolchain-row { border-top: 1px solid #e6e8eb; }
 .toolchain-row.expanded { background: #fbfcff; }

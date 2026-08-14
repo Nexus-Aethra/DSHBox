@@ -26,6 +26,135 @@ pub struct ExtensionRecord {
     pub profile: Option<String>,
     pub path: String,
     pub installed_at: u64,
+    #[serde(default)]
+    pub repository_id: Option<String>,
+    #[serde(default)]
+    pub content_digest: Option<String>,
+}
+
+/// One immutable extension source owned by the DSH Box repository.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryExtension {
+    pub id: String,
+    pub kind: ExtensionKind,
+    pub name: String,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    pub content_digest: String,
+    pub source_path: String,
+    pub imported_at: u64,
+    pub diagnostic: Option<String>,
+}
+
+/// A valid extension candidate found inside one Container workspace.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceExtension {
+    pub kind: ExtensionKind,
+    pub name: String,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    pub relative_path: String,
+    pub content_digest: String,
+    pub diagnostic: Option<String>,
+}
+
+/// Finds extension roots in a workspace without following symlinks or entering dependency output.
+pub fn scan_workspace_extensions(workspace: &Path) -> Vec<WorkspaceExtension> {
+    let mut found = Vec::new();
+    let mut pending = vec![workspace.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else { continue; };
+        let kind = detect_extension_kind(&directory).ok();
+        if let Some(kind) = kind {
+            let metadata = workspace_extension_metadata(&kind, &directory);
+            let relative_path = directory.strip_prefix(workspace).ok().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
+            match metadata {
+                Ok((name, version, description)) => found.push(WorkspaceExtension { kind, name, version, description, relative_path, content_digest: extension_digest(&directory).unwrap_or_else(|error| format!("unavailable:{error}")), diagnostic: None }),
+                Err(error) => found.push(WorkspaceExtension { kind, name: directory.file_name().and_then(|item| item.to_str()).unwrap_or("extension").to_owned(), version: None, description: None, relative_path, content_digest: String::new(), diagnostic: Some(error) }),
+            }
+            continue;
+        }
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            if matches!(name.to_str(), Some(".git" | "node_modules" | "dist" | "build" | ".cache" | ".dsh")) { continue; }
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) { pending.push(entry.path()); }
+        }
+    }
+    found.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    found
+}
+
+fn workspace_extension_metadata(kind: &ExtensionKind, source: &Path) -> Result<(String, Option<String>, Option<String>), String> {
+    match kind {
+        ExtensionKind::Skill => {
+            let content = fs::read_to_string(source.join("SKILL.md")).map_err(|error| error.to_string())?;
+            let field = |key: &str| content.lines().find_map(|line| line.strip_prefix(key).map(str::trim)).map(|value| value.trim_matches(['\'', '"']).to_owned());
+            Ok((field("name:").ok_or("skill frontmatter has no name")?, None, field("description:")))
+        }
+        ExtensionKind::Plugin => {
+            let value: Value = serde_json::from_str(&fs::read_to_string(source.join("package.json")).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+            Ok((value["name"].as_str().ok_or("plugin package.json has no name")?.to_owned(), value["version"].as_str().map(str::to_owned), value["description"].as_str().map(str::to_owned)))
+        }
+    }
+}
+
+pub fn repository_root(runtime: &Path) -> PathBuf {
+    runtime.join("repository")
+}
+
+pub fn repository_index_path(runtime: &Path) -> PathBuf {
+    repository_root(runtime).join("index.json")
+}
+
+/// Reads the index and verifies every source still exists. Invalid entries remain visible as diagnostics.
+pub fn scan_repository(runtime: &Path) -> Vec<RepositoryExtension> {
+    let path = repository_index_path(runtime);
+    let mut entries: Vec<RepositoryExtension> = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    for entry in &mut entries {
+        let source = Path::new(&entry.source_path);
+        if !source.is_dir() {
+            entry.diagnostic = Some("repository source directory is missing".to_owned());
+        } else if let Err(error) = detect_extension_kind(source) {
+            entry.diagnostic = Some(error);
+        } else {
+            entry.content_digest = extension_digest(source).unwrap_or_else(|error| format!("unavailable:{error}"));
+        }
+    }
+    entries.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+    entries
+}
+
+pub fn write_repository_index(runtime: &Path, entries: &[RepositoryExtension]) -> Result<(), String> {
+    let path = repository_index_path(runtime);
+    fs::create_dir_all(path.parent().ok_or("repository index has no parent")?).map_err(|error| error.to_string())?;
+    fs::write(path, serde_json::to_string_pretty(entries).map_err(|error| error.to_string())?).map_err(|error| error.to_string())
+}
+
+/// Stable content digest excluding dependency and VCS directories.
+pub fn extension_digest(root: &Path) -> Result<String, String> {
+    fn visit(root: &Path, current: &Path, bytes: &mut Vec<u8>) -> Result<(), String> {
+        let mut entries = fs::read_dir(current).map_err(|error| error.to_string())?.filter_map(Result::ok).collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            if matches!(name.to_str(), Some(".git" | "node_modules")) { continue; }
+            let path = entry.path();
+            let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
+            bytes.extend_from_slice(relative.to_string_lossy().as_bytes());
+            if entry.file_type().map_err(|error| error.to_string())?.is_dir() { visit(root, &path, bytes)?; }
+            else if path.is_file() { bytes.extend_from_slice(&fs::read(&path).map_err(|error| error.to_string())?); }
+        }
+        Ok(())
+    }
+    let mut bytes = Vec::new(); visit(root, root, &mut bytes)?;
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes { hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3); }
+    Ok(format!("fnv1a64:{hash:016x}"))
 }
 
 pub fn detect_extension_kind(directory: &Path) -> Result<ExtensionKind, String> {
@@ -72,6 +201,26 @@ pub fn write_extension_record(
         !(item.kind == record.kind && item.name == record.name && item.profile == record.profile)
     });
     records.push(record);
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&records).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Removes the persisted record for one plugin installed into a profile.
+pub fn remove_plugin_record(
+    container: &DshContainer,
+    profile: &str,
+    name: &str,
+) -> Result<(), String> {
+    let path = extension_records_path(container);
+    let mut records = read_extension_records(container);
+    records.retain(|item| {
+        !(item.kind == ExtensionKind::Plugin
+            && item.profile.as_deref() == Some(profile)
+            && item.name == name)
+    });
     fs::write(
         path,
         serde_json::to_string_pretty(&records).map_err(|error| error.to_string())?,

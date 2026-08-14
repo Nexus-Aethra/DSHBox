@@ -15,10 +15,6 @@
   },
   "bundle": {
     "active": true,
-    "resources": {
-      "resources/runtime/": "runtime/",
-      "resources/server/": "server/"
-    },
     "windows": {
       "nsis": {
         "installMode": "both",

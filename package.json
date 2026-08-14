@@ -6,8 +6,8 @@
   "scripts": {
     "runtime:prepare": "node scripts/prepare-runtime.mjs",
     "server:prepare": "node scripts/prepare-server.mjs",
-    "bundle:linux": "DSH_BOX_RUNTIME_TARGET=linux-x64 pnpm runtime:prepare && pnpm server:prepare && pnpm tauri build --bundles deb",
-    "bundle:windows": "DSH_BOX_RUNTIME_TARGET=win-x64 pnpm runtime:prepare && pnpm server:prepare && pnpm tauri build --bundles nsis",
+    "bundle:linux": "DSH_BOX_RUNTIME_TARGET=linux-x64 pnpm runtime:prepare && pnpm server:prepare && pnpm tauri build --bundles deb --config src-tauri/tauri.linux.conf.json",
+    "bundle:windows": "node scripts/bundle-windows.mjs",
     "bundle:macos": "DSH_BOX_RUNTIME_TARGET=macos-arm64 pnpm runtime:prepare && pnpm server:prepare && pnpm tauri build --bundles dmg",
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

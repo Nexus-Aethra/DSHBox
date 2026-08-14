@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "resources": {
+      "resources/runtime/linux-x64/": "runtime/linux-x64/",
+      "resources/server/linux-x64/": "server/linux-x64/"
+    }
+  }
+}

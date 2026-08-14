@@ -17,6 +17,7 @@ members = [
   "crates/box-extensions",
   "crates/box-state",
   "crates/box-server-core",
+  "crates/dshboxd",
   "tools/runtime-packager",
 ]
 resolver = "2"
@@ -48,7 +49,3 @@ box-server-core = { path = "crates/box-server-core" }
 [[bin]]
 name = "dshbox"
 path = "src/main.rs"
-
-[[bin]]
-name = "dshboxd"
-path = "src/server/main.rs"

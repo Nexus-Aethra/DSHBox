@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "resources": {
+      "resources/runtime/win-x64/": "runtime/win-x64/",
+      "resources/server/win-x64/": "server/win-x64/"
+    }
+  }
+}

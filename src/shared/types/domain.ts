@@ -6,6 +6,9 @@ export type ExtensionPlugin = { name: string; version: string | null; descriptio
 export type ProfileExtensions = { name: string; plugins: ExtensionPlugin[]; diagnostics: string[] }
 export type ContainerSkill = { name: string; description: string | null; path: string; diagnostic: string | null }
 export type ContainerExtensions = { containerId: string; profiles: ProfileExtensions[]; skills: ContainerSkill[]; diagnostics: string[]; scannedAt: number }
+export type ExtensionKind = 'plugin' | 'skill'
+export type RepositoryExtension = { id: string; kind: ExtensionKind; name: string; version: string | null; description: string | null; contentDigest: string; sourcePath: string; importedAt: number; diagnostic: string | null }
+export type WorkspaceExtension = { kind: ExtensionKind; name: string; version: string | null; description: string | null; relativePath: string; contentDigest: string; diagnostic: string | null }
 export type TaskStatus = 'queued' | 'running' | 'waiting_input' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
 export type TaskRecord = { id: string; kind: string; resourceKeys: string[]; status: TaskStatus; stage: string; progress: number; createdAt: number; startedAt: number | null; finishedAt: number | null; logPath: string; error: string | null; params: Record<string, unknown>; cancelRequested: boolean }
 export type BoxConfig = { runtimeDirectory: string | null; selectedDshVersion: string | null; language: Language; toolchainSources: Record<string, string> }
@@ -21,6 +24,7 @@ export type ResourceSnapshot = {
   versions: DshVersion[]
   containers: DshContainer[]
   containerExtensions: Record<string, ContainerExtensions>
+  extensionRepository: RepositoryExtension[]
   tasks: TaskRecord[]
   resources: Record<string, ResourceState>
   scannedAt: number

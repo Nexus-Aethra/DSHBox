@@ -92,7 +92,13 @@ fn main() -> Result<(), String> {
         } else {
             "node/bin/node".into()
         },
-        npm_entry: "node/lib/node_modules/npm/bin/npm-cli.js".into(),
+        // Windows Node archives place npm at node/node_modules/npm, while
+        // Unix archives place it at node/lib/node_modules/npm.
+        npm_entry: if windows {
+            "node/node_modules/npm/bin/npm-cli.js".into()
+        } else {
+            "node/lib/node_modules/npm/bin/npm-cli.js".into()
+        },
         pnpm_entry: "pnpm/node_modules/pnpm/bin/pnpm.cjs".into(),
     };
     fs::write(
@@ -167,7 +173,7 @@ fn unpack_node(bytes: &[u8], destination: &Path, zip: bool) -> Result<(), String
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index).map_err(stringify)?;
             let relative = strip_first(Path::new(entry.name()))?;
-            if relative.as_os_str().is_empty() {
+            if relative.as_os_str().is_empty() || is_redundant_node_file(&relative) {
                 continue;
             }
             let target = destination.join(relative);
@@ -186,6 +192,77 @@ fn unpack_node(bytes: &[u8], destination: &Path, zip: bool) -> Result<(), String
         unpack_tar(Archive::new(decoder), destination, None)?;
     }
     Ok(())
+}
+
+/// Files that are never invoked by DSH Box and only bloat the installer.
+/// The runtime is driven exclusively through the node executable plus the
+/// npm-cli.js and pnpm.cjs entry points recorded in the manifest.
+fn is_redundant_node_file(relative: &Path) -> bool {
+    let components: Vec<_> = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let first = components.first().map(String::as_str).unwrap_or("");
+    // Corepack and its shims are unused; DSH Box pins pnpm itself.
+    if first == "node_modules" && components.get(1).map(String::as_str) == Some("corepack") {
+        return true;
+    }
+    // Unix archives ship C headers and man pages that the app never uses.
+    if matches!(first, "include" | "share") {
+        return true;
+    }
+    if components.len() == 1 {
+        return matches!(
+            first,
+            "CHANGELOG.md"
+                | "README.md"
+                | "corepack"
+                | "corepack.cmd"
+                | "npm"
+                | "npm.cmd"
+                | "npm.ps1"
+                | "npx"
+                | "npx.cmd"
+                | "npx.ps1"
+                | "install_tools.bat"
+                | "nodevars.bat"
+        );
+    }
+    if first == "lib" && components.get(1).map(String::as_str) == Some("node_modules") {
+        return is_redundant_npm_file(&components[2..]);
+    }
+    // Windows Node archives keep npm directly under node_modules.
+    if first == "node_modules" && components.get(1).map(String::as_str) == Some("npm") {
+        return is_redundant_npm_file(&components[2..]);
+    }
+    false
+}
+
+fn is_redundant_npm_file(relative: &[String]) -> bool {
+    match relative.first().map(String::as_str) {
+        Some("docs") | Some("man") => true,
+        // Documentation is never needed at runtime; keep LICENSE files only.
+        Some(_) => relative
+            .last()
+            .map(String::as_str)
+            .is_some_and(|name| name.ends_with(".md") && !name.starts_with("LICENSE")),
+        None => false,
+    }
+}
+
+/// pnpm tarball entries that duplicate dist content or are never used.
+fn is_redundant_pnpm_file(relative: &Path) -> bool {
+    let components: Vec<_> = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if components.first().map(String::as_str) == Some("artifacts") {
+        return true;
+    }
+    components
+        .last()
+        .map(String::as_str)
+        .is_some_and(|name| name.ends_with(".md") && !name.starts_with("LICENSE"))
 }
 fn unpack_tgz(bytes: &[u8], destination: &Path, prefix: &str) -> Result<(), String> {
     fs::create_dir_all(destination).map_err(stringify)?;
@@ -211,6 +288,13 @@ fn unpack_tar<R: Read>(
             None => strip_first(&path)?,
         };
         if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let redundant = match required_prefix {
+            Some(_) => is_redundant_pnpm_file(&relative),
+            None => is_redundant_node_file(&relative),
+        };
+        if redundant {
             continue;
         }
         let target = destination.join(relative);
