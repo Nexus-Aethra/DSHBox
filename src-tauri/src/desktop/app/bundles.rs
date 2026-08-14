@@ -232,10 +232,10 @@ pub(crate) fn export_extension_bundle(
 
 #[derive(Deserialize)]
 pub(crate) struct ImportBundleRequest {
-    archive: String,
+    pub(crate) archive: String,
     /// "overwrite" replaces same-named repository entries; "keep" keeps the
     /// existing entry and gives the imported one a "name (2)" suffix.
-    conflict: String,
+    pub(crate) conflict: String,
 }
 
 #[tauri::command]

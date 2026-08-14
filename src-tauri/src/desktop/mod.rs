@@ -1,4 +1,4 @@
-mod app;
+pub mod app;
 
 pub fn run() {
     app::run();

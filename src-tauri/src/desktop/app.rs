@@ -51,6 +51,7 @@ mod toolchains;
 mod versions;
 
 pub(crate) use bundles::*;
+pub(crate) use commands::versions::install_dsh_version_with_cancel;
 pub(crate) use containers::*;
 pub(crate) use extensions::*;
 pub(crate) use lifecycle::*;
@@ -108,7 +109,7 @@ pub(crate) struct AddContainerExtensionRequest {
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ImportRepositoryExtensionRequest { source: String }
+pub(crate) struct ImportRepositoryExtensionRequest { pub(crate) source: String }
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,7 +117,7 @@ pub(crate) struct CopyRepositoryExtensionRequest { id: String, profile: Option<S
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ExportRepositoryExtensionRequest { repository_id: String, destination: String }
+pub(crate) struct ExportRepositoryExtensionRequest { pub(crate) repository_id: String, pub(crate) destination: String }
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
