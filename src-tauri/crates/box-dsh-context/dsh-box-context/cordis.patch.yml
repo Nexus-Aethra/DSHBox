@@ -1,0 +1,12 @@
+# @deepseek-ai/dsh-box-context: the bundle layer applied when a profile lists this package.
+#
+# Box writes the runtime values (contextFile, order) at container start.
+# During development and local smoke the hardcoded path under /tmp is
+# acceptable; the real override arrives via --patch <container>/state/dsh-box-context.patch.yml.
+
+- insert:
+    - id: dsh-box-context
+      name: '@deepseek-ai/dsh-box-context'
+      config:
+        contextFile: /tmp/dsh-box-context.json
+        order: 130

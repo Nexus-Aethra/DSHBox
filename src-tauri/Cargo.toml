@@ -17,6 +17,7 @@ members = [
   "crates/box-extensions",
   "crates/box-state",
   "crates/box-server-core",
+  "crates/box-dsh-context",
   "crates/dshboxd",
   "tools/runtime-packager",
 ]

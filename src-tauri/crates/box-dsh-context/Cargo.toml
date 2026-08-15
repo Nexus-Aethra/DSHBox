@@ -1,0 +1,9 @@
+[package]
+name = "box-dsh-context"
+version = "0.1.0"
+edition = "2021"
+description = "DSH Box context plugin: registers a DSH system-prompt context carrying per-container metadata."
+license = "MIT"
+publish = false
+
+[dependencies]
