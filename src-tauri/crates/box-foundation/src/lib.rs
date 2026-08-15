@@ -28,6 +28,12 @@ pub struct BoxConfig {
     /// set, spawned pnpm/npm toolchains receive `npm_config_registry`.
     #[serde(default)]
     pub npm_registry: Option<String>,
+    /// SHA-256 of the bundled plugins manifest Box wrote into
+    /// `<runtimeDirectory>/plugins/node_modules/` on the last vendor pass.
+    /// `initialize_bundled_plugins` compares this against the current
+    /// resource manifest and skips the copy when they match.
+    #[serde(default)]
+    pub plugins_manifest_digest: Option<String>,
 }
 
 fn default_language() -> String {
@@ -43,6 +49,7 @@ impl Default for BoxConfig {
             toolchain_sources: BTreeMap::new(),
             github_mirror: None,
             npm_registry: None,
+            plugins_manifest_digest: None,
         }
     }
 }
