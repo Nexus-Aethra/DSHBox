@@ -113,7 +113,7 @@ pub(crate) fn start_dsh_container_with_task(
     let profile = value["profile"].as_str().unwrap_or("web");
     repair_known_profile_template(&directory, profile)?;
     let workspace = ensure_container_workspace(&directory)?;
-    let context_patch = write_dshbox_context_patch(&directory, &value, profile)?;
+    let context_files = write_dshbox_context_snapshot(&directory, &value, profile)?;
     let source = dsh_version_directory(&root, version);
     if !source.join("package.json").is_file() {
         return Err("DSH source is incomplete".to_owned());
@@ -219,6 +219,11 @@ pub(crate) fn start_dsh_container_with_task(
         }
         // Forward the host's live output to both host.log and the task log so
         // the panel shows startup details instead of looking stuck.
+        // Surface the Cordis plugin tree vendored by commit 4 to DSH's
+        // bundle resolver via NODE_PATH. DSH's app-boot/src/profile.ts
+        // resolves bundles through createRequire().resolve.paths(), which
+        // consults NODE_PATH as the final fallback.
+        let plugins_node_modules = std::path::PathBuf::from(&root).join("plugins").join("node_modules");
         let mut command = command_for_toolchain(&pnpm);
         command
             .args([
@@ -228,12 +233,13 @@ pub(crate) fn start_dsh_container_with_task(
                 "--profile",
                 profile,
                 "--patch",
-                context_patch.to_string_lossy().as_ref(),
+                context_files.patch_path.to_string_lossy().as_ref(),
                 "--patch",
                 patch.to_string_lossy().as_ref(),
             ])
             .current_dir(&workspace)
-            .env("DSH_HOME", directory.join("profile"));
+            .env("DSH_HOME", directory.join("profile"))
+            .env("NODE_PATH", plugins_node_modules.as_os_str());
         let mut child = spawn_forwarding_log(&mut command, &log_path, task)
             .map_err(|error| format!("cannot start DSH host: {error}"))?;
         let ready = (0..80).any(|attempt| {

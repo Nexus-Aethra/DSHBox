@@ -1,3 +1,7 @@
+use box_dsh_context::{
+    render_patch_yml, render_snapshot, DshContextFiles, DEFAULT_ORDER, PATCH_FILENAME,
+    SNAPSHOT_FILENAME,
+};
 use box_containers::{
     container_directory, scan_containers, CreateDshContainerRequest, DshContainer,
 };
@@ -193,7 +197,15 @@ fn run_inner() -> Result<(), String> {
                 .resource_dir()
                 .map_err(|error| error.to_string())?;
             write_startup_log(&format!("resource directory: {}", resources.display()));
-            initialize_bundled_runtime(resources).map_err(|error| { write_startup_log(&format!("bundled runtime initialization failed: {error}")); error })?;
+            initialize_bundled_runtime(resources.clone()).map_err(|error| { write_startup_log(&format!("bundled runtime initialization failed: {error}")); error })?;
+            // Vendored Cordis plugins live in the Tauri resource and need to be
+            // copied into the runtime directory on first launch (and after every
+            // resource change). Errors are non-fatal: a container can still start
+            // without the plugin, just without structured container metadata in
+            // the system prompt.
+            if let Err(error) = initialize_bundled_plugins(&resources) {
+                write_startup_log(&format!("bundled plugins initialization skipped: {error}"));
+            }
             if let Ok(runtime) = bundled_runtime() {
                 write_startup_log(&format!(
                     "bundled runtime ready: node {} at {}, npm {}, pnpm {}",
