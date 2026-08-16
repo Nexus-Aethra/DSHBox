@@ -7,13 +7,14 @@ use crate::containers::{
     ensure_container_workspace, preflight_profile_plugins, repair_known_profile_template,
     write_dshbox_context_snapshot,
 };
+use crate::image::lookup_template_path;
 use crate::state::{ContainerManager, ManagedHost};
 use crate::toolchains::{
     command_for_toolchain, resolve_toolchain, spawn_forwarding_log, wait_for_process,
 };
 use box_containers::container_directory;
 use box_dsh_context::PLUGIN_ID;
-use box_dsh_versions::{templates_directory, version_directory as dsh_version_directory};
+use box_dsh_versions::version_directory as dsh_version_directory;
 use box_foundation::{is_safe_identifier, read_config};
 use box_scheduler::TaskContext;
 use std::{
@@ -47,14 +48,17 @@ pub(crate) fn start_dsh_container_inner(
     let value: serde_json::Value = serde_json::from_str(&metadata)
         .map_err(|error| format!("cannot parse container: {error}"))?;
     // Startup contract: every container must be based on a template (or its
-    // `image` alias). The referenced template file must still exist locally.
+    // `image` alias). The referenced template must still resolve through the
+    // hash index (built templates live in `templates/<fnv1a64>/list.json`,
+    // not as a flat `<name>.dsh` file — the legacy filename lookup would
+    // miss them and report `template not found` even though the container
+    // was materialised correctly moments before). `lookup_template_path`
+    // falls back to the legacy alias for older installs.
     match value["template"].as_str() {
         Some(name) => {
-            let template_path =
-                templates_directory(&root).join(format!("{name}.dsh"));
-            if !template_path.is_file() {
-                return Err(format!("template not found: {name}"));
-            }
+            lookup_template_path(&root, name).map_err(|error| {
+                format!("template not found: {name} ({error})")
+            })?;
         }
         None => {
             if value["image"].as_str().is_none() {

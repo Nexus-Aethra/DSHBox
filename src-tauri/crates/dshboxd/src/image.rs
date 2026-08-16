@@ -8,10 +8,10 @@
 use crate::containers::create_dsh_container_sync;
 use crate::extensions::{import_into_repository, link_repository_extension};
 use box_dsh_versions::{
-    collect_unreferenced_template_hash, harness_template_path, read_template_index,
-    template_content_path, template_index_path,
-    template_storage_root, templates_directory,
-    write_template_index, TemplateEntry,
+    collect_unreferenced_template_hash, harness_template_path, read_built_template,
+    read_template_index, referenced_snapshot_digests, template_content_path,
+    template_index_path, template_storage_root, templates_directory,
+    write_built_template, write_template_index, TemplateEntry,
 };
 use box_extensions::transfer::{
     archive_content_root, copy_extension_source, extract_extension_tarball,
@@ -19,9 +19,10 @@ use box_extensions::transfer::{
 use box_extensions::{repository_root, scan_repository, ExtensionKind, RepositoryExtension};
 use box_foundation::{mirror_url, now_seconds, read_config};
 use box_image::{
-    compile_manifest, parse_script, registry, write_dshimage, AddKind, ImageManifest, ImageOp,
-    ImageResource, ImageList, ParsedSource, IMAGE_LIST_SCHEMA_VERSION,
+    compile_manifest, parse_script, write_dshimage, AddKind, ImageManifest, ImageOp,
+    ParsedSource,
 };
+use box_api::{TemplateResource, TemplateResourceList, TEMPLATE_LIST_SCHEMA_VERSION};
 use box_runtime::shallow_clone_with_cancel;
 use box_scheduler::TaskContext;
 use std::{
@@ -33,7 +34,7 @@ use std::{
 // definition; a field change is a workspace-wide compile error instead of
 // a silent deserialization failure on one client.
 pub(crate) use box_api::{
-    BuildImageRequest, CreateImageContainerRequest, CreateTemplateContainerRequest, TemplateInfo,
+    BuildImageRequest, CreateTemplateContainerRequest, TemplateInfo,
 };
 
 /// Maximum depth of the FROM template chain.
@@ -115,8 +116,9 @@ pub(crate) fn build_image_from_script(
     script.harness_ref = resolved.harness_ref;
     script.profile = resolved.profile;
 
-    // ── Image build (spec: docs/specs/image-build.md) ──
-    // The build produces a metadata-only image in the local registry; no
+    // ── Build (spec: docs/specs/image-build.md) ──
+    // The build produces a BUILT TEMPLATE — metadata only, registered in
+    // the same content-addressable store as source script templates; no
     // container is created here. Plugins are recorded as references into
     // the shared repository (their content is never touched); every other
     // kind becomes a content-addressed snapshot of the data store.
@@ -125,8 +127,8 @@ pub(crate) fn build_image_from_script(
         .clone()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| script.name.clone());
-    task.update("Resolving image resources", 15);
-    let mut resources: Vec<ImageResource> = Vec::new();
+    task.update("Resolving template resources", 15);
+    let mut resources: Vec<TemplateResource> = Vec::new();
     let mut inline_blobs: Vec<(String, PathBuf)> = Vec::new();
     let total_ops = script.ops.len().max(1);
     for (index, op) in script.ops.iter().enumerate() {
@@ -166,7 +168,7 @@ pub(crate) fn build_image_from_script(
                 }
             };
             inline_blobs.push((entry.content_digest.clone(), PathBuf::from(&entry.source_path)));
-            resources.push(ImageResource::Reference {
+            resources.push(TemplateResource::Reference {
                 kind: label.to_owned(),
                 name: entry.name.clone(),
                 version: entry.version.clone(),
@@ -188,7 +190,7 @@ pub(crate) fn build_image_from_script(
                 "snapshotted {} {} -> data/{}",
                 label, entry.name, entry.digest
             ));
-            resources.push(ImageResource::Snapshot {
+            resources.push(TemplateResource::Snapshot {
                 kind: label.to_owned(),
                 name: entry.name.clone(),
                 digest: entry.digest.clone(),
@@ -197,8 +199,8 @@ pub(crate) fn build_image_from_script(
         }
     }
 
-    let list = ImageList {
-        schema_version: IMAGE_LIST_SCHEMA_VERSION,
+    let list = TemplateResourceList {
+        schema_version: TEMPLATE_LIST_SCHEMA_VERSION,
         name: image_name.clone(),
         base: script
             .base_template
@@ -211,8 +213,8 @@ pub(crate) fn build_image_from_script(
         created_at: now_seconds(),
         resources,
     };
-    task.update("Writing image registry", 90);
-    let entry = registry::write_image(&root, &list)?;
+    task.update("Writing built template", 90);
+    let entry = write_built_template(&root, &list)?;
 
     if let Some(output_path) = request.output_path.as_ref() {
         task.update("Writing image archive", 96);
@@ -223,7 +225,7 @@ pub(crate) fn build_image_from_script(
 
     task.update("Image built", 100);
     task.log(&format!(
-        "image {} ({}) ready with {} resource(s)",
+        "built template {} ({}) ready with {} resource(s)",
         list.name,
         entry.id,
         list.resources.len()
@@ -239,27 +241,27 @@ fn kind_label(kind: &AddKind) -> &'static str {
     }
 }
 
-/// Create a container from a registered image (spec section 6): skeleton
-/// first, then link every plugin reference out of the repository and
-/// hard-copy every snapshot out of the data store.
-pub(crate) fn create_container_from_image(
-    request: CreateImageContainerRequest,
+/// Materialize a BUILT template into a container (spec section 6):
+/// skeleton first, then link every plugin reference out of the repository
+/// and hard-copy every snapshot out of the data store.
+fn materialize_built_template(
+    root: &str,
+    request: &CreateTemplateContainerRequest,
+    list: TemplateResourceList,
     task: &TaskContext,
 ) -> Result<box_containers::DshContainer, String> {
-    let root = read_config()?
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    task.update("Reading image", 10);
-    let list = registry::read_image_by_name(&root, &request.image)?
-        .ok_or_else(|| format!("image `{}` not found; build it first with `dshbox build`", request.image))?;
     task.update("Creating container", 30);
     let version = list
         .harness_ref
         .clone()
         .unwrap_or_else(|| "latest".to_owned());
-    let container = create_dsh_container_sync(&request.name, &version, &list.profile)?;
-    record_container_origin(&container, "image", &list.name)?;
-    task.update("Materialising image resources", 45);
+    let profile = request
+        .profile
+        .clone()
+        .unwrap_or_else(|| list.profile.clone());
+    let container = create_dsh_container_sync(&request.name, &version, &profile)?;
+    record_container_origin(&container, "template", &list.name)?;
+    task.update("Materialising template resources", 45);
     let total = list.resources.len().max(1);
     for (index, resource) in list.resources.iter().enumerate() {
         task.update(
@@ -267,19 +269,19 @@ pub(crate) fn create_container_from_image(
             (45 + (index * 50) / total) as u8,
         );
         match resource {
-            ImageResource::Reference { name, entry_id, .. } => {
+            TemplateResource::Reference { name, entry_id, .. } => {
                 crate::extensions::link_repository_extension(
                     &container.id,
-                    Some(&list.profile),
+                    Some(&profile),
                     entry_id,
                     task,
                 )
                 .map_err(|error| format!("cannot link plugin `{name}` from repository: {error}"))?;
             }
-            ImageResource::Snapshot { kind, name, digest, destination } => {
+            TemplateResource::Snapshot { kind, name, digest, destination } => {
                 task.log(&format!("copying snapshot {name} (data/{digest}) -> {destination}"));
                 crate::data::hard_copy_snapshot(
-                    Path::new(&root),
+                    Path::new(root),
                     &container,
                     kind,
                     name,
@@ -290,64 +292,21 @@ pub(crate) fn create_container_from_image(
         }
     }
     task.log(&format!(
-        "container {} created from image {} with {} resource(s)",
+        "container {} created from built template {} with {} resource(s)",
         container.id,
-        request.image,
+        list.name,
         list.resources.len()
     ));
     Ok(container)
 }
 
-/// List the local image registry (index rows, newest names included).
-pub(crate) fn list_images() -> Result<Vec<registry::ImageEntry>, String> {
+/// GC data-store digests no built template references (`dshbox template
+/// prune`). Returns the removed digests.
+pub(crate) fn prune_template_snapshots() -> Result<Vec<String>, String> {
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
-    let mut entries: Vec<registry::ImageEntry> = registry::read_image_index(&root)?.into_values().collect();
-    entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    Ok(entries)
-}
-
-/// Read one image list by name (for `dshbox image show`).
-pub(crate) fn read_image(name: &str) -> Result<registry::ImageList, String> {
-    let root = read_config()?
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    registry::read_image_by_name(&root, name)?
-        .ok_or_else(|| format!("image `{name}` not found"))
-}
-
-/// Remove an image unless a container still references it.
-pub(crate) fn remove_image_rpc(name: &str) -> Result<(), String> {
-    let root = read_config()?
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    let used_by: Vec<String> = box_containers::scan_containers(&root)
-        .map_err(|error| format!("cannot scan containers: {error}"))?
-        .into_values()
-        .filter(|container| container_origin(&container.directory, "image").as_deref() == Some(name))
-        .map(|container| container.id)
-        .collect();
-    if !used_by.is_empty() {
-        return Err(format!(
-            "image `{name}` is used by {} container(s) ({}); remove them first",
-            used_by.len(),
-            used_by.join(", ")
-        ));
-    }
-    if !registry::remove_image(&root, name)? {
-        return Err(format!("image `{name}` not found"));
-    }
-    Ok(())
-}
-
-/// GC data-store digests no stored image references (`dshbox image prune`).
-/// Returns the removed digests.
-pub(crate) fn prune_image_snapshots() -> Result<Vec<String>, String> {
-    let root = read_config()?
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    let referenced = registry::referenced_snapshot_digests(&root)?;
+    let referenced = referenced_snapshot_digests(&root)?;
     let store = crate::data::data_root(Path::new(&root));
     let mut removed = Vec::new();
     let entries = match std::fs::read_dir(&store) {
@@ -392,13 +351,6 @@ fn digest_in_container_use(root: &str, digest: &str) -> Result<bool, String> {
         }
     }
     Ok(false)
-}
-
-fn container_origin(directory: &str, key: &str) -> Option<String> {
-    let metadata_path = Path::new(directory).join("container.json");
-    let metadata: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&metadata_path).ok()?).ok()?;
-    metadata[key].as_str().map(str::to_owned)
 }
 
 fn record_container_origin(
@@ -450,9 +402,11 @@ fn find_repository_entry(
         })
 }
 
-/// Create a container from a local template (`.dsh` in the templates
-/// directory), then start it — mirrors `dshbox run` and the UI's
-/// create-then-start flow.
+/// Create a container from a local template, then start it — mirrors
+/// `dshbox run` and the UI's create-then-start flow. Both template forms
+/// are supported: a BUILT template (resource list produced by `dshbox
+/// build`) materialises by linking references and hard-copying snapshots;
+/// a source script template is parsed and materialised op by op.
 pub(crate) fn materialize_template_container(
     request: CreateTemplateContainerRequest,
     task: &TaskContext,
@@ -464,6 +418,10 @@ pub(crate) fn materialize_template_container(
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
+    // Built template first: the metadata-only form needs no parsing.
+    if let Some(list) = read_built_template(&root, &request.template)? {
+        return materialize_built_template(&root, &request, list, task);
+    }
     // Resolve through the index so any template name (including
     // `github.com/<owner>/<repo>:<tag>` aliases) finds the right script
     // body in the content-addressable hash directory. The legacy
@@ -620,6 +578,7 @@ pub(crate) fn list_templates() -> Result<Vec<TemplateInfo>, String> {
             id: entry.id.clone(),
             harness_ref: entry.harness_ref.clone(),
             profile: entry.profile.clone(),
+            built: entry.built,
         })
         .collect();
     templates.sort_by(|a, b| match (a.name == "latest", b.name == "latest") {
@@ -669,6 +628,7 @@ fn migrate_legacy_template_files(root: &str) -> Result<(), String> {
             profile: String::new(),
             imported_at: now_seconds(),
             from_ref: None,
+            built: false,
         };
         index.insert(entry.name.clone(), entry);
         std::fs::remove_file(&path).map_err(|error| error.to_string())?;
@@ -708,8 +668,12 @@ pub(crate) fn read_template(name: &str) -> Result<String, String> {
 }
 
 /// Resolve a template's on-disk path via the index, transparently falling
-/// back to the legacy flat layout so older installs still work.
-fn lookup_template_path(root: &str, name: &str) -> Result<PathBuf, String> {
+/// back to the legacy flat layout so older installs still work. Published
+/// to the daemon crate so the lifetime/start path can validate the
+/// referenced template before spawning the DSH host (built templates live
+/// in `templates/<fnv1a64>/list.json`; the legacy filename lookup misses
+/// them and previously reported `template not found`).
+pub(crate) fn lookup_template_path(root: &str, name: &str) -> Result<PathBuf, String> {
     migrate_legacy_template_files(root)?;
     let index = read_template_index(root);
     if let Some(entry) = index.get(name) {
@@ -869,6 +833,7 @@ pub(crate) fn remove_template(name: &str) -> Result<(), String> {
                     profile: String::new(),
                     imported_at: 0,
                     from_ref: None,
+                    built: false,
                 })
             } else {
                 None

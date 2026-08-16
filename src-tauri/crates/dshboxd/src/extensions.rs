@@ -59,6 +59,32 @@ pub(crate) fn repository_metadata(
     }
 }
 
+/// Look up an existing repository entry by its package identity:
+/// `(kind, name, version)`. Plugins require an exact version match because
+/// the `img-<id>` rows are per-version (v0.12.2 and v0.12.3 of the same
+/// plugin are distinct entries the user can keep side by side); skills are
+/// not versioned, so the version slot is ignored. Missing or invalid
+/// entries (`diagnostic` set) are skipped so a stale failure does not
+/// poison the cache hit path.
+fn find_repository_entry_by_identity(
+    root: &str,
+    kind: &ExtensionKind,
+    name: &str,
+    version: Option<&str>,
+) -> Option<RepositoryExtension> {
+    scan_repository(Path::new(root))
+        .into_iter()
+        .find(|entry| {
+            entry.kind == *kind
+                && entry.name == name
+                && entry.diagnostic.is_none()
+                && match (kind, version, &entry.version) {
+                    (ExtensionKind::Plugin, want, have) => want == have.as_deref(),
+                    (ExtensionKind::Skill, _, _) => true,
+                }
+        })
+}
+
 /// Link a repository entry into a container profile (plugin) or skill root.
 /// Plugins are materialised as a hybrid view (real root directory + code
 /// subdirectory links sharing inodes with the repository); skills are
@@ -133,6 +159,24 @@ pub(crate) fn import_into_repository(
         .ok_or("DSH Box storage is not configured")?;
     let (name, version, description) =
         repository_metadata(&kind, source).map_err(|error| format!("repository metadata: {error}"))?;
+    // Cache hit: the same package (`name[@version]` for plugin, `name` for
+    // skill) already lives in the repository. The local source is the same
+    // artefact under hash storage, so reuse the existing entry instead of
+    // creating a duplicate `img-<task_id>` row. The caller's staging clone
+    // gets discarded by the next staging timestamp — no leak.
+    if let Some(existing) = find_repository_entry_by_identity(&root, &kind, &name, version.as_deref()) {
+        let kind_label = match existing.kind {
+            ExtensionKind::Plugin => "plugin",
+            ExtensionKind::Skill => "skill",
+        };
+        task.log(&format!(
+            "reusing cached {} {}{}",
+            kind_label,
+            existing.name,
+            existing.version.as_deref().map(|v| format!("@{v}")).unwrap_or_default(),
+        ));
+        return Ok(existing);
+    }
     let entry_id = format!("img-{}", task.task_id);
     let destination = repository_root(Path::new(&root))
         .join(match kind {
@@ -543,4 +587,130 @@ pub(crate) fn container_list_plugins(id: &str, profile: &str) -> Result<Vec<Stri
         .filter_map(serde_json::Value::as_str)
         .map(str::to_owned)
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use box_foundation::BoxPaths;
+    use box_scheduler::TaskManager;
+    use std::env;
+
+    struct NoopNotifier;
+    impl box_scheduler::TaskNotifier for NoopNotifier {
+        fn stage(&self, _task_id: &str, _stage: &str, _progress: u8) {}
+        fn log(&self, _task_id: &str, _line: &str) {}
+    }
+
+    fn sandbox(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("dshboxd-ext-{name}-{}", now_seconds()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_config(home: &Path, runtime: &Path) {
+        let config_dir = home.join(".dsh-box");
+        fs::create_dir_all(&config_dir).unwrap();
+        let body = serde_json::json!({ "runtimeDirectory": runtime.to_string_lossy() });
+        fs::write(config_dir.join("config.json"), serde_json::to_string_pretty(&body).unwrap()).unwrap();
+    }
+
+    fn test_task(runtime: &Path) -> TaskContext {
+        TaskContext {
+            manager: TaskManager::default(),
+            paths: BoxPaths {
+                config: runtime.join("config.json"),
+                runtime: Some(runtime.to_path_buf()),
+            },
+            notifier: std::sync::Arc::new(NoopNotifier),
+            task_id: "test-task".to_owned(),
+        }
+    }
+
+    fn make_plugin_source(name: &str, version: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "dshboxd-ext-src-{name}-{version}-{}",
+            now_seconds()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let manifest = serde_json::json!({
+            "name": name,
+            "version": version,
+            "description": "test plugin",
+            "dsh": {
+                "bundle": {
+                    "patch": "[]",
+                },
+            },
+        });
+        fs::write(dir.join("package.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+        dir
+    }
+
+    // Importing the same plugin twice should reuse the entry id from the
+    // first call rather than minting a second `img-<task_id>` row.
+    #[test]
+    fn import_dedup_by_name_and_version() {
+        let home = sandbox("dedup-home");
+        let runtime = sandbox("dedup-runtime");
+        write_config(&home, &runtime);
+        let _guard = EnvGuard::set("HOME", &home);
+
+        let source_a = make_plugin_source("dsh-better-sidebar", "0.12.3");
+        let task = test_task(&runtime);
+        let first = import_into_repository(&task, &source_a).unwrap();
+        let source_b = make_plugin_source("dsh-better-sidebar", "0.12.3");
+        let second = import_into_repository(&task, &source_b).unwrap();
+        assert_eq!(first.id, second.id, "second import should reuse the cached entry");
+        let entries = scan_repository(&runtime);
+        let matching: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.name == "dsh-better-sidebar" && entry.version.as_deref() == Some("0.12.3"))
+            .collect();
+        assert_eq!(matching.len(), 1, "exactly one entry should match the package identity");
+
+        // Different version skews the cache key.
+        let source_c = make_plugin_source("dsh-better-sidebar", "0.12.4");
+        let task_v2 = TaskContext {
+            task_id: "test-task-v2".to_owned(),
+            ..task
+        };
+        let third = import_into_repository(&task_v2, &source_c).unwrap();
+        assert_ne!(first.id, third.id, "different version must create a new entry");
+        let entries = scan_repository(&runtime);
+        let matching: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.name == "dsh-better-sidebar")
+            .collect();
+        assert_eq!(matching.len(), 2, "two distinct versions should coexist");
+
+        let _ = fs::remove_dir_all(&source_a);
+        let _ = fs::remove_dir_all(&source_b);
+        let _ = fs::remove_dir_all(&source_c);
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = env::var(key).ok();
+            // SAFETY: tests in this module run on a single thread by default
+            // (no other tests touch HOME concurrently), and we restore the
+            // previous value on drop.
+            unsafe { env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { env::set_var(self.key, value) },
+                None => unsafe { env::remove_var(self.key) },
+            }
+        }
+    }
 }
