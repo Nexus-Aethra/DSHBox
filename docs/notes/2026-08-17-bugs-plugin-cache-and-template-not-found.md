@@ -110,10 +110,31 @@ match value["template"].as_str() {
 `lookup_template_path(&root, name)`（需要从 image.rs 提升为 `pub(crate)`）。
 `Err("template not found: ...") ` 错误格式也要匹配现有输出。
 
-**已修复**：[`lookup_template_path` 提升为 `pub(crate)`](file:///home/wpp/homework/DSHBox/src-tauri/crates/dshboxd/src/image.rs#L672-L686)，
+**已修复**。[`lookup_template_path` 提升为 `pub(crate)`](file:///home/wpp/homework/DSHBox/src-tauri/crates/dshboxd/src/image.rs#L676-L698)，
 [`start_dsh_container_inner`](file:///home/wpp/homework/DSHBox/src-tauri/crates/dshboxd/src/lifecycle.rs#L51-L66) 改为调用它；
 命中失败时仍报 `template not found: <name> (<error>)` 以兼容既有错误格式。
 `templates_directory` 同步从 lifecycle.rs 的 import 中删除。
+
+**注意：第一次修复不够**。第一版我让 `lookup_template_path` 调用
+`template_content_path(root, &entry.id)`，但这个函数硬编码
+`templates/<id>/script.dsh` ——built template 实体是 `list.json`，所以路径上
+找个空，等到 `is_file()` 返回 false、legacy alias 也不存在时照样报
+`template not found: dsh-test`。用户的实际错误
+`template not found: dsh-test (template not found: dsh-test)` 里**外层**来自
+`start_dsh_container_inner` 的包装、**内层**才是 `lookup_template_path` 自己
+吐出来的，这一层就是被假阳性的 `script.dsh` 路径骗出来的。
+
+真正的修复：[`lookup_template_path`](file:///home/wpp/homework/DSHBox/src-tauri/crates/dshboxd/src/image.rs#L676-L698)
+遍历 `templates/<id>/` 目录里实际存在的 `script.dsh` / `list.json`，两个都接受
+（template 可同时携带两种形态，但不常发生，遵循"命中即返回、跳过其余"）。
+回归测试 `image::tests::lookup_template_path_finds_built_template_list_json`
+和 `..._finds_script_template_script_dsh` 在文件末尾，分别覆盖 built 和
+script 两种形态。
+
+也正是这次水合告诉自己：「读到 caller 报告的错误信息包含 caller 自己的
+wrapper」时，先把 caller 的内部错误单独剥出来跑一次（或者看测试是否覆盖了
+caller 内部失败路径），不要假设 `format!("...({error})")` 里的 `{error}`
+是外层引发的——很可能是两层都报同一个最终错误。
 
 ---
 

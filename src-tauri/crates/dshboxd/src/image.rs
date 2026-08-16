@@ -677,9 +677,17 @@ pub(crate) fn lookup_template_path(root: &str, name: &str) -> Result<PathBuf, St
     migrate_legacy_template_files(root)?;
     let index = read_template_index(root);
     if let Some(entry) = index.get(name) {
-        let path = template_content_path(root, &entry.id);
-        if path.is_file() {
-            return Ok(path);
+        // A single hash directory may hold whichever form the template
+        // currently takes: `script.dsh` for a pulled/imported source
+        // template, `list.json` for a built one. `template_content_path`
+        // hardcodes `script.dsh` and was authored before the built-form
+        // existed — check the actual file instead of guessing.
+        let directory = template_storage_root(root).join(&entry.id);
+        for filename in ["script.dsh", "list.json"] {
+            let path = directory.join(filename);
+            if path.is_file() {
+                return Ok(path);
+            }
         }
     }
     let legacy = harness_template_path(root, name);
@@ -1005,4 +1013,93 @@ fn write_archive(
         output.display()
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    fn sandbox(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("dshboxd-image-{name}-{}", now_seconds()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // `lookup_template_path` must accept a hash directory that holds
+    // `list.json` (a built template), not just `script.dsh`. The bug it
+    // fixed was: `start_dsh_container_inner` validating the container's
+    // referenced template by trying to find `script.dsh`, missing the
+    // built form, and aborting the run with `template not found`.
+    #[test]
+    fn lookup_template_path_finds_built_template_list_json() {
+        let root = sandbox("lookup-built");
+        let id = "01ac9770f2962dd02";
+        let directory = template_storage_root(root.to_string_lossy().as_ref()).join(id);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("list.json"),
+            br#"{"schemaVersion":7,"name":"dsh-test","resources":[]}"#,
+        )
+        .unwrap();
+        let mut index = read_template_index(root.to_string_lossy().as_ref());
+        index.insert(
+            "dsh-test".to_owned(),
+            TemplateEntry {
+                name: "dsh-test".to_owned(),
+                id: id.to_owned(),
+                harness_ref: Some("latest".to_owned()),
+                profile: "web".to_owned(),
+                imported_at: now_seconds(),
+                from_ref: None,
+                built: true,
+            },
+        );
+        write_template_index(root.to_string_lossy().as_ref(), &index).unwrap();
+
+        let resolved = lookup_template_path(root.to_string_lossy().as_ref(), "dsh-test").unwrap();
+        assert!(
+            resolved.ends_with("list.json"),
+            "must resolve to the built form: got {resolved:?}"
+        );
+    }
+
+    // Script templates still resolve via `script.dsh` (the historic form).
+    #[test]
+    fn lookup_template_path_finds_script_template_script_dsh() {
+        let root = sandbox("lookup-script");
+        let id = "02bb4e2e4ef6a2aad8";
+        let directory = template_storage_root(root.to_string_lossy().as_ref()).join(id);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("script.dsh"),
+            "FROM github.com/deepseek-ai/deepseek-harness:latest\nPROFILE web\n",
+        )
+        .unwrap();
+        let mut index = read_template_index(root.to_string_lossy().as_ref());
+        index.insert(
+            "github.com/deepseek-ai/deepseek-harness:latest".to_owned(),
+            TemplateEntry {
+                name: "github.com/deepseek-ai/deepseek-harness:latest".to_owned(),
+                id: id.to_owned(),
+                harness_ref: Some("latest".to_owned()),
+                profile: "web".to_owned(),
+                imported_at: now_seconds(),
+                from_ref: Some("github.com/deepseek-ai/deepseek-harness:latest".to_owned()),
+                built: false,
+            },
+        );
+        write_template_index(root.to_string_lossy().as_ref(), &index).unwrap();
+
+        let resolved = lookup_template_path(
+            root.to_string_lossy().as_ref(),
+            "github.com/deepseek-ai/deepseek-harness:latest",
+        )
+        .unwrap();
+        assert!(
+            resolved.ends_with("script.dsh"),
+            "must resolve to the script form: got {resolved:?}"
+        );
+    }
 }
