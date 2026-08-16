@@ -225,6 +225,7 @@ dependencies = [
 name = "box-image"
 version = "0.1.0"
 dependencies = [
+ "box-dsh-versions",
  "box-extensions",
  "flate2",
  "serde",

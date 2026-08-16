@@ -15,8 +15,10 @@ use crate::extensions::{
     remove_repository_extension, remove_repository_plugin,
 };
 use crate::image::{
-    build_image_from_script, export_template, import_template, list_templates, materialize_template_container,
-    read_template, remove_template, BuildImageRequest, CreateTemplateContainerRequest,
+    build_image_from_script, create_container_from_image, export_template, import_template,
+    list_images, list_templates, materialize_template_container, prune_image_snapshots,
+    read_image, read_template, remove_image_rpc, remove_template, BuildImageRequest,
+    CreateImageContainerRequest, CreateTemplateContainerRequest,
 };
 use crate::lifecycle::{
     rebuild_dsh_container_with_task, start_dsh_container_inner, stop_dsh_container,
@@ -105,6 +107,19 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("export_bundle") => enqueue_bundle_export(state, request),
         Some("import_bundle") => enqueue_bundle_import(state, request),
         Some("create_container_from_template") => enqueue_template_container(state, request),
+        Some("create_container_from_image") => enqueue_image_container(state, request),
+        Some("list_images") => list_images().map(|entries| json!(entries)),
+        Some("read_image") => {
+            let name = request["name"].as_str().unwrap_or("").to_owned();
+            read_image(&name).map(|list| json!(list))
+        }
+        Some("remove_image") => {
+            let name = request["name"].as_str().unwrap_or("").to_owned();
+            remove_image_rpc(&name).map(|_| json!({ "removed": name }))
+        }
+        Some("prune_image_snapshots") => {
+            prune_image_snapshots().map(|removed| json!({ "removed": removed }))
+        }
         Some("create_container") => create_container_rpc(request),
         Some("enqueue_container_start") => enqueue_container_start(state, request),
         Some("enqueue_container_stop") => enqueue_container_stop(state, request),
@@ -482,6 +497,31 @@ fn enqueue_template_container(state: &DaemonState, request: &Value) -> Result<Va
         params,
         move |task| {
             let container = materialize_template_container(parsed, task)?;
+            let url = start_dsh_container_inner(&container.id, &containers.running, Some(task))?;
+            task.update(format!("Container {} is ready", container.id), 100);
+            task.log(&format!("container url: {url}"));
+            Ok(())
+        },
+    )
+}
+
+/// Materialize an image container and start its DSH host inside one daemon
+/// task; mirrors `enqueue_template_container` for the image path.
+fn enqueue_image_container(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    let parsed: CreateImageContainerRequest = serde_json::from_value(request.clone())
+        .map_err(|error| format!("invalid image container request: {error}"))?;
+    let params = json!({
+        "name": parsed.name.clone(),
+        "image": parsed.image.clone(),
+    });
+    let containers = state.containers.clone();
+    enqueue_task_worker(
+        state,
+        "image-container",
+        vec!["repository:extensions".to_owned()],
+        params,
+        move |task| {
+            let container = create_container_from_image(parsed, task)?;
             let url = start_dsh_container_inner(&container.id, &containers.running, Some(task))?;
             task.update(format!("Container {} is ready", container.id), 100);
             task.log(&format!("container url: {url}"));

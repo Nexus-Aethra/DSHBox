@@ -1,5 +1,7 @@
-//! `dshbox build [path]` — build a container from a boxfile (or `.dsh`
-//! script). The default filename lookup mirrors `Dockerfile` conventions:
+//! `dshbox build [path]` — build an IMAGE from a boxfile (or `.dsh`
+//! script). The image is metadata only (docs/specs/image-build.md); use
+//! `dshbox run <image>` afterwards to create and start a container.
+//! The default filename lookup mirrors `Dockerfile` conventions:
 //! `./boxfile` → `./Boxfile` → `./.boxfile` in the current working
 //! directory.
 
@@ -56,13 +58,15 @@ fn opt(value: &str) -> Option<String> {
 }
 
 fn print_help() {
-    println!("dshbox build [path] [--file <path>] [--name <container>] [--output <path.dshimage>]");
+    println!("dshbox build [path] [--file <path>] [--name <image>] [--output <path.dshimage>]");
     println!();
-    println!("Parse a boxfile and build a container from it.");
+    println!("Parse a boxfile and build an IMAGE from it (no container is created).");
+    println!("Plugins are referenced from the shared repository; every other kind");
+    println!("is snapshotted into the data store (docs/specs/image-build.md).");
     println!();
     println!("If no path is given, the command looks for the first match among:");
     println!("  {}", DEFAULT_BOXFILE_NAMES.join(", "));
     println!();
     println!("Boxfile format is the same as .dsh (FROM / PROFILE / NAME / ADD lines).");
-    println!("Use 'dshbox run <template>' afterwards to start the built container.");
+    println!("Use 'dshbox run <image>' afterwards to create and start a container.");
 }

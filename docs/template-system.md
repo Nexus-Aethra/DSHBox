@@ -1,6 +1,8 @@
 # Template system
 
-Updated: 2026-08-15 (harness unified into the template model; `data` kind removed; `CP` accepted as an alias)
+Updated: 2026-08-17 (corrections: `data` kind is implemented, FROM chain
+depth is 4, install flow goes through `pull_template`, the image build
+pipeline is specified separately in `docs/specs/image-build.md`)
 
 A **template** is DSH Box's unit of container construction. Everything in the
 Resources tab is a template — including the "Harness" entry, which is just the
@@ -42,7 +44,7 @@ VERSION <version>      # optional, defaults to "latest"
 LABEL key=value        # optional, repeatable
 DEF <name> @<path>     # optional, repeatable
 
-ADD plugin|skill <source> [@<dest>]   # one or more
+ADD plugin|skill|data <source> [@<dest>]   # one or more
 CP <source> [@<dest>]                 # alias for `ADD plugin`
 ```
 
@@ -64,8 +66,8 @@ the "incremental" mode).
 
 ### Resources at a glance
 
-A template is fundamentally a **plugin aggregator**. The two built-in kinds
-today are `plugin` and `skill`; `data` was a legacy alias and has been removed.
+A template is fundamentally a **plugin aggregator**. The three built-in kinds
+today are `plugin`, `skill`, and `data`.
 
 - **plugin** — copied to `@plugin`, which the builder resolves against the
   `DEF plugin` table. The default system DEF is
@@ -74,6 +76,11 @@ today are `plugin` and `skill`; `data` was a legacy alias and has been removed.
   `ADD plugin` is the syntax sugar for that whole flow.
 - **skill** — copied to `@skill`, which defaults to `@profile/skills`. Skills
   are data-only resources, so the builder just copies them in place.
+- **data** — materialised into the content-addressed data store
+  (`<root>/data/<digest>/`, fnv1a64 digest) and copied per-container under
+  `extensions/data/<name>`. Implemented in `crates/dshboxd/src/data.rs`
+  (`materialize_data_add`); orphaned blobs are reclaimed by `dshbox image
+  data prune`.
 - **session** — reserved for cross-container migration (`ADD session
   container1` would copy another container's session history). Not yet wired
   through the script parser; the manifest schema already supports it via
@@ -107,8 +114,8 @@ You add your own with `DEF <name> @<path>`. Once defined, both `ADD plugin
 @mybin/foo` and `ADD @mybin/foo` resolve through it.
 
 `ADD` without an explicit `@<dest>` falls back to the kind's default:
-plugin → `@plugin`, skill → `@skill`. The previous `data` kind required an
-explicit destination; that's gone now.
+plugin → `@plugin`, skill → `@skill`. `data` payloads are stored in the
+data store and need no destination at all.
 
 ## A complete example
 
@@ -138,29 +145,36 @@ content already exists in the archive.
 
 ## From template to running container
 
-1. **Install** the harness — `enqueue_dsh_version_install(v)` clones the
-   `github.com/deepseek-ai/deepseek-harness` repository into
-   `<runtime>/runtimes/v/source` and writes a base template into
-   `<runtime>/templates/v.dsh`.
-2. **Extend** — the user opens the Template tab, optionally copies the base
-   template into a new file (or edits in place) and adds `ADD` / `DEF` lines.
-3. **Build** — `enqueue_image_build(<script>)` parses the script, walks the
-   template chain (`FROM` is recursive up to two levels), resolves every
-   source, and writes a `manifest.v6.json` archive.
-4. **Create** — `create_dsh_container_from_template(name, template, profile)`
-   materialises a container that runs the DSH Host against that profile. The
-   host reads the manifest, copies the resolved `adds` into the container's
-   filesystem, and starts.
+1. **Pull** the harness — `dshbox pull template github.com/deepseek-ai/deepseek-harness[:tag]`
+   clones the repository into `<runtime>/runtimes/<version>/source` via
+   libgit2, writes the completion marker `.dshbox-runtime.json` (the
+   installed-version criterion), and registers a base template in the
+   content-addressable template store (`templates/<hash>/script.dsh` +
+   `state/template-index.json`; a legacy `templates/<version>.dsh` alias is
+   kept for the build path).
+2. **Extend** — the user runs `dshbox init` or copies the base template and
+   adds `ADD` / `DEF` lines.
+3. **Build / run** — `dshbox build` produces a metadata-only **image**
+   (resolving the `FROM` chain up to **four** levels): plugins are recorded
+   as references into the shared repository, every other kind is hashed
+   into the data store as a snapshot. `dshbox run <image>` then creates and
+   starts a container (plugins linked, snapshots hard-copied); a template
+   name still works and builds implicitly. An optional `--output` exports a
+   portable `.dshimage` archive. Full design: `docs/specs/image-build.md`.
+4. **Start** — the daemon creates the container directory, links/copies the
+   materialised extensions into the profile, writes the `dsh-box-context`
+   snapshot + patch, and spawns the DSH Host against that profile.
 
 ## Resources page → templates
 
 The Resources tab in the UI reflects this model directly:
 
-- **Harness** — installed DSH versions. Each row corresponds to a base
-  template under `<runtime>/templates/`. The "Fill missing templates" button
-  calls `upgrade_legacy_resources`, which scans `<runtime>/runtimes/`, ensures
-  every installed version has a base template, and returns a per-version
-  report (`{version, templatePath, templateCreated}`).
+- **Harness** — the tag catalog of the official harness repo (fetched over
+  the git protocol) plus installed DSH versions. Pulling a tag registers a
+  base template in the template index. The "Fill missing templates" button
+  calls `upgrade_legacy_resources`, which scans `<runtime>/runtimes/`,
+  ensures every installed version has a base template, and returns a
+  per-version report (`{version, templatePath, templateCreated}`).
 - **Plugins** — entries that live in the local Repository (`<runtime>/repository/plugins/`).
   Pull one into a template with `ADD plugin <name>`.
 - **Bundles** — saved selections of plugin entries; useful for sharing a
@@ -174,15 +188,16 @@ only as a label.
 
 ## Migration notes (for older installations)
 
-- The legacy `ADD data <source>` kind has been removed. Use `ADD plugin
-  <source> [@<dest>]` instead, or `CP <source> [@<dest>]` for the same
-  effect with no syntax sugar.
-- `CP` is now accepted as a keyword. Old scripts that wrote `CP ./local.conf
-  @profile/etc` continue to parse unchanged.
-- The old `.dshbox-runtime.json` and `<runtime>/runtimes/<v>/.dboxfile` files
-  are no longer read or rewritten. They are left in place as historical
-  artefacts; the only thing the migration pass does now is ensure every
-  installed version has a `<runtime>/templates/<v>.dsh` base template.
+- `ADD data <source>` is fully supported (see "Resources at a glance");
+  earlier drafts of this document incorrectly said it was removed.
+- `CP` is accepted as a keyword aliasing `ADD plugin`. Old scripts that
+  wrote `CP ./local.conf @profile/etc` continue to parse unchanged.
+- `.dshbox-runtime.json` IS live metadata: `pull_template` writes it after a
+  successful clone and both `installed_versions` and container creation use
+  it as the install-completion marker (a `.git` directory alone means a
+  clone is still in flight). Only the legacy `<runtime>/runtimes/<v>/.dboxfile`
+  file is a dead artefact. The migration pass ensures every installed
+  version has a base template.
 - `ResourceKind::Harness` has been removed. UI rows that previously reported
   `kind: "harness"` will simply not appear; the corresponding `runtime:<v>`
   resource continues to exist.

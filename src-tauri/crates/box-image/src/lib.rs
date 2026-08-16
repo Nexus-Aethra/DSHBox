@@ -13,9 +13,13 @@ pub mod script;
 pub mod manifest;
 pub mod archive;
 pub mod error;
+pub mod registry;
 
 pub use archive::{read_dshimage, write_dshimage, ImageArchive};
 pub use error::ImageError;
+pub use registry::{
+    ImageEntry, ImageIndex, ImageList, ImageResource, IMAGE_LIST_SCHEMA_VERSION,
+};
 pub use manifest::{
     compile_manifest, parse_manifest, serialize_manifest, AddSource, ImageManifest,
     ResolvedAdd, TemplateBase,

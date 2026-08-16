@@ -36,7 +36,7 @@ export function useTasks(refreshers: TaskRefreshers, onError: (message: string |
       // but its kind does not carry the `container-` prefix the daemon
       // uses for lifecycle tasks, so it needs an explicit mention or the
       // container list never refreshes after creation.
-      if (task.kind.startsWith('container-') || task.kind === 'image-build' || task.kind === 'template-container') current.onContainersChanged()
+      if (task.kind.startsWith('container-') || task.kind === 'image-build' || task.kind === 'template-container' || task.kind === 'image-container') current.onContainersChanged()
       if ((task.kind === 'container-extension-add' || task.kind === 'container-extension-copy' || task.kind === 'container-bundle-install') && task.resourceKeys.some((key) => key.startsWith('container:'))) {
         const containerId = task.resourceKeys.find((key) => key.startsWith('container:'))?.slice('container:'.length)
         if (containerId !== undefined) void current.onContainerDetailsChanged(containerId).catch((reason: unknown) => { onError(String(reason)) })

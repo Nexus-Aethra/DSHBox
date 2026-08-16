@@ -1,22 +1,20 @@
-//! `dshbox image` — deprecated alias for `dshbox build`.
+//! `dshbox image` — manage the local image registry.
 //!
-//! The unified top-level command is `dshbox build <boxfile>`. This module
-//! is retained as a backwards-compatible shim while existing scripts and
-//! docs catch up. Only the `build` action is honoured; the rest of the
-//! pre-deprecation surface (preview/inspect/ls/rm) was a stub and is now
-//! removed.
+//! `dshbox build` produces images (metadata-only lists per
+//! docs/specs/image-build.md); this module lists, inspects, removes, and
+//! prunes them. `image build` stays as an alias of `dshbox build`.
 
 use std::path::Path;
 
+use box_image::registry::{ImageEntry, ImageList};
 use box_scheduler::TaskRecord;
 
 use crate::desktop::app::image::{preview_image_script, validate_archive};
 use super::rpc;
 
-/// Build a container from a build script. The core of the legacy
-/// `dshbox image build` action — kept `pub(crate)` so the new
-/// `dshbox build` command can delegate to it. The build runs on the
-/// daemon; this process only enqueues and polls.
+/// Build an image from a build script. Runs on the daemon; this process
+/// only enqueues and polls. `--name` names the image, `--output`
+/// additionally exports a portable `.dshimage` archive.
 pub(crate) fn build(script_path: &str, output_path: Option<String>, container_name: Option<String>) -> Result<(), String> {
     // The daemon runs with a different CWD; resolve every path here.
     let script = rpc::absolutize_path(script_path);
@@ -34,28 +32,33 @@ pub(crate) fn build(script_path: &str, output_path: Option<String>, container_na
     let task: TaskRecord = serde_json::from_value(value)
         .map_err(|error| format!("invalid task record from daemon: {error}"))?;
     rpc::wait_task(&client, &task.id)?;
-    println!("container built from {script_path}");
+    println!("image built from {script_path}");
     Ok(())
 }
 
-/// Deprecated entry point. Prints a warning then forwards to `build` for
-/// backwards compatibility. `prune` (the data-store garbage collector) is
-/// the one non-build action kept here; the rest of the pre-deprecation
-/// surface (preview/inspect/ls/rm) was a stub and is now removed.
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
-    eprintln!("warning: 'dshbox image' is deprecated, use 'dshbox build' instead.");
     let Some(action) = arguments.first().map(String::as_str) else {
-        return Err("expected image build <script>|prune".to_owned());
+        return Err("expected an image action: ls | show | rm | prune | build".to_owned());
     };
     if matches!(action, "help" | "--help" | "-h") {
-        println!("dshbox image build <script.dsh> [--output <path.dshimage>] [--name <container-name>]");
-        println!("dshbox image prune");
-        println!();
-        println!("Deprecated alias for 'dshbox build'. `prune` removes data-store");
-        println!("blobs no container references.");
+        println!("dshbox image ls                 list the local image registry");
+        println!("dshbox image show <name>        print one image's resource list");
+        println!("dshbox image rm <name>          remove an image (refuses if a container uses it)");
+        println!("dshbox image prune              GC data-store snapshots no image references");
+        println!("dshbox image build <script.dsh> [--output <path>] [--name <image>]  (alias of dshbox build)");
         return Ok(());
     }
     match action {
+        "ls" => list(),
+        "show" => {
+            let name = arguments.get(1).ok_or("expected an image name")?;
+            show(name)
+        }
+        "rm" => {
+            let name = arguments.get(1).ok_or("expected an image name")?;
+            remove(name)
+        }
+        "prune" => prune(),
         "build" => {
             let script_path = arguments.get(1).ok_or("expected a script path")?;
             let output_path = arguments
@@ -68,25 +71,73 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
                 .map(|pair| pair[1].clone());
             build(script_path, output_path, container_name)
         }
-        "prune" => data_prune(),
         _ => Err(format!(
-            "unknown image action: {action}; only 'build' and 'prune' remain (use 'dshbox build')"
+            "unknown image action: {action}; try ls | show | rm | prune | build"
         )),
     }
 }
 
-/// `dshbox image prune` — garbage-collect orphaned data-store blobs via the
-/// daemon's `prune_orphaned_data` RPC.
-fn data_prune() -> Result<(), String> {
+fn list() -> Result<(), String> {
     let client = rpc::connect()?;
-    let value = rpc::call(&client, "prune_orphaned_data", serde_json::json!({}))?;
-    let removed: Vec<String> = serde_json::from_value(value)
+    let value = rpc::call(&client, "list_images", serde_json::json!({}))?;
+    let entries: Vec<ImageEntry> = serde_json::from_value(value)
+        .map_err(|error| format!("invalid image list from daemon: {error}"))?;
+    println!("ID\tNAME\tBASE\tCREATED");
+    for entry in entries {
+        println!("{}\t{}\t{}\t{}", entry.id, entry.name, entry.base, entry.created_at);
+    }
+    Ok(())
+}
+
+fn show(name: &str) -> Result<(), String> {
+    let client = rpc::connect()?;
+    let value = rpc::call(&client, "read_image", serde_json::json!({ "name": name }))?;
+    let list: ImageList = serde_json::from_value(value)
+        .map_err(|error| format!("invalid image from daemon: {error}"))?;
+    println!("name:     {}", list.name);
+    println!("base:     {}", list.base);
+    println!("profile:  {}", list.profile);
+    println!("harness:  {}", list.harness_ref.as_deref().unwrap_or("-"));
+    println!("created:  {}", list.created_at);
+    println!("resources: ({} total)", list.resources.len());
+    for (index, resource) in list.resources.iter().enumerate() {
+        match resource {
+            box_image::ImageResource::Reference { kind, name, version, entry_id } => {
+                println!(
+                    "  {}. {kind} {name} {} (reference -> repository entry {entry_id})",
+                    index + 1,
+                    version.as_deref().unwrap_or("-")
+                );
+            }
+            box_image::ImageResource::Snapshot { kind, name, digest, destination } => {
+                println!(
+                    "  {}. {kind} {name} (snapshot data/{digest} -> {destination})",
+                    index + 1
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove(name: &str) -> Result<(), String> {
+    let client = rpc::connect()?;
+    rpc::call(&client, "remove_image", serde_json::json!({ "name": name }))?;
+    println!("removed image `{name}`");
+    Ok(())
+}
+
+/// GC data-store digests no stored image (and no live container) references.
+fn prune() -> Result<(), String> {
+    let client = rpc::connect()?;
+    let value = rpc::call(&client, "prune_image_snapshots", serde_json::json!({}))?;
+    let removed: Vec<String> = serde_json::from_value(value["removed"].clone())
         .map_err(|error| format!("invalid prune response from daemon: {error}"))?;
     if removed.is_empty() {
-        println!("no orphaned data blobs to prune");
+        println!("no unreferenced image snapshots to prune");
     } else {
         for digest in &removed {
-            println!("pruned orphaned data blob {digest}");
+            println!("pruned snapshot {digest}");
         }
     }
     Ok(())
@@ -160,18 +211,4 @@ fn inspect(archive_path: &str) -> Result<(), String> {
         println!("  {}. ADD {} {}  -> {}  blob={}  digest={}", i + 1, kind, src, add.destination, add.blob, add.digest);
     }
     Ok(())
-}
-
-#[allow(dead_code)]
-fn list_images() -> Result<(), String> {
-    // TODO: scan a saved-images directory for .dshimage archives.
-    println!("ID\tNAME\tVERSION\tCREATED");
-    println!("(no saved images yet — use 'dshbox build --output <file.dshimage>' to create one)");
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn remove_image(_id: &str) -> Result<(), String> {
-    // TODO: remove a saved image by id.
-    Err("image removal is not yet implemented".to_owned())
 }

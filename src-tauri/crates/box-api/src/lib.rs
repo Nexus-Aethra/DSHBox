@@ -48,6 +48,14 @@ pub struct CreateTemplateContainerRequest {
     pub profile: Option<String>,
 }
 
+/// Parameters of `create_container_from_image`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateImageContainerRequest {
+    pub name: String,
+    pub image: String,
+}
+
 /// Parameters of `import_template`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,6 +163,13 @@ mod tests {
     fn create_template_container_request_wire_shape() {
         fixture_roundtrip::<CreateTemplateContainerRequest>(
             r#"{"name":"demo","template":"github.com/deepseek-ai/deepseek-harness:latest","profile":null}"#,
+        );
+    }
+
+    #[test]
+    fn create_image_container_request_wire_shape() {
+        fixture_roundtrip::<CreateImageContainerRequest>(
+            r#"{"name":"demo","image":"sidebar-demo"}"#,
         );
     }
 

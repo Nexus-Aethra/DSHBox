@@ -188,9 +188,47 @@ fn materialize_data_add_at(
     Ok(())
 }
 
+/// Hard-copy one stored snapshot into a container (image-driven creation).
+/// `destination` is container-relative (e.g. `profile/skills/foo` or
+/// `extensions/data/foo`). The copy is fully detached from the store —
+/// in-container edits never write back. Data-kind snapshots keep the usual
+/// `state/data.json` bookkeeping so `image prune` knows real usage.
+pub(crate) fn hard_copy_snapshot(
+    runtime: &Path,
+    container: &DshContainer,
+    kind: &str,
+    name: &str,
+    digest: &str,
+    destination: &str,
+) -> Result<(), String> {
+    let store_dir = data_root(runtime).join(digest);
+    if !store_dir.is_dir() {
+        return Err(format!(
+            "snapshot `{name}` (digest {digest}) is missing from the data store; rebuild the image"
+        ));
+    }
+    let target = PathBuf::from(&container.directory).join(destination.trim_start_matches('/'));
+    copy_extension_source(&store_dir, &target)?;
+    if kind == "data" {
+        let mut uses = read_container_data(container);
+        uses.retain(|item| item.name != name);
+        uses.push(DataUse {
+            name: name.to_owned(),
+            digest: digest.to_owned(),
+        });
+        write_container_data(container, &uses)?;
+    }
+    Ok(())
+}
+
 /// Import a data source into the store, or resolve a bare name against the
 /// store index. Returns the store entry.
-fn import_or_resolve(
+///
+/// Also the snapshot primitive of the image build pipeline: every
+/// non-plugin ADD is staged through here so its content lands in
+/// `data/<digest>/` with a `name -> digest` mapping (spec:
+/// docs/specs/image-build.md).
+pub(crate) fn import_or_resolve(
     task: &TaskContext,
     runtime: &Path,
     source: &ParsedSource,

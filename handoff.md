@@ -1,8 +1,14 @@
 # DSH Box — Handoff Document
 
+> NOTE: This document is a historical snapshot. The authoritative design for
+> the image build pipeline is `docs/specs/image-build.md`. Current status:
+> 98+ Rust workspace tests pass, `dshboxd` compiles and ships as the daemon,
+> Windows named pipes are implemented, and ADD data / FROM chaining /
+> template import-export are all implemented.
+
 ## Current State Summary
 
-**Verification**: 25 Rust tests pass | tsc --noEmit passes | cargo check passes (dshboxd excluded)
+**Verification**: cargo test --workspace passes | tsc --noEmit passes | e2e scripts in scripts/ pass
 
 ---
 
@@ -43,12 +49,24 @@
 | Command | File | Status |
 |---------|------|--------|
 | dshbox info/ps | mod.rs | Done |
-| dshbox dsh | dsh.rs | Done |
-| dshbox plugin | plugin.rs | Done (legacy, kept for compat) |
-| dshbox bundle | bundle.rs | Done (legacy, kept for compat) |
-| dshbox image | image.rs | Done (v6 manifest) |
-| dshbox resources | resources.rs | NEW (unified add/ls/rm/export/bundle) |
+| dshbox rpc | mod.rs | Done (raw RPC debug escape hatch) |
+| dshbox pull template | pull.rs | Done (libgit2 clone + hash-indexed template store) |
+| dshbox init | init.rs | Done (starter boxfile) |
+| dshbox build | build.rs | Done (produces a metadata-only image) |
+| dshbox run | run.rs | Done (image-first, template fallback builds implicitly) |
+| dshbox container | container.rs | Done (logs/url/start/stop/rebuild) |
+| dshbox template | template.rs | Done (ls/show/import/export/rm) |
+| dshbox plugin | plugin.rs | Done |
+| dshbox bundle | bundle.rs | Done |
+| dshbox image | image.rs | Done (ls/show/rm/prune against the local registry) |
 | dshbox config | config.rs | Done |
+
+Removed: `dshbox dsh` (subcommand dropped), `dshbox resources` (superseded by plugin/bundle).
+
+> Build model: `dshbox build` produces a metadata-only image (plugins
+> referenced from the repository, every other kind hashed into the data
+> store as snapshots); containers are created from images via `dshbox run`.
+> Full design: `docs/specs/image-build.md`.
 
 ### Frontend (src/)
 
@@ -71,6 +89,7 @@
 - src/features/plugin-repo/PluginRepo.tsx — replaced by ResourcesPage
 - src/state/useRepository.ts — replaced by useResources
 - src/state/useImages.ts — replaced by useResources
+- src-tauri/src/cli/dsh.rs — orphaned leftover of the removed `dsh` subcommand (untracked; safe to delete)
 
 ---
 
@@ -191,14 +210,19 @@ User-facing:  Harness, Template, Plugin, Bundle
 
 ## Known Issues / Future Work
 
-1. dshboxd crate has a pre-existing compile error (unrelated to this refactor)
-2. Template tab — currently only supports building from .dsh scripts; listing/importing/exporting existing .dshimage files needs a scanner
-3. ADD data — parser supports it but builder skips data ops (no fetch/install hooks yet)
-4. Container-path sources — [@]<container-id>@/path parser support is partial
-5. Harness .dboxfile — not yet auto-generated on DSH version install
-6. Batch pnpm hook — pnpm dsh plugin add is called per-plugin; could batch into one call
-7. Windows named pipe — dshboxd uses Unix socket; Windows stub is unimplemented
-8. Template FROM chaining — building FROM another template (not just FROM harness) is not implemented
+Resolved since this document was first written: dshboxd compiles and is the
+production daemon; template listing/import/export works (hash-indexed store);
+ADD data is implemented (content-addressed store under `<root>/data/`);
+base templates are generated on harness pull; template FROM chaining works
+(depth limit 4); Windows named pipes are implemented.
+
+Remaining:
+
+1. UI image surface — the CLI image registry is complete, but the desktop
+   UI has no image list view yet (containers are still created from
+   templates in the dialog); see `docs/specs/image-build.md` section 8
+2. Container-path sources — [@]<container-id>@/path parser support is partial
+3. Batch pnpm hook — pnpm dsh plugin add is called per-plugin; could batch into one call
 
 ---
 
@@ -206,11 +230,16 @@ User-facing:  Harness, Template, Plugin, Bundle
 
 # Backend
 cd src-tauri
-cargo check --workspace --exclude dshboxd
-cargo test -p box-image -p box-state
+cargo test --workspace
+cargo build --release -p dshboxd -p dshbox
 
 # Frontend
-npx tsc --noEmit
+pnpm tsc --noEmit
+
+# E2E (isolated daemons, safe to run)
+bash scripts/e2e-pull-list.sh
+bash scripts/e2e-container-skill.sh
+bash scripts/e2e-catalog.sh
 
 # Dev server (requires Tauri)
 cd src-tauri && cargo tauri dev

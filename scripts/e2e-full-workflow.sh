@@ -47,7 +47,7 @@ cd "$WORKSPACE"
 "$DSHBOX" init
 ls -la boxfile.dsh
 
-echo "[6/9] write a boxfile with $PLUGIN_REF and build"
+echo "[6/9] write a boxfile with $PLUGIN_REF and build an image"
 cat > boxfile.dsh <<EOF
 FROM github.com/deepseek-ai/deepseek-harness:latest
 PROFILE web
@@ -57,11 +57,12 @@ ADD plugin $PLUGIN_REF
 EOF
 "$DSHBOX" build ./boxfile.dsh --name sidebar-test
 
-echo "[7/9] dshbox ps"
+echo "[7/9] dshbox image ls (build must not create a container)"
+"$DSHBOX" image ls
 "$DSHBOX" ps
 
-echo "[8/9] dshbox run the template to start the container"
-"$DSHBOX" run github.com/deepseek-ai/deepseek-harness:latest --name sidebar-runtime || true
+echo "[8/9] dshbox run the image to create + start the container"
+"$DSHBOX" run sidebar-test --name sidebar-runtime || true
 
 echo "[9/9] verify container reached running state"
 "$DSHBOX" ps

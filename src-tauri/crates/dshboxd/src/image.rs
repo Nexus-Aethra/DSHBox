@@ -19,7 +19,8 @@ use box_extensions::transfer::{
 use box_extensions::{repository_root, scan_repository, ExtensionKind, RepositoryExtension};
 use box_foundation::{mirror_url, now_seconds, read_config};
 use box_image::{
-    compile_manifest, parse_script, write_dshimage, ImageManifest, ImageOp, ParsedSource,
+    compile_manifest, parse_script, registry, write_dshimage, AddKind, ImageManifest, ImageOp,
+    ImageResource, ImageList, ParsedSource, IMAGE_LIST_SCHEMA_VERSION,
 };
 use box_runtime::shallow_clone_with_cancel;
 use box_scheduler::TaskContext;
@@ -32,7 +33,7 @@ use std::{
 // definition; a field change is a workspace-wide compile error instead of
 // a silent deserialization failure on one client.
 pub(crate) use box_api::{
-    BuildImageRequest, CreateTemplateContainerRequest, TemplateInfo,
+    BuildImageRequest, CreateImageContainerRequest, CreateTemplateContainerRequest, TemplateInfo,
 };
 
 /// Maximum depth of the FROM template chain.
@@ -114,17 +115,104 @@ pub(crate) fn build_image_from_script(
     script.harness_ref = resolved.harness_ref;
     script.profile = resolved.profile;
 
-    let container_name = request
+    // ── Image build (spec: docs/specs/image-build.md) ──
+    // The build produces a metadata-only image in the local registry; no
+    // container is created here. Plugins are recorded as references into
+    // the shared repository (their content is never touched); every other
+    // kind becomes a content-addressed snapshot of the data store.
+    let image_name = request
         .container_name
         .clone()
+        .filter(|value| !value.is_empty())
         .unwrap_or_else(|| script.name.clone());
-    task.update("Creating container", 15);
-    let container =
-        create_dsh_container_sync(&container_name, &script.harness_ref.clone().unwrap_or_else(|| "latest".to_owned()), &script.profile)?;
-    record_container_template(&container, &script)?;
-    task.update("Materialising extensions", 25);
+    task.update("Resolving image resources", 15);
+    let mut resources: Vec<ImageResource> = Vec::new();
+    let mut inline_blobs: Vec<(String, PathBuf)> = Vec::new();
+    let total_ops = script.ops.len().max(1);
+    for (index, op) in script.ops.iter().enumerate() {
+        let ImageOp::Add { kind, source, .. } = op;
+        let progress = 15 + ((index * 70) / total_ops);
+        task.update(
+            format!(
+                "Resolving {}/{} ({})",
+                index + 1,
+                total_ops,
+                describe_parsed(source),
+            ),
+            progress as u8,
+        );
+        let label = kind_label(kind);
+        if matches!(kind, AddKind::Plugin) {
+            // Reference mode: the plugin content stays in the repository;
+            // the image only records which entry it means.
+            let entry = match source {
+                ParsedSource::BareName { name, scope, version } => {
+                    if scope.as_deref() == Some(SYSTEM_PLUGIN_SCOPE) {
+                        task.log(&format!(
+                            "skipping system plugin @{SYSTEM_PLUGIN_SCOPE}/{name}: provided by the harness"
+                        ));
+                        continue;
+                    }
+                    find_repository_entry(&root, &ExtensionKind::Plugin, name, scope.as_deref(), version.as_deref())?
+                }
+                ParsedSource::Github { url, ref_ } => {
+                    fetch_github_extension(task, url, ref_.as_deref(), &ExtensionKind::Plugin)?
+                }
+                ParsedSource::Tarball { url, local } => {
+                    fetch_tarball_extension(task, url, *local, &ExtensionKind::Plugin)?
+                }
+                ParsedSource::LocalDir { path } => {
+                    fetch_local_dir_extension(task, path, &ExtensionKind::Plugin)?
+                }
+            };
+            inline_blobs.push((entry.content_digest.clone(), PathBuf::from(&entry.source_path)));
+            resources.push(ImageResource::Reference {
+                kind: label.to_owned(),
+                name: entry.name.clone(),
+                version: entry.version.clone(),
+                entry_id: entry.id.clone(),
+            });
+        } else {
+            // Snapshot mode (skill/data/...): content lands in the data
+            // store under its digest; the image records the mapping.
+            let entry = crate::data::import_or_resolve(task, Path::new(&root), source)?;
+            let destination = match kind {
+                AddKind::Skill => format!("profile/skills/{}", entry.name),
+                _ => format!("extensions/data/{}", entry.name),
+            };
+            inline_blobs.push((
+                entry.digest.clone(),
+                crate::data::data_root(Path::new(&root)).join(&entry.digest),
+            ));
+            task.log(&format!(
+                "snapshotted {} {} -> data/{}",
+                label, entry.name, entry.digest
+            ));
+            resources.push(ImageResource::Snapshot {
+                kind: label.to_owned(),
+                name: entry.name.clone(),
+                digest: entry.digest.clone(),
+                destination,
+            });
+        }
+    }
 
-    let inline_blobs = materialize_ops(task, &container, &script)?;
+    let list = ImageList {
+        schema_version: IMAGE_LIST_SCHEMA_VERSION,
+        name: image_name.clone(),
+        base: script
+            .base_template
+            .clone()
+            .or_else(|| script.harness_ref.clone())
+            .unwrap_or_else(|| script.harness_url.clone()),
+        profile: script.profile.clone(),
+        harness_ref: script.harness_ref.clone(),
+        labels: script.labels.clone(),
+        created_at: now_seconds(),
+        resources,
+    };
+    task.update("Writing image registry", 90);
+    let entry = registry::write_image(&root, &list)?;
 
     if let Some(output_path) = request.output_path.as_ref() {
         task.update("Writing image archive", 96);
@@ -135,11 +223,231 @@ pub(crate) fn build_image_from_script(
 
     task.update("Image built", 100);
     task.log(&format!(
-        "container {} ready with {} extension(s)",
-        container.id,
-        script.ops.len()
+        "image {} ({}) ready with {} resource(s)",
+        list.name,
+        entry.id,
+        list.resources.len()
     ));
     Ok(())
+}
+
+fn kind_label(kind: &AddKind) -> &'static str {
+    match kind {
+        AddKind::Plugin => "plugin",
+        AddKind::Skill => "skill",
+        AddKind::Data => "data",
+    }
+}
+
+/// Create a container from a registered image (spec section 6): skeleton
+/// first, then link every plugin reference out of the repository and
+/// hard-copy every snapshot out of the data store.
+pub(crate) fn create_container_from_image(
+    request: CreateImageContainerRequest,
+    task: &TaskContext,
+) -> Result<box_containers::DshContainer, String> {
+    let root = read_config()?
+        .runtime_directory
+        .ok_or("DSH Box storage is not configured")?;
+    task.update("Reading image", 10);
+    let list = registry::read_image_by_name(&root, &request.image)?
+        .ok_or_else(|| format!("image `{}` not found; build it first with `dshbox build`", request.image))?;
+    task.update("Creating container", 30);
+    let version = list
+        .harness_ref
+        .clone()
+        .unwrap_or_else(|| "latest".to_owned());
+    let container = create_dsh_container_sync(&request.name, &version, &list.profile)?;
+    record_container_origin(&container, "image", &list.name)?;
+    task.update("Materialising image resources", 45);
+    let total = list.resources.len().max(1);
+    for (index, resource) in list.resources.iter().enumerate() {
+        task.update(
+            format!("Installing {}/{}", index + 1, total),
+            (45 + (index * 50) / total) as u8,
+        );
+        match resource {
+            ImageResource::Reference { name, entry_id, .. } => {
+                crate::extensions::link_repository_extension(
+                    &container.id,
+                    Some(&list.profile),
+                    entry_id,
+                    task,
+                )
+                .map_err(|error| format!("cannot link plugin `{name}` from repository: {error}"))?;
+            }
+            ImageResource::Snapshot { kind, name, digest, destination } => {
+                task.log(&format!("copying snapshot {name} (data/{digest}) -> {destination}"));
+                crate::data::hard_copy_snapshot(
+                    Path::new(&root),
+                    &container,
+                    kind,
+                    name,
+                    digest,
+                    destination,
+                )?;
+            }
+        }
+    }
+    task.log(&format!(
+        "container {} created from image {} with {} resource(s)",
+        container.id,
+        request.image,
+        list.resources.len()
+    ));
+    Ok(container)
+}
+
+/// List the local image registry (index rows, newest names included).
+pub(crate) fn list_images() -> Result<Vec<registry::ImageEntry>, String> {
+    let root = read_config()?
+        .runtime_directory
+        .ok_or("DSH Box storage is not configured")?;
+    let mut entries: Vec<registry::ImageEntry> = registry::read_image_index(&root)?.into_values().collect();
+    entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(entries)
+}
+
+/// Read one image list by name (for `dshbox image show`).
+pub(crate) fn read_image(name: &str) -> Result<registry::ImageList, String> {
+    let root = read_config()?
+        .runtime_directory
+        .ok_or("DSH Box storage is not configured")?;
+    registry::read_image_by_name(&root, name)?
+        .ok_or_else(|| format!("image `{name}` not found"))
+}
+
+/// Remove an image unless a container still references it.
+pub(crate) fn remove_image_rpc(name: &str) -> Result<(), String> {
+    let root = read_config()?
+        .runtime_directory
+        .ok_or("DSH Box storage is not configured")?;
+    let used_by: Vec<String> = box_containers::scan_containers(&root)
+        .map_err(|error| format!("cannot scan containers: {error}"))?
+        .into_values()
+        .filter(|container| container_origin(&container.directory, "image").as_deref() == Some(name))
+        .map(|container| container.id)
+        .collect();
+    if !used_by.is_empty() {
+        return Err(format!(
+            "image `{name}` is used by {} container(s) ({}); remove them first",
+            used_by.len(),
+            used_by.join(", ")
+        ));
+    }
+    if !registry::remove_image(&root, name)? {
+        return Err(format!("image `{name}` not found"));
+    }
+    Ok(())
+}
+
+/// GC data-store digests no stored image references (`dshbox image prune`).
+/// Returns the removed digests.
+pub(crate) fn prune_image_snapshots() -> Result<Vec<String>, String> {
+    let root = read_config()?
+        .runtime_directory
+        .ok_or("DSH Box storage is not configured")?;
+    let referenced = registry::referenced_snapshot_digests(&root)?;
+    let store = crate::data::data_root(Path::new(&root));
+    let mut removed = Vec::new();
+    let entries = match std::fs::read_dir(&store) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(removed),
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Keep metadata files (index.json) and staging trees; only digest
+        // directories (16 hex chars) are GC candidates.
+        if name.len() != 16 || !name.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            continue;
+        }
+        if referenced.contains(&name) {
+            continue;
+        }
+        // Container-owned copies are detached; still-used data is also
+        // recorded in each container's state/data.json — keep a digest if
+        // any live container claims it.
+        if digest_in_container_use(&root, &name)? {
+            continue;
+        }
+        if std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed.push(name);
+        }
+    }
+    Ok(removed)
+}
+
+fn digest_in_container_use(root: &str, digest: &str) -> Result<bool, String> {
+    for container in box_containers::scan_containers(root)
+        .map_err(|error| format!("cannot scan containers: {error}"))?
+        .into_values()
+    {
+        let uses_path = PathBuf::from(&container.directory).join("state/data.json");
+        if let Ok(text) = std::fs::read_to_string(&uses_path) {
+            if let Ok(uses) = serde_json::from_str::<Vec<box_api::DataUse>>(&text) {
+                if uses.iter().any(|item| item.digest == digest) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn container_origin(directory: &str, key: &str) -> Option<String> {
+    let metadata_path = Path::new(directory).join("container.json");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&metadata_path).ok()?).ok()?;
+    metadata[key].as_str().map(str::to_owned)
+}
+
+fn record_container_origin(
+    container: &box_containers::DshContainer,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let metadata_path = Path::new(&container.directory).join("container.json");
+    let mut metadata: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&metadata_path)
+            .map_err(|error| format!("cannot read container: {error}"))?,
+    )
+    .map_err(|error| format!("cannot parse container: {error}"))?;
+    metadata[key] = serde_json::Value::String(value.to_owned());
+    std::fs::write(
+        &metadata_path,
+        serde_json::to_string_pretty(&metadata).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("cannot save container: {error}"))
+}
+
+fn find_repository_entry(
+    root: &str,
+    kind: &ExtensionKind,
+    name: &str,
+    scope: Option<&str>,
+    version: Option<&str>,
+) -> Result<RepositoryExtension, String> {
+    let full_name = match scope {
+        Some(scope) => format!("@{scope}/{name}"),
+        None => name.to_string(),
+    };
+    let entries = scan_repository(Path::new(root));
+    entries
+        .into_iter()
+        .find(|entry| {
+            entry.kind == *kind
+                && entry.name == full_name
+                && match (version, &entry.version) {
+                    (None, _) => true,
+                    (Some(want), Some(have)) => want == have,
+                    (Some(_), None) => false,
+                }
+        })
+        .ok_or_else(|| {
+            format!(
+                "plugin `{full_name}` not found in repository. Import it first with `ADD plugin {full_name}` from a source you control."
+            )
+        })
 }
 
 /// Create a container from a local template (`.dsh` in the templates
@@ -203,18 +511,7 @@ fn record_container_template(
     let Some(template) = template else {
         return Ok(());
     };
-    let metadata_path = Path::new(&container.directory).join("container.json");
-    let mut metadata: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&metadata_path)
-            .map_err(|error| format!("cannot read container: {error}"))?,
-    )
-    .map_err(|error| format!("cannot parse container: {error}"))?;
-    metadata["template"] = serde_json::Value::String(template);
-    std::fs::write(
-        &metadata_path,
-        serde_json::to_string_pretty(&metadata).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| format!("cannot save container: {error}"))
+    record_container_origin(container, "template", &template)
 }
 
 fn materialize_ops(
@@ -616,27 +913,7 @@ fn install_from_repository(
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
-    let full_name = match scope {
-        Some(scope) => format!("@{scope}/{name}"),
-        None => name.to_string(),
-    };
-    let entries = scan_repository(Path::new(&root));
-    let entry = entries
-        .into_iter()
-        .find(|entry| {
-            entry.kind == *kind
-                && entry.name == full_name
-                && match (version, &entry.version) {
-                    (None, _) => true,
-                    (Some(want), Some(have)) => want == have,
-                    (Some(_), None) => false,
-                }
-        })
-        .ok_or_else(|| {
-            format!(
-                "plugin `{full_name}` not found in repository. Import it first with `ADD plugin {full_name}` from a source you control."
-            )
-        })?;
+    let entry = find_repository_entry(&root, kind, name, scope, version)?;
     install_from_repository_entry(task, container, profile, &entry)
 }
 

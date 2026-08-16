@@ -32,13 +32,15 @@ description: How to author a DSH Box boxfile (`.dsh`) — directives, source sha
 
 A **boxfile** is a `.dsh` script describing one container. It mirrors a
 Dockerfile: a base template provides the runtime layout, and `ADD` lines
-layer extensions on top. Build & run with:
+layer extensions on top. Building produces an **image** (metadata only:
+plugins are referenced from the shared repository, every other resource is
+snapshotted into the data store); containers are created from images:
 
 ```
 dshbox init              # generate a starter boxfile in the cwd
 dshbox pull template <ref>
-dshbox build ./boxfile.dsh
-dshbox run <template>
+dshbox build ./boxfile.dsh --name my-image
+dshbox run my-image      # or a template name (builds implicitly)
 ```
 
 ## Directives
@@ -116,8 +118,14 @@ local daemon, so the same state is shared with the desktop GUI.
 # Workflow
 dshbox init                              # scaffold a boxfile.dsh here
 dshbox pull template <owner/repo>[:tag]  # fetch a base template
-dshbox build [boxfile.dsh]               # build this container's image
-dshbox run <template>                    # create + start a container
+dshbox build [boxfile.dsh] [--name img]  # build an IMAGE (no container yet)
+dshbox run <image|template>              # create + start a container
+
+# Images
+dshbox image ls                          # list the local image registry
+dshbox image show <name>                 # print an image's resource list
+dshbox image rm <name>                   # remove an image
+dshbox image prune                       # GC unreferenced snapshots
 
 # Templates
 dshbox template ls                       # list local templates
