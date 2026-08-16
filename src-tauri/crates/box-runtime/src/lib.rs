@@ -230,6 +230,97 @@ pub fn remove_checkout(destination: &Path) {
     }
 }
 
+/// List the tags a public remote advertises, without downloading any
+/// objects — libgit2's equivalent of `git ls-remote --tags`, keeping the
+/// project free of any dependency on a system git executable. Like the
+/// clone path, remote listings try the detected system proxy first and
+/// fall back to a direct connection; a local directory is read from its
+/// `refs/tags/` namespace directly.
+pub fn list_remote_tags(url: &str) -> BoxResult<Vec<String>> {
+    // Local repositories (tests / development): read tags off disk instead
+    // of negotiating a smart-protocol connection with ourselves.
+    if Path::new(url).is_dir() {
+        let repository = git2::Repository::open(url)
+            .map_err(|error| format!("cannot open local repository: {error}"))?;
+        let mut tags = Vec::new();
+        for reference in repository
+            .references()
+            .map_err(|error| format!("cannot list local refs: {error}"))?
+            .flatten()
+        {
+            if let Some(tag) = reference.name().and_then(|name| name.strip_prefix("refs/tags/")) {
+                tags.push(tag.to_owned());
+            }
+        }
+        tags.sort();
+        return Ok(tags);
+    }
+    let proxy = detect_proxy_url();
+    if let Some(proxy_url) = proxy.as_deref() {
+        match list_remote_tags_once(url, Some(proxy_url)) {
+            Ok(tags) => return Ok(tags),
+            Err(error) => {
+                // The proxy may be stale or blocking git; retry directly.
+                if let Ok(tags) = list_remote_tags_once(url, None) {
+                    return Ok(tags);
+                }
+                return Err(error);
+            }
+        }
+    }
+    list_remote_tags_once(url, None)
+}
+
+fn list_remote_tags_once(url: &str, proxy_url: Option<&str>) -> BoxResult<Vec<String>> {
+    // An anonymous remote on a throwaway bare repository is enough to run
+    // the ref advertisement; nothing is persisted or fetched.
+    let scratch = std::env::temp_dir().join(format!(
+        "dsh-box-lsremote-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let repository = git2::Repository::init_bare(&scratch)
+        .map_err(|error| format!("cannot prepare git session: {error}"))?;
+    let result = (|| -> BoxResult<Vec<String>> {
+        let mut remote = repository
+            .remote_anonymous(url)
+            .map_err(|error| format!("cannot resolve remote {url}: {error}"))?;
+        let mut proxy = git2::ProxyOptions::new();
+        match proxy_url {
+            Some(proxy_url) => {
+                proxy.url(proxy_url);
+            }
+            None => {
+                proxy.auto();
+            }
+        }
+        let connection = remote
+            .connect_auth(git2::Direction::Fetch, None, Some(proxy))
+            .map_err(|error| format!("cannot reach {url}: {error}"))?;
+        let mut tags = Vec::new();
+        for head in connection
+            .list()
+            .map_err(|error| format!("cannot list refs of {url}: {error}"))?
+        {
+            let name = head.name();
+            // Skip peeled tag objects (`refs/tags/v1^{}`); the plain ref
+            // already names the tag.
+            if let Some(tag) = name.strip_prefix("refs/tags/") {
+                if !tag.ends_with("^{}") {
+                    tags.push(tag.to_owned());
+                }
+            }
+        }
+        tags.sort();
+        Ok(tags)
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +355,34 @@ mod tests {
         let commit = shallow_clone(source.to_str().unwrap(), &destination, None).unwrap();
         assert!(destination.join("README.md").is_file());
         assert_eq!(commit.len(), 40);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn list_remote_tags_reads_local_repository_tags() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-box-lstags-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let repository = Repository::init(&root).unwrap();
+        fs::write(root.join("README.md"), "tagged").unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        index.write().unwrap();
+        let tree = repository.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = Signature::now("DSH Box", "box@example.invalid").unwrap();
+        let commit_id = repository
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .unwrap();
+        let commit = repository.find_commit(commit_id).unwrap();
+        repository.tag("v0.1.0", commit.as_object(), &signature, "release", false).unwrap();
+        repository.tag("v0.2.0", commit.as_object(), &signature, "release", false).unwrap();
+        let tags = list_remote_tags(root.to_str().unwrap()).unwrap();
+        assert_eq!(tags, vec!["v0.1.0".to_owned(), "v0.2.0".to_owned()]);
         let _ = fs::remove_dir_all(root);
     }
 }

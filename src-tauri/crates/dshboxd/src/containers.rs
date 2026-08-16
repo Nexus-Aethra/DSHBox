@@ -170,7 +170,14 @@ pub(crate) fn create_dsh_container_sync(
     let root = config
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
-    if !dsh_version_directory(&root, version).join(".git").is_dir() {
+    // The completion marker (written after a successful clone) is the
+    // installed criterion — `.git` exists from the moment a clone starts,
+    // so keying on it would let containers build against a half-downloaded
+    // harness.
+    if !dsh_version_directory(&root, version)
+        .join(".dshbox-runtime.json")
+        .is_file()
+    {
         return Err(format!("DSH version is not installed: {version}"));
     }
     let timestamp = SystemTime::now()

@@ -8,6 +8,7 @@ name = "dshboxd"
 path = "src/main.rs"
 
 [dependencies]
+box-api = { path = "../box-api" }
 box-containers = { path = "../box-containers" }
 box-dsh-context = { path = "../box-dsh-context" }
 box-dsh-versions = { path = "../box-dsh-versions" }

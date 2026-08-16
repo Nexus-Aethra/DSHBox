@@ -9,6 +9,7 @@ default-run = "dshbox"
 [workspace]
 members = [
   "crates/box-foundation",
+  "crates/box-api",
   "crates/box-scheduler",
   "crates/box-runtime",
   "crates/box-toolchains",
@@ -49,6 +50,7 @@ tauri-plugin-dialog = "2.4.0"
 webbrowser = "1.0"
 xz2 = "0.1"
 box-foundation = { path = "crates/box-foundation" }
+box-api = { path = "crates/box-api" }
 box-scheduler = { path = "crates/box-scheduler" }
 box-runtime = { path = "crates/box-runtime" }
 box-toolchains = { path = "crates/box-toolchains" }

@@ -23,10 +23,16 @@ use box_image::{
 };
 use box_runtime::shallow_clone_with_cancel;
 use box_scheduler::TaskContext;
-use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+};
+
+// Wire types live in box-api so the daemon, desktop, and CLI share one
+// definition; a field change is a workspace-wide compile error instead of
+// a silent deserialization failure on one client.
+pub(crate) use box_api::{
+    BuildImageRequest, CreateTemplateContainerRequest, TemplateInfo,
 };
 
 /// Maximum depth of the FROM template chain.
@@ -34,32 +40,6 @@ pub(crate) const MAX_TEMPLATE_CHAIN_DEPTH: usize = 4;
 
 /// System plugin scope: `@deepseek-ai/*` plugins ship with the harness.
 pub(crate) const SYSTEM_PLUGIN_SCOPE: &str = "deepseek-ai";
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct TemplateInfo {
-    pub(crate) name: String,
-    /// Content-addressable identifier (fnv1a64 hex of the script body).
-    pub(crate) id: String,
-    pub(crate) harness_ref: Option<String>,
-    pub(crate) profile: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct BuildImageRequest {
-    pub(crate) script_path: String,
-    pub(crate) output_path: Option<String>,
-    pub(crate) container_name: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CreateTemplateContainerRequest {
-    pub(crate) name: String,
-    pub(crate) template: String,
-    pub(crate) profile: Option<String>,
-}
 
 struct ResolvedBase {
     harness_url: String,

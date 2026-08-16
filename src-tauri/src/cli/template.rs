@@ -36,14 +36,14 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
 fn list() -> Result<(), String> {
     let client = rpc::connect()?;
     let value = rpc::call(&client, "list_templates", json!({}))?;
-    let templates: Vec<serde_json::Value> = serde_json::from_value(value)
+    // Shared box-api type: the CLI and the desktop passthrough deserialize
+    // the very struct the daemon serializes, so neither can drift.
+    let templates: Vec<box_api::TemplateInfo> = serde_json::from_value(value)
         .map_err(|error| format!("invalid template list from daemon: {error}"))?;
     println!("NAME\tVERSION\tPROFILE");
     for template in templates {
-        let name = template["name"].as_str().unwrap_or("");
-        let version = template["harnessRef"].as_str().unwrap_or("-");
-        let profile = template["profile"].as_str().unwrap_or("");
-        println!("{name}\t{version}\t{profile}");
+        let version = template.harness_ref.as_deref().unwrap_or("-");
+        println!("{}\t{version}\t{}", template.name, template.profile);
     }
     Ok(())
 }

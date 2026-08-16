@@ -59,6 +59,8 @@ type Props = {
   onUninstallDshVersion: (version: string) => Promise<void>
   onRefreshDshCatalog: () => Promise<void>
   onUpgradeResources: () => Promise<void>
+  onReloadPlugins: () => Promise<void>
+  onLoadTemplates: () => Promise<void>
   onChooseScript: () => Promise<string | null>
   onBuildTemplate: (scriptPath: string) => Promise<void>
   onImportTemplate: (archive: string) => Promise<void>
@@ -80,6 +82,7 @@ export function ResourcesPage({
   onImportPlugin, onChooseArchive, onExportPlugin, onDeletePlugin,
   onLoadBundles, onCreateBundle, onDeleteBundle, onExportBundle, onImportBundle,
   onInstallDshVersion, onUninstallDshVersion, onRefreshDshCatalog, onUpgradeResources,
+    onReloadPlugins, onLoadTemplates,
   onChooseScript, onBuildTemplate,
   onImportTemplate, onChooseExportDestination, onExportTemplate, onRemoveTemplate,
   scriptPreview,
@@ -95,7 +98,15 @@ export function ResourcesPage({
   const [pendingDelete, setPendingDelete] = useState<{ kind: 'plugin' | 'bundle'; id: string; name: string; refs: string[] } | null>(null)
   const [pendingTemplateDelete, setPendingTemplateDelete] = useState<{ name: string } | null>(null)
 
-  useEffect(() => { if (tab === 'bundles') void onLoadBundles() }, [tab])
+  // Tab-scoped loading: each tab refreshes its own data the moment it is
+  // shown, so a template pulled from the CLI shows up as soon as the user
+  // opens the Template tab without any manual refresh.
+  useEffect(() => {
+    if (tab === 'plugins') void onReloadPlugins()
+    if (tab === 'bundles') void onLoadBundles()
+    if (tab === 'template') void onLoadTemplates()
+    if (tab === 'harness') void onRefreshDshCatalog()
+  }, [tab])
 
   async function browse(): Promise<void> { const path = await onChooseArchive(); if (path) setSource(path) }
   async function addPlugin(): Promise<void> { if (!source.trim()) return; await onImportPlugin(source.trim()); setSource('') }

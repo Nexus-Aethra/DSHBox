@@ -4,7 +4,7 @@
 
 use box_dsh_versions::{
     installed_versions, parse_template_ref, pull_template, upgrade_legacy_harness,
-    version_directory, HarnessUpgradeReport, DSH_TAGS_API,
+    version_directory, HarnessUpgradeReport, DSH_TAGS_API, HARNESS_STANDARD_REF,
 };
 use box_foundation::{mirror_url, read_config, write_config};
 use serde::Deserialize;
@@ -30,9 +30,39 @@ pub(crate) fn read_dsh_catalog(root: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Fetch the harness version catalog. Primary path is the git protocol via
+/// libgit2 (`ls-remote` equivalent, no system git executable, no GitHub API
+/// rate limits): the harness repo's tags ARE the version list. The GitHub
+/// REST API stays as a fallback for networks where the git transport is
+/// blocked but plain HTTPS works.
 pub(crate) fn fetch_dsh_tags() -> Result<Vec<String>, String> {
     let config = read_config()?;
-    let endpoint = mirror_url(DSH_TAGS_API, config.github_mirror.as_deref());
+    // Resolve the harness clone URL from the canonical reference and route
+    // it through the configured mirror exactly like `pull_template` does.
+    let parsed = parse_template_ref(HARNESS_STANDARD_REF)
+        .map_err(|error| format!("invalid harness reference: {error}"))?;
+    let target = mirror_url(&parsed.url, config.github_mirror.as_deref());
+    match box_runtime::list_remote_tags(&target) {
+        Ok(tags) => {
+            let filtered: Vec<String> = tags
+                .into_iter()
+                .filter(|name| is_safe_version_name(name))
+                .collect();
+            if !filtered.is_empty() {
+                return Ok(filtered);
+            }
+            // Repo reachable but tagless: fall through to the API so a
+            // legitimately empty ls-remote does not blank the catalog.
+        }
+        Err(error) => {
+            eprintln!("dshboxd: git tag listing failed ({error}); falling back to the GitHub API");
+        }
+    }
+    fetch_dsh_tags_api(config.github_mirror.as_deref())
+}
+
+fn fetch_dsh_tags_api(github_mirror: Option<&str>) -> Result<Vec<String>, String> {
+    let endpoint = mirror_url(DSH_TAGS_API, github_mirror);
     let client = reqwest::blocking::Client::builder()
         .user_agent("DSH-Box/0.1")
         .timeout(Duration::from_secs(20))

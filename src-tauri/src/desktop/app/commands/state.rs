@@ -33,15 +33,9 @@ pub(crate) fn refresh_resource_state(app: tauri::AppHandle) -> Result<ResourceSn
     app.state::<ResourceStateManager>().snapshot()
 }
 
-/// One entry of the content-addressed data store (image tab).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DataEntry {
-    pub name: String,
-    pub digest: String,
-    pub imported_at: u64,
-    pub source: String,
-}
+/// One entry of the content-addressed data store (image tab). Shared
+/// through box-api with the daemon that serializes it.
+pub(crate) use box_api::DataEntry;
 
 /// Lists data-store entries via the daemon.
 #[tauri::command]

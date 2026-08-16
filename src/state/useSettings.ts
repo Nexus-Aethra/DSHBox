@@ -34,13 +34,10 @@ export function useSettings(onError: (message: string | null) => void) {
 
   useEffect(() => {
     void boxApi.loadConfig().then(setConfig).catch((reason: unknown) => { onError(String(reason)) }).finally(() => { setLoading(false) })
-    void refreshToolchains()
     void boxApi.getServerServiceStatus().then(setServerService).catch(() => undefined)
-    // Load the data for the default section up front: the nav buttons only
-    // fetch when clicked, so without this the first page stays empty until
-    // the user switches away and back.
-    void loadDshVersions()
-    void loadInstalledDshVersions()
+    // Page-scoped loading: toolchains and DSH versions are fetched when the
+    // user enters the section/tab that renders them (App.tsx `loadSection`),
+    // not up front — the gate above only needs config + service status.
   }, [])
 
   // Keep the mirror settings form in sync when the saved config changes.
@@ -57,7 +54,17 @@ export function useSettings(onError: (message: string | null) => void) {
 
   async function loadDshVersions(): Promise<void> {
     setLoadingVersions(true)
-    try { setDshVersions(await boxApi.listDshVersions()); onError(null) } catch (reason) { onError(String(reason)) } finally { setLoadingVersions(false) }
+    try {
+      const versions = await boxApi.listDshVersions()
+      // `latest` (the default branch) is a virtual entry the Harness tab
+      // always offers first: pulling without a tag resolves to it, so the
+      // option must exist even when the repo carries no tags at all.
+      if (!versions.some((version) => version.name === 'latest')) {
+        versions.unshift({ name: 'latest', installed: false })
+      }
+      setDshVersions(versions)
+      onError(null)
+    } catch (reason) { onError(String(reason)) } finally { setLoadingVersions(false) }
   }
 
   async function installDshVersion(version: string): Promise<void> {

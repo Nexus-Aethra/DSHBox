@@ -45,6 +45,7 @@ pub fn run() -> Option<i32> {
         "config" => config::command(&arguments[1..]),
         "container" => container::command(&arguments[1..]),
         "image" => image::command(&arguments[1..]),
+        "rpc" => raw_rpc(&arguments[1..]),
         "template" => template::command(&arguments[1..]),
         "resources" => {
             eprintln!("warning: 'dshbox resources' is deprecated; 'plugin' and 'bundle' cover its actions.");
@@ -61,6 +62,29 @@ pub fn run() -> Option<i32> {
         return Some(1);
     }
     Some(0)
+}
+
+/// Raw RPC escape hatch: `dshbox rpc <method> [json-params]` forwards one
+/// request to the daemon verbatim and pretty-prints the response. This is
+/// the curl-equivalent debugging tool for the 50+ RPC methods — no typed
+/// command needed to poke any endpoint.
+fn raw_rpc(arguments: &[String]) -> Result<(), String> {
+    let method = arguments
+        .first()
+        .filter(|value| !value.is_empty())
+        .ok_or("usage: dshbox rpc <method> [json-params]")?;
+    let params: serde_json::Value = match arguments.get(1) {
+        Some(raw) => serde_json::from_str(raw)
+            .map_err(|error| format!("invalid JSON params: {error}"))?,
+        None => serde_json::json!({}),
+    };
+    if !params.is_object() {
+        return Err("params must be a JSON object".to_owned());
+    }
+    let client = rpc::connect()?;
+    let value = rpc::call(&client, method, params)?;
+    println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+    Ok(())
 }
 
 fn print_containers() -> Result<(), String> {
@@ -131,6 +155,7 @@ fn print_help() {
     println!("  dshbox info                show storage and resource summary");
     println!("  dshbox ps                  list running and stopped containers");
     println!("  dshbox help                print this help");
+    println!("  dshbox rpc <method> [json] raw daemon RPC call, pretty-printed (debug)");
     println!("  dshbox ui                  launch the desktop GUI");
     println!();
     println!("Pull:");

@@ -11,32 +11,22 @@
 
 use std::path::Path;
 
+use box_api::{
+    BuildImageRequest, CommitImageRequest, CreateTemplateContainerRequest,
+    ExportTemplateRequest, ImportTemplateRequest, LoadImageRequest, RemoveTemplateRequest,
+    TemplateInfo, TemplateText,
+};
 use box_image::{
     parse_manifest, parse_script, ImageManifest, ImageOp, ParsedSource,
 };
 use box_scheduler::{TaskManager, TaskRecord};
-use serde::Deserialize;
 use tauri::AppHandle;
 
 use super::{absolutize_path, call, connect, queue_task};
 
-/// Frontend-facing description of a local template.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TemplateInfo {
-    pub name: String,
-    pub path: String,
-    pub harness_ref: Option<String>,
-    pub profile: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateTemplateContainerRequest {
-    pub name: String,
-    pub template: String,
-    pub profile: Option<String>,
-}
+// Wire structs (TemplateInfo, BuildImageRequest, ...) come from box-api so
+// the desktop passthrough deserializes the exact shape the daemon
+// serializes; drift is a compile error now instead of a silent empty list.
 
 /// Frontend-friendly preview result.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -94,34 +84,6 @@ impl PreviewSource {
             },
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BuildImageRequest {
-    pub script_path: String,
-    pub output_path: Option<String>,
-    pub container_name: Option<String>,
-}
-
-// Stub payloads for the planned commit/load flows: deserialized from the
-// frontend but not yet consumed by any implementation, so field reads are
-// suppressed until those flows land.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
-pub struct CommitImageRequest {
-    pub container_id: String,
-    pub output_path: String,
-    pub name: String,
-    pub version: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
-pub struct LoadImageRequest {
-    pub archive_path: String,
 }
 
 /// Parse a script and return a frontend-friendly preview, without doing
@@ -209,33 +171,6 @@ pub(crate) fn list_templates() -> Result<Vec<TemplateInfo>, String> {
     let value = call(&client, "list_templates", serde_json::json!({}))?;
     serde_json::from_value(value)
         .map_err(|error| format!("invalid template list: {error}"))
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TemplateText {
-    pub name: String,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ImportTemplateRequest {
-    pub archive: String,
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExportTemplateRequest {
-    pub name: String,
-    pub destination: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoveTemplateRequest {
-    pub name: String,
 }
 
 /// Read the raw text of a local template so the UI can preview it before

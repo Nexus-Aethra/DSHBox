@@ -18,18 +18,14 @@ export function useContainers(
   const [containerMenuId, setContainerMenuId] = useState<string | null>(null)
   const [workspaceExtensions, setWorkspaceExtensions] = useState<WorkspaceExtension[]>([])
 
-  // Initial load on mount: the container list and templates must be present
-  // before the user navigates to the Container section (nav buttons only
-  // refetch when clicked).
-  useEffect(() => {
-    void loadContainers()
-    void loadTemplates()
-  }, [])
+  // Page-scoped loading: no mount-time prefetch. The Container section (and
+  // the Resources > Template tab) load this state when entered, so the
+  // daemon is never queried for pages the user has not opened.
 
   // Default the create form to the latest base template once known, and
   // pre-fill the profile from the template's own PROFILE directive.
   useEffect(() => {
-    setSelectedTemplate((current) => current || templates.find((template) => template.name === 'latest')?.name || templates[0]?.name || '')
+    setSelectedTemplate((current) => current || templates.find((template) => template.name.endsWith(':latest'))?.name || templates[0]?.name || '')
   }, [templates])
   useEffect(() => {
     const template = templates.find((item) => item.name === selectedTemplate)

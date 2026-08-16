@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { boxApi } from '../shared/api/box-api'
 import type { DshContainer, ExtensionBundle, PreviewScriptResult, RepositoryExtension, TemplateInfo } from '../shared/types/domain'
 
@@ -11,12 +11,10 @@ export function useResources(
   const [scriptPreview, setScriptPreview] = useState<PreviewScriptResult | null>(null)
   const [references, setReferences] = useState<Record<string, number>>({})
 
-  // Initial load: the app starts on the Resources section, so its data must
-  // be fetched on mount (the nav buttons only refetch when clicked).
-  useEffect(() => {
-    void loadPlugins()
-    void loadBundles()
-  }, [])
+  // Page-scoped loading: no mount-time prefetch. Every section/tab loads
+  // its own data when the user enters it (see App.tsx `loadSection` and the
+  // ResourcesPage tab effect), so the list on screen always matches the
+  // daemon even when the CLI changed state in between.
 
   async function loadPlugins(): Promise<void> {
     try {

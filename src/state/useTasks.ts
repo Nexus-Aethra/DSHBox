@@ -4,6 +4,7 @@ import type { TaskRecord } from '../shared/types/domain'
 
 export type TaskRefreshers = {
   onVersionsChanged: () => void
+  onTemplatesChanged: () => void
   onContainersChanged: () => void
   onRepositoryChanged: () => void
   onBundlesChanged: () => void
@@ -27,6 +28,10 @@ export function useTasks(refreshers: TaskRefreshers, onError: (message: string |
       if (task.status !== 'succeeded') return
       const current = refreshersRef.current
       if (task.kind === 'dsh-version-install' || task.kind === 'template-pull' || task.kind === 'dsh-catalog-refresh') current.onVersionsChanged()
+      // A pulled template registers itself in the template index, so the
+      // Resources > Template list (and the container-creation picker) must
+      // reload right after the pull settles.
+      if (task.kind === 'template-pull') current.onTemplatesChanged()
       if (task.kind.startsWith('container-') || task.kind === 'image-build') current.onContainersChanged()
       if ((task.kind === 'container-extension-add' || task.kind === 'container-extension-copy' || task.kind === 'container-bundle-install') && task.resourceKeys.some((key) => key.startsWith('container:'))) {
         const containerId = task.resourceKeys.find((key) => key.startsWith('container:'))?.slice('container:'.length)

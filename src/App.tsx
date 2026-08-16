@@ -103,6 +103,7 @@ export function MainApp() {
   const tasks = useTasks(
     {
       onVersionsChanged: () => { void settings.loadDshVersions(); void settings.loadInstalledDshVersions() },
+      onTemplatesChanged: () => void containers.loadTemplates(),
       onContainersChanged: () => void containers.loadContainers(),
       onRepositoryChanged: () => void resources.loadPlugins(),
       onBundlesChanged: () => void resources.loadBundles(),
@@ -135,6 +136,36 @@ export function MainApp() {
   async function removeTemplateByName(name: string): Promise<void> {
     try { await resources.removeTemplateByName(name); await containers.loadTemplates(); } catch (reason) { setError(String(reason)) }
   }
+
+  // Page-scoped data loading: every section fetches its own resources the
+  // moment the user enters it (and only then). Extra requests compared to a
+  // mount-time prefetch are cheap; staleness bugs (CLI pulled a template but
+  // the UI list stayed empty) are structurally impossible.
+  function loadSection(target: Section): void {
+    if (target === 'resources') {
+      void resources.loadPlugins()
+      void resources.loadBundles()
+      void settings.loadDshVersions()
+      void settings.refreshDshCatalog()
+      void containers.loadTemplates()
+    }
+    if (target === 'container') {
+      void settings.loadInstalledDshVersions()
+      void containers.loadContainers()
+      void containers.loadTemplates()
+    }
+    if (target === 'settings') {
+      void settings.refreshToolchains()
+    }
+  }
+
+  // Load the default section once the startup gate clears (config loaded and
+  // a runtime directory chosen); onboarding completion flips the dependency.
+  const onboardingDone = !settings.loading && config.runtimeDirectory !== null
+  useEffect(() => {
+    if (onboardingDone) loadSection(section)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onboardingDone])
 
   if (settings.loading) {
     return (
@@ -177,8 +208,7 @@ export function MainApp() {
             className={`nav-item${item === section ? ' active' : ''}`}
             onClick={() => {
               setSection(item)
-              if (item === 'resources') { void resources.loadPlugins(); void settings.loadDshVersions(); void settings.refreshDshCatalog() }
-              if (item === 'container') { void settings.loadInstalledDshVersions(); void containers.loadContainers(); void containers.loadTemplates() }
+              loadSection(item)
             }}
           >
             {text[item]}
@@ -187,7 +217,7 @@ export function MainApp() {
       </nav>
       <div className="topbar-actions">
         <button type="button" className="task-button" onClick={() => { tasks.setTaskPanelOpen(true) }}>{text.tasks}{tasks.tasks.filter((task) => task.status === 'queued' || task.status === 'running').length > 0 && <span>{tasks.tasks.filter((task) => task.status === 'queued' || task.status === 'running').length}</span>}</button>
-        <Button variant={section === 'settings' ? 'ghost' : 'ghost'} size="sm" className={section === 'settings' ? 'settings-button active' : 'settings-button'} onClick={() => { setSection('settings') }}>{text.settings}</Button>
+        <Button variant={section === 'settings' ? 'ghost' : 'ghost'} size="sm" className={section === 'settings' ? 'settings-button active' : 'settings-button'} onClick={() => { setSection('settings'); loadSection('settings') }}>{text.settings}</Button>
       </div>
     </header>
     {section === 'container' && containers.selectedContainer !== null && <ContainerDetails container={containers.selectedContainer} details={containers.containerDetails} repository={resources.plugins} bundles={resources.bundles} workspaceExtensions={containers.workspaceExtensions} text={text} onBack={() => { containers.setSelectedContainer(null); containers.setContainerDetails(null); containers.setWorkspaceExtensions([]) }} onAddProfile={containers.addContainerProfile} onSelectProfile={containers.setContainerProfile} onAddExtension={containers.addContainerExtension} onAddBundle={async (profile, bundleId, conflict) => { if (containers.selectedContainer !== null) await resources.installBundle(containers.selectedContainer.id, profile, bundleId, conflict) }} onDeletePlugin={containers.deleteContainerPlugin} onScanWorkspace={containers.scanWorkspaceExtensions} onImportWorkspace={containers.importWorkspaceExtension} onReadLog={containers.readContainerLog} onOpenInBrowser={containers.openContainerInBrowser} />}
@@ -323,7 +353,7 @@ export function MainApp() {
         {error !== null && <p className="error" role="alert">{error}</p>}
       </section>
     )}
-    {section === 'resources' && <ResourcesPage plugins={resources.plugins} bundles={resources.bundles} references={resources.references} dshVersions={settings.dshVersions} installedDshVersions={settings.installedDshVersions} installingVersion={settings.installingVersion} loadingVersions={settings.loadingVersions} upgradingResources={settings.upgradingResources} upgradeReport={settings.upgradeReport} activeTaskFor={activeTaskFor} templates={containers.templates} scriptPreview={resources.scriptPreview} text={text} onImportPlugin={resources.importPlugin} onChooseArchive={chooseExtensionArchive} onExportPlugin={async (entry) => { await resources.exportPlugin(entry, text) }} onDeletePlugin={resources.deletePlugin} onLoadBundles={resources.loadBundles} onCreateBundle={resources.createBundle} onDeleteBundle={resources.deleteBundle} onExportBundle={async (bundle, mode) => { await resources.exportBundle(bundle, mode, text) }} onImportBundle={resources.importBundle} onInstallDshVersion={settings.installDshVersion} onUninstallDshVersion={settings.uninstallDshVersion} onRefreshDshCatalog={settings.refreshDshCatalog} onUpgradeResources={settings.upgradeResources} onChooseScript={async () => resources.chooseScriptFile(text)} onBuildTemplate={resources.buildTemplate} onImportTemplate={importTemplateArchive} onChooseExportDestination={chooseTemplateExportDestination} onExportTemplate={exportTemplateToPath} onRemoveTemplate={removeTemplateByName} />}
+    {section === 'resources' && <ResourcesPage plugins={resources.plugins} bundles={resources.bundles} references={resources.references} dshVersions={settings.dshVersions} installedDshVersions={settings.installedDshVersions} installingVersion={settings.installingVersion} loadingVersions={settings.loadingVersions} upgradingResources={settings.upgradingResources} upgradeReport={settings.upgradeReport} activeTaskFor={activeTaskFor} templates={containers.templates} scriptPreview={resources.scriptPreview} text={text} onImportPlugin={resources.importPlugin} onChooseArchive={chooseExtensionArchive} onExportPlugin={async (entry) => { await resources.exportPlugin(entry, text) }} onDeletePlugin={resources.deletePlugin} onLoadBundles={resources.loadBundles} onCreateBundle={resources.createBundle} onDeleteBundle={resources.deleteBundle} onExportBundle={async (bundle, mode) => { await resources.exportBundle(bundle, mode, text) }} onImportBundle={resources.importBundle} onInstallDshVersion={settings.installDshVersion} onUninstallDshVersion={settings.uninstallDshVersion} onRefreshDshCatalog={settings.refreshDshCatalog} onUpgradeResources={settings.upgradeResources} onReloadPlugins={resources.loadPlugins} onLoadTemplates={containers.loadTemplates} onChooseScript={async () => resources.chooseScriptFile(text)} onBuildTemplate={resources.buildTemplate} onImportTemplate={importTemplateArchive} onChooseExportDestination={chooseTemplateExportDestination} onExportTemplate={exportTemplateToPath} onRemoveTemplate={removeTemplateByName} />}
     {tasks.taskPanelOpen && <TaskPanel tasks={tasks.tasks} logs={tasks.taskLogs} text={text} onClose={() => { tasks.setTaskPanelOpen(false) }} onCancel={tasks.cancelTask} onRetry={tasks.retryTask} onLog={tasks.showTaskLog} onDelete={tasks.deleteTask} />}
   </main>
 }

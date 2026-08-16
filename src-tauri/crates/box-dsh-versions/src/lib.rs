@@ -292,7 +292,16 @@ pub fn installed_versions(root: &str) -> BoxResult<Vec<String>> {
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().into_string().ok())
         .filter(|name| {
-            is_safe_identifier(name) && version_directory(root, name).join(".git").is_dir()
+            // The completion marker (`.dshbox-runtime.json`, written only
+            // after a successful clone in `pull_template`) is the installed
+            // criterion — NOT the `.git` directory, which libgit2 creates
+            // the instant a clone starts. Harness clones are large and take
+            // minutes; keying on `.git` made the UI report "installed" while
+            // the download was still running.
+            is_safe_identifier(name)
+                && version_directory(root, name)
+                    .join(".dshbox-runtime.json")
+                    .is_file()
         })
         .collect::<Vec<_>>();
     versions.sort();
@@ -467,8 +476,29 @@ mod tests {
             now_seconds()
         ));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("runtimes/v0.1.0/source/.git")).unwrap();
+        // A finished install carries the completion marker written by
+        // `pull_template`; `.git` alone means a clone still in flight.
+        let source = dir.join("runtimes/v0.1.0/source");
+        fs::create_dir_all(source.join(".git")).unwrap();
+        fs::write(
+            source.join(".dshbox-runtime.json"),
+            "{\"version\":\"v0.1.0\",\"commit\":\"deadbeef\"}",
+        )
+        .unwrap();
         dir
+    }
+
+    #[test]
+    fn in_flight_clone_is_not_reported_installed() {
+        let dir = fixture("in-flight");
+        // Simulate a harness clone that started (`.git` created) but has
+        // not finished (no marker yet): it must not count as installed,
+        // otherwise the UI shows "installed" mid-download.
+        let source = dir.join("runtimes/latest/source");
+        fs::create_dir_all(source.join(".git")).unwrap();
+        let versions = installed_versions(dir.to_str().unwrap()).unwrap();
+        assert_eq!(versions, vec!["v0.1.0"]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

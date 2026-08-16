@@ -14,10 +14,12 @@ use box_foundation::{mirror_url, now_seconds, read_config};
 use box_image::ParsedSource;
 use box_runtime::shallow_clone_with_cancel;
 use box_scheduler::TaskContext;
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+// Wire + on-disk index format, shared through box-api.
+pub(crate) use box_api::{DataEntry, DataUse};
 
 use crate::image::download_remote_tarball;
 
@@ -27,26 +29,6 @@ pub(crate) fn data_root(runtime: &Path) -> PathBuf {
 
 fn data_index_path(runtime: &Path) -> PathBuf {
     data_root(runtime).join("index.json")
-}
-
-/// One entry of the data store: name → content digest.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DataEntry {
-    pub name: String,
-    pub digest: String,
-    pub imported_at: u64,
-    pub source: String,
-}
-
-/// One data payload copied into a container; recorded in
-/// `<container>/state/data.json` so `image prune` knows which digests are
-/// still in use.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DataUse {
-    pub name: String,
-    pub digest: String,
 }
 
 fn read_data_index(runtime: &Path) -> BTreeMap<String, DataEntry> {
