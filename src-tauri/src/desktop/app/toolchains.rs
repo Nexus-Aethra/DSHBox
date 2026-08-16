@@ -92,68 +92,6 @@ pub(crate) fn command_for_toolchain(toolchain: &ResolvedToolchain) -> Command {
     command
 }
 
-pub(crate) fn wait_for_process(
-    child: &mut Child,
-    task: Option<&TaskContext>,
-    description: &str,
-) -> Result<std::process::ExitStatus, String> {
-    loop {
-        if task.map(TaskContext::cancelled).unwrap_or(false) {
-            kill_process_tree(child.id());
-            let _ = child.wait();
-            return Err(format!("task cancelled while {description}"));
-        }
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            return Ok(status);
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// Spawns a child with piped output and forwards every line to both the
-/// given log file and the task's live log, so the UI shows progress instead
-/// of appearing stuck during long installs/builds.
-pub(crate) fn spawn_forwarding_log(
-    command: &mut Command,
-    log_file: &Path,
-    task: Option<&TaskContext>,
-) -> Result<Child, String> {
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    let stdout = child.stdout.take().ok_or("missing piped stdout")?;
-    let stderr = child.stderr.take().ok_or("missing piped stderr")?;
-    let log_file = log_file.to_path_buf();
-    for stream in [
-        Box::new(stdout) as Box<dyn std::io::Read + Send>,
-        Box::new(stderr),
-    ] {
-        let task = task.cloned();
-        let log_file = log_file.clone();
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                let _ = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_file)
-                    .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
-                if let Some(task) = &task {
-                    let trimmed = line.trim_end();
-                    if !trimmed.is_empty() {
-                        task.log(trimmed);
-                    }
-                }
-                line.clear();
-            }
-        });
-    }
-    Ok(child)
-}
-
 #[allow(dead_code)]
 pub(crate) fn node_platform() -> Result<String, String> {
     let os = match env::consts::OS {

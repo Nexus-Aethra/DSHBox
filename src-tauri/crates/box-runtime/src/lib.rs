@@ -98,6 +98,9 @@ pub fn detect_proxy_url() -> Option<String> {
     None
 }
 
+// Windows-only helper: ProxyServer values from the registry often carry no
+// scheme; normalize them before handing them to the HTTP client.
+#[allow(dead_code)]
 fn with_http_scheme(server: &str) -> String {
     let server = server.trim();
     if server.starts_with("http://")
@@ -122,6 +125,10 @@ fn clone_once(
     // repositories are useful for tests and development; public remotes stay shallow.
     if !Path::new(url).is_dir() {
         fetch.depth(1);
+        // Shallow fetches only pull the default branch's tip commit; without
+        // this call `revparse_single("v0.12.2")` cannot resolve tags
+        // because the `refs/tags/v0.12.2` pointer is never downloaded.
+        fetch.download_tags(git2::AutotagOption::All);
     }
     let mut callbacks = RemoteCallbacks::new();
     let cancelled_for_progress = std::sync::Arc::clone(&cancelled);
@@ -148,17 +155,33 @@ fn clone_once(
     }
     let mut builder = RepoBuilder::new();
     builder.fetch_options(fetch);
-    if let Some(revision) = revision {
-        builder.branch(revision);
-    }
     let repository = builder
         .clone(url, destination)
         .map_err(|error| format!("Git clone failed: {error}"))?;
-    let commit = repository
-        .head()
-        .map_err(|error| format!("cannot resolve cloned revision: {error}"))?
-        .peel_to_commit()
-        .map_err(|error| format!("cannot resolve cloned commit: {error}"))?;
+    // Resolve the requested revision after clone. RepoBuilder::branch only
+    // matches refs/heads, so it silently misses tags and trips with
+    // `reference 'refs/remotes/origin/<ref>' not found`. revparse_single
+    // walks the usual tag → branch → commit resolution order instead.
+    let commit = if let Some(revision) = revision {
+        let object = repository
+            .revparse_single(revision)
+            .map_err(|error| format!("cannot resolve revision `{revision}`: {error}"))?;
+        repository
+            .checkout_tree(&object, None)
+            .map_err(|error| format!("cannot checkout `{revision}`: {error}"))?;
+        repository
+            .set_head_detached(object.id())
+            .map_err(|error| format!("cannot detach HEAD to `{revision}`: {error}"))?;
+        object
+            .peel_to_commit()
+            .map_err(|error| format!("cannot resolve cloned commit: {error}"))?
+    } else {
+        repository
+            .head()
+            .map_err(|error| format!("cannot resolve cloned revision: {error}"))?
+            .peel_to_commit()
+            .map_err(|error| format!("cannot resolve cloned commit: {error}"))?
+    };
     Ok(commit.id().to_string())
 }
 

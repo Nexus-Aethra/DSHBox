@@ -1,15 +1,17 @@
 {
   "name": "dshbox",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "runtime:prepare": "node scripts/prepare-runtime.mjs",
     "plugin:build": "node scripts/build-plugin.mjs",
     "server:prepare": "node scripts/prepare-server.mjs",
-    "bundle:linux": "DSH_BOX_RUNTIME_TARGET=linux-x64 pnpm plugin:build && pnpm runtime:prepare && pnpm server:prepare && pnpm tauri build --bundles deb --config src-tauri/tauri.linux.conf.json",
+    "bundle:linux": "DSH_BOX_RUNTIME_TARGET=linux-x64 pnpm plugin:build && pnpm runtime:prepare && pnpm server:prepare && pnpm tauri build --bundles deb,rpm --config src-tauri/tauri.linux.conf.json",
     "bundle:windows": "node scripts/bundle-windows.mjs",
-    "bundle:macos": "DSH_BOX_RUNTIME_TARGET=macos-arm64 pnpm runtime:prepare && pnpm server:prepare && pnpm tauri build --bundles dmg",
+    "bundle:macos": "DSH_BOX_RUNTIME_TARGET=macos-arm64 pnpm plugin:build && pnpm runtime:prepare && pnpm server:prepare && pnpm tauri build --bundles dmg --config src-tauri/tauri.macos.conf.json",
+    "desktop:install": "node scripts/install-desktop-entry.mjs",
+    "desktop:install:system": "node scripts/install-desktop-entry.mjs --system",
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "tauri": "tauri"

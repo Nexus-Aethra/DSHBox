@@ -5,50 +5,14 @@ pub(crate) fn create_dsh_container(
     request: CreateDshContainerRequest,
     app: tauri::AppHandle,
 ) -> Result<DshContainer, String> {
-    let name = request.name.trim().to_owned();
-    let version = request.version;
-    let profile = request.profile.trim().to_owned();
-    if !is_safe_version_name(&version) {
-        return Err("invalid DSH version".to_owned());
-    }
-    if name.is_empty() || name.len() > 80 {
-        return Err("container name must contain 1 to 80 characters".to_owned());
-    }
-    if !is_safe_identifier(&profile) {
-        return Err("profile must use letters, numbers, dots, dashes, or underscores".to_owned());
-    }
-    let config = read_config()?;
-    let root = config
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    if !dsh_version_directory(&root, &version).join(".git").is_dir() {
-        return Err(format!("DSH version is not installed: {version}"));
-    }
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| error.to_string())?
-        .as_secs();
-    let id = format!("container-{timestamp}");
-    let directory = PathBuf::from(&root).join("instances").join(&id);
-    for name in ["profile", "workspace", "logs", "state"] {
-        fs::create_dir_all(directory.join(name))
-            .map_err(|error| format!("cannot create container: {error}"))?;
-    }
-    create_profile_manifest(&directory, &profile)?;
-    let metadata = serde_json::json!({ "id": id, "name": name, "version": version, "profile": profile, "source": dsh_version_directory(&root, &version) });
-    fs::write(
-        directory.join("container.json"),
-        serde_json::to_string_pretty(&metadata).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| format!("cannot write container metadata: {error}"))?;
-    let container = DshContainer {
-        id,
-        name,
-        version,
-        profile,
-        directory: directory.to_string_lossy().into_owned(),
-        status: "stopped".to_owned(),
-    };
+    let client = connect()?;
+    let value = call(
+        &client,
+        "create_container",
+        serde_json::json!({ "name": request.name, "version": request.version, "profile": request.profile }),
+    )?;
+    let container: DshContainer = serde_json::from_value(value)
+        .map_err(|error| format!("invalid container record: {error}"))?;
     refresh_global_state(&app);
     Ok(container)
 }
@@ -98,6 +62,11 @@ pub(crate) fn write_profile_support_files(directory: &Path) -> Result<(), String
     Ok(())
 }
 
+/// Ensure the container's workspace directory exists.
+///
+/// Only used by the context-snapshot tests below; the daemon owns container
+/// lifecycle now.
+#[allow(dead_code)] // kept for the context_snapshot_tests below
 pub(crate) fn ensure_container_workspace(directory: &Path) -> Result<PathBuf, String> {
     let workspace = directory.join("workspace");
     fs::create_dir_all(&workspace)
@@ -111,6 +80,10 @@ pub(crate) fn ensure_container_workspace(directory: &Path) -> Result<PathBuf, St
 /// that the agent receives as a user-role history snapshot. Returning the
 /// absolute paths lets the lifecycle wiring mount both the snapshot and the
 /// Cordis patch overlay that points at it.
+///
+/// Only used by the context-snapshot tests below; the daemon renders the
+/// snapshots for live containers now.
+#[allow(dead_code)] // kept for the context_snapshot_tests below
 pub(crate) fn write_dshbox_context_snapshot(
     directory: &Path,
     container: &serde_json::Value,
@@ -170,6 +143,7 @@ pub(crate) fn write_dshbox_context_snapshot(
 /// `<DSH_HOME>/.credentials.yaml`. Tolerant of missing or malformed
 /// files: a container that has not configured providers yet still gets a
 /// valid snapshot with an empty providers list.
+#[allow(dead_code)] // kept for the context_snapshot_tests below
 fn read_credentials_env_names(profile_home: &Path) -> Vec<String> {
     let path = profile_home.join(".credentials.yaml");
     let body = match fs::read_to_string(&path) {
@@ -192,184 +166,6 @@ fn read_credentials_env_names(profile_home: &Path) -> Vec<String> {
     names
 }
 
-
-/// Repairs Box-created, empty named profiles from builds before profile templates were persisted.
-pub(crate) fn repair_known_profile_template(container_directory: &Path, profile: &str) -> Result<(), String> {
-    if !matches!(profile, "web" | "headless") {
-        return Ok(());
-    }
-    let directory = container_directory.join("profile/profiles").join(profile);
-    let manifest_path = directory.join("package.json");
-    let mut manifest: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(&manifest_path)
-            .map_err(|error| format!("cannot read profile: {error}"))?,
-    )
-    .map_err(|error| format!("cannot parse profile: {error}"))?;
-    let empty = manifest
-        .pointer("/dsh/profile/bundles")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(Vec::is_empty);
-    if empty {
-        manifest["dsh"]["profile"]["bundles"] =
-            serde_json::json!(profile_template_bundles(profile));
-        fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| format!("cannot repair profile: {error}"))?;
-    }
-    write_profile_support_files(&directory)
-}
-
-/// Ensures every non-bundled DSH plugin selected by a profile has its declared runtime entry.
-/// GitHub and tarball imports may contain TypeScript sources, so this prepares those sources
-/// before the DSH loader attempts to import them.
-pub(crate) fn preflight_profile_plugins(
-    container_directory: &Path,
-    profile: &str,
-    task: Option<&TaskContext>,
-) -> Result<(), String> {
-    let profile_directory = container_directory.join("profile/profiles").join(profile);
-    let manifest: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(profile_directory.join("package.json"))
-            .map_err(|error| format!("cannot read profile manifest: {error}"))?,
-    )
-    .map_err(|error| format!("cannot parse profile manifest: {error}"))?;
-    let bundles = manifest
-        .pointer("/dsh/profile/bundles")
-        .and_then(serde_json::Value::as_array)
-        .ok_or("profile manifest has no dsh.profile.bundles")?;
-    for bundle in bundles.iter().filter_map(serde_json::Value::as_str) {
-        if bundle.starts_with("@deepseek-ai/") {
-            continue;
-        }
-        let plugin_directory = profile_directory.join("node_modules").join(bundle);
-        let plugin_manifest_path = plugin_directory.join("package.json");
-        if !plugin_manifest_path.is_file() {
-            return Err(format!(
-                "profile plugin {bundle} is not installed; re-add it from Container details"
-            ));
-        }
-        let plugin_manifest: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(&plugin_manifest_path)
-                .map_err(|error| format!("cannot read plugin {bundle} manifest: {error}"))?,
-        )
-        .map_err(|error| format!("cannot parse plugin {bundle} manifest: {error}"))?;
-        let Some(entry) = plugin_runtime_entry(&plugin_manifest) else {
-            continue;
-        };
-        if plugin_directory.join(&entry).is_file() {
-            continue;
-        }
-        if let Some(task) = task {
-            task.update(format!("Preparing plugin {bundle}"), 32);
-            task.log(&format!(
-                "plugin {bundle} entry {entry} is missing; installing dependencies and building its source"
-            ));
-            prepare_plugin_source(&plugin_directory, bundle, &entry, task)?;
-        } else {
-            return Err(format!(
-                "plugin {bundle} has no built entry {entry}; start it from DSH Box so it can be prepared"
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn plugin_runtime_entry(manifest: &serde_json::Value) -> Option<String> {
-    manifest
-        .get("main")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| {
-            manifest
-                .pointer("/exports/./default")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-}
-
-pub(crate) fn prepare_plugin_source(
-    directory: &Path,
-    name: &str,
-    entry: &str,
-    task: &TaskContext,
-) -> Result<(), String> {
-    let pnpm = resolve_toolchain("pnpm")?;
-    let task_record = task.manager.task(&task.task_id)?;
-    let log = fs::OpenOptions::new()
-        .append(true)
-        .open(&task_record.log_path)
-        .map_err(|error| error.to_string())?;
-    let frozen = if directory.join("pnpm-lock.yaml").is_file() {
-        "--frozen-lockfile"
-    } else {
-        "--no-frozen-lockfile"
-    };
-    let mut install = command_for_toolchain(&pnpm)
-        .args([
-            "--dir",
-            directory.to_string_lossy().as_ref(),
-            "install",
-            frozen,
-        ])
-        .stdout(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .stderr(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .spawn()
-        .map_err(|error| format!("cannot install dependencies for plugin {name}: {error}"))?;
-    let status = wait_for_process(&mut install, Some(task), "installing plugin dependencies")?;
-    if !status.success() {
-        return Err(format!(
-            "plugin {name} dependency installation exited with {status}"
-        ));
-    }
-    if directory.join(entry).is_file() {
-        return Ok(());
-    }
-    if plugin_has_script(directory, "build")? {
-        task.update(format!("Building plugin {name}"), 38);
-        let mut build = command_for_toolchain(&pnpm)
-            .args([
-                "--dir",
-                directory.to_string_lossy().as_ref(),
-                "run",
-                "build",
-            ])
-            .stdout(Stdio::from(
-                log.try_clone().map_err(|error| error.to_string())?,
-            ))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .map_err(|error| format!("cannot build plugin {name}: {error}"))?;
-        let status = wait_for_process(&mut build, Some(task), "building plugin")?;
-        if !status.success() {
-            return Err(format!("plugin {name} build exited with {status}"));
-        }
-    }
-    if directory.join(entry).is_file() {
-        Ok(())
-    } else {
-        Err(format!(
-            "plugin {name} build completed but did not create its declared entry {entry}"
-        ))
-    }
-}
-
-pub(crate) fn plugin_has_script(directory: &Path, script: &str) -> Result<bool, String> {
-    let manifest: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(directory.join("package.json"))
-            .map_err(|error| format!("cannot read plugin manifest: {error}"))?,
-    )
-    .map_err(|error| format!("cannot parse plugin manifest: {error}"))?;
-    Ok(manifest
-        .pointer(&format!("/scripts/{script}"))
-        .and_then(serde_json::Value::as_str)
-        .is_some())
-}
 
 #[tauri::command]
 pub(crate) fn add_dsh_container_profile(
@@ -446,28 +242,20 @@ pub(crate) fn set_dsh_container_profile(
 #[tauri::command]
 pub(crate) fn delete_dsh_container(
     id: String,
-    manager: tauri::State<ContainerManager>,
-    tasks: tauri::State<TaskManager>,
+    _manager: tauri::State<ContainerManager>,
+    _tasks: tauri::State<TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     if !is_safe_version_name(&id) {
         return Err("invalid container id".to_owned());
     }
-    ensure_resource_idle(&tasks, &format!("container:{id}"))?;
-    manager
-        .running
-        .lock()
-        .map_err(|_| "container manager lock failed")?
-        .remove(&id);
-    let config = read_config()?;
-    let root = config
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    let directory = PathBuf::from(root).join("instances").join(&id);
-    if !directory.is_dir() {
-        return Err(format!("container not found: {id}"));
+    // The daemon stops the container and removes its directory; the desktop
+    // only needs to close the container's front window locally.
+    if let Some(window) = app.get_webview_window(&format!("dsh-front-{id}")) {
+        let _ = window.close();
     }
-    fs::remove_dir_all(directory).map_err(|error| format!("cannot remove container: {error}"))?;
+    let client = connect()?;
+    call(&client, "delete_container", serde_json::json!({ "id": id }))?;
     refresh_global_state(&app);
     Ok(())
 }

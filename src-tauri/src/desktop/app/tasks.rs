@@ -11,34 +11,40 @@ pub(crate) fn refresh_global_state(app: &tauri::AppHandle) {
     let Ok(config) = read_config() else {
         return;
     };
-    let mut containers = config
-        .runtime_directory
-        .as_deref()
-        .and_then(|root| scan_containers(root).ok())
-        .map(|items| items.into_values().collect::<Vec<_>>())
+    // The daemon owns host processes, so container states come from it.
+    // A failed daemon call degrades to empty/stopped instead of blocking.
+    let connection = connect().ok();
+    let mut containers: Vec<DshContainer> = connection
+        .as_ref()
+        .and_then(|client| call(client, "list_containers", serde_json::json!({})).ok())
+        .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
-    if let Ok(mut running) = app.state::<ContainerManager>().running.lock() {
-        for container in &mut containers {
-            container.status = match running.get_mut(&container.id) {
-                Some(host) => match host.child.try_wait() {
-                    Ok(None) => "running".to_owned(),
-                    Ok(Some(_)) | Err(_) => "stopped".to_owned(),
-                },
-                None => "stopped".to_owned(),
-            };
+    for container in &mut containers {
+        if container.status != "running" {
+            container.status = "stopped".to_owned();
         }
     }
-    let versions = config
-        .runtime_directory
-        .as_deref()
-        .and_then(|root| installed_dsh_versions(root).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|name| DshVersion {
-            name,
-            installed: true,
+    let versions = connection
+        .as_ref()
+        .and_then(|client| {
+            call(
+                client,
+                "list_installed_dsh_versions",
+                serde_json::json!({}),
+            )
+            .ok()
         })
-        .collect();
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+        .map(|names| {
+            names
+                .into_iter()
+                .map(|name| DshVersion {
+                    name,
+                    installed: true,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let state = app.state::<ResourceStateManager>();
     state.refresh_all(&config, scan_toolchains(&config), versions, containers);
     state.replace_tasks(task_records(&app.state::<TaskManager>()));
@@ -156,8 +162,26 @@ pub(crate) fn run_queued_task(
 }
 
 #[tauri::command]
-pub(crate) fn list_tasks(resources: tauri::State<ResourceStateManager>) -> Result<Vec<TaskRecord>, String> {
-    Ok(resources.snapshot()?.tasks)
+pub(crate) fn list_tasks(
+    manager: tauri::State<TaskManager>,
+    resources: tauri::State<ResourceStateManager>,
+) -> Result<Vec<TaskRecord>, String> {
+    // Daemon-owned tasks come from the daemon (it persists them as it goes);
+    // local tasks (toolchain installs) come from the local manager. The
+    // daemon is authoritative for ids it owns, so overlapping entries from
+    // an earlier disk restore are dropped.
+    let client = connect()?;
+    let mut tasks: Vec<TaskRecord> = serde_json::from_value(
+        call(&client, "list_tasks", serde_json::json!({}))?,
+    )
+    .map_err(|error| format!("invalid task list: {error}"))?;
+    for task in manager.list().map_err(|error| error.to_string())? {
+        if !tasks.iter().any(|existing| existing.id == task.id) {
+            tasks.push(task);
+        }
+    }
+    resources.replace_tasks(tasks.clone());
+    Ok(tasks)
 }
 
 #[tauri::command]
@@ -166,8 +190,19 @@ pub(crate) fn cancel_task(
     manager: tauri::State<TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    manager.request_cancel(&task_paths()?, &id)?;
-    emit_task_update(&manager, &app, &id);
+    // Local tasks (toolchain installs) cancel locally; daemon tasks cancel
+    // on the daemon, which owns their workers.
+    if manager
+        .task(&id)
+        .map(|task| task.kind == "toolchain-install")
+        .unwrap_or(false)
+    {
+        manager.request_cancel(&task_paths()?, &id)?;
+        emit_task_update(&manager, &app, &id);
+        return Ok(());
+    }
+    let client = connect()?;
+    call(&client, "cancel_task", serde_json::json!({ "id": id }))?;
     Ok(())
 }
 
@@ -177,8 +212,17 @@ pub(crate) fn delete_task(
     manager: tauri::State<TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    manager.remove(&task_paths()?, &id)?;
-    refresh_global_state(&app);
+    if manager
+        .task(&id)
+        .map(|task| task.kind == "toolchain-install")
+        .unwrap_or(false)
+    {
+        manager.remove(&task_paths()?, &id)?;
+        refresh_global_state(&app);
+        return Ok(());
+    }
+    let client = connect()?;
+    call(&client, "delete_task", serde_json::json!({ "id": id }))?;
     Ok(())
 }
 
@@ -202,7 +246,22 @@ pub(crate) fn retry_task(
     manager: tauri::State<TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
-    let previous = manager.task(&id)?;
+    // Local tasks live in the local manager; daemon tasks (including ones
+    // restored from disk before this session) are fetched from the daemon.
+    let previous = match manager.task(&id) {
+        Ok(task) if task.kind == "toolchain-install" => task,
+        _ => {
+            let client = connect()?;
+            let tasks: Vec<TaskRecord> = serde_json::from_value(
+                call(&client, "list_tasks", serde_json::json!({}))?,
+            )
+            .map_err(|error| format!("invalid task list: {error}"))?;
+            tasks
+                .into_iter()
+                .find(|task| task.id == id)
+                .ok_or("task not found")?
+        }
+    };
     match previous.kind.as_str() {
         "toolchain-install" => enqueue_toolchain_install(
             previous.params["id"]
@@ -212,10 +271,10 @@ pub(crate) fn retry_task(
             manager,
             app,
         ),
-        "dsh-version-install" => enqueue_dsh_version_install(
+        "template-pull" => enqueue_pull_template(
             previous.params["version"]
                 .as_str()
-                .ok_or("task has no DSH version")?
+                .ok_or("task has no template version")?
                 .to_owned(),
             manager,
             app,

@@ -8,3 +8,4 @@ box-foundation = { path = "../box-foundation" }
 box-runtime = { path = "../box-runtime" }
 box-toolchains = { path = "../box-toolchains" }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

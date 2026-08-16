@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "resources": {
+      "resources/runtime/macos-arm64/": "runtime/macos-arm64/",
+      "resources/server/macos-arm64/": "server/macos-arm64/",
+      "resources/plugins/macos-arm64/": "plugins/macos-arm64/"
+    }
+  }
+}

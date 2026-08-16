@@ -1,6 +1,11 @@
 //! `dshbox config` — inspect and update local configuration.
+//! `show` reads the config file; `set` forwards the change to the daemon so
+//! both processes stay consistent.
 
-use box_foundation::{read_config, write_config};
+use box_foundation::read_config;
+use serde_json::json;
+
+use super::rpc;
 
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     let Some(action) = arguments.first().map(String::as_str) else {
@@ -36,14 +41,35 @@ fn set_value(arguments: &[String]) -> Result<(), String> {
     let value = arguments
         .get(1)
         .ok_or("expected a value (use an empty string to clear)")?;
-    let mut config = read_config()?;
+    let client = rpc::connect()?;
     match key.as_str() {
-        "runtime" => config.runtime_directory = Some(value.clone()),
-        "mirror.github" => config.github_mirror = non_empty(value),
-        "mirror.npm" => config.npm_registry = non_empty(value),
+        "runtime" => {
+            rpc::call(
+                &client,
+                "save_runtime_directory",
+                json!({ "runtimeDirectory": value.clone() }),
+            )?;
+        }
+        "mirror.github" | "mirror.npm" => {
+            let config = read_config()?;
+            let github = if key == "mirror.github" {
+                non_empty(value)
+            } else {
+                config.github_mirror.clone()
+            };
+            let npm = if key == "mirror.npm" {
+                non_empty(value)
+            } else {
+                config.npm_registry.clone()
+            };
+            rpc::call(
+                &client,
+                "save_mirror_settings",
+                json!({ "githubMirror": github, "npmRegistry": npm }),
+            )?;
+        }
         _ => return Err(format!("unknown config key: {key}")),
     }
-    write_config(&config)?;
     println!("config {key} = {value}");
     Ok(())
 }

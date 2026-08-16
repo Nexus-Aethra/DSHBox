@@ -49,6 +49,149 @@ pub(crate) fn bundled_server_path(resource_directory: &Path) -> PathBuf {
     ))
 }
 
+/// True when the daemon's discovery record is reachable right now.
+fn daemon_alive() -> bool {
+    box_server_core::read_discovery()
+        .ok()
+        .flatten()
+        .map(|discovery| box_client::RpcClient::from_discovery(&discovery).ping().is_ok())
+        .unwrap_or(false)
+}
+
+/// Build-batch of this desktop binary, embedded at compile time from
+/// `src-tauri/.build-stamp` (epoch seconds written on every daemon rebuild).
+pub(crate) const CLIENT_BUILD_STAMP: &str = env!("DSHBOX_BUILD_STAMP");
+
+/// Wait up to `timeout` for a reachable daemon and return a connected client.
+fn wait_for_daemon(timeout: Duration) -> Option<box_client::RpcClient> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(Some(discovery)) = box_server_core::read_discovery() {
+            let client = box_client::RpcClient::from_discovery(&discovery);
+            if client.ping().is_ok() {
+                return Some(client);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    }
+}
+
+/// Protocol handshake on startup: when the running daemon was built in a
+/// different build batch than this desktop binary (a stale daemon left
+/// over from before an upgrade), stop it and start the daemon shipped with
+/// this install. Failures are logged but never block startup.
+pub(crate) fn reconcile_daemon_build(server: &Path) {
+    let Some(client) = wait_for_daemon(Duration::from_secs(5)) else {
+        write_startup_log("daemon did not become reachable; skipping build stamp check");
+        return;
+    };
+    let remote_stamp = client
+        .call("get_info", serde_json::json!({}))
+        .ok()
+        .and_then(|info| info["buildStamp"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    if remote_stamp == CLIENT_BUILD_STAMP {
+        write_startup_log(&format!("daemon build stamp matches ({remote_stamp})"));
+        return;
+    }
+    write_startup_log(&format!(
+        "daemon build stamp {remote_stamp:?} != client {CLIENT_BUILD_STAMP:?}; restarting daemon"
+    ));
+    let _ = client.call("shutdown", serde_json::json!({}));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while daemon_alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    // Bring the freshly-installed daemon up: through the user service when
+    // one exists, otherwise by spawning the bundled sidecar directly.
+    #[cfg(unix)]
+    {
+        if let Err(error) = restart_user_service() {
+            write_startup_log(&format!(
+                "daemon restart via service failed ({error}); spawning directly"
+            ));
+            spawn_daemon_fallback(server);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = restart_user_service();
+    }
+    if let Some(client) = wait_for_daemon(Duration::from_secs(5)) {
+        let stamp = client
+            .call("get_info", serde_json::json!({}))
+            .ok()
+            .and_then(|info| info["buildStamp"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let message = if stamp == CLIENT_BUILD_STAMP {
+            format!("daemon restarted with matching build stamp ({stamp})")
+        } else {
+            "daemon restarted but build stamp still does not match".to_owned()
+        };
+        write_startup_log(&message);
+    } else {
+        write_startup_log("daemon did not come back after restart");
+    }
+}
+
+/// Fallback launcher for platforms without a per-user service manager
+/// (macOS) and for environments where service installation failed: spawns
+/// the bundled daemon directly unless one is already reachable, so the
+/// desktop app never blocks on a missing daemon.
+pub(crate) fn spawn_daemon_fallback(server: &Path) {
+    if daemon_alive() {
+        write_startup_log("dshboxd is already reachable; skipping fallback spawn");
+        return;
+    }
+    let mut command = Command::new(server);
+    command.arg("--service");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let _ = command.process_group(0);
+    }
+    match command.spawn() {
+        Ok(_) => write_startup_log(&format!("spawned dshboxd fallback: {}", server.display())),
+        Err(error) => write_startup_log(&format!("dshboxd fallback spawn failed: {error}")),
+    }
+}
+
+/// User-level PATH entry (`~/.local/bin/dshboxd`) so `dshbox` CLI commands
+/// can auto-spawn the daemon without opening the desktop app first.
+/// Recreated on every launch so it never points at a stale sidecar path.
+/// Idempotent; failures are logged but non-fatal. Windows uses a per-user
+/// scheduled task instead (symlinks there need privileges).
+#[cfg(unix)]
+pub(crate) fn link_daemon_into_path(server: &Path) {
+    use std::os::unix::fs::symlink;
+    let home = match dirs::home_dir() {
+        Some(home) => home,
+        None => {
+            write_startup_log("cannot determine home directory; skipping dshboxd PATH link");
+            return;
+        }
+    };
+    let bin_dir = home.join(".local/bin");
+    if let Err(error) = fs::create_dir_all(&bin_dir) {
+        write_startup_log(&format!("cannot create {}: {error}", bin_dir.display()));
+        return;
+    }
+    let link = bin_dir.join("dshboxd");
+    let _ = fs::remove_file(&link);
+    match symlink(server, &link) {
+        Ok(()) => write_startup_log(&format!(
+            "linked dshboxd PATH entry: {} -> {}",
+            link.display(),
+            server.display()
+        )),
+        Err(error) => write_startup_log(&format!("cannot link dshboxd PATH entry: {error}")),
+    }
+}
+
+
 pub(crate) fn initialize_bundled_runtime(resource_directory: PathBuf) -> Result<(), String> {
     let root = resource_directory.join("runtime").join(bundled_target());
     let manifest: BundledRuntimeManifest = serde_json::from_str(
@@ -95,6 +238,13 @@ pub(crate) fn initialize_bundled_runtime(resource_directory: PathBuf) -> Result<
 #[tauri::command]
 pub(crate) fn get_server_service_status() -> ServiceStatus {
     service_status()
+}
+
+/// Health probe for the frontend startup gate: true once the daemon's
+/// discovery record is reachable and it answers `ping`.
+#[tauri::command]
+pub(crate) fn get_daemon_status() -> bool {
+    daemon_alive()
 }
 
 #[tauri::command]
@@ -170,25 +320,8 @@ pub(crate) fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 let _ = restart_user_service();
             }
             "tray-quit" => {
-                // app.exit() does not wait for children: leave the hosts
-                // running and their node processes keep the container ports
-                // alive after the UI is gone. Stop them before exiting.
-                let manager = app.state::<ContainerManager>();
-                let hosts = manager
-                    .running
-                    .lock()
-                    .map(|mut running| std::mem::take(&mut *running).into_iter().collect::<Vec<_>>())
-                    .unwrap_or_default();
-                for (_, mut host) in hosts {
-                    kill_process_tree(host.child.id());
-                    let _ = host.child.wait();
-                    let descendants = host
-                        .tree
-                        .lock()
-                        .map(|tree| tree.clone())
-                        .unwrap_or_default();
-                    kill_pids(&descendants);
-                }
+                // The daemon owns container hosts, so quitting the UI leaves
+                // them running under dshboxd; nothing to stop here.
                 app.exit(0);
             }
             _ => {}
@@ -233,7 +366,7 @@ struct PluginsManifest {
 #[allow(dead_code)]
 pub(crate) fn initialize_bundled_plugins(resource_directory: &Path) -> Result<(), String> {
     let target = bundled_target();
-    let resource_plugins = resource_directory.join("plugins").join(&target);
+    let resource_plugins = resource_directory.join("plugins").join(target);
     let manifest_path = resource_plugins.join("plugins-manifest.json");
     if !manifest_path.is_file() {
         // Resource might not carry the plugin (e.g. a developer build
@@ -292,9 +425,10 @@ pub(crate) fn initialize_bundled_plugins(resource_directory: &Path) -> Result<()
     Ok(())
 }
 
-/// Recursive directory copy used by `initialize_bundled_plugins`.
-#[allow(dead_code)]
-fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> {
+/// Recursive directory copy used by `initialize_bundled_plugins` and the
+/// Windows fallback in `lifecycle::link_vendored_plugin` (directory
+/// symlinks need Developer Mode or an elevated shell there).
+pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> {
     fs::create_dir_all(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;

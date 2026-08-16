@@ -1,16 +1,16 @@
 import { useEffect, useState } from 'react'
 import { boxApi } from '../shared/api/box-api'
-import type { ContainerExtensions, DshContainer, RepositoryExtension, WorkspaceExtension } from '../shared/types/domain'
+import type { ContainerExtensions, DshContainer, RepositoryExtension, TemplateInfo, WorkspaceExtension } from '../shared/types/domain'
 
 export function useContainers(
-  installedDshVersions: string[],
   onError: (message: string | null) => void,
   onRepositoryUpdate: (repository: RepositoryExtension[]) => void,
 ) {
   const [containers, setContainers] = useState<DshContainer[]>([])
   const [selectedContainer, setSelectedContainer] = useState<DshContainer | null>(null)
   const [containerDetails, setContainerDetails] = useState<ContainerExtensions | null>(null)
-  const [containerVersion, setContainerVersion] = useState('')
+  const [templates, setTemplates] = useState<TemplateInfo[]>([])
+  const [selectedTemplate, setSelectedTemplate] = useState('')
   const [creatingContainer, setCreatingContainer] = useState(false)
   const [creatingContainerView, setCreatingContainerView] = useState(false)
   const [containerName, setContainerName] = useState('')
@@ -18,19 +18,36 @@ export function useContainers(
   const [containerMenuId, setContainerMenuId] = useState<string | null>(null)
   const [workspaceExtensions, setWorkspaceExtensions] = useState<WorkspaceExtension[]>([])
 
-  // Default the create form to the first installed DSH version once known.
+  // Initial load on mount: the container list and templates must be present
+  // before the user navigates to the Container section (nav buttons only
+  // refetch when clicked).
   useEffect(() => {
-    setContainerVersion((current) => current || installedDshVersions[0] || '')
-  }, [installedDshVersions])
+    void loadContainers()
+    void loadTemplates()
+  }, [])
+
+  // Default the create form to the latest base template once known, and
+  // pre-fill the profile from the template's own PROFILE directive.
+  useEffect(() => {
+    setSelectedTemplate((current) => current || templates.find((template) => template.name === 'latest')?.name || templates[0]?.name || '')
+  }, [templates])
+  useEffect(() => {
+    const template = templates.find((item) => item.name === selectedTemplate)
+    if (template) setNewContainerProfile((current) => current === 'web' ? template.profile : current)
+  }, [selectedTemplate])
 
   async function loadContainers(): Promise<void> {
     try { setContainers(await boxApi.listContainers()) } catch (reason) { onError(String(reason)) }
   }
 
+  async function loadTemplates(): Promise<void> {
+    try { setTemplates(await boxApi.listTemplates()); onError(null) } catch (reason) { onError(String(reason)) }
+  }
+
   async function createContainer(): Promise<void> {
-    if (!containerVersion) return
+    if (!selectedTemplate) return
     setCreatingContainer(true)
-    try { await boxApi.createContainer(containerName, containerVersion, newContainerProfile); await loadContainers(); setCreatingContainerView(false); setContainerName(''); setNewContainerProfile('web'); onError(null) } catch (reason) { onError(String(reason)) } finally { setCreatingContainer(false) }
+    try { await boxApi.createContainerFromTemplate(containerName, selectedTemplate, newContainerProfile); setCreatingContainerView(false); setContainerName(''); setNewContainerProfile('web'); setSelectedTemplate(''); await loadContainers(); onError(null) } catch (reason) { onError(String(reason)) } finally { setCreatingContainer(false) }
   }
 
   async function showContainerDetails(container: DshContainer): Promise<void> {
@@ -100,7 +117,8 @@ export function useContainers(
 
   return {
     containers, setContainers, selectedContainer, setSelectedContainer, containerDetails, setContainerDetails,
-    containerVersion, setContainerVersion, creatingContainer, creatingContainerView, setCreatingContainerView,
+    templates, loadTemplates, selectedTemplate, setSelectedTemplate,
+    creatingContainer, creatingContainerView, setCreatingContainerView,
     containerName, setContainerName, newContainerProfile, setNewContainerProfile, containerMenuId, setContainerMenuId,
     workspaceExtensions, setWorkspaceExtensions, loadContainers, createContainer, showContainerDetails,
     refreshSelectedContainer, addContainerProfile, setContainerProfile, addContainerExtension,

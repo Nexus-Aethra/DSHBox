@@ -32,3 +32,32 @@ pub(crate) fn refresh_resource_state(app: tauri::AppHandle) -> Result<ResourceSn
     refresh_global_state(&app);
     app.state::<ResourceStateManager>().snapshot()
 }
+
+/// One entry of the content-addressed data store (image tab).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DataEntry {
+    pub name: String,
+    pub digest: String,
+    pub imported_at: u64,
+    pub source: String,
+}
+
+/// Lists data-store entries via the daemon.
+#[tauri::command]
+pub(crate) fn list_data_entries() -> Result<Vec<DataEntry>, String> {
+    let client = connect()?;
+    let value = call(&client, "list_data_entries", serde_json::json!({}))?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("invalid data entries from daemon: {error}"))
+}
+
+/// Garbage-collects orphaned data-store blobs via the daemon. Returns the
+/// removed content digests.
+#[tauri::command]
+pub(crate) fn prune_orphaned_data() -> Result<Vec<String>, String> {
+    let client = connect()?;
+    let value = call(&client, "prune_orphaned_data", serde_json::json!({}))?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("invalid prune response from daemon: {error}"))
+}

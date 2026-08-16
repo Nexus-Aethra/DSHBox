@@ -5,7 +5,7 @@
 
 use box_containers::DshContainer;
 use box_dsh_versions::DshVersion;
-use box_extensions::{scan_container_extensions, scan_repository, ContainerExtensions, RepositoryExtension};
+use box_extensions::{read_bundles, scan_container_extensions, scan_repository, ContainerExtensions, ExtensionBundle, RepositoryExtension};
 use box_foundation::{now_seconds, BoxConfig, BoxPaths, BoxResult};
 use box_scheduler::TaskRecord;
 use box_toolchains::ToolchainStatus;
@@ -13,16 +13,24 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    path::Path,
     sync::{Arc, RwLock},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ResourceKind {
+    // System-level kinds
     Toolchain,
     Runtime,
     Container,
     Task,
+    // User-facing resource kinds. The Resources page surfaces the official
+    // harness as a "Harness" tab, but the backing resource is the same as
+    // every other template — there is no separate `Harness` kind any more.
+    Template,
+    Plugin,
+    Bundle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +67,11 @@ pub struct ResourceSnapshot {
     pub container_extensions: BTreeMap<String, ContainerExtensions>,
     #[serde(default)]
     pub extension_repository: Vec<RepositoryExtension>,
+    /// Reference counts for repository extensions (how many containers
+    /// currently link each entry). Drives the UI's usage badge and protects
+    /// entries from `plugin prune`.
+    #[serde(default)]
+    pub repository_references: BTreeMap<String, u32>,
     pub tasks: Vec<TaskRecord>,
     pub resources: BTreeMap<String, ResourceState>,
     pub scanned_at: u64,
@@ -77,6 +90,7 @@ impl Default for ResourceSnapshot {
             containers: Vec::new(),
             container_extensions: BTreeMap::new(),
             extension_repository: Vec::new(),
+            repository_references: BTreeMap::new(),
             tasks: Vec::new(),
             resources: BTreeMap::new(),
             scanned_at: now,
@@ -205,6 +219,7 @@ impl ResourceStateManager {
                 .map(|container| (container.id.clone(), scan_container_extensions(container)))
                 .collect();
             state.extension_repository = config.runtime_directory.as_deref().map(|runtime| scan_repository(std::path::Path::new(runtime))).unwrap_or_default();
+            state.repository_references = config.runtime_directory.as_deref().map(|runtime| box_extensions::read_references(std::path::Path::new(runtime))).unwrap_or_default();
             state.containers = containers;
             state.scanned_at = now_seconds();
         });
@@ -319,6 +334,43 @@ fn rebuild_resources(state: &mut ResourceSnapshot) {
                 progress: Some(task.progress),
             },
         );
+    }
+    // Plugin: repository extensions of kind Plugin
+    for entry in &state.extension_repository {
+        if entry.kind == box_extensions::ExtensionKind::Plugin {
+            resources.insert(
+                format!("plugin:{}", entry.id),
+                ResourceState {
+                    resource_key: format!("plugin:{}", entry.id),
+                    kind: ResourceKind::Plugin,
+                    name: entry.name.clone(),
+                    health: if entry.diagnostic.is_some() {
+                        ResourceHealth::Failed
+                    } else {
+                        ResourceHealth::Ready
+                    },
+                    detail: entry.version.clone(),
+                    progress: None,
+                },
+            );
+        }
+    }
+    // Bundle: extension bundles
+    if let Some(runtime_dir) = &state.runtime_directory {
+        let bundles: Vec<ExtensionBundle> = read_bundles(Path::new(runtime_dir));
+        for bundle in &bundles {
+            resources.insert(
+                format!("bundle:{}", bundle.id),
+                ResourceState {
+                    resource_key: format!("bundle:{}", bundle.id),
+                    kind: ResourceKind::Bundle,
+                    name: bundle.name.clone(),
+                    health: ResourceHealth::Ready,
+                    detail: Some(format!("{} entries", bundle.entries.len())),
+                    progress: None,
+                },
+            );
+        }
     }
     state.resources = resources;
 }

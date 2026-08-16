@@ -7,6 +7,7 @@ use box_foundation::now_seconds;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -140,6 +141,77 @@ pub fn write_repository_index(runtime: &Path, entries: &[RepositoryExtension]) -
     let path = repository_index_path(runtime);
     fs::create_dir_all(path.parent().ok_or("repository index has no parent")?).map_err(|error| error.to_string())?;
     fs::write(path, serde_json::to_string_pretty(entries).map_err(|error| error.to_string())?).map_err(|error| error.to_string())
+}
+
+// ── Reference counting ────────────────────────────────────────────────────
+// Persistent per-entry reference counter stored at
+// `<root>/repository/references.json`. Every container that links a
+// repository entry into its extensions owns one reference; `dshbox plugin
+// prune` removes only entries whose count reached zero, so running
+// containers never keep dangling links.
+
+pub fn references_path(runtime: &Path) -> PathBuf {
+    repository_root(runtime).join("references.json")
+}
+
+/// Read the persisted reference map (id → container count). Missing or
+/// malformed files read as empty, mirroring `scan_repository`.
+pub fn read_references(runtime: &Path) -> BTreeMap<String, u32> {
+    fs::read_to_string(references_path(runtime))
+        .ok()
+        .and_then(|source| serde_json::from_str(&source).ok())
+        .unwrap_or_default()
+}
+
+pub fn write_references(
+    runtime: &Path,
+    references: &BTreeMap<String, u32>,
+) -> Result<(), String> {
+    let path = references_path(runtime);
+    fs::create_dir_all(path.parent().ok_or("references has no parent")?)
+        .map_err(|error| error.to_string())?;
+    fs::write(
+        path,
+        serde_json::to_string_pretty(references).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Record that one more container links `entry_id`. Missing entries start
+/// at 1.
+pub fn increment_reference(runtime: &Path, entry_id: &str) -> Result<(), String> {
+    let mut references = read_references(runtime);
+    *references.entry(entry_id.to_owned()).or_insert(0) += 1;
+    write_references(runtime, &references)
+}
+
+/// Record that one container stopped linking `entry_id`. The count is
+/// saturating (never goes below zero); returns the remaining count.
+pub fn decrement_reference(runtime: &Path, entry_id: &str) -> Result<u32, String> {
+    let mut references = read_references(runtime);
+    let count = references.entry(entry_id.to_owned()).or_insert(0);
+    *count = count.saturating_sub(1);
+    let remaining = *count;
+    write_references(runtime, &references)?;
+    Ok(remaining)
+}
+
+/// Repository ids whose reference count is zero — candidates for
+/// `remove_repository_extension`. Entries absent from the map count as
+/// unused, so a fresh store prunes nothing extra.
+pub fn unused_repository_ids(runtime: &Path) -> Vec<String> {
+    let references = read_references(runtime);
+    let entries = scan_repository(runtime);
+    entries
+        .into_iter()
+        .filter(|entry| references.get(&entry.id).copied().unwrap_or(0) == 0)
+        .map(|entry| entry.id)
+        .collect()
+}
+
+/// How many containers currently reference `entry_id` (0 when absent).
+pub fn reference_count(runtime: &Path, entry_id: &str) -> u32 {
+    read_references(runtime).get(entry_id).copied().unwrap_or(0)
 }
 
 /// One entry inside an exported extension bundle.
@@ -585,6 +657,7 @@ mod tests {
             name: "One".to_owned(),
             version: "latest".to_owned(),
             profile: "web".to_owned(),
+            template: None,
             directory: root.to_string_lossy().into_owned(),
             status: "stopped".to_owned(),
         }
@@ -617,6 +690,56 @@ mod tests {
         );
         assert!(found.profiles[0].plugins[1].diagnostic.is_some());
         assert_eq!(found.skills[0].name, "demo");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reference_counts_are_persisted_and_saturating() {
+        let root = std::env::temp_dir().join(format!("dshbox-references-test-{}", now_seconds()));
+        fs::create_dir_all(repository_root(&root)).unwrap();
+
+        // Absent entries count as zero until incremented.
+        assert_eq!(reference_count(&root, "img-a"), 0);
+        assert!(unused_repository_ids(&root).is_empty());
+
+        increment_reference(&root, "img-a").unwrap();
+        increment_reference(&root, "img-a").unwrap();
+        increment_reference(&root, "img-b").unwrap();
+        assert_eq!(reference_count(&root, "img-a"), 2);
+        assert_eq!(reference_count(&root, "img-b"), 1);
+
+        // Map survives a fresh read (persisted on disk).
+        assert_eq!(read_references(&root).len(), 2);
+
+        // Decrement is saturating and returns the remaining count.
+        assert_eq!(decrement_reference(&root, "img-a").unwrap(), 1);
+        assert_eq!(decrement_reference(&root, "img-a").unwrap(), 0);
+        assert_eq!(decrement_reference(&root, "img-a").unwrap(), 0);
+
+        // Zero-count entries are reported by unused_repository_ids when
+        // they exist in the repository index.
+        write_repository_index(
+            &root,
+            &[RepositoryExtension {
+                id: "img-a".to_owned(),
+                kind: ExtensionKind::Plugin,
+                name: "a".to_owned(),
+                version: None,
+                description: None,
+                content_digest: "d".to_owned(),
+                source_path: "missing".to_owned(),
+                imported_at: 0,
+                diagnostic: None,
+                source: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(unused_repository_ids(&root), vec!["img-a"]);
+
+        // Incrementing again removes it from the unused set.
+        increment_reference(&root, "img-a").unwrap();
+        assert!(unused_repository_ids(&root).is_empty());
+
         let _ = fs::remove_dir_all(root);
     }
 

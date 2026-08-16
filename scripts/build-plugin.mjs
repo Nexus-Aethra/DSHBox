@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, statSync, readFileS
 import { createHash } from 'node:crypto'
 import { dirname, join, relative } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { isFresh } from './mtime.mjs'
 
 // Resolve the target triple, mirroring scripts/prepare-runtime.mjs.
 const target = process.argv.includes('--target')
@@ -20,7 +21,11 @@ if (!existsSync(pluginSource)) {
 }
 
 const force = process.argv.includes('--force')
-if (existsSync(output) && !force) {
+
+// Skip rebuilding while the vendored plugin tree is newer than every
+// tracked source file under the plugin package. Pass --force to rebuild.
+const sources = [join(root, 'src-tauri/crates/box-dsh-context/dsh-box-context')]
+if (isFresh(output, sources, force)) {
   console.log(`plugins already prepared at ${output}; pass --force to rebuild`)
   process.exit(0)
 }
