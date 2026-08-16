@@ -375,8 +375,15 @@ fn ensure_bundled_context_plugin(directory: &Path, profile: &str) -> Result<(), 
         .join("@deepseek-ai")
         .join(PLUGIN_ID);
     if !vendored.join("package.json").is_file() {
-        // Vendored plugin tree is missing (e.g. a developer build that
-        // skipped the plugin bundler); let DSH surface the resolution
+        // Self-heal before giving up: the config's manifest digest may
+        // predate the current storage root (the vendoring copy never
+        // landed here), so re-run the vendoring once. `initialize_bundled
+        // _plugins` verifies the tree in the current directory itself.
+        let _ = crate::state::initialize_bundled_plugins();
+    }
+    if !vendored.join("package.json").is_file() {
+        // Vendored plugin tree is still missing (e.g. a developer build
+        // that skipped the plugin bundler); let DSH surface the resolution
         // error if the patch still references the bundle.
         return Ok(());
     }

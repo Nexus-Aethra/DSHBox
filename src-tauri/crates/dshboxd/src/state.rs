@@ -183,9 +183,6 @@ pub(crate) fn initialize_bundled_plugins() -> Result<(), String> {
     let digest = format!("{:016x}", hasher.finish());
 
     let config = read_config()?;
-    if config.plugins_manifest_digest.as_deref() == Some(digest.as_str()) {
-        return Ok(());
-    }
     let Some(runtime_directory) = config.runtime_directory.as_ref() else {
         return Ok(());
     };
@@ -195,6 +192,16 @@ pub(crate) fn initialize_bundled_plugins() -> Result<(), String> {
     }
 
     let cache_root = runtime_root.join("plugins");
+    // The digest only proves "this manifest was vendored once"; it travels
+    // inside the config and therefore survives a storage-root switch
+    // (`config set runtime` / onboarding). Short-circuit only when the
+    // vendored tree itself exists in the CURRENT runtime directory —
+    // otherwise every container start dies with ERR_MODULE_NOT_FOUND for
+    // @deepseek-ai/dsh-box-context while the daemon believes it is done.
+    let digest_matches = config.plugins_manifest_digest.as_deref() == Some(digest.as_str());
+    if digest_matches && cache_root.join("plugins-manifest.json").is_file() {
+        return Ok(());
+    }
     if cache_root.exists() {
         std::fs::remove_dir_all(&cache_root)
             .map_err(|error| format!("cannot clean {}: {error}", cache_root.display()))?;
