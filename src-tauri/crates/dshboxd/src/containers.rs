@@ -107,7 +107,40 @@ The trailing `@<dest>` is an optional destination path override.
 * A boxfile that only contains `FROM` + `PROFILE` is a valid "base only"
   build; useful for trying out a freshly-pulled template.
 
-See `dshbox help` for the full command reference.
+## DSH Box CLI quick reference
+
+DSH Box ships the `dshbox` binary on PATH; every command talks to the
+local daemon, so the same state is shared with the desktop GUI.
+
+```
+# Workflow
+dshbox init                              # scaffold a boxfile.dsh here
+dshbox pull template <owner/repo>[:tag]  # fetch a base template
+dshbox build [boxfile.dsh]               # build this container's image
+dshbox run <template>                    # create + start a container
+
+# Templates
+dshbox template ls                       # list local templates
+dshbox template show <name>              # print a template's script
+dshbox template export <name> [dest]     # save a template as tarball
+dshbox template import <file.tar.gz>     # install a template tarball
+dshbox template rm <name>                # remove a template
+
+# Extensions
+dshbox plugin ls                         # list repository plugins/skills
+dshbox plugin import <source>            # add from dir / tarball / github
+dshbox bundle ls                         # list extension bundles
+
+# This container
+dshbox ps                                # list containers + status
+dshbox container url <id>                # webview URL of a running host
+dshbox container logs <id>               # tail the DSH host log
+dshbox container stop <id>               # stop a running container
+dshbox container start <id>              # start a stopped container
+```
+
+Run `dshbox help` for the full command reference, or
+`dshbox <command> help` for action-level usage.
 "#;
 
 const BOXFILE_GUIDE_SKILL_NAME: &str = "boxfile-guide";

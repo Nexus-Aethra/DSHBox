@@ -15,7 +15,7 @@ mod toolchains;
 mod versions;
 
 use box_server_core::{default_endpoint, remove_discovery, write_discovery};
-use state::{initialize_bundled_runtime, DaemonState};
+use state::{initialize_bundled_plugins, initialize_bundled_runtime, DaemonState};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
@@ -41,6 +41,12 @@ mod unix {
 
         if let Err(error) = initialize_bundled_runtime() {
             eprintln!("warning: bundled runtime unavailable: {error}");
+        }
+        // Vendor the bundled Cordis plugins (dsh-box-context) into the
+        // configured runtime directory; deferred silently when storage is
+        // not configured yet (the save_runtime_directory RPC re-runs it).
+        if let Err(error) = initialize_bundled_plugins() {
+            eprintln!("warning: bundled plugins unavailable: {error}");
         }
         let state = match DaemonState::load() {
             Ok(state) => Arc::new(state),

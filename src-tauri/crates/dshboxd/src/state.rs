@@ -9,7 +9,7 @@ use box_state::ResourceStateManager;
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command},
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
@@ -137,6 +137,94 @@ pub(crate) fn bundled_runtime() -> Result<&'static BundledRuntime, String> {
     BUNDLED_RUNTIME
         .get()
         .ok_or("bundled runtime is unavailable; start dshboxd first".to_owned())
+}
+
+/// Vendor the bundled Cordis plugin tree (`resources/plugins/<target>/`,
+/// carrying `@deepseek-ai/dsh-box-context`) into
+/// `<runtimeDirectory>/plugins/`, mirroring the desktop's
+/// `initialize_bundled_plugins`. Without this the container-start path
+/// (`ensure_bundled_context_plugin`) finds no vendored tree, the profile
+/// symlink is skipped, and the DSH host dies with
+/// `Cannot find package '@deepseek-ai/dsh-box-context'` — exactly the
+/// failure mode every CLI-driven container start used to hit because the
+/// daemon never ran the desktop-only copy.
+///
+/// Digest-idempotent: the manifest body is hashed and compared against
+/// `BoxConfig.plugins_manifest_digest`, so repeat starts are no-ops. Defers
+/// silently while no runtime directory is configured; the
+/// `save_runtime_directory` RPC re-runs this so onboarding picks it up.
+pub(crate) fn initialize_bundled_plugins() -> Result<(), String> {
+    use box_foundation::{read_config, write_config};
+    use std::hash::{Hash, Hasher};
+
+    let resource_plugins = match resource_directory() {
+        Ok(root) => root.join("plugins").join(bundled_target()),
+        Err(error) => {
+            eprintln!("dshboxd: bundled plugins skipped: {error}");
+            return Ok(());
+        }
+    };
+    let manifest_path = resource_plugins.join("plugins-manifest.json");
+    if !manifest_path.is_file() {
+        // Developer build that skipped the plugin bundler; the container
+        // start path tolerates the missing tree.
+        eprintln!(
+            "dshboxd: bundled plugins skipped: {} not found",
+            manifest_path.display()
+        );
+        return Ok(());
+    }
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    manifest_bytes.hash(&mut hasher);
+    bundled_target().hash(&mut hasher);
+    let digest = format!("{:016x}", hasher.finish());
+
+    let config = read_config()?;
+    if config.plugins_manifest_digest.as_deref() == Some(digest.as_str()) {
+        return Ok(());
+    }
+    let Some(runtime_directory) = config.runtime_directory.as_ref() else {
+        return Ok(());
+    };
+    let runtime_root = PathBuf::from(runtime_directory);
+    if !runtime_root.is_dir() {
+        return Ok(());
+    }
+
+    let cache_root = runtime_root.join("plugins");
+    if cache_root.exists() {
+        std::fs::remove_dir_all(&cache_root)
+            .map_err(|error| format!("cannot clean {}: {error}", cache_root.display()))?;
+    }
+    copy_dir_recursive(&resource_plugins, &cache_root)
+        .map_err(|error| format!("cannot vendor bundled plugins: {error}"))?;
+
+    let mut updated = config;
+    updated.plugins_manifest_digest = Some(digest);
+    write_config(&updated)?;
+    eprintln!("dshboxd vendored bundled plugins into {}", cache_root.display());
+    Ok(())
+}
+
+/// Recursive directory copy for the bundled plugin tree (files and
+/// directories only; symlinks are not expected inside the resource).
+fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// Everything the daemon owns, shared with every connection thread.

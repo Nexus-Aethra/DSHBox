@@ -568,6 +568,11 @@ fn save_runtime_directory_rpc(state: &DaemonState, request: &Value) -> Result<Va
     // worker resolve the newly chosen storage root without a restart (a
     // daemon started before onboarding must adopt the new directory).
     state.adopt_config(&config)?;
+    // Onboarding path: the daemon startup copy deferred because no runtime
+    // directory was configured yet, so vendor the bundled plugins now.
+    if let Err(error) = crate::state::initialize_bundled_plugins() {
+        return Err(format!("cannot vendor bundled plugins: {error}"));
+    }
     Ok(json!({ "saved": true, "restartRequired": true }))
 }
 

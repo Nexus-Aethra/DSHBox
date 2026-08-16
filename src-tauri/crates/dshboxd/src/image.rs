@@ -9,8 +9,8 @@ use crate::containers::create_dsh_container_sync;
 use crate::extensions::{import_into_repository, link_repository_extension};
 use box_dsh_versions::{
     collect_unreferenced_template_hash, harness_template_path, read_template_index,
-    sanitize_template_ref, template_content_path, template_index_path,
-    template_manifest_path, template_storage_root, templates_directory,
+    template_content_path, template_index_path,
+    template_storage_root, templates_directory,
     write_template_index, TemplateEntry,
 };
 use box_extensions::transfer::{

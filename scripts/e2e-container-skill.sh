@@ -95,6 +95,9 @@ assert "name: boxfile-guide" in content
 assert "FROM <base>" in content
 assert "ADD <kind>" in content
 assert "## Best practices" in content
-assert "dshbox help" in content
+assert "## DSH Box CLI quick reference" in content
+assert "dshbox init" in content
+assert "dshbox template ls" in content
+assert "dshbox container url <id>" in content
 print(f"OK: boxfile-guide skill installed at {skill_md}")
 PY
