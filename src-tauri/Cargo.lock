@@ -152,6 +152,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "box-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "box-client"
+version = "0.1.0"
+dependencies = [
+ "box-foundation",
+ "box-server-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "box-containers"
 version = "0.1.0"
 dependencies = [
@@ -178,6 +196,7 @@ dependencies = [
  "box-runtime",
  "box-toolchains",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -200,6 +219,17 @@ dependencies = [
  "dirs",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "box-image"
+version = "0.1.0"
+dependencies = [
+ "box-extensions",
+ "flate2",
+ "serde",
+ "serde_json",
+ "tar",
 ]
 
 [[package]]
@@ -605,6 +635,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 
 [[package]]
+name = "ctrlc"
+version = "3.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0b1fab2ae45819af2d0731d60f2afe17227ebb1a1538a236da84c93e9a60162"
+dependencies = [
+ "dispatch2",
+ "nix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -824,18 +865,22 @@ dependencies = [
 
 [[package]]
 name = "dshbox"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "box-api",
+ "box-client",
  "box-containers",
  "box-dsh-context",
  "box-dsh-versions",
  "box-extensions",
  "box-foundation",
+ "box-image",
  "box-runtime",
  "box-scheduler",
  "box-server-core",
  "box-state",
  "box-toolchains",
+ "ctrlc",
  "dirs",
  "flate2",
  "reqwest 0.12.28",
@@ -856,8 +901,24 @@ dependencies = [
 name = "dshboxd"
 version = "0.1.0"
 dependencies = [
+ "box-api",
+ "box-containers",
+ "box-dsh-context",
+ "box-dsh-versions",
+ "box-extensions",
+ "box-foundation",
+ "box-image",
+ "box-runtime",
+ "box-scheduler",
  "box-server-core",
+ "box-state",
+ "box-toolchains",
+ "flate2",
+ "reqwest 0.12.28",
+ "serde",
  "serde_json",
+ "serde_yaml",
+ "tar",
 ]
 
 [[package]]
@@ -2212,6 +2273,18 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
 
 [[package]]
 name = "num-conv"

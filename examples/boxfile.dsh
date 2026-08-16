@@ -1,0 +1,30 @@
+# DSH Box template build script
+# Syntax:
+#   FROM <harness-source>          required
+#   PROFILE <name>                 required
+#   NAME <image-name>              optional
+#   VERSION <version>              optional
+#   LABEL key=value                optional, repeatable
+#   DEF <name> @<path>            optional, repeatable (path alias)
+#   ADD plugin|skill|data <src> [@<dest>]   one or more
+
+FROM github.com/deepseek-ai/deepseek-harness:latest
+PROFILE web
+NAME team-stack
+VERSION 1.0.0
+LABEL maintainer=alice@example.com
+
+# Override default install paths (optional)
+# DEF plugin @profile/profiles/web/node_modules
+# DEF skill  @profile/skills
+
+# Plugins: installed into node_modules
+ADD plugin github.com/team/cordis-plugin-foo:1.2.3
+ADD plugin cordis-plugin-bar
+
+# Skills: installed into profile/skills
+ADD skill github.com/team/team-conventions
+
+# Data: pure cp, requires explicit destination
+# ADD data ./local-sessions/ @profile/sessions
+# ADD data container-xxx@/profile/keys.yaml @profile/apikeys.yaml

@@ -1,4 +1,4 @@
-﻿//! Framework-independent task state, locks, and persistence for DSH Box.
+//! Framework-independent task state, locks, and persistence for DSH Box.
 
 use box_foundation::{now_seconds, BoxPaths, BoxResult};
 use serde::{Deserialize, Serialize};
@@ -155,6 +155,31 @@ pub struct TaskManager {
 }
 
 impl TaskManager {
+    /// Merge tasks from the persisted state file without overwriting
+    /// in-memory tasks that are still queued or running. This lets the CLI
+    /// and UI share the same task queue: the CLI enqueues and runs tasks,
+    /// the UI picks up the new records without breaking its own in-flight
+    /// work.
+    pub fn merge_from_disk(&self, paths: &BoxPaths) -> BoxResult<()> {
+        let path = paths.tasks_state()?;
+        if !path.exists() {
+            return Ok(());
+        }
+        let tasks: Vec<TaskRecord> =
+            serde_json::from_str(&fs::read_to_string(&path).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
+        for task in tasks {
+            // Only insert tasks that are not already tracked in memory.
+            // This preserves the in-memory status of running tasks while
+            // picking up tasks that were enqueued by another process.
+            if !state.tasks.contains_key(&task.id) {
+                state.tasks.insert(task.id.clone(), task);
+            }
+        }
+        Ok(())
+    }
+
     pub fn restore(&self, paths: &BoxPaths) -> BoxResult<()> {
         let path = paths.tasks_state()?;
         if !path.exists() {
@@ -369,6 +394,125 @@ impl TaskManager {
             serde_json::to_string_pretty(&self.list()?).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())
+    }
+}
+
+// ---- Client for the dshboxd daemon ----
+
+/// Lightweight client that talks to the dshboxd daemon over the local
+/// transport: Unix domain socket on Linux/macOS, named pipe on Windows.
+/// The endpoint and token are read from the discovery file.
+#[derive(Clone)]
+pub struct TaskClient {
+    endpoint: String,
+    token: String,
+}
+
+impl TaskClient {
+    pub fn connect(discovery: &serde_json::Value) -> Result<Self, String> {
+        let endpoint = discovery["endpoint"]
+            .as_str()
+            .ok_or("discovery file missing endpoint")?
+            .to_owned();
+        let token = discovery["token"]
+            .as_str()
+            .ok_or("discovery file missing token")?
+            .to_owned();
+        Ok(Self { endpoint, token })
+    }
+
+    /// Send a JSON-line request and return the result field.
+    #[cfg(unix)]
+    fn call(&self, request: serde_json::Value) -> Result<serde_json::Value, String> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        let mut stream = UnixStream::connect(&self.endpoint)
+            .map_err(|error| format!("cannot connect to daemon at {}: {error}", self.endpoint))?;
+        let body = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+        stream.write_all(body.as_bytes()).map_err(|error| error.to_string())?;
+        stream.write_all(b"\n").map_err(|error| error.to_string())?;
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).map_err(|error| format!("daemon read error: {error}"))?;
+        let response: serde_json::Value =
+            serde_json::from_str(&line).map_err(|error| format!("daemon response error: {error}"))?;
+        if response["ok"].as_bool() != Some(true) {
+            return Err(response["error"].as_str().unwrap_or("unknown daemon error").to_owned());
+        }
+        Ok(response["result"].clone())
+    }
+
+    #[cfg(windows)]
+    fn call(&self, _request: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("dshboxd named-pipe transport is not yet implemented for Windows".to_owned())
+    }
+
+    pub fn ping(&self) -> Result<serde_json::Value, String> {
+        self.call(serde_json::json!({"token": self.token, "method": "ping"}))
+    }
+
+    pub fn enqueue(
+        &self,
+        kind: &str,
+        resource_keys: Vec<String>,
+        params: serde_json::Value,
+    ) -> Result<TaskRecord, String> {
+        let result = self.call(serde_json::json!({
+            "token": self.token,
+            "method": "enqueue_task",
+            "kind": kind,
+            "resource_keys": resource_keys,
+            "params": params,
+        }))?;
+        serde_json::from_value(result).map_err(|error| format!("invalid task record: {error}"))
+    }
+
+    pub fn list(&self) -> Result<Vec<TaskRecord>, String> {
+        let result = self.call(serde_json::json!({
+            "token": self.token,
+            "method": "list_tasks",
+        }))?;
+        serde_json::from_value(result).map_err(|error| format!("invalid task list: {error}"))
+    }
+
+    pub fn cancel(&self, id: &str) -> Result<(), String> {
+        self.call(serde_json::json!({
+            "token": self.token,
+            "method": "cancel_task",
+            "id": id,
+        }))?;
+        Ok(())
+    }
+
+    pub fn status(&self, id: &str) -> Result<TaskRecord, String> {
+        let result = self.call(serde_json::json!({
+            "token": self.token,
+            "method": "task_status",
+            "id": id,
+        }))?;
+        serde_json::from_value(result).map_err(|error| format!("invalid task record: {error}"))
+    }
+
+    pub fn update_progress(&self, id: &str, stage: &str, progress: u8) -> Result<(), String> {
+        self.call(serde_json::json!({
+            "token": self.token,
+            "method": "update_progress",
+            "id": id,
+            "stage": stage,
+            "progress": progress,
+        }))?;
+        Ok(())
+    }
+
+    pub fn finish(&self, id: &str, success: bool, error_msg: Option<&str>) -> Result<(), String> {
+        self.call(serde_json::json!({
+            "token": self.token,
+            "method": "finish_task",
+            "id": id,
+            "success": success,
+            "error_msg": error_msg,
+        }))?;
+        Ok(())
     }
 }
 

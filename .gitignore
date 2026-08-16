@@ -10,3 +10,10 @@
 /src-tauri/crates/box-dsh-context/dsh-box-context/dist/
 /src-tauri/crates/box-dsh-context/dsh-box-context/node_modules/
 /src-tauri/.build-stamp
+# Local debugging / build leftovers: never commit these.
+/.e2e-dbg/
+/.tmp/
+/.bundle-tmp/
+.bundle-verify.log
+.e2e-*.log
+/src-tauri/*.dsh.tar.gz
