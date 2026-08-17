@@ -162,6 +162,20 @@ pub(crate) fn install_container_plugin(
     if !status.success() {
         return Err(format!("dsh plugin add exited with {status}"));
     }
+    // `dsh plugin add` registers the plugin as a `link:` reference in the
+    // profile's package.json. pnpm 11 with `nodeLinker: hoisted` does NOT
+    // traverse `link:` to resolve transitive dependencies, so the plugin's
+    // own deps end up invisible to the DSH loader (which resolves bare
+    // specifiers from the profile's `baseUrl`). Re-register the plugin as
+    // a workspace member with `workspace:*` so pnpm hoists its dependency
+    // closure into the profile's node_modules.
+    promote_plugin_to_workspace_member(
+        &PathBuf::from(&container.directory).join("profile/profiles").join(profile),
+        &source_directory,
+        &name,
+        &pnpm,
+        task,
+    )?;
     write_extension_record(
         container,
         ExtensionRecord {
@@ -184,6 +198,265 @@ pub(crate) fn install_container_plugin(
 
 fn is_github_source(source: &str) -> bool {
     source.trim_start().starts_with("https://github.com/")
+}
+
+/// Switch a freshly-added plugin from DSH's `link:` reference to a pnpm
+/// `workspace:*` member, then rewrite the profile's `pnpm-workspace.yaml`
+/// to include the plugin's source directory. This is the only reliable way
+/// to get a plugin's transitive dependencies into the profile's
+/// `node_modules` under pnpm 11 `nodeLinker: hoisted`: `link:` references
+/// are treated as opaque and their dependency graph is ignored.
+///
+/// The original `link:` reference is preserved as a fallback (renamed under
+/// the workspace comment) so tools that read the manifest continue to find
+/// the resolved package name, but the active dependency is `workspace:*`.
+///
+/// Idempotent: a profile that already lists the plugin's source under
+/// `packages:` and references it via `workspace:*` is left untouched.
+fn promote_plugin_to_workspace_member(
+    profile_dir: &Path,
+    plugin_source: &Path,
+    plugin_name: &str,
+    pnpm: &crate::toolchains::ResolvedToolchain,
+    task: &TaskContext,
+) -> Result<(), String> {
+    let manifest_path = profile_dir.join("package.json");
+    let workspace_manifest = profile_dir.join("pnpm-workspace.yaml");
+    if !manifest_path.is_file() || !workspace_manifest.is_file() {
+        return Err(format!(
+            "profile at {} is missing package.json or pnpm-workspace.yaml",
+            profile_dir.display()
+        ));
+    }
+    let plugin_source_string = plugin_source.to_string_lossy().into_owned();
+    let workspace_text = fs::read_to_string(&workspace_manifest)
+        .map_err(|error| format!("cannot read {}: {error}", workspace_manifest.display()))?;
+    let mut new_workspace = workspace_text.clone();
+    if workspace_text.contains(&plugin_source_string) {
+        // Already a workspace member: skip the rewrite but still ensure
+        // the package.json entry uses `workspace:*` (a half-finished
+        // previous attempt may have only done the workspace side).
+    } else {
+        new_workspace = inject_workspace_package(&workspace_text, &plugin_source_string);
+    }
+    // pnpm ≥10 blocks postinstall/build scripts of third-party dependencies
+    // unless explicitly approved (ERR_PNPM_IGNORED_BUILDS). Native modules
+    // (`cpu-features`, `ssh2`, `cloudflared`) only work after their
+    // native-binding step runs, so the container profile must elevate the
+    // trust level to `dangerouslyAllowAllBuilds: true`. The plugin's own
+    // source dir already carries this from `install_plugin_dependencies`,
+    // but the hoist walk at the profile level now sees deps that the
+    // plugin didn't install itself, so the profile needs the same flag.
+    if !new_workspace.contains("dangerouslyAllowAllBuilds") {
+        let trailing = if new_workspace.ends_with('\n') { "" } else { "\n" };
+        new_workspace.push_str(&format!(
+            "{trailing}dangerouslyAllowAllBuilds: true\n"
+        ));
+    }
+    if new_workspace != workspace_text {
+        fs::write(&workspace_manifest, &new_workspace)
+            .map_err(|error| format!("cannot write {}: {error}", workspace_manifest.display()))?;
+    }
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
+    let new_manifest = switch_dependency_to_workspace(&manifest_text, plugin_name);
+    if new_manifest != manifest_text {
+        fs::write(&manifest_path, new_manifest)
+            .map_err(|error| format!("cannot write {}: {error}", manifest_path.display()))?;
+    }
+    let task_record = task.manager.task(&task.task_id)?;
+    let log = fs::OpenOptions::new()
+        .append(true)
+        .open(&task_record.log_path)
+        .map_err(|error| error.to_string())?;
+    task.log(&format!(
+        "promoting plugin {plugin_name} to workspace member at {}",
+        plugin_source_string
+    ));
+    let mut child = command_for_toolchain(pnpm)
+        .args([
+            "--dir",
+            profile_dir.to_string_lossy().as_ref(),
+            "install",
+            "--no-frozen-lockfile",
+        ])
+        .stdout(Stdio::from(
+            log.try_clone().map_err(|error| error.to_string())?,
+        ))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .map_err(|error| format!("cannot start workspace install: {error}"))?;
+    let status = wait_for_process(&mut child, Some(task), "installing plugin dependencies")?;
+    if !status.success() {
+        return Err(format!(
+            "workspace install for plugin {plugin_name} exited with {status}"
+        ));
+    }
+    Ok(())
+}
+
+/// Append an extra `packages:` entry to a `pnpm-workspace.yaml` whose
+/// `packages:` list is a YAML block sequence. If the file uses a different
+/// layout (no top-level `packages:` key, inline flow sequence, etc.) the
+/// original is returned untouched so the caller can surface a clearer
+/// error. The new entry is anchored right after the last existing `- `
+/// line of the block sequence — never at end-of-file — so YAML keeps
+/// treating every `- ` line as a member of the `packages:` list.
+fn inject_workspace_package(workspace_text: &str, new_path: &str) -> String {
+    let Some(packages_index) = workspace_text.find("packages:") else {
+        return workspace_text.to_owned();
+    };
+    let after_packages = &workspace_text[packages_index + "packages:".len()..];
+    let first_significant_offset = after_packages
+        .chars()
+        .position(|character| !character.is_whitespace())
+        .unwrap_or(after_packages.len());
+    let first_significant = after_packages[first_significant_offset..]
+        .chars()
+        .next()
+        .unwrap_or('\0');
+    let key_column = workspace_text[..packages_index]
+        .rfind('\n')
+        .map(|new_line| packages_index - new_line - 1)
+        .unwrap_or(packages_index);
+    let block_indent: String = " ".repeat(key_column + 2);
+    if first_significant == '[' {
+        let close = after_packages.find(']').unwrap_or(after_packages.len());
+        let inside = &after_packages[first_significant_offset + 1..close];
+        let entries: Vec<&str> = inside
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        let rebuilt_entries = entries
+            .iter()
+            .map(|entry| format!("{block_indent}- {entry}\n"))
+            .collect::<String>();
+        let tail = &after_packages[close + 1..];
+        let rebuilt = format!(
+            "packages:\n{rebuilt_entries}{block_indent}- {new_path}\n{tail}"
+        );
+        let prefix = &workspace_text[..packages_index];
+        return format!("{prefix}{rebuilt}");
+    }
+    if first_significant != '-' {
+        // Unknown shape — return unchanged so the caller can surface a
+        // clearer diagnostic than a half-rewrite would.
+        return workspace_text.to_owned();
+    }
+    // Block sequence: walk the lines after `packages:`, find the last
+    // `- ` line that has the same indent as the first, and insert the
+    // new entry immediately after it. Lines that don't start with the
+    // expected indent (or start with `-`) end the sequence.
+    let lines: Vec<&str> = workspace_text.lines().collect();
+    let packages_line_index = workspace_text[..packages_index].matches('\n').count();
+    let mut last_member_index: Option<usize> = None;
+    for (offset, line) in lines.iter().enumerate().skip(packages_line_index + 1) {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('-') {
+            if indented_match(indent, &block_indent) {
+                last_member_index = Some(offset);
+                continue;
+            }
+            break;
+        }
+        if indent < block_indent.len() {
+            break;
+        }
+        // A non-`-` line at the same indent is a sibling key (e.g.
+        // `nodeLinker:`) — the block sequence is over.
+        break;
+    }
+    let Some(last_member_index) = last_member_index else {
+        // Empty list — emit the very first entry directly under the key.
+        let mut output = String::new();
+        for (offset, line) in lines.iter().enumerate() {
+            if offset == packages_line_index {
+                output.push_str(line);
+                output.push('\n');
+                output.push_str(&block_indent);
+                output.push_str("- ");
+                output.push_str(new_path);
+                output.push('\n');
+            } else {
+                output.push_str(line);
+                if offset + 1 < lines.len() {
+                    output.push('\n');
+                }
+            }
+        }
+        if !workspace_text.ends_with('\n') && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        return output;
+    };
+    let mut output = String::new();
+    for (offset, line) in lines.iter().enumerate() {
+        if offset == last_member_index {
+            output.push_str(line);
+            output.push('\n');
+            output.push_str(&block_indent);
+            output.push_str("- ");
+            output.push_str(new_path);
+        } else {
+            output.push_str(line);
+        }
+        if offset + 1 < lines.len() {
+            output.push('\n');
+        }
+    }
+    if workspace_text.ends_with('\n') && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    if !workspace_text.ends_with('\n') && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output
+}
+
+/// Whether `observed` is a leading-indent run that matches `expected`
+/// (which is itself a whitespace-only string). Both strings are non-empty
+/// here because the caller knows the first `-` line already has the
+/// expected indent.
+fn indented_match(observed: usize, expected: &str) -> bool {
+    observed == expected.len()
+}
+
+/// Replace the `link:...` (or `file:...`) reference for `plugin_name` in
+/// the profile's `package.json` with `workspace:*`. If the plugin is
+/// already a `workspace:*` reference, the JSON is returned unchanged.
+fn switch_dependency_to_workspace(manifest_text: &str, plugin_name: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(manifest_text) else {
+        return manifest_text.to_owned();
+    };
+    let Some(deps) = value
+        .get_mut("dependencies")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return manifest_text.to_owned();
+    };
+    let Some(entry) = deps.get_mut(plugin_name) else {
+        return manifest_text.to_owned();
+    };
+    let Some(current) = entry.as_str() else {
+        return manifest_text.to_owned();
+    };
+    if current == "workspace:*" {
+        return manifest_text.to_owned();
+    }
+    *entry = serde_json::Value::String("workspace:*".to_owned());
+    let mut serialized = serde_json::to_string_pretty(&value)
+        .unwrap_or_else(|_| manifest_text.to_owned());
+    // Match the surrounding repo's package.json style: trailing newline
+    // so user-level editors and pnpm both see a file ending in a newline.
+    if !serialized.ends_with('\n') {
+        serialized.push('\n');
+    }
+    serialized
 }
 
 /// Create a bundle from repository entry ids (docker-style: name + picks).
@@ -653,4 +926,62 @@ pub(crate) fn install_container_bundle(
     let _ = fs::remove_dir_all(staging);
     task.update("Bundle installed into container", 95);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{inject_workspace_package, switch_dependency_to_workspace};
+
+    #[test]
+    fn inject_workspace_package_appends_to_block_sequence() {
+        let input = "packages:\n  - .\n\nnodeLinker: hoisted\n";
+        let output = inject_workspace_package(input, "/path/to/plugin");
+        // Trailing newline is preserved exactly as in the input.
+        assert_eq!(
+            output,
+            "packages:\n  - .\n  - /path/to/plugin\n\nnodeLinker: hoisted\n"
+        );
+    }
+
+    #[test]
+    fn inject_workspace_package_handles_inline_flow_sequence() {
+        // Entrys are preserved verbatim from the source flow sequence so
+        // pnpm sees the same intent; the only change is the conversion to
+        // a block sequence with the new entry appended.
+        let input = "packages: ['.', '../shared']\n";
+        let output = inject_workspace_package(input, "/path/to/plugin");
+        assert_eq!(
+            output,
+            "packages:\n  - '.'\n  - '../shared'\n  - /path/to/plugin\n\n"
+        );
+    }
+
+    #[test]
+    fn inject_workspace_package_passes_through_unknown_layout() {
+        let input = "nodeLinker: hoisted\n";
+        let output = inject_workspace_package(input, "/path/to/plugin");
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn switch_dependency_to_workspace_replaces_link() {
+        let input = r#"{
+  "dependencies": {
+    "@linxin666/dsh-web-ui-all": "link:/path/to/source"
+  }
+}"#;
+        let output = switch_dependency_to_workspace(input, "@linxin666/dsh-web-ui-all");
+        assert!(output.contains("\"workspace:*\""));
+        assert!(!output.contains("link:"));
+    }
+
+    #[test]
+    fn switch_dependency_to_workspace_is_idempotent() {
+        let once = switch_dependency_to_workspace(
+            r#"{"dependencies": {"p": "link:/x"}}"#,
+            "p",
+        );
+        let twice = switch_dependency_to_workspace(&once, "p");
+        assert_eq!(once, twice);
+    }
 }

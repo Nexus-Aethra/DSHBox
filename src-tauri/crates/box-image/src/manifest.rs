@@ -46,6 +46,15 @@ pub enum AddSource {
     PluginPath { plugin_name: String, rel_path: String },
     /// Path inside a container.
     ContainerPath { container_id: Option<String>, path: String },
+    /// Explicit `git:` prefix form: clones a GitHub repo by short-form ref.
+    GitPrefix { ref_: String },
+    /// Explicit `npm:` prefix form: resolves a registry package via
+    /// `pnpm pack <spec>` and imports the produced tarball.
+    NpmPrefix { spec: String },
+    /// Spec understood only by `box-install-handlers::parse_spec` —
+    /// registry rename, `workspace:*`, `git+https://...`, `file:` /
+    /// `link:` prefixes, etc. The builder forwards verbatim.
+    Passthrough { spec: String },
 }
 
 /// How a resolved ADD payload is materialised into a container.
@@ -210,6 +219,15 @@ fn source_from_parsed(value: &ParsedSource) -> AddSource {
             };
             AddSource::LocalPath { path: full_name }
         }
+        ParsedSource::Passthrough { spec } => {
+            // Round-trip via the install-handlers crate so manifest
+            // serialisation sees the canonical InstallSpec shape; the
+            // existing AddSource enum does not model workspace/alias,
+            // so we re-encode as a tagged marker the builder can match.
+            AddSource::Passthrough { spec: spec.clone() }
+        }
+        ParsedSource::GitPrefix { ref_ } => AddSource::GitPrefix { ref_: ref_.clone() },
+        ParsedSource::NpmPrefix { spec } => AddSource::NpmPrefix { spec: spec.clone() },
     }
 }
 
@@ -237,6 +255,40 @@ fn source_name(source: &ParsedSource) -> String {
             Some(scope) => format!("@{scope}/{name}"),
             None => name.clone(),
         },
+        ParsedSource::GitPrefix { ref_ } => {
+            // `git:github.com/owner/repo:tag` → derive name from the last
+            // short-form segment, mirroring the implicit shape.
+            let last_at = ref_.rfind('@');
+            let last_colon = ref_.rfind(':');
+            let cut = match (last_at, last_colon) {
+                (Some(at), Some(colon)) if at > colon => at,
+                (Some(_), Some(colon)) => colon,
+                (Some(at), None) => at,
+                (None, Some(colon)) => colon,
+                (None, None) => return "git-extension".to_owned(),
+            };
+            let head = &ref_[..cut];
+            head.rsplit('/').next().unwrap_or("git-extension").trim_end_matches(".git").to_string()
+        }
+        ParsedSource::NpmPrefix { spec } => {
+            // `npm:@scope/name@1.2.3` → `@scope/name`; `npm:name@1.2.3` → `name`.
+            let stripped_at = spec.strip_prefix('@').unwrap_or(spec);
+            let slash = stripped_at.find('/');
+            let (scope_part, rest) = match slash {
+                Some(pos) => (Some(&spec[..pos + 1]), &stripped_at[pos + 1..]),
+                None => (None, stripped_at),
+            };
+            let version_at = rest.rfind('@');
+            let name = match version_at {
+                Some(pos) => &rest[..pos],
+                None => rest,
+            };
+            match scope_part {
+                Some(scope) => format!("{scope}{name}"),
+                None => name.to_owned(),
+            }
+        }
+        ParsedSource::Passthrough { spec } => spec.clone(),
     }
 }
 

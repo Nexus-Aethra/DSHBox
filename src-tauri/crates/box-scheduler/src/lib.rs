@@ -48,6 +48,11 @@ pub struct TaskContext {
     pub paths: BoxPaths,
     pub notifier: std::sync::Arc<dyn TaskNotifier>,
     pub task_id: String,
+    /// Profile directory the task is scoped to. Used by workspace
+    /// install handlers (`workspace:*`) and any other handler that
+    /// needs to look up pnpm-workspace.yaml. `None` when the task
+    /// runs outside a profile (e.g. host-side daemon maintenance).
+    pub profile_dir: Option<std::path::PathBuf>,
 }
 
 impl TaskContext {
@@ -122,6 +127,7 @@ pub fn run_queued<F>(
         paths: paths.clone(),
         notifier: notifier.clone(),
         task_id: task_id.to_owned(),
+        profile_dir: None,
     };
     notifier.log(task_id, "worker started");
     let result = work(&context);

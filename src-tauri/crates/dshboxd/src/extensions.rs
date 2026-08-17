@@ -280,6 +280,35 @@ fn install_plugin_dependencies(
     version: Option<&str>,
 ) -> Result<(), String> {
     let pnpm = resolve_toolchain("pnpm")?;
+    // pnpm ≥10 blocks postinstall/build scripts of third-party
+    // dependencies unless explicitly approved (ERR_PNPM_IGNORED_BUILDS
+    // exits the install with status 1 — see the user-facing failure
+    // "plugin ... dependency installation exited with exit status: 1").
+    // DSH container plugins are expected to run their deps' build
+    // scripts (native modules like `cpu-features`/`ssh2`/`cloudflared`
+    // need them); the container is isolated, so we approve them
+    // wholesale with `dangerouslyAllowAllBuilds: true`.
+    //
+    // Note: `onlyBuiltDependencies: ['*']` is a pnpm ≤9 setting; pnpm
+    // 11 reads `dangerouslyAllowAllBuilds` instead (verified against
+    // the bundled pnpm 11.7.0 — the old key is silently ignored and the
+    // install still fails with ERR_PNPM_IGNORED_BUILDS).
+    let workspace_manifest = directory.join("pnpm-workspace.yaml");
+    // Rewrite whenever the file is missing OR was produced by an older
+    // dshboxd (which wrote the pnpm-9 `onlyBuiltDependencies` key that
+    // pnpm 11 silently ignores). Preserve a user-authored manifest that
+    // already sets `dangerouslyAllowAllBuilds`.
+    let needs_rewrite = match fs::read_to_string(&workspace_manifest) {
+        Ok(content) => !content.contains("dangerouslyAllowAllBuilds"),
+        Err(_) => true,
+    };
+    if needs_rewrite {
+        fs::write(
+            &workspace_manifest,
+            "packages:\n  - .\n\nnodeLinker: hoisted\ndangerouslyAllowAllBuilds: true\n",
+        )
+        .map_err(|error| format!("cannot write workspace manifest: {error}"))?;
+    }
     let task_record = task.manager.task(&task.task_id)?;
     let log = fs::OpenOptions::new()
         .append(true)
@@ -736,6 +765,7 @@ mod tests {
             },
             notifier: std::sync::Arc::new(NoopNotifier),
             task_id: "test-task".to_owned(),
+            profile_dir: None,
         }
     }
 

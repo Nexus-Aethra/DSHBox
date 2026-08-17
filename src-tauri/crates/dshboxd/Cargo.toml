@@ -15,6 +15,7 @@ box-dsh-versions = { path = "../box-dsh-versions" }
 box-extensions = { path = "../box-extensions" }
 box-foundation = { path = "../box-foundation" }
 box-image = { path = "../box-image" }
+box-install-handlers = { path = "../box-install-handlers" }
 box-runtime = { path = "../box-runtime" }
 box-scheduler = { path = "../box-scheduler" }
 box-server-core = { path = "../box-server-core" }

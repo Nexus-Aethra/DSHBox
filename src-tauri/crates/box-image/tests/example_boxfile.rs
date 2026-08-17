@@ -24,5 +24,5 @@ fn parses_example_boxfile() {
         script.labels.get("maintainer").map(String::as_str),
         Some("alice@example.com")
     );
-    assert_eq!(script.ops.len(), 3);
+    assert_eq!(script.ops.len(), 4);
 }

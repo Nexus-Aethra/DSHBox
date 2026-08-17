@@ -20,4 +20,6 @@ pub use manifest::{
     compile_manifest, parse_manifest, serialize_manifest, AddSource, ImageManifest,
     ResolvedAdd, TemplateBase,
 };
-pub use script::{parse_script, AddKind, ImageOp, ImageScript, ParsedSource};
+pub use script::{
+    parse_script, parse_source_token, AddKind, ImageOp, ImageScript, ParsedSource,
+};

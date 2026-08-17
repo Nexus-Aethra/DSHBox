@@ -61,6 +61,17 @@ pub enum PreviewSource {
         scope: Option<String>,
         version: Option<String>,
     },
+    /// Explicit `git:` prefix form: mirrors `Github` but records that the
+    /// author wrote the prefix on purpose.
+    GitPrefix { ref_: String },
+    /// Explicit `npm:` prefix form: forwards the raw spec string the
+    /// builder will hand to `pnpm pack`.
+    NpmPrefix { spec: String },
+    /// Spec understood only by `box-install-handlers::parse_spec` —
+    /// registry rename, `workspace:*`, `git+https://...`, `file:` /
+    /// `link:` prefixes, etc. The frontend displays the raw spec
+    /// verbatim so the user can verify which shape was recognised.
+    Passthrough { spec: String },
 }
 
 impl PreviewSource {
@@ -82,6 +93,9 @@ impl PreviewSource {
                 scope: scope.clone(),
                 version: version.clone(),
             },
+            ParsedSource::GitPrefix { ref_ } => PreviewSource::GitPrefix { ref_: ref_.clone() },
+            ParsedSource::NpmPrefix { spec } => PreviewSource::NpmPrefix { spec: spec.clone() },
+            ParsedSource::Passthrough { spec } => PreviewSource::Passthrough { spec: spec.clone() },
         }
     }
 }
@@ -133,6 +147,9 @@ fn describe_parsed(value: &ParsedSource) -> String {
                 None => head,
             }
         }
+        ParsedSource::GitPrefix { ref_ } => format!("git:{ref_}"),
+        ParsedSource::NpmPrefix { spec } => format!("npm:{spec}"),
+        ParsedSource::Passthrough { spec } => spec.clone(),
     }
 }
 

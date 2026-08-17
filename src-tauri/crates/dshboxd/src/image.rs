@@ -9,9 +9,9 @@ use crate::containers::create_dsh_container_sync;
 use crate::extensions::{import_into_repository, link_repository_extension};
 use box_dsh_versions::{
     collect_unreferenced_template_hash, harness_template_path, read_built_template,
-    read_template_index, referenced_snapshot_digests, template_content_path,
-    template_index_path, template_storage_root, templates_directory,
-    write_built_template, write_template_index, TemplateEntry,
+    read_template_index, referenced_snapshot_digests, template_index_path,
+    template_storage_root, templates_directory, write_built_template, write_template_index,
+    TemplateEntry,
 };
 use box_extensions::transfer::{
     archive_content_root, copy_extension_source, extract_extension_tarball,
@@ -19,8 +19,8 @@ use box_extensions::transfer::{
 use box_extensions::{repository_root, scan_repository, ExtensionKind, RepositoryExtension};
 use box_foundation::{mirror_url, now_seconds, read_config};
 use box_image::{
-    compile_manifest, parse_script, write_dshimage, AddKind, ImageManifest, ImageOp,
-    ParsedSource,
+    compile_manifest, parse_script, parse_source_token, write_dshimage, AddKind,
+    ImageManifest, ImageOp, ParsedSource,
 };
 use box_api::{TemplateResource, TemplateResourceList, TEMPLATE_LIST_SCHEMA_VERSION};
 use box_runtime::shallow_clone_with_cancel;
@@ -165,6 +165,38 @@ pub(crate) fn build_image_from_script(
                 }
                 ParsedSource::LocalDir { path } => {
                     fetch_local_dir_extension(task, path, &ExtensionKind::Plugin)?
+                }
+                ParsedSource::GitPrefix { ref_ } => {
+                    // `git:<ref>` mirrors the implicit short-form shape; the
+                    // builder clones through the same code path so the
+                    // repository dedup logic is shared with bare GitHub adds.
+                    let parsed = parse_source_token(
+                        0,
+                        ref_,
+                        Path::new(""),
+                    )
+                    .map_err(|error| format!("git: ref `{}` is not a valid GitHub short form: {error}", ref_))?;
+                    match parsed {
+                        ParsedSource::Github { url, ref_ } => {
+                            fetch_github_extension(task, &url, ref_.as_deref(), &ExtensionKind::Plugin)?
+                        }
+                        _ => return Err(format!(
+                            "git: ref `{}` did not parse as a GitHub short form (use `host/owner/repo[:tag|@ref]`)",
+                            ref_
+                        )),
+                    }
+                }
+                ParsedSource::NpmPrefix { spec } => {
+                    fetch_npm_extension(task, spec, &ExtensionKind::Plugin)?
+                }
+                ParsedSource::Passthrough { spec } => {
+                    // Specs that only `box-install-handlers::parse_spec`
+                    // understands (registry alias, `workspace:*`,
+                    // `git+https://...`, `file:` / `link:`, …). Run the
+                    // handler through `box-install-handlers` and reuse
+                    // the dedup-aware `import_into_repository` path so
+                    // the cache hit logic stays the same.
+                    fetch_via_install_handlers(task, spec, &ExtensionKind::Plugin)?
                 }
             };
             inline_blobs.push((entry.content_digest.clone(), PathBuf::from(&entry.source_path)));
@@ -535,6 +567,36 @@ fn materialize_ops(
                 ));
                 install_from_repository_entry(task, container, &script.profile, &entry)?;
             }
+            ParsedSource::GitPrefix { ref_ } => {
+                // git: prefix on a run-time ADD: clone the same way the
+                // implicit short form would. Pinned tags resolve through the
+                // shared fetch_github_extension path so dedup and dependency
+                // install both kick in.
+                let parsed = parse_source_token(
+                    0,
+                    ref_,
+                    Path::new(""),
+                )
+                .map_err(|error| format!("git: ref `{}` is not a valid GitHub short form: {error}", ref_))?;
+                match parsed {
+                    ParsedSource::Github { url, ref_ } => {
+                        let entry = fetch_github_extension(task, &url, ref_.as_deref(), &ext_kind)?;
+                        install_from_repository_entry(task, container, &script.profile, &entry)?;
+                    }
+                    _ => return Err(format!(
+                        "git: ref `{}` did not parse as a GitHub short form (use `host/owner/repo[:tag|@ref]`)",
+                        ref_
+                    )),
+                }
+            }
+            ParsedSource::NpmPrefix { spec } => {
+                let entry = fetch_npm_extension(task, spec, &ext_kind)?;
+                install_from_repository_entry(task, container, &script.profile, &entry)?;
+            }
+            ParsedSource::Passthrough { spec } => {
+                let entry = fetch_via_install_handlers(task, spec, &ext_kind)?;
+                install_from_repository_entry(task, container, &script.profile, &entry)?;
+            }
         }
     }
     Ok(inline_blobs)
@@ -558,6 +620,9 @@ fn describe_parsed(value: &ParsedSource) -> String {
                 None => head,
             }
         }
+        ParsedSource::GitPrefix { ref_ } => format!("git:{ref_}"),
+        ParsedSource::NpmPrefix { spec } => format!("npm:{spec}"),
+        ParsedSource::Passthrough { spec } => spec.clone(),
     }
 }
 
@@ -921,6 +986,51 @@ fn fetch_github_extension(
     let cancelled = task.clone();
     shallow_clone_with_cancel(&target, &destination, reference, move || cancelled.cancelled())?;
     import_into_repository(task, &destination)
+}
+
+/// Resolve an `npm:<spec>` source through the install-handlers
+/// RegistryHandler (registry metadata → dist.tarball → download →
+/// unpack — NOT `pnpm pack`, which in pnpm ≥11 only packs the local
+/// workspace directory and would silently produce an empty manifest).
+/// Delegates to [`fetch_via_install_handlers`] so the registry path,
+/// the `Passthrough` path, and the spec parse stay in lock-step.
+fn fetch_npm_extension(
+    task: &TaskContext,
+    spec: &str,
+    kind: &ExtensionKind,
+) -> Result<RepositoryExtension, String> {
+    if spec.trim().is_empty() {
+        return Err("npm: prefix requires a non-empty spec".to_owned());
+    }
+    fetch_via_install_handlers(task, spec, kind)
+}
+
+/// Route a `Passthrough` spec through `box-install-handlers::handler_for`
+/// so every shape `parse_spec` understands (registry rename,
+/// `workspace:*`, `git+https://...`, `file:` / `link:`, …) is fetched
+/// the same way and lands in the same repository dedup path.
+fn fetch_via_install_handlers(
+    task: &TaskContext,
+    spec: &str,
+    _kind: &ExtensionKind,
+) -> Result<RepositoryExtension, String> {
+    use box_install_handlers::{handler_for, parse_spec};
+    let parsed = parse_spec(spec, Path::new(""))
+        .map_err(|e| format!("cannot parse passthrough spec `{spec}`: {e}"))?;
+    let handler = handler_for(parsed)
+        .map_err(|e| format!("cannot build handler for `{spec}`: {e}"))?;
+    let root = read_config()
+        .map_err(|error| format!("DSH Box storage is not configured: {error}"))?
+        .runtime_directory
+        .ok_or("DSH Box storage is not configured")?;
+    let staging_id = format!("passthrough-{}-{}", std::process::id(), now_seconds());
+    let staging = repository_root(Path::new(&root))
+        .join("staging")
+        .join(&staging_id);
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
+    let outcome = handler.fetch(task, &staging).map_err(|e| e.to_string())?;
+    import_into_repository(task, &outcome.source_root)
 }
 
 fn fetch_tarball_extension(

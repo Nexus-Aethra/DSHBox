@@ -115,8 +115,10 @@ pub enum ImageOp {
     },
 }
 
-/// Resolution of a single ADD source. The four variants map 1:1 to the
-/// shapes documented on the module-level rustdoc.
+/// Resolution of a single ADD source. The variants map 1:1 to the
+/// shapes documented on the module-level rustdoc. `GitPrefix` and
+/// `NpmPrefix` are explicit `git:` / `npm:` prefix forms that disambiguate
+/// the source kind at parse time without guessing from token shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedSource {
     /// GitHub clone, optionally pinned to a tag/branch/commit.
@@ -133,6 +135,22 @@ pub enum ParsedSource {
         scope: Option<String>,
         version: Option<String>,
     },
+    /// Spec that only `box-install-handlers::parse_spec` understands:
+    /// `npm:@scope/name@1.2.3` (registry rename), `workspace:*`,
+    /// `git+https://...`, `file:./path`, etc. The builder forwards this
+    /// verbatim to the install-handlers crate; everything else still
+    /// dispatches through the variants above.
+    Passthrough { spec: String },
+    /// Explicit `git:<ref>` form. The builder clones a GitHub repo just
+    /// like the implicit `host/owner/repo[:tag|@ref]` shape, but the
+    /// explicit prefix documents intent and stays unambiguous when the
+    /// ref would otherwise look like a bare name.
+    GitPrefix { ref_: String },
+    /// Explicit `npm:<spec>` form. The builder resolves `<spec>` from
+    /// the configured npm registry (`pnpm pack <spec>`), imports the
+    /// resulting tarball into Repository, and runs the post-import
+    /// dependency install.
+    NpmPrefix { spec: String },
 }
 
 /// Tokenize and parse a script. `base_dir` is used to resolve relative
@@ -354,7 +372,46 @@ pub fn parse_source_token(
         });
     }
 
+    // Explicit `git:` / `npm:` prefix forms. The prefix is the only
+    // authoritative signal of intent; the remainder of the token is
+    // forwarded verbatim to the respective resolver. We refuse empty
+    // payloads so a stray `ADD plugin npm:` produces a clear error
+    // instead of falling through to the bare-name branch.
+    if let Some(rest) = token.strip_prefix("npm:") {
+        if rest.is_empty() {
+            return Err(ImageError::InvalidSource {
+                line,
+                source: token.to_string(),
+                reason: "npm: prefix requires a spec (e.g. `npm:@scope/name@1.2.3`)".to_string(),
+            });
+        }
+        return Ok(ParsedSource::NpmPrefix { spec: rest.to_owned() });
+    }
+    if let Some(rest) = token.strip_prefix("git:") {
+        if rest.is_empty() {
+            return Err(ImageError::InvalidSource {
+                line,
+                source: token.to_string(),
+                reason: "git: prefix requires a ref (e.g. `git:github.com/owner/repo:latest`)".to_string(),
+            });
+        }
+        return Ok(ParsedSource::GitPrefix { ref_: rest.to_owned() });
+    }
+
     if token.contains("://") {
+        // `git+https://...` / `git+ssh://...` are git sources, not
+        // tarballs. Forward them to the install-handlers crate so the
+        // Git handler clones them.
+        if token.starts_with("git+https://")
+            || token.starts_with("git+http://")
+            || token.starts_with("git+ssh://")
+        {
+            if box_install_handlers::parse_spec(token, base_dir).is_ok() {
+                return Ok(ParsedSource::Passthrough {
+                    spec: token.to_owned(),
+                });
+            }
+        }
         let local = !(token.starts_with("http://") || token.starts_with("https://"));
         return Ok(ParsedSource::Tarball { url: token.to_string(), local });
     }
@@ -394,6 +451,23 @@ pub fn parse_source_token(
             reason: "bare name must include a package (use `name` or `@scope/name`)"
                 .to_string(),
         });
+    }
+
+    // Last-resort passthrough: any spec the local grammar did not
+    // classify (registry aliases, `workspace:*`, `git+https://...`,
+    // `npm:` rename, `file:`/`link:` prefixes, etc.) is forwarded
+    // verbatim to `box-install-handlers::parse_spec`, which accepts the
+    // full pnpm spec set. A spec that classifies as plain `Registry`
+    // (a bare `name[@version]` or `@scope/name[@version]`) stays as
+    // `BareName` here so the existing dedup-by-name semantics work;
+    // `Passthrough` is reserved for the genuinely new multi-prefix
+    // syntax users opt into.
+    if let Ok(spec) = box_install_handlers::parse_spec(token, base_dir) {
+        if !matches!(spec, box_install_handlers::InstallSpec::Registry { .. }) {
+            return Ok(ParsedSource::Passthrough {
+                spec: token.to_owned(),
+            });
+        }
     }
     Ok(ParsedSource::BareName {
         name: name.to_string(),

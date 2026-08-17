@@ -1,0 +1,16 @@
+[package]
+name = "box-install-handlers"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+box-extensions = { path = "../box-extensions" }
+box-foundation = { path = "../box-foundation" }
+box-runtime = { path = "../box-runtime" }
+box-scheduler = { path = "../box-scheduler" }
+box-toolchains = { path = "../box-toolchains" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+thiserror = "2.0"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

@@ -113,6 +113,11 @@ fn data_source_name(source: &ParsedSource) -> String {
             .unwrap_or("data")
             .to_owned(),
         ParsedSource::BareName { name, .. } => name.clone(),
+        ParsedSource::GitPrefix { .. } | ParsedSource::NpmPrefix { .. } | ParsedSource::Passthrough { .. } => {
+            // Unreachable in practice — `stage_source` rejects these
+            // variants for `ADD data` — but the match must be exhaustive.
+            "data".to_owned()
+        }
     }
 }
 
@@ -138,6 +143,9 @@ fn describe_source(source: &ParsedSource) -> String {
                 None => head,
             }
         }
+        ParsedSource::GitPrefix { ref_ } => format!("git:{ref_}"),
+        ParsedSource::NpmPrefix { spec } => format!("npm:{spec}"),
+        ParsedSource::Passthrough { spec } => spec.clone(),
     }
 }
 
@@ -310,6 +318,15 @@ fn stage_source(
         ParsedSource::BareName { .. } => {
             Err("bare data names are resolved from the store index".to_owned())
         }
+        ParsedSource::GitPrefix { ref_ } => Err(format!(
+            "git: prefix is not supported on `ADD data` (use `ADD data {ref_}` without the prefix)"
+        )),
+        ParsedSource::NpmPrefix { spec } => Err(format!(
+            "npm: prefix is only supported on `ADD plugin` (got `ADD data npm:{spec}`)"
+        )),
+        ParsedSource::Passthrough { spec } => Err(format!(
+            "advanced spec `{spec}` is not supported on `ADD data`; use one of: GitHub short-form / local path / local tarball / remote tarball"
+        )),
     }
 }
 
@@ -396,6 +413,7 @@ mod tests {
             },
             notifier: std::sync::Arc::new(NoopNotifier),
             task_id: "test".to_owned(),
+            profile_dir: None,
         }
     }
 

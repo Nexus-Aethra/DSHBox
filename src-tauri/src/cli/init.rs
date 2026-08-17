@@ -46,10 +46,21 @@ PROFILE web
 #   GitHub short form  github.com/<owner>/<repo>[@<ref>]; a tag is
 #                      optional (defaults to HEAD); e.g.
 #                      `ADD plugin github.com/foo/bar@v1.0.0`
+#   npm registry       npm:<name>[@<version>]; e.g.
+#                      `npm:@org/foo@^1.0.0` or `npm:react@18`
+#   git / git+ssh      git+ssh://git@host/<owner>/repo[#<ref>] etc.
 #   local absolute     /path/to/local/dir
 #   local relative     ./relative/path  or  ../relative/path
 #   local tarball      file:///path/to/archive.tar.gz
 #   remote tarball     https://example.com/archive.tar.gz
+#   workspace alias    workspace:* refers to a sibling workspace entry
+#   pnpm alias         alias@npm:real-package@version
+#
+# Anything the upstream `pnpm add` accepts is accepted here: paste a URL
+# someone shared with you, the GitHub URL from a release page, or an
+# `npm:foo` form — DSH Box routes it through the install-handler crate
+# so the source path, fetch strategy, and post-install reconciliation
+# can never drift across surfaces.
 #
 # ── Examples (uncomment the ones you want) ───────────────────────────────
 #
@@ -60,6 +71,11 @@ PROFILE web
 # From a public GitHub repo (optionally pinned to a tag)
 # ADD plugin github.com/deepseek-ai/deepseek-harness-plugin@v1.0.0
 # ADD skill github.com/deepseek-ai/deepseek-harness-skill
+#
+# From the npm registry (any spec pnpm accepts)
+# ADD plugin npm:@linxin666/dsh-web-ui-all
+# ADD plugin npm:lodash@4.17.21
+# ADD plugin npm:@types/node@latest
 #
 # From a local directory (absolute or relative to this boxfile)
 # ADD plugin /home/me/code/my-plugin
