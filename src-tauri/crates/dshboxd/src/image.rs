@@ -13,18 +13,16 @@ use box_dsh_versions::{
     template_storage_root, templates_directory, write_built_template, write_template_index,
     TemplateEntry,
 };
-use box_extensions::transfer::{
-    archive_content_root, copy_extension_source, extract_extension_tarball,
-};
+use box_extensions::transfer::extract_extension_tarball;
 use box_extensions::{repository_root, scan_repository, ExtensionKind, RepositoryExtension};
-use box_foundation::{mirror_url, now_seconds, read_config};
+use box_foundation::{now_seconds, read_config};
 use box_image::{
     compile_manifest, parse_script, parse_source_token, write_dshimage, AddKind,
     ImageManifest, ImageOp, ParsedSource,
 };
 use box_api::{TemplateResource, TemplateResourceList, TEMPLATE_LIST_SCHEMA_VERSION};
-use box_runtime::shallow_clone_with_cancel;
 use box_scheduler::TaskContext;
+use crate::toolchains::command_for_toolchain;
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -157,46 +155,10 @@ pub(crate) fn build_image_from_script(
                     }
                     find_repository_entry(&root, &ExtensionKind::Plugin, name, scope.as_deref(), version.as_deref())?
                 }
-                ParsedSource::Github { url, ref_ } => {
-                    fetch_github_extension(task, url, ref_.as_deref(), &ExtensionKind::Plugin)?
-                }
-                ParsedSource::Tarball { url, local } => {
-                    fetch_tarball_extension(task, url, *local, &ExtensionKind::Plugin)?
-                }
-                ParsedSource::LocalDir { path } => {
-                    fetch_local_dir_extension(task, path, &ExtensionKind::Plugin)?
-                }
-                ParsedSource::GitPrefix { ref_ } => {
-                    // `git:<ref>` mirrors the implicit short-form shape; the
-                    // builder clones through the same code path so the
-                    // repository dedup logic is shared with bare GitHub adds.
-                    let parsed = parse_source_token(
-                        0,
-                        ref_,
-                        Path::new(""),
-                    )
-                    .map_err(|error| format!("git: ref `{}` is not a valid GitHub short form: {error}", ref_))?;
-                    match parsed {
-                        ParsedSource::Github { url, ref_ } => {
-                            fetch_github_extension(task, &url, ref_.as_deref(), &ExtensionKind::Plugin)?
-                        }
-                        _ => return Err(format!(
-                            "git: ref `{}` did not parse as a GitHub short form (use `host/owner/repo[:tag|@ref]`)",
-                            ref_
-                        )),
-                    }
-                }
-                ParsedSource::NpmPrefix { spec } => {
-                    fetch_npm_extension(task, spec, &ExtensionKind::Plugin)?
-                }
-                ParsedSource::Passthrough { spec } => {
-                    // Specs that only `box-install-handlers::parse_spec`
-                    // understands (registry alias, `workspace:*`,
-                    // `git+https://...`, `file:` / `link:`, …). Run the
-                    // handler through `box-install-handlers` and reuse
-                    // the dedup-aware `import_into_repository` path so
-                    // the cache hit logic stays the same.
-                    fetch_via_install_handlers(task, spec, &ExtensionKind::Plugin)?
+                parsed => {
+                    let spec = parsed_source_to_pnpm_spec(&parsed)
+                        .map_err(|e| format!("cannot convert source to spec: {e}"))?;
+                    fetch_extension_via_pnpm_pack(task, &spec, &ExtensionKind::Plugin)?
                 }
             };
             inline_blobs.push((entry.content_digest.clone(), PathBuf::from(&entry.source_path)));
@@ -545,56 +507,10 @@ fn materialize_ops(
                     version.as_deref(),
                 )?;
             }
-            ParsedSource::Github { url, ref_ } => {
-                let entry = fetch_github_extension(task, url, ref_.as_deref(), &ext_kind)?;
-                install_from_repository_entry(task, container, &script.profile, &entry)?;
-            }
-            ParsedSource::Tarball { url, local } => {
-                let entry = fetch_tarball_extension(task, url, *local, &ext_kind)?;
-                if !*local {
-                    inline_blobs.push((
-                        entry.content_digest.clone(),
-                        PathBuf::from(&entry.source_path),
-                    ));
-                }
-                install_from_repository_entry(task, container, &script.profile, &entry)?;
-            }
-            ParsedSource::LocalDir { path } => {
-                let entry = fetch_local_dir_extension(task, path, &ext_kind)?;
-                inline_blobs.push((
-                    entry.content_digest.clone(),
-                    PathBuf::from(&entry.source_path),
-                ));
-                install_from_repository_entry(task, container, &script.profile, &entry)?;
-            }
-            ParsedSource::GitPrefix { ref_ } => {
-                // git: prefix on a run-time ADD: clone the same way the
-                // implicit short form would. Pinned tags resolve through the
-                // shared fetch_github_extension path so dedup and dependency
-                // install both kick in.
-                let parsed = parse_source_token(
-                    0,
-                    ref_,
-                    Path::new(""),
-                )
-                .map_err(|error| format!("git: ref `{}` is not a valid GitHub short form: {error}", ref_))?;
-                match parsed {
-                    ParsedSource::Github { url, ref_ } => {
-                        let entry = fetch_github_extension(task, &url, ref_.as_deref(), &ext_kind)?;
-                        install_from_repository_entry(task, container, &script.profile, &entry)?;
-                    }
-                    _ => return Err(format!(
-                        "git: ref `{}` did not parse as a GitHub short form (use `host/owner/repo[:tag|@ref]`)",
-                        ref_
-                    )),
-                }
-            }
-            ParsedSource::NpmPrefix { spec } => {
-                let entry = fetch_npm_extension(task, spec, &ext_kind)?;
-                install_from_repository_entry(task, container, &script.profile, &entry)?;
-            }
-            ParsedSource::Passthrough { spec } => {
-                let entry = fetch_via_install_handlers(task, spec, &ext_kind)?;
+            parsed => {
+                let spec = parsed_source_to_pnpm_spec(&parsed)
+                    .map_err(|e| format!("cannot convert source to spec: {e}"))?;
+                let entry = fetch_extension_via_pnpm_pack(task, &spec, &ext_kind)?;
                 install_from_repository_entry(task, container, &script.profile, &entry)?;
             }
         }
@@ -964,145 +880,121 @@ fn install_from_repository_entry(
     link_repository_extension(&container.id, Some(profile), &entry.id, task)
 }
 
-fn fetch_github_extension(
-    task: &TaskContext,
-    url: &str,
-    reference: Option<&str>,
-    _kind: &ExtensionKind,
-) -> Result<RepositoryExtension, String> {
-    let root = read_config()?
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    let staging_id = format!("github-{}-{}", std::process::id(), now_seconds());
-    let staging = repository_root(Path::new(&root))
-        .join("staging")
-        .join(&staging_id);
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
-    let destination = staging.join("source");
-    let config = read_config()?;
-    let target = mirror_url(url, config.github_mirror.as_deref());
-    task.log(&format!("cloning GitHub repository {url}"));
-    let cancelled = task.clone();
-    shallow_clone_with_cancel(&target, &destination, reference, move || cancelled.cancelled())?;
-    import_into_repository(task, &destination)
-}
-
-/// Resolve an `npm:<spec>` source through the install-handlers
-/// RegistryHandler (registry metadata → dist.tarball → download →
-/// unpack — NOT `pnpm pack`, which in pnpm ≥11 only packs the local
-/// workspace directory and would silently produce an empty manifest).
-/// Delegates to [`fetch_via_install_handlers`] so the registry path,
-/// the `Passthrough` path, and the spec parse stay in lock-step.
-fn fetch_npm_extension(
-    task: &TaskContext,
-    spec: &str,
-    kind: &ExtensionKind,
-) -> Result<RepositoryExtension, String> {
-    if spec.trim().is_empty() {
-        return Err("npm: prefix requires a non-empty spec".to_owned());
+/// Convert a `ParsedSource` variant into a pnpm-compatible spec string.
+fn parsed_source_to_pnpm_spec(source: &ParsedSource) -> Result<String, String> {
+    match source {
+        ParsedSource::Github { url, ref_ } => {
+            // Extract host/owner/repo from https://host/owner/repo
+            let host = url
+                .strip_prefix("https://")
+                .ok_or_else(|| format!("invalid github URL: {url}"))?;
+            let prefix = if host.starts_with("github.com/") {
+                "github:"
+            } else if host.starts_with("gitlab.com/") {
+                "gitlab:"
+            } else if host.starts_with("bitbucket.org/") {
+                "bitbucket:"
+            } else {
+                return Err(format!("unsupported git host: {url}"));
+            };
+            let spec = format!("{}{}", prefix, &host[prefix.len()..]);
+            match ref_ {
+                Some(r) => Ok(format!("{spec}#{}", r)),
+                None => Ok(spec),
+            }
+        }
+        ParsedSource::Tarball { url, local } => {
+            if *local {
+                Ok(format!("file:{}", url))
+            } else {
+                Ok(url.clone())
+            }
+        }
+        ParsedSource::LocalDir { path } => Ok(format!("file:{}", path.display())),
+        ParsedSource::GitPrefix { ref_ } => {
+            // `git:` prefix (DSHBox-specific) carries a `host/owner/repo` short form.
+            let ref_str = ref_.as_str();
+            let prefix = if ref_str.starts_with("github.com/") {
+                "github:"
+            } else if ref_str.starts_with("gitlab.com/") {
+                "gitlab:"
+            } else if ref_str.starts_with("bitbucket.org/") {
+                "bitbucket:"
+            } else {
+                return Err(format!("unsupported git: host: {ref_str}"));
+            };
+            let spec = format!("{}{}", prefix, &ref_str[ref_str.find('/').unwrap_or(0) + 1..]);
+            match ref_.rfind([':', '@']) {
+                Some(pos) => {
+                    let separator = &ref_str[pos..pos + 1];
+                    let tail = &ref_str[pos + 1..];
+                    if tail.is_empty() {
+                        Ok(spec)
+                    } else {
+                        Ok(format!("{spec}{separator}{tail}"))
+                    }
+                }
+                None => Ok(spec),
+            }
+        }
+        ParsedSource::NpmPrefix { spec } => Ok(spec.clone()),
+        ParsedSource::Passthrough { spec } => Ok(spec.clone()),
+        ParsedSource::BareName { .. } => Err("BareName must be handled by caller".to_string()),
     }
-    fetch_via_install_handlers(task, spec, kind)
 }
 
-/// Route a `Passthrough` spec through `box-install-handlers::handler_for`
-/// so every shape `parse_spec` understands (registry rename,
-/// `workspace:*`, `git+https://...`, `file:` / `link:`, …) is fetched
-/// the same way and lands in the same repository dedup path.
-fn fetch_via_install_handlers(
+fn fetch_extension_via_pnpm_pack(
     task: &TaskContext,
     spec: &str,
     _kind: &ExtensionKind,
 ) -> Result<RepositoryExtension, String> {
-    use box_install_handlers::{handler_for, parse_spec};
-    let parsed = parse_spec(spec, Path::new(""))
-        .map_err(|e| format!("cannot parse passthrough spec `{spec}`: {e}"))?;
-    let handler = handler_for(parsed)
-        .map_err(|e| format!("cannot build handler for `{spec}`: {e}"))?;
     let root = read_config()
         .map_err(|error| format!("DSH Box storage is not configured: {error}"))?
         .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    let staging_id = format!("passthrough-{}-{}", std::process::id(), now_seconds());
-    let staging = repository_root(Path::new(&root))
-        .join("staging")
-        .join(&staging_id);
+        .ok_or("DSH Box storage is not configured".to_string())?;
+    let staging_id = format!("pack-{}-{}", std::process::id(), now_seconds());
+    let staging = repository_root(Path::new(&root)).join("staging").join(&staging_id);
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
-    let outcome = handler.fetch(task, &staging).map_err(|e| e.to_string())?;
-    import_into_repository(task, &outcome.source_root)
-}
 
-fn fetch_tarball_extension(
-    task: &TaskContext,
-    source: &str,
-    local: bool,
-    _kind: &ExtensionKind,
-) -> Result<RepositoryExtension, String> {
-    let root = read_config()?
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    let staging_id = format!("tar-{}-{}", std::process::id(), now_seconds());
-    let staging = repository_root(Path::new(&root))
-        .join("staging")
-        .join(&staging_id);
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
-    let destination = staging.join("source");
-    if local {
-        let archive = PathBuf::from(source);
-        if !archive.is_file() {
-            return Err(format!("tarball `{source}` does not exist"));
-        }
-        task.log(&format!("extracting local tarball {}", archive.display()));
-        extract_extension_tarball(&archive, &destination)?;
-    } else {
-        task.log(&format!("downloading tarball {source}"));
-        download_remote_tarball(source, &destination)?;
+    let pnpm = crate::toolchains::resolve_toolchain("pnpm")
+        .map_err(|e| format!("cannot resolve pnpm: {e}"))?;
+    task.log(&format!("packing extension source via pnpm: {spec}"));
+
+    let mut cmd = command_for_toolchain(&pnpm);
+    cmd.args([
+        "pack",
+        spec,
+        "--pack-destination",
+        staging.to_str().ok_or_else(|| "staging path is not valid UTF-8".to_string())?,
+    ]);
+    let output = cmd
+        .output()
+        .map_err(|e| format!("pnpm pack failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "pnpm pack exited with non-zero status".to_string()
+        } else {
+            stderr
+        });
     }
-    let content_root = archive_content_root(&destination)?;
-    import_into_repository(task, &content_root)
-}
 
-fn fetch_local_dir_extension(
-    task: &TaskContext,
-    source: &Path,
-    _kind: &ExtensionKind,
-) -> Result<RepositoryExtension, String> {
-    let root = read_config()?
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    let staging_id = format!("dir-{}-{}", std::process::id(), now_seconds());
-    let staging = repository_root(Path::new(&root))
-        .join("staging")
-        .join(&staging_id);
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
+    // pnpm pack produces a tarball in staging; extract it and import.
+    let packed: Vec<PathBuf> = std::fs::read_dir(&staging)
+        .map_err(|e| format!("cannot read staging dir: {e}"))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()).is_some())
+        .collect();
+    if packed.is_empty() {
+        return Err("pnpm pack produced no tarball".to_string());
+    }
     let destination = staging.join("source");
-    task.log(&format!("copying local directory {}", source.display()));
-    copy_extension_source(source, &destination)?;
+    let _ = std::fs::remove_dir_all(&destination);
+    std::fs::create_dir_all(&destination).map_err(|e| format!("cannot create source dir: {e}"))?;
+    extract_extension_tarball(&packed[0], &destination)
+        .map_err(|e| format!("cannot extract tarball: {e}"))?;
     import_into_repository(task, &destination)
-}
-
-pub(crate) fn download_remote_tarball(url: &str, destination: &Path) -> Result<(), String> {
-    use std::io::Write;
-    let response = reqwest::blocking::get(url)
-        .map_err(|error| format!("download {url}: {error}"))?;
-    let bytes = response
-        .bytes()
-        .map_err(|error| format!("download {url}: {error}"))?;
-    let archive_path = destination
-        .parent()
-        .unwrap_or(destination)
-        .join("archive.bin");
-    let mut file = std::fs::File::create(&archive_path)
-        .map_err(|error| format!("cannot create archive staging: {error}"))?;
-    file.write_all(&bytes)
-        .map_err(|error| format!("cannot write archive: {error}"))?;
-    std::fs::create_dir_all(destination).map_err(|error| error.to_string())?;
-    extract_extension_tarball(&archive_path, destination)?;
-    let _ = std::fs::remove_file(&archive_path);
-    Ok(())
 }
 
 fn write_archive(

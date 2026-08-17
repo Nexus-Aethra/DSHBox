@@ -51,9 +51,9 @@ pub enum AddSource {
     /// Explicit `npm:` prefix form: resolves a registry package via
     /// `pnpm pack <spec>` and imports the produced tarball.
     NpmPrefix { spec: String },
-    /// Spec understood only by `box-install-handlers::parse_spec` —
-    /// registry rename, `workspace:*`, `git+https://...`, `file:` /
-    /// `link:` prefixes, etc. The builder forwards verbatim.
+    /// Full pnpm spec syntax — registry rename, `workspace:*`,
+    /// `git+https://...`, `file:` / `link:` prefixes, etc. The builder
+    /// forwards verbatim to `pnpm pack`.
     Passthrough { spec: String },
 }
 
@@ -220,10 +220,10 @@ fn source_from_parsed(value: &ParsedSource) -> AddSource {
             AddSource::LocalPath { path: full_name }
         }
         ParsedSource::Passthrough { spec } => {
-            // Round-trip via the install-handlers crate so manifest
-            // serialisation sees the canonical InstallSpec shape; the
-            // existing AddSource enum does not model workspace/alias,
-            // so we re-encode as a tagged marker the builder can match.
+            // Full pnpm spec string — the manifest serialises it as a
+            // tagged marker so the builder can hand it verbatim to
+            // `pnpm pack`. The existing AddSource enum does not model
+            // every workspace/alias variant, so we keep the raw spec.
             AddSource::Passthrough { spec: spec.clone() }
         }
         ParsedSource::GitPrefix { ref_ } => AddSource::GitPrefix { ref_: ref_.clone() },

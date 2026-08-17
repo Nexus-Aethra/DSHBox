@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::{
     ffi::OsString,
     io::{BufRead, BufReader},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::Duration,
 };
@@ -73,6 +73,15 @@ pub(crate) fn command_for_toolchain(toolchain: &ResolvedToolchain) -> Command {
     if let Ok(config) = read_config() {
         if let Some(registry) = config.npm_registry.as_deref() {
             command.env("npm_config_registry", registry);
+        }
+        // Pin pnpm's store under DSHBox's runtime directory so the cache
+        // moves with the install and is removed on uninstall — the default
+        // `~/.local/share/pnpm/store` would otherwise scatter outside of
+        // DSHBox's control.
+        if let Some(runtime_dir) = config.runtime_directory.as_deref() {
+            let pnpm_root = PathBuf::from(runtime_dir).join("pnpm");
+            let _ = std::fs::create_dir_all(&pnpm_root);
+            command.env("PNPM_STORE_DIR", pnpm_root.join("store"));
         }
     }
     command

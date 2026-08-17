@@ -135,10 +135,9 @@ pub enum ParsedSource {
         scope: Option<String>,
         version: Option<String>,
     },
-    /// Spec that only `box-install-handlers::parse_spec` understands:
-    /// `npm:@scope/name@1.2.3` (registry rename), `workspace:*`,
-    /// `git+https://...`, `file:./path`, etc. The builder forwards this
-    /// verbatim to the install-handlers crate; everything else still
+    /// Full pnpm spec syntax — `npm:@scope/name@1.2.3` (registry rename),
+    /// `workspace:*`, `git+https://...`, `file:./path`, etc. The builder
+    /// forwards this verbatim to `pnpm pack`; everything else still
     /// dispatches through the variants above.
     Passthrough { spec: String },
     /// Explicit `git:<ref>` form. The builder clones a GitHub repo just
@@ -400,17 +399,15 @@ pub fn parse_source_token(
 
     if token.contains("://") {
         // `git+https://...` / `git+ssh://...` are git sources, not
-        // tarballs. Forward them to the install-handlers crate so the
-        // Git handler clones them.
+        // tarballs. Forward them as passthrough specs so pnpm handles them
+        // natively; no need to re-validate against a local parser.
         if token.starts_with("git+https://")
             || token.starts_with("git+http://")
             || token.starts_with("git+ssh://")
         {
-            if box_install_handlers::parse_spec(token, base_dir).is_ok() {
-                return Ok(ParsedSource::Passthrough {
-                    spec: token.to_owned(),
-                });
-            }
+            return Ok(ParsedSource::Passthrough {
+                spec: token.to_owned(),
+            });
         }
         let local = !(token.starts_with("http://") || token.starts_with("https://"));
         return Ok(ParsedSource::Tarball { url: token.to_string(), local });
@@ -453,21 +450,23 @@ pub fn parse_source_token(
         });
     }
 
-    // Last-resort passthrough: any spec the local grammar did not
-    // classify (registry aliases, `workspace:*`, `git+https://...`,
-    // `npm:` rename, `file:`/`link:` prefixes, etc.) is forwarded
-    // verbatim to `box-install-handlers::parse_spec`, which accepts the
-    // full pnpm spec set. A spec that classifies as plain `Registry`
-    // (a bare `name[@version]` or `@scope/name[@version]`) stays as
-    // `BareName` here so the existing dedup-by-name semantics work;
-    // `Passthrough` is reserved for the genuinely new multi-prefix
-    // syntax users opt into.
-    if let Ok(spec) = box_install_handlers::parse_spec(token, base_dir) {
-        if !matches!(spec, box_install_handlers::InstallSpec::Registry { .. }) {
-            return Ok(ParsedSource::Passthrough {
-                spec: token.to_owned(),
-            });
-        }
+    // Last-resort passthrough: tokens starting with a pnpm-specific prefix
+    // or containing `://` (git+https, git+ssh) are forwarded verbatim so
+    // pnpm handles the full syntax. A bare `name[:version]` or
+    // `@scope/name[:version]` stays as `BareName` so the existing
+    // dedup-by-name semantics work.
+    let starts_with_prefix = token.starts_with("npm:")
+        || token.starts_with("workspace:")
+        || token.starts_with("file:")
+        || token.starts_with("link:")
+        || token.starts_with("github:")
+        || token.starts_with("gitlab:")
+        || token.starts_with("bitbucket:");
+    let has_git_scheme = token.contains("://");
+    if starts_with_prefix || has_git_scheme {
+        return Ok(ParsedSource::Passthrough {
+            spec: token.to_owned(),
+        });
     }
     Ok(ParsedSource::BareName {
         name: name.to_string(),

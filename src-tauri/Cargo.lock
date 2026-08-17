@@ -227,27 +227,10 @@ name = "box-image"
 version = "0.1.0"
 dependencies = [
  "box-extensions",
- "box-install-handlers",
  "flate2",
  "serde",
  "serde_json",
  "tar",
-]
-
-[[package]]
-name = "box-install-handlers"
-version = "0.1.0"
-dependencies = [
- "box-extensions",
- "box-foundation",
- "box-runtime",
- "box-scheduler",
- "box-toolchains",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -926,7 +909,6 @@ dependencies = [
  "box-extensions",
  "box-foundation",
  "box-image",
- "box-install-handlers",
  "box-runtime",
  "box-scheduler",
  "box-server-core",

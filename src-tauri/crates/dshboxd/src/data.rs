@@ -16,12 +16,32 @@ use box_runtime::shallow_clone_with_cancel;
 use box_scheduler::TaskContext;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 // Wire + on-disk index format, shared through box-api.
 pub(crate) use box_api::{DataEntry, DataUse};
 
-use crate::image::download_remote_tarball;
+/// Download a remote tarball URL and extract it into `destination`.
+pub(crate) fn download_remote_tarball(url: &str, destination: &Path) -> Result<(), String> {
+    let response = reqwest::blocking::get(url)
+        .map_err(|error| format!("download {url}: {error}"))?;
+    let bytes = response
+        .bytes()
+        .map_err(|error| format!("download {url}: {error}"))?;
+    let archive_path = destination
+        .parent()
+        .unwrap_or(destination)
+        .join("archive.bin");
+    let mut file = std::fs::File::create(&archive_path)
+        .map_err(|error| format!("cannot create archive staging: {error}"))?;
+    file.write_all(&bytes)
+        .map_err(|error| format!("cannot write archive: {error}"))?;
+    std::fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+    extract_extension_tarball(&archive_path, destination)?;
+    let _ = std::fs::remove_file(&archive_path);
+    Ok(())
+}
 
 pub(crate) fn data_root(runtime: &Path) -> PathBuf {
     runtime.join("data")

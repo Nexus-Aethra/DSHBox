@@ -67,9 +67,9 @@ pub enum PreviewSource {
     /// Explicit `npm:` prefix form: forwards the raw spec string the
     /// builder will hand to `pnpm pack`.
     NpmPrefix { spec: String },
-    /// Spec understood only by `box-install-handlers::parse_spec` —
-    /// registry rename, `workspace:*`, `git+https://...`, `file:` /
-    /// `link:` prefixes, etc. The frontend displays the raw spec
+    /// Full pnpm spec syntax — registry rename, `workspace:*`,
+    /// `git+https://...`, `file:` / `link:` prefixes, etc. The frontend
+    /// displays the raw spec.
     /// verbatim so the user can verify which shape was recognised.
     Passthrough { spec: String },
 }
