@@ -14,7 +14,7 @@ pub struct ServerDiscovery {
     pub token: String,
     pub pid: u32,
     pub started_at: u64,
-    pub endpoint: String,
+    pub port: u16,
 }
 
 pub fn server_directory() -> BoxResult<PathBuf> {
@@ -28,19 +28,6 @@ pub fn discovery_path() -> BoxResult<PathBuf> {
     Ok(server_directory()?.join("discovery.json"))
 }
 
-/// Returns the transport endpoint for the daemon.
-/// On Unix this is a filesystem path (Unix domain socket).
-/// On Windows this is a named pipe path.
-#[cfg(unix)]
-pub fn default_endpoint() -> std::path::PathBuf {
-    server_directory().unwrap_or_else(|_| std::path::PathBuf::from("/tmp")).join("dshboxd.sock")
-}
-
-#[cfg(windows)]
-pub fn default_endpoint() -> String {
-    r"\\.\pipe\dshboxd".to_owned()
-}
-
 pub fn read_discovery() -> BoxResult<Option<ServerDiscovery>> {
     let path = discovery_path()?;
     if !path.exists() {
@@ -51,14 +38,14 @@ pub fn read_discovery() -> BoxResult<Option<ServerDiscovery>> {
         .map_err(|error| error.to_string())
 }
 
-pub fn write_discovery(endpoint: impl Into<String>) -> BoxResult<ServerDiscovery> {
+pub fn write_discovery(port: u16) -> BoxResult<ServerDiscovery> {
     let directory = server_directory()?;
     fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let discovery = ServerDiscovery {
         token: uuid::Uuid::new_v4().to_string(),
         pid: process::id(),
         started_at: now_seconds(),
-        endpoint: endpoint.into(),
+        port,
     };
     let temporary = directory.join("discovery.json.tmp");
     fs::write(

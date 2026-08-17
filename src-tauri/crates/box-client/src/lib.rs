@@ -1,4 +1,4 @@
-//! Thin JSON-over-unix-socket client for the `dshboxd` daemon.
+//! Thin HTTP client for the `dshboxd` daemon.
 //!
 //! Used by the `dshbox` CLI (and, in a later phase, the desktop app) so
 //! every client talks to the daemon instead of running business logic in
@@ -6,7 +6,7 @@
 //! daemon and, when the daemon is not running, attempts to spawn it from
 //! `PATH` and waits for it to come up.
 
-use box_server_core::{default_endpoint, read_discovery, ServerDiscovery};
+use box_server_core::{read_discovery, ServerDiscovery};
 use serde_json::Value;
 
 /// Response frame every daemon method returns.
@@ -20,7 +20,7 @@ pub struct RpcResponse {
 /// A connected client bound to one daemon discovery.
 #[derive(Clone)]
 pub struct RpcClient {
-    endpoint: String,
+    port: u16,
     token: String,
 }
 
@@ -28,7 +28,7 @@ impl RpcClient {
     /// Build a client from an existing discovery record.
     pub fn from_discovery(discovery: &ServerDiscovery) -> Self {
         Self {
-            endpoint: discovery.endpoint.clone(),
+            port: discovery.port,
             token: discovery.token.clone(),
         }
     }
@@ -56,8 +56,7 @@ impl RpcClient {
             }
             if std::time::Instant::now() >= deadline {
                 return Err(format!(
-                    "failed to reach dshboxd at {}; start it with: dshboxd &",
-                    default_endpoint().display()
+                    "failed to reach dshboxd; start it with: dshboxd &"
                 ));
             }
             std::thread::sleep(std::time::Duration::from_millis(120));
@@ -80,30 +79,59 @@ impl RpcClient {
         Ok(())
     }
 
-    /// Send one JSON-line request; returns the parsed response frame.
-    #[cfg(unix)]
+    /// Send one JSON request via HTTP POST /rpc; returns the parsed response frame.
     fn exchange(&self, request: Value) -> Result<RpcResponse, String> {
-        use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixStream;
-        let mut stream = UnixStream::connect(&self.endpoint)
-            .map_err(|error| format!("cannot connect to dshboxd at {}: {error}", self.endpoint))?;
-        let body = serde_json::to_string(&request).map_err(|error| error.to_string())?;
-        stream
-            .write_all(body.as_bytes())
-            .map_err(|error| error.to_string())?;
-        stream.write_all(b"\n").map_err(|error| error.to_string())?;
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|error| format!("dshboxd read error: {error}"))?;
-        serde_json::from_str(&line)
-            .map_err(|error| format!("dshboxd response error: {error}"))
-    }
+        use std::io::{BufReader, Read, Write};
+        use std::net::TcpStream;
 
-    #[cfg(windows)]
-    fn exchange(&self, _request: Value) -> Result<RpcResponse, String> {
-        Err("dshboxd named-pipe transport is not yet implemented for Windows".to_owned())
+        let addr = format!("127.0.0.1:{}", self.port);
+        let mut stream = TcpStream::connect(&addr)
+            .map_err(|error| format!("cannot connect to dshboxd at {}: {error}", addr))?;
+
+        let body = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+        let request_line = format!(
+            "POST /rpc HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            self.token,
+            body
+        );
+        stream
+            .write_all(request_line.as_bytes())
+            .map_err(|error| error.to_string())?;
+        stream.flush().map_err(|error| error.to_string())?;
+
+        let mut reader = BufReader::new(stream);
+        let mut response_str = String::new();
+        reader
+            .read_to_string(&mut response_str)
+            .map_err(|error| format!("dshboxd read error: {error}"))?;
+
+        // Parse HTTP response: find header/body boundary
+        let mut boundary = None;
+        for (i, _) in response_str.match_indices("\r\n\r\n") {
+            boundary = Some(i + 4);
+            break;
+        }
+        let boundary = match boundary {
+            Some(pos) => pos,
+            None => return Err("dshboxd response parse error: missing header/body boundary".to_string()),
+        };
+
+        // Read status line to detect non-200
+        let status_line = response_str[..boundary].lines().next().unwrap_or("");
+        if !status_line.starts_with("HTTP/1.1 200") {
+            let body_part = &response_str[boundary..];
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(body_part);
+            if let Ok(val) = parsed {
+                let err = val["error"].as_str().unwrap_or("unknown error");
+                return Err(err.to_string());
+            }
+            return Err(format!("dshboxd returned: {}", status_line));
+        }
+
+        let body_part = &response_str[boundary..];
+        serde_json::from_str(body_part)
+            .map_err(|error| format!("dshboxd response error: {error}"))
     }
 
     /// Call a method with JSON params; returns the `result` field or the

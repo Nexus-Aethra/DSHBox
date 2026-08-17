@@ -405,52 +405,83 @@ impl TaskManager {
 
 // ---- Client for the dshboxd daemon ----
 
-/// Lightweight client that talks to the dshboxd daemon over the local
-/// transport: Unix domain socket on Linux/macOS, named pipe on Windows.
-/// The endpoint and token are read from the discovery file.
+/// Lightweight client that talks to the dshboxd daemon over HTTP/1.1 on TCP.
+/// The port and token are read from the discovery file.
 #[derive(Clone)]
 pub struct TaskClient {
-    endpoint: String,
+    port: u16,
     token: String,
 }
 
 impl TaskClient {
     pub fn connect(discovery: &serde_json::Value) -> Result<Self, String> {
-        let endpoint = discovery["endpoint"]
-            .as_str()
-            .ok_or("discovery file missing endpoint")?
-            .to_owned();
+        let port = discovery["port"]
+            .as_u64()
+            .ok_or("discovery file missing port")?
+            .try_into()
+            .map_err(|_| "discovery port out of range")?;
         let token = discovery["token"]
             .as_str()
             .ok_or("discovery file missing token")?
             .to_owned();
-        Ok(Self { endpoint, token })
+        Ok(Self { port, token })
     }
 
-    /// Send a JSON-line request and return the result field.
-    #[cfg(unix)]
+    /// Send an HTTP POST /rpc request and return the result field.
     fn call(&self, request: serde_json::Value) -> Result<serde_json::Value, String> {
-        use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixStream;
-        let mut stream = UnixStream::connect(&self.endpoint)
-            .map_err(|error| format!("cannot connect to daemon at {}: {error}", self.endpoint))?;
+        use std::io::{BufReader, Read, Write};
+        use std::net::TcpStream;
+
+        let addr = format!("127.0.0.1:{}", self.port);
+        let mut stream = TcpStream::connect(&addr)
+            .map_err(|error| format!("cannot connect to daemon at {}: {error}", addr))?;
+
         let body = serde_json::to_string(&request).map_err(|error| error.to_string())?;
-        stream.write_all(body.as_bytes()).map_err(|error| error.to_string())?;
-        stream.write_all(b"\n").map_err(|error| error.to_string())?;
+        let request_line = format!(
+            "POST /rpc HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            self.token,
+            body
+        );
+        stream
+            .write_all(request_line.as_bytes())
+            .map_err(|error| error.to_string())?;
+        stream.flush().map_err(|error| error.to_string())?;
+
         let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).map_err(|error| format!("daemon read error: {error}"))?;
+        let mut response_str = String::new();
+        reader
+            .read_to_string(&mut response_str)
+            .map_err(|error| format!("daemon read error: {error}"))?;
+
+        let mut boundary = None;
+        for (i, _) in response_str.match_indices("\r\n\r\n") {
+            boundary = Some(i + 4);
+            break;
+        }
+        let boundary = match boundary {
+            Some(pos) => pos,
+            None => return Err("daemon response parse error: missing header/body boundary".to_string()),
+        };
+
+        let status_line = response_str[..boundary].lines().next().unwrap_or("");
+        if !status_line.starts_with("HTTP/1.1 200") {
+            let body_part = &response_str[boundary..];
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(body_part);
+            if let Ok(val) = parsed {
+                let err = val["error"].as_str().unwrap_or("unknown daemon error");
+                return Err(err.to_string());
+            }
+            return Err(format!("daemon returned: {}", status_line));
+        }
+
+        let body_part = &response_str[boundary..];
         let response: serde_json::Value =
-            serde_json::from_str(&line).map_err(|error| format!("daemon response error: {error}"))?;
+            serde_json::from_str(body_part).map_err(|error| format!("daemon response error: {error}"))?;
         if response["ok"].as_bool() != Some(true) {
             return Err(response["error"].as_str().unwrap_or("unknown daemon error").to_owned());
         }
         Ok(response["result"].clone())
-    }
-
-    #[cfg(windows)]
-    fn call(&self, _request: serde_json::Value) -> Result<serde_json::Value, String> {
-        Err("dshboxd named-pipe transport is not yet implemented for Windows".to_owned())
     }
 
     pub fn ping(&self) -> Result<serde_json::Value, String> {
