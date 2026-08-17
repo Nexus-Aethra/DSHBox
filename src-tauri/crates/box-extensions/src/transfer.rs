@@ -42,8 +42,20 @@ pub fn classify_plugin_entry(name: &str) -> EntryMode {
         // Code-bearing directories — share across containers.
         "src" | "lib" | "dist" | "dist-node" | "bin" | "build" | "out" | "public"
         | "static" | "assets" | "scripts" => EntryMode::Link,
+        // `node_modules` is shared across containers as a link into the
+        // repository entry exactly the same way `src`/`lib` are. The skip
+        // here previously broke the host install: the container plugin
+        // source had no `node_modules`, so `pnpm install` rebuilt from the
+        // registry (creating a non-pnpm layout), the plugin's `tsdown`
+        // build then couldn't resolve runtime deps through `.pnpm/*` and
+        // externalised them — DSH runtime's client loader then failed
+        // with `clsx missed the module table` because `require("clsx")`
+        // was still in the bundle. Linking the directory keeps the pnpm
+        // store layout intact so rolldown's resolver finds transitive
+        // deps exactly as the plugin author wrote them.
+        "node_modules" => EntryMode::Link,
         // Noise — never copy, never link.
-        "node_modules" | ".git" | "__pycache__" | "target" | ".pnpm-store" | ".cache"
+        ".git" | "__pycache__" | "target" | ".pnpm-store" | ".cache"
         | ".pnpm" | ".turbo" | ".next" | ".DS_Store" => EntryMode::Skip,
         // Metadata that the toolchain (plugin add, postinstall hooks,
         // patch authors) might rewrite.
@@ -501,10 +513,22 @@ mod tests {
     }
 
     #[test]
-    fn classify_skips_node_modules_and_build_caches() {
-        for name in ["node_modules", ".git", "target", ".pnpm-store", ".cache"] {
+    fn classify_skips_build_caches() {
+        // `node_modules` is shared as a link (see the comment in
+        // `classify_plugin_entry` for the rationale: the host install
+        // step needs the pnpm-resolved layout intact for the plugin's
+        // `tsdown` build to find transitive deps, otherwise un-inlined
+        // runtime imports show up as `require("clsx")` in the bundle
+        // and DSH runtime's client loader fails with
+        // `clsx missed the module table`).
+        for name in [".git", "target", ".pnpm-store", ".cache", ".pnpm", ".turbo", ".next", ".DS_Store"] {
             assert_eq!(classify_plugin_entry(name), EntryMode::Skip, "{name}");
         }
+    }
+
+    #[test]
+    fn classify_links_node_modules() {
+        assert_eq!(classify_plugin_entry("node_modules"), EntryMode::Link);
     }
 
     #[test]
@@ -540,8 +564,16 @@ mod tests {
         );
         assert_same_shared_file(&source.join("src/index.ts"), &src_link.join("index.ts"));
 
-        // node_modules must not be materialised at all.
-        assert!(!destination.join("node_modules").exists());
+        // node_modules must be linked as a directory so the plugin's
+        // pnpm-resolved tree is preserved (see `classify_plugin_entry`).
+        let nm_link = destination.join("node_modules");
+        let nm_meta = fs::symlink_metadata(&nm_link).unwrap();
+        assert!(
+            nm_meta.file_type().is_symlink(),
+            "node_modules/ should be a symlink but got {:?}",
+            nm_meta.file_type()
+        );
+        assert_same_shared_file(&source.join("node_modules/pkg/"), &nm_link.join("pkg"));
         let _ = fs::remove_dir_all(root);
     }
 
