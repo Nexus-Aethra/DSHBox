@@ -155,6 +155,14 @@ pub(crate) fn build_image_from_script(
                     }
                     find_repository_entry(&root, &ExtensionKind::Plugin, name, scope.as_deref(), version.as_deref())?
                 }
+                ParsedSource::LocalDir { path } => {
+                    // Local directories are already on disk; pnpm pack from
+                    // the workspace root resolves to the workspace itself
+                    // (wrong package), and lifecycle scripts fail without
+                    // node_modules. Import directly — no tarball round-trip.
+                    task.log(&format!("importing local plugin {}", path.display()));
+                    import_into_repository(task, path)?
+                }
                 parsed => {
                     let spec = parsed_source_to_pnpm_spec(&parsed)
                         .map_err(|e| format!("cannot convert source to spec: {e}"))?;
