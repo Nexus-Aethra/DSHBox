@@ -105,10 +105,9 @@ fn find_repository_entry_by_identity(
     })
 }
 
-/// Link a repository entry into a container profile (plugin) or skill root.
-/// Plugins are materialised as a hybrid view (real root directory + code
-/// subdirectory links sharing inodes with the repository); skills are
-/// copied so every container owns an editable copy.
+/// Install a repository entry into a container profile (plugin) or skill root.
+/// Plugins are installed via `dsh plugin add` with the repository source path;
+/// skills are copied into a per-container directory.
 pub(crate) fn link_repository_extension(
     container_id: &str,
     profile: Option<&str>,
@@ -128,23 +127,21 @@ pub(crate) fn link_repository_extension(
     let container = box_containers::scan_containers(&root)?
         .remove(container_id)
         .ok_or("container not found")?;
-    task.update("Linking repository extension", 25);
+    task.update("Installing repository extension", 25);
     match entry.kind {
         ExtensionKind::Plugin => {
             let profile = profile.ok_or("plugin installation requires a profile")?;
-            if !std::path::PathBuf::from(&container.directory)
+            let profile_dir = PathBuf::from(&container.directory)
                 .join("profile/profiles")
-                .join(profile)
-                .join("package.json")
-                .is_file()
-            {
+                .join(profile);
+            if !profile_dir.join("package.json").is_file() {
                 return Err(format!("profile not found: {profile}"));
             }
-            // Pass the repository source path directly: the installer
-            // links code subtrees into the container instead of copying
-            // them, so all containers share the same plugin inodes.
+            // Install the plugin into the profile via DSH's tooling. The
+            // plugin source lives in the shared repository directory so
+            // multiple containers can reference the same entry.
             let source_path = PathBuf::from(&entry.source_path);
-            install_container_plugin(
+            crate::bundles::install_container_plugin(
                 &container,
                 profile,
                 "repository",
@@ -152,8 +149,6 @@ pub(crate) fn link_repository_extension(
                 source_path,
                 task,
             )?;
-            // The container now links this shared entry: record ownership
-            // so `plugin prune` never removes in-use plugins.
             box_extensions::increment_reference(Path::new(&root), &entry.id)?;
         }
         ExtensionKind::Skill => {
@@ -166,7 +161,7 @@ pub(crate) fn link_repository_extension(
             fs::create_dir_all(staging.parent().ok_or("extension staging has no parent")?)
                 .map_err(|error| error.to_string())?;
             copy_extension_source(Path::new(&entry.source_path), &staging)?;
-            install_container_skill(&container, "repository", &entry.id, staging, task)?
+            crate::bundles::install_container_skill(&container, "repository", &entry.id, staging, task)?
         }
     }
     task.update("Container extension installed", 95);

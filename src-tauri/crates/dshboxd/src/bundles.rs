@@ -8,7 +8,6 @@ use box_containers::DshContainer;
 use box_dsh_versions::version_directory as dsh_version_directory;
 use box_extensions::transfer::{
     append_plugin_archive, copy_extension_source, extract_extension_tarball,
-    install_plugin_to_container_mode,
 };
 use box_extensions::{
     detect_extension_kind, directory_size, extension_digest, read_bundles, repository_root,
@@ -96,35 +95,48 @@ pub(crate) fn install_container_plugin(
         .as_str()
         .ok_or("plugin package.json has no name")?
         .to_owned();
-    let source_directory = PathBuf::from(&container.directory)
-        .join("extensions/plugins")
-        .join(if source_kind == "repository" {
-            source
-        } else {
-            &task.task_id
-        })
-        .join("source");
-    if source_directory.exists() {
-        return Err(format!(
-            "plugin is already installed from this repository entry: {name}"
-        ));
+
+    let profile_dir = PathBuf::from(&container.directory)
+        .join("profile/profiles")
+        .join(profile);
+    if !profile_dir.join("package.json").is_file() {
+        return Err(format!("profile not found: {profile}"));
     }
-    fs::create_dir_all(source_directory.parent().ok_or("plugin destination has no parent")?)
-        .map_err(|error| error.to_string())?;
-    if source_kind == "repository" {
-        // Repository-sourced plugins are materialised as a hybrid view: the
-        // plugin root (metadata files) becomes a real per-container
-        // directory while code subtrees (src/lib/dist/...) become links
-        // back into the shared repository entry. Containers therefore share
-        // code inodes while still owning everything they might edit.
-        // `extracted` is the repository entry's source path in this mode.
-        install_plugin_to_container_mode(&extracted, &source_directory)?;
+
+    // Determine the persistent source path for this plugin.
+    // Repository entries already live in the shared runtime directory;
+    // use them directly so containers share the same source.
+    // External sources live in a staging dir that gets cleaned up; persist
+    // them into a per-container directory first.
+    let plugin_source = if source_kind == "repository" {
+        if box_extensions::read_extension_records(container)
+            .iter()
+            .any(|r| r.name == name && r.profile.as_deref() == Some(profile))
+        {
+            return Err(format!(
+                "plugin {name} is already installed in profile {profile}"
+            ));
+        }
+        extracted
     } else {
-        // External sources (github/tarball/user directory) are staged per
-        // task; move the whole tree so the container owns a full copy.
+        let source_directory = PathBuf::from(&container.directory)
+            .join("extensions/plugins")
+            .join(&task.task_id)
+            .join("source");
+        if source_directory.exists() {
+            return Err(format!("plugin is already installed: {name}"));
+        }
+        fs::create_dir_all(
+            source_directory
+                .parent()
+                .ok_or("plugin destination has no parent")?,
+        )
+        .map_err(|error| error.to_string())?;
         fs::rename(&extracted, &source_directory)
             .map_err(|error| format!("cannot store plugin source: {error}"))?;
-    }
+        source_directory
+    };
+
     task.update("Installing DSH plugin", 60);
     task.log(&format!("adding plugin {name} to profile {profile}"));
     let root = read_config()?
@@ -146,7 +158,7 @@ pub(crate) fn install_container_plugin(
             "--profile",
             profile,
             "add",
-            source_directory.to_string_lossy().as_ref(),
+            plugin_source.to_string_lossy().as_ref(),
         ])
         .env(
             "DSH_HOME",
@@ -165,13 +177,12 @@ pub(crate) fn install_container_plugin(
     // `dsh plugin add` registers the plugin as a `link:` reference in the
     // profile's package.json. pnpm 11 with `nodeLinker: hoisted` does NOT
     // traverse `link:` to resolve transitive dependencies, so the plugin's
-    // own deps end up invisible to the DSH loader (which resolves bare
-    // specifiers from the profile's `baseUrl`). Re-register the plugin as
-    // a workspace member with `workspace:*` so pnpm hoists its dependency
-    // closure into the profile's node_modules.
+    // own deps end up invisible to the DSH loader. Re-register the plugin
+    // as a workspace member with `workspace:*` so pnpm hoists its
+    // dependency closure into the profile's node_modules.
     promote_plugin_to_workspace_member(
-        &PathBuf::from(&container.directory).join("profile/profiles").join(profile),
-        &source_directory,
+        &profile_dir,
+        &plugin_source,
         &name,
         &pnpm,
         task,
@@ -184,14 +195,14 @@ pub(crate) fn install_container_plugin(
             source_kind: source_kind.to_owned(),
             source: source.to_owned(),
             profile: Some(profile.to_owned()),
-            path: source_directory.to_string_lossy().into_owned(),
+            path: plugin_source.to_string_lossy().into_owned(),
             installed_at: now_seconds(),
             repository_id: if source_kind == "repository" {
                 Some(source.to_owned())
             } else {
                 None
             },
-            content_digest: extension_digest(&source_directory).ok(),
+            content_digest: extension_digest(&plugin_source).ok(),
         },
     )
 }
