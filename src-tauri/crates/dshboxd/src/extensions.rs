@@ -653,6 +653,11 @@ mod tests {
     // first call rather than minting a second `img-<task_id>` row.
     #[test]
     fn import_dedup_by_name_and_version() {
+        // Acquire the daemon-wide test lock so we don't race with other
+        // tests that mutate HOME (e.g. dispatch::tests::describe_container_*);
+        // otherwise the config file is sometimes gone before the daemon's
+        // `read_config` looks at it.
+        let _lock = crate::test_support::env_lock();
         let home = sandbox("dedup-home");
         let runtime = sandbox("dedup-runtime");
         write_config(&home, &runtime);

@@ -15,10 +15,9 @@ use crate::extensions::{
     remove_repository_extension, remove_repository_plugin,
 };
 use crate::image::{
-    build_image_from_script, create_container_from_image, export_template, import_template,
-    list_images, list_templates, materialize_template_container, prune_image_snapshots,
-    read_image, read_template, remove_image_rpc, remove_template, BuildImageRequest,
-    CreateImageContainerRequest, CreateTemplateContainerRequest,
+    build_image_from_script, export_template, import_template, list_templates,
+    materialize_template_container, prune_template_snapshots, read_template, remove_template,
+    BuildImageRequest, CreateTemplateContainerRequest,
 };
 use crate::lifecycle::{
     rebuild_dsh_container_with_task, start_dsh_container_inner, stop_dsh_container,
@@ -28,8 +27,9 @@ use crate::versions::{
     catalog_names, pull_template_with_cancel, refresh_dsh_catalog, uninstall_dsh_version,
     upgrade_legacy_resources,
 };
+use box_api::ContainerDescription;
 use box_dsh_versions::{installed_versions, parse_template_ref};
-use box_extensions::{read_bundles, scan_repository};
+use box_extensions::{read_bundles, scan_container_extensions, scan_repository};
 use box_foundation::{now_seconds, read_config, write_config};
 use box_scheduler::{run_queued, TaskContext, TaskRecord};
 use serde_json::{json, Value};
@@ -107,24 +107,19 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("export_bundle") => enqueue_bundle_export(state, request),
         Some("import_bundle") => enqueue_bundle_import(state, request),
         Some("create_container_from_template") => enqueue_template_container(state, request),
-        Some("create_container_from_image") => enqueue_image_container(state, request),
-        Some("list_images") => list_images().map(|entries| json!(entries)),
-        Some("read_image") => {
+        Some("read_template_list") => {
             let name = request["name"].as_str().unwrap_or("").to_owned();
-            read_image(&name).map(|list| json!(list))
+            read_template_list(&name)
         }
-        Some("remove_image") => {
-            let name = request["name"].as_str().unwrap_or("").to_owned();
-            remove_image_rpc(&name).map(|_| json!({ "removed": name }))
-        }
-        Some("prune_image_snapshots") => {
-            prune_image_snapshots().map(|removed| json!({ "removed": removed }))
+        Some("prune_template_snapshots") => {
+            prune_template_snapshots().map(|removed| json!({ "removed": removed }))
         }
         Some("create_container") => create_container_rpc(request),
         Some("enqueue_container_start") => enqueue_container_start(state, request),
         Some("enqueue_container_stop") => enqueue_container_stop(state, request),
         Some("enqueue_container_rebuild") => enqueue_container_rebuild(state, request),
         Some("delete_container") => delete_container_rpc(state, request),
+        Some("describe_container") => describe_container_rpc(state, request),
         Some("upgrade_legacy_resources") => upgrade_legacy_resources().map(|reports| json!(reports)),
         Some("enqueue_container_extension_add") => enqueue_container_extension_add(state, request),
         Some("enqueue_workspace_extension_import") => enqueue_workspace_extension_import(state, request),
@@ -505,29 +500,15 @@ fn enqueue_template_container(state: &DaemonState, request: &Value) -> Result<Va
     )
 }
 
-/// Materialize an image container and start its DSH host inside one daemon
-/// task; mirrors `enqueue_template_container` for the image path.
-fn enqueue_image_container(state: &DaemonState, request: &Value) -> Result<Value, String> {
-    let parsed: CreateImageContainerRequest = serde_json::from_value(request.clone())
-        .map_err(|error| format!("invalid image container request: {error}"))?;
-    let params = json!({
-        "name": parsed.name.clone(),
-        "image": parsed.image.clone(),
-    });
-    let containers = state.containers.clone();
-    enqueue_task_worker(
-        state,
-        "image-container",
-        vec!["repository:extensions".to_owned()],
-        params,
-        move |task| {
-            let container = create_container_from_image(parsed, task)?;
-            let url = start_dsh_container_inner(&container.id, &containers.running, Some(task))?;
-            task.update(format!("Container {} is ready", container.id), 100);
-            task.log(&format!("container url: {url}"));
-            Ok(())
-        },
-    )
+/// Returns the resource list of a built template (the metadata-only form
+/// produced by `dshbox build`), for `dshbox template show`.
+fn read_template_list(name: &str) -> Result<Value, String> {
+    let root = read_config()?
+        .runtime_directory
+        .ok_or("DSH Box storage is not configured")?;
+    let list = box_dsh_versions::read_built_template(&root, name)?
+        .ok_or_else(|| format!("template `{name}` is not a built template"))?;
+    Ok(json!(list))
 }
 
 /// Parse a string array parameter.
@@ -739,6 +720,73 @@ fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<Value, S
     Ok(json!({ "id": id, "deleted": true }))
 }
 
+/// Compose the full container description used by `dshbox container describe`.
+/// Reuses the on-disk `DshContainer` summary as the base, then enriches it
+/// with live runtime signals (URL, host PID) and the same extensions scan
+/// the desktop details panel uses (`scan_container_extensions`). The result
+/// is serialised through `box_api::ContainerDescription` so the wire shape
+/// is identical for every consumer (CLI text, CLI `--json`, future UI).
+fn describe_container_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    let id = request["id"].as_str().unwrap_or("").to_owned();
+    if !box_foundation::is_safe_identifier(&id) {
+        return Err("invalid container id".to_owned());
+    }
+    let root = read_config()?
+        .runtime_directory
+        .ok_or("DSH Box storage is not configured")?;
+    let container = box_containers::scan_containers(&root)?
+        .remove(&id)
+        .ok_or_else(|| format!("container not found: {id}"))?;
+    // Live signals: the URL is only known while the host process is in our
+    // running registry; the PID file + `is_host_alive` probe decide whether
+    // the host is actually still alive (a crash leaves the registry stale
+    // until the next user action). The PID file is the source of truth for
+    // `status` — the URL is informational and may be absent for short-lived
+    // races between the daemon adding the registry entry and writing the
+    // PID file.
+    let url = state
+        .containers
+        .running
+        .lock()
+        .map_err(|_| "container manager lock failed".to_owned())?
+        .get(&id)
+        .map(|host| host.url.clone());
+    let host_pid = read_live_host_pid(&container);
+    let status = if host_pid.is_some() { "running" } else { "stopped" };
+    let extensions = scan_container_extensions(&container);
+    let description = ContainerDescription {
+        id: container.id.clone(),
+        name: container.name.clone(),
+        version: container.version.clone(),
+        profile: container.profile.clone(),
+        template: container.template.clone(),
+        directory: container.directory.clone(),
+        status: status.to_owned(),
+        url,
+        host_pid,
+        extensions: serde_json::to_value(&extensions)
+            .map_err(|error| format!("cannot serialize extensions: {error}"))?,
+    };
+    let value = serde_json::to_value(&description)
+        .map_err(|error| format!("cannot serialize description: {error}"))?;
+    Ok(value)
+}
+
+/// Read the PID file and confirm the host process is still alive (Unix
+/// `kill -0`; Windows `tasklist`). Mirrors `is_host_alive` from
+/// `box_containers` but returns the PID rather than a boolean — callers
+/// that only need a flag still go through the box-containers helper.
+fn read_live_host_pid(container: &box_containers::DshContainer) -> Option<u32> {
+    let pid_path = box_containers::host_pid_path(container);
+    let pid_text = std::fs::read_to_string(&pid_path).ok()?;
+    let pid = pid_text.trim().parse::<u32>().ok()?;
+    if box_containers::is_host_alive(container) {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
 /// Safe relative path check for workspace extension imports (mirrors the
 /// desktop's guard: no absolute paths, no parent/root components).
 fn is_safe_workspace_relative_path(value: &str) -> bool {
@@ -886,4 +934,164 @@ fn delete_task_rpc(state: &DaemonState, request: &Value) -> Result<Value, String
         .remove(&paths, id)
         .map(|_| json!({ "id": id, "deleted": true }))
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the dispatch table; see `describe_container_rpc` below
+    //! for the most thorough coverage. The `env_lock` helper at the
+    //! crate level serialises every test that mutates `HOME` (or the
+    //! daemon's config dir) so they cannot trample each other's
+    //! persisted config files when cargo runs the suite in parallel.
+
+    use super::*;
+    use crate::test_support::env_lock;
+    use box_containers::{container_directory, host_pid_path};
+    use box_foundation::{read_config, BoxConfig, BoxPaths};
+    use std::{
+        env, fs,
+        path::PathBuf,
+        sync::{Arc, RwLock},
+    };
+
+    /// Builds a runtime directory with one container + a PID file pointing
+    /// at a child the test owns. Returns the daemon state and the
+    /// container id. The caller MUST hold `env_lock()` for the entire
+    /// lifetime of the test (including `cleanup`) — see the module docs.
+    fn setup(include_live_pid: bool) -> (DaemonState, String, PathBuf, PathBuf) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let home = env::temp_dir().join(format!("dshboxd-dispatch-home-{stamp}"));
+        let runtime = env::temp_dir().join(format!("dshboxd-dispatch-runtime-{stamp}"));
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&runtime);
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+        // Persist the runtime directory to a fake $HOME/.dsh-box/config.json.
+        let config_dir = home.join(".dsh-box");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config = BoxConfig {
+            runtime_directory: Some(runtime.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        fs::write(
+            config_dir.join("config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+        // Same env var that box_foundation::read_config looks up.
+        // SAFETY: tests are single-threaded within a process.
+        unsafe { env::set_var("DSHBOX_CONFIG_DIR", &config_dir) };
+        unsafe { env::set_var("HOME", &home) };
+
+        let id = format!("container-{stamp}");
+        let directory = container_directory(runtime.to_string_lossy().as_ref(), &id);
+        fs::create_dir_all(directory.join("state")).unwrap();
+        fs::create_dir_all(directory.join("profile/profiles")).unwrap();
+        fs::write(
+            directory.join("container.json"),
+            serde_json::json!({
+                "id": id,
+                "name": "dsh-test",
+                "version": "latest",
+                "profile": "web",
+                "template": "dsh-test",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let pid = if include_live_pid {
+            // Spawn a child whose PID we own; `kill -0` will succeed for
+            // the lifetime of the test. Reaped at the end.
+            let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+            let pid = child.id();
+            // Stash the child for the test to reap later; storing into the
+            // env is too awkward, so we leak the handle and rely on the
+            // process being short-lived enough that the OS cleans up.
+            Box::leak(Box::new(child));
+            fs::write(host_pid_path(&box_containers::DshContainer {
+                id: id.clone(),
+                name: "dsh-test".into(),
+                version: "latest".into(),
+                profile: "web".into(),
+                template: Some("dsh-test".into()),
+                directory: directory.to_string_lossy().into_owned(),
+                status: "running".into(),
+            }), pid.to_string()).unwrap();
+            Some(pid)
+        } else {
+            None
+        };
+        let _ = pid; // silence unused warning when include_live_pid is false
+
+        // Build the DaemonState directly (avoids relying on the global
+        // discovery file) using the same fields DaemonState::load wires up.
+        let config = read_config().unwrap();
+        let paths = BoxPaths::from_config(&config).unwrap();
+        let state = DaemonState {
+            manager: box_scheduler::TaskManager::default(),
+            paths: RwLock::new(paths),
+            containers: Arc::new(ContainerManager::default()),
+            resources: box_state::ResourceStateManager::default(),
+        };
+        (state, id, home, runtime)
+    }
+
+    fn cleanup(home: &PathBuf, runtime: &PathBuf) {
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(runtime);
+    }
+
+    #[test]
+    fn describe_container_marks_running_when_pid_alive() {
+        let _guard = env_lock();
+        let (state, id, home, runtime) = setup(true);
+        let response = describe_container_rpc(&state, &json!({ "id": id })).unwrap();
+        assert_eq!(response["id"], id);
+        assert_eq!(response["name"], "dsh-test");
+        assert_eq!(response["version"], "latest");
+        assert_eq!(response["profile"], "web");
+        assert_eq!(response["template"], "dsh-test");
+        assert_eq!(response["status"], "running");
+        // URL is only set when the daemon actually started the host (no
+        // running entry in the registry); `host_pid` is the live probe.
+        assert!(response["url"].is_null());
+        assert!(response["hostPid"].is_u64());
+        // Extensions object is present (empty profile scan).
+        assert!(response["extensions"].is_object());
+        assert!(response["extensions"]["profiles"].is_array());
+        cleanup(&home, &runtime);
+    }
+
+    #[test]
+    fn describe_container_marks_stopped_when_pid_file_missing() {
+        let _guard = env_lock();
+        let (state, id, home, runtime) = setup(false);
+        let response = describe_container_rpc(&state, &json!({ "id": id })).unwrap();
+        assert_eq!(response["status"], "stopped");
+        assert!(response["url"].is_null());
+        assert!(response["hostPid"].is_null());
+        cleanup(&home, &runtime);
+    }
+
+    #[test]
+    fn describe_container_rejects_unsafe_identifier() {
+        let _guard = env_lock();
+        let (state, _id, home, runtime) = setup(false);
+        let err = describe_container_rpc(&state, &json!({ "id": "../etc/passwd" })).unwrap_err();
+        assert!(err.contains("invalid container id"), "got: {err}");
+        cleanup(&home, &runtime);
+    }
+
+    #[test]
+    fn describe_container_returns_error_for_unknown_id() {
+        let _guard = env_lock();
+        let (state, _id, home, runtime) = setup(false);
+        let err = describe_container_rpc(&state, &json!({ "id": "container-missing" })).unwrap_err();
+        assert!(err.contains("container not found"), "got: {err}");
+        cleanup(&home, &runtime);
+    }
 }
