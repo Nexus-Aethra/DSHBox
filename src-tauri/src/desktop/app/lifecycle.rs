@@ -85,6 +85,16 @@ pub(crate) async fn open_dsh_front(
     _manager: tauri::State<'_, ContainerManager>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
+    open_dsh_front_for_client(id, app).await
+}
+
+/// Shared by the Tauri command and by a CLI-launched desktop client. Window
+/// ownership stays entirely in the desktop process; the CLI only supplies an
+/// already-validated container id through its startup arguments.
+pub(crate) async fn open_dsh_front_for_client(
+    id: String,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     // The daemon owns the host process, so its URL comes from the daemon;
     // window management stays local (WebView2 details, focus, retries).
     let client = connect()?;

@@ -2,7 +2,7 @@
 # Syntax:
 #   FROM <harness-source>          required
 #   PROFILE <name>                 required
-#   NAME <image-name>              optional
+#   NAME <template-name>           optional
 #   VERSION <version>              optional
 #   LABEL key=value                optional, repeatable
 #   DEF <name> @<path>            optional, repeatable (path alias)

@@ -22,9 +22,11 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     match action {
         "ls" | "list" if arguments.len() >= 2 => container_plugins(&arguments[1..]),
         "ls" | "list" => repository_list(),
-        "import" => repository_import(arguments.get(1).ok_or(
-            "expected a source: GitHub URL, local directory, or tarball",
-        )?),
+        "import" => repository_import(
+            arguments
+                .get(1)
+                .ok_or("expected a source: GitHub URL, local directory, or tarball")?,
+        ),
         "export" => repository_export(
             arguments.get(1).ok_or("expected a repository entry id")?,
             arguments.get(2).ok_or("expected a destination path")?,

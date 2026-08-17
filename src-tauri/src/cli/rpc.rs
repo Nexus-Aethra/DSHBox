@@ -123,9 +123,10 @@ pub(crate) fn wait_task(client: &RpcClient, task_id: &str) -> Result<(), String>
             "succeeded" => return Ok(()),
             "cancelled" => return Err("task cancelled".to_owned()),
             "failed" => {
-                return Err(task.error.clone().unwrap_or_else(|| {
-                    format!("task failed at {}", task.stage)
-                }))
+                return Err(task
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("task failed at {}", task.stage)))
             }
             _ => {}
         }

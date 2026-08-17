@@ -14,7 +14,7 @@ export type DshContainer = { id: string; name: string; version: string; profile:
 // `<runtime>/templates/<content-hash>/script.dsh` and looked up through
 // the runtime's template index; `id` is the fnv1a64 hash and `name` is the
 // user-facing alias used by `template rm/show/export`.
-export type TemplateInfo = { name: string; id: string; harnessRef: string | null; profile: string }
+export type TemplateInfo = { name: string; id: string; harnessRef: string | null; profile: string; built?: boolean }
 export type ExtensionPlugin = { name: string; version: string | null; description: string | null; path: string | null; diagnostic: string | null }
 export type ProfileExtensions = { name: string; plugins: ExtensionPlugin[]; diagnostics: string[] }
 export type ContainerSkill = { name: string; description: string | null; path: string; diagnostic: string | null }

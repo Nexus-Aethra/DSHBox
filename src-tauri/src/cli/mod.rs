@@ -21,6 +21,16 @@ use std::env;
 
 pub fn run() -> Option<i32> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
+    // `container open` starts a GUI client with this private hand-off
+    // argument. The desktop process then creates the DSH webview itself;
+    // the CLI must never fall back to a system browser.
+    if arguments.len() == 3
+        && arguments[0] == "ui"
+        && arguments[1] == "--open-container"
+        && !arguments[2].is_empty()
+    {
+        return None;
+    }
     // Only launch the GUI when the user explicitly asks for it.
     if arguments.len() == 1 && matches!(arguments[0].as_str(), "ui" | "--tray") {
         return None;
@@ -171,7 +181,7 @@ fn print_help() {
     println!();
     println!("Container lifecycle:");
     println!("  dshbox container describe <id> [--json]   print detailed container info");
-    println!("  dshbox container open <id>                open the running container in the system browser");
+    println!("  dshbox container open <id>                open the running container in a DSH Box window");
     println!("  dshbox container logs <id>                tail the DSH host log");
     println!("  dshbox container url <id>                 print the webview URL of a running container");
     println!("  dshbox container start <id>               start the DSH host of a stopped container");

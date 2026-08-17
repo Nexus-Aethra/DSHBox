@@ -92,6 +92,7 @@ skill_md = os.path.join(container_dir, "profile", "skills", "boxfile-guide", "SK
 assert os.path.isfile(skill_md), f"boxfile-guide SKILL.md missing at {skill_md}"
 content = open(skill_md).read()
 assert "name: boxfile-guide" in content
+assert "## When to use this Box skill" in content
 assert "FROM <base>" in content
 assert "ADD <kind>" in content
 assert "## Best practices" in content

@@ -5,12 +5,12 @@
 use crate::bundles::{install_container_plugin, install_container_skill};
 use crate::toolchains::{command_for_toolchain, resolve_toolchain, wait_for_process};
 use box_dsh_versions::version_directory as dsh_version_directory;
+use box_extensions::transfer::{
+    append_plugin_archive, archive_content_root, copy_extension_source, extract_extension_tarball,
+};
 use box_extensions::{
     detect_extension_kind, read_bundles, remove_plugin_record, repository_root, scan_repository,
     write_bundles, write_repository_index, ExtensionKind, RepositoryExtension,
-};
-use box_extensions::transfer::{
-    append_plugin_archive, archive_content_root, copy_extension_source, extract_extension_tarball,
 };
 use box_foundation::{is_safe_identifier, mirror_url, now_seconds, read_config};
 use box_runtime::shallow_clone_with_cancel;
@@ -22,14 +22,35 @@ use std::{
     process::Stdio,
 };
 
+/// True when the plugin's package.json declares any runtime or build
+/// dependency. A pure-patch plugin (e.g. a Cordis `patch: "./x.yml"`
+/// with no imports) has nothing to install and skips the pnpm boot —
+/// saves the bundled-runtime boot for unit tests with empty fixtures
+/// and for plugins that genuinely have no npm deps to fetch.
+fn plugin_declares_deps(directory: &Path) -> bool {
+    let Ok(manifest_text) = fs::read_to_string(directory.join("package.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&manifest_text) else {
+        return false;
+    };
+    let non_empty = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|object| !object.is_empty())
+    };
+    non_empty("dependencies") || non_empty("devDependencies")
+}
+
 pub(crate) fn repository_metadata(
     kind: &ExtensionKind,
     source: &Path,
 ) -> Result<(String, Option<String>, Option<String>), String> {
     match kind {
         ExtensionKind::Skill => {
-            let content = fs::read_to_string(source.join("SKILL.md"))
-                .map_err(|error| error.to_string())?;
+            let content =
+                fs::read_to_string(source.join("SKILL.md")).map_err(|error| error.to_string())?;
             let field = |key: &str| {
                 content
                     .lines()
@@ -44,7 +65,8 @@ pub(crate) fn repository_metadata(
         }
         ExtensionKind::Plugin => {
             let value: serde_json::Value = serde_json::from_str(
-                &fs::read_to_string(source.join("package.json")).map_err(|error| error.to_string())?,
+                &fs::read_to_string(source.join("package.json"))
+                    .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
             Ok((
@@ -72,17 +94,15 @@ fn find_repository_entry_by_identity(
     name: &str,
     version: Option<&str>,
 ) -> Option<RepositoryExtension> {
-    scan_repository(Path::new(root))
-        .into_iter()
-        .find(|entry| {
-            entry.kind == *kind
-                && entry.name == name
-                && entry.diagnostic.is_none()
-                && match (kind, version, &entry.version) {
-                    (ExtensionKind::Plugin, want, have) => want == have.as_deref(),
-                    (ExtensionKind::Skill, _, _) => true,
-                }
-        })
+    scan_repository(Path::new(root)).into_iter().find(|entry| {
+        entry.kind == *kind
+            && entry.name == name
+            && entry.diagnostic.is_none()
+            && match (kind, version, &entry.version) {
+                (ExtensionKind::Plugin, want, have) => want == have.as_deref(),
+                (ExtensionKind::Skill, _, _) => true,
+            }
+    })
 }
 
 /// Link a repository entry into a container profile (plugin) or skill root.
@@ -124,7 +144,14 @@ pub(crate) fn link_repository_extension(
             // links code subtrees into the container instead of copying
             // them, so all containers share the same plugin inodes.
             let source_path = PathBuf::from(&entry.source_path);
-            install_container_plugin(&container, profile, "repository", &entry.id, source_path, task)?;
+            install_container_plugin(
+                &container,
+                profile,
+                "repository",
+                &entry.id,
+                source_path,
+                task,
+            )?;
             // The container now links this shared entry: record ownership
             // so `plugin prune` never removes in-use plugins.
             box_extensions::increment_reference(Path::new(&root), &entry.id)?;
@@ -157,14 +184,26 @@ pub(crate) fn import_into_repository(
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
-    let (name, version, description) =
-        repository_metadata(&kind, source).map_err(|error| format!("repository metadata: {error}"))?;
+    let (name, version, description) = repository_metadata(&kind, source)
+        .map_err(|error| format!("repository metadata: {error}"))?;
     // Cache hit: the same package (`name[@version]` for plugin, `name` for
     // skill) already lives in the repository. The local source is the same
     // artefact under hash storage, so reuse the existing entry instead of
     // creating a duplicate `img-<task_id>` row. The caller's staging clone
     // gets discarded by the next staging timestamp — no leak.
-    if let Some(existing) = find_repository_entry_by_identity(&root, &kind, &name, version.as_deref()) {
+    if let Some(existing) =
+        find_repository_entry_by_identity(&root, &kind, &name, version.as_deref())
+    {
+        // Repositories created before dependency installation was added have
+        // no `node_modules/`. Repair such a cache hit before reusing it so a
+        // later container link never builds against an empty dependency tree.
+        let existing_source = Path::new(&existing.source_path);
+        if matches!(kind, ExtensionKind::Plugin)
+            && plugin_declares_deps(existing_source)
+            && !existing_source.join("node_modules").is_dir()
+        {
+            install_plugin_dependencies(task, existing_source, &name, version.as_deref())?;
+        }
         let kind_label = match existing.kind {
             ExtensionKind::Plugin => "plugin",
             ExtensionKind::Skill => "skill",
@@ -173,7 +212,11 @@ pub(crate) fn import_into_repository(
             "reusing cached {} {}{}",
             kind_label,
             existing.name,
-            existing.version.as_deref().map(|v| format!("@{v}")).unwrap_or_default(),
+            existing
+                .version
+                .as_deref()
+                .map(|v| format!("@{v}"))
+                .unwrap_or_default(),
         ));
         return Ok(existing);
     }
@@ -191,6 +234,24 @@ pub(crate) fn import_into_repository(
     fs::create_dir_all(destination.parent().ok_or("destination has no parent")?)
         .map_err(|error| error.to_string())?;
     copy_extension_source(source, &destination)?;
+    // Plugins need their dependencies installed at import time so the
+    // repository entry owns a ready-to-link source. Code subdirectory
+    // links into a container keep inode sharing with the repo entry,
+    // and the plugin's build (tsdown/rolldown) resolves transitive
+    // deps from the symlinked source files — if the repo entry has no
+    // `node_modules/`, the resolver walks past the symlink and
+    // externalises every dep it cannot find, leaving `require("clsx")`
+    // (and friends) in the bundle. Installing here once keeps the
+    // pnpm store layout intact so every later container reuses it.
+    //
+    // Plugins with no `dependencies` / `devDependencies` (pure-patch
+    // plugins, or test fixtures) skip the pnpm boot — they have
+    // nothing to install and would only pay the runtime-bootstrap
+    // cost. The bundled runtime must already be initialised by the
+    // caller when this branch fires, which is the production path.
+    if matches!(kind, ExtensionKind::Plugin) && plugin_declares_deps(&destination) {
+        install_plugin_dependencies(task, &destination, &name, version.as_deref())?;
+    }
     let digest = box_extensions::extension_digest(&destination)?;
     let mut entries = scan_repository(Path::new(&root));
     entries.push(RepositoryExtension {
@@ -210,6 +271,56 @@ pub(crate) fn import_into_repository(
         .into_iter()
         .find(|entry| entry.id == entry_id)
         .expect("entry we just pushed"))
+}
+
+fn install_plugin_dependencies(
+    task: &TaskContext,
+    directory: &Path,
+    name: &str,
+    version: Option<&str>,
+) -> Result<(), String> {
+    let pnpm = resolve_toolchain("pnpm")?;
+    let task_record = task.manager.task(&task.task_id)?;
+    let log = fs::OpenOptions::new()
+        .append(true)
+        .open(&task_record.log_path)
+        .map_err(|error| error.to_string())?;
+    let frozen = directory.join("pnpm-lock.yaml").is_file();
+    task.log(&format!(
+        "installing dependencies for {}{}",
+        name,
+        version.map(|v| format!("@{v}")).unwrap_or_default(),
+    ));
+    let mut install = command_for_toolchain(&pnpm);
+    install
+        .args([
+            "--dir",
+            directory.to_string_lossy().as_ref(),
+            "install",
+            "--force",
+            if frozen {
+                "--frozen-lockfile"
+            } else {
+                "--no-frozen-lockfile"
+            },
+        ])
+        .stdout(Stdio::from(
+            log.try_clone().map_err(|error| error.to_string())?,
+        ))
+        .stderr(Stdio::from(
+            log.try_clone().map_err(|error| error.to_string())?,
+        ));
+    let mut child = install
+        .spawn()
+        .map_err(|error| format!("cannot start plugin dependency install: {error}"))?;
+    let status = wait_for_process(&mut child, Some(task), "installing plugin dependencies")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "plugin {name} dependency installation exited with {status}"
+        ))
+    }
 }
 
 /// Export a repository entry as a `.tar.gz` archive.
@@ -259,9 +370,11 @@ pub(crate) fn remove_repository_extension(id: &str) -> Result<(), String> {
             entry.name
         ));
     }
-    fs::remove_dir_all(PathBuf::from(&entry.source_path).parent().ok_or(
-        "repository source has no parent",
-    )?)
+    fs::remove_dir_all(
+        PathBuf::from(&entry.source_path)
+            .parent()
+            .ok_or("repository source has no parent")?,
+    )
     .map_err(|error| error.to_string())?;
     entries.retain(|entry| entry.id != id);
     write_repository_index(Path::new(&root), &entries)?;
@@ -323,7 +436,10 @@ pub(crate) fn container_plugin_add(
             "add",
             spec,
         ])
-        .env("DSH_HOME", PathBuf::from(&container.directory).join("profile"))
+        .env(
+            "DSH_HOME",
+            PathBuf::from(&container.directory).join("profile"),
+        )
         .stdout(Stdio::from(
             log.try_clone().map_err(|error| error.to_string())?,
         ))
@@ -414,14 +530,9 @@ pub(crate) fn install_container_extension(
         ExtensionKind::Skill => {
             install_container_skill(&container, source_kind, source, extracted, task)
         }
-        ExtensionKind::Plugin => install_container_plugin(
-            &container,
-            profile,
-            source_kind,
-            source,
-            extracted,
-            task,
-        ),
+        ExtensionKind::Plugin => {
+            install_container_plugin(&container, profile, source_kind, source, extracted, task)
+        }
     }?;
     let _ = fs::remove_dir_all(staging);
     task.update("Refreshing container extensions", 95);
@@ -509,11 +620,7 @@ pub(crate) fn export_repository_plugin(
 
 /// Disable a plugin in a container profile and remove its records.
 /// Mirrors the desktop's `remove_repository_plugin` without Tauri deps.
-pub(crate) fn remove_repository_plugin(
-    id: &str,
-    profile: &str,
-    name: &str,
-) -> Result<(), String> {
+pub(crate) fn remove_repository_plugin(id: &str, profile: &str, name: &str) -> Result<(), String> {
     if !is_safe_identifier(id) || !is_safe_identifier(profile) || !is_safe_package_name(name) {
         return Err("invalid plugin removal request".to_owned());
     }
@@ -613,7 +720,11 @@ mod tests {
         let config_dir = home.join(".dsh-box");
         fs::create_dir_all(&config_dir).unwrap();
         let body = serde_json::json!({ "runtimeDirectory": runtime.to_string_lossy() });
-        fs::write(config_dir.join("config.json"), serde_json::to_string_pretty(&body).unwrap()).unwrap();
+        fs::write(
+            config_dir.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
     }
 
     fn test_task(runtime: &Path) -> TaskContext {
@@ -645,7 +756,11 @@ mod tests {
                 },
             },
         });
-        fs::write(dir.join("package.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+        fs::write(
+            dir.join("package.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
         dir
     }
 
@@ -668,13 +783,22 @@ mod tests {
         let first = import_into_repository(&task, &source_a).unwrap();
         let source_b = make_plugin_source("dsh-better-sidebar", "0.12.3");
         let second = import_into_repository(&task, &source_b).unwrap();
-        assert_eq!(first.id, second.id, "second import should reuse the cached entry");
+        assert_eq!(
+            first.id, second.id,
+            "second import should reuse the cached entry"
+        );
         let entries = scan_repository(&runtime);
         let matching: Vec<_> = entries
             .iter()
-            .filter(|entry| entry.name == "dsh-better-sidebar" && entry.version.as_deref() == Some("0.12.3"))
+            .filter(|entry| {
+                entry.name == "dsh-better-sidebar" && entry.version.as_deref() == Some("0.12.3")
+            })
             .collect();
-        assert_eq!(matching.len(), 1, "exactly one entry should match the package identity");
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly one entry should match the package identity"
+        );
 
         // Different version skews the cache key.
         let source_c = make_plugin_source("dsh-better-sidebar", "0.12.4");
@@ -683,7 +807,10 @@ mod tests {
             ..task
         };
         let third = import_into_repository(&task_v2, &source_c).unwrap();
-        assert_ne!(first.id, third.id, "different version must create a new entry");
+        assert_ne!(
+            first.id, third.id,
+            "different version must create a new entry"
+        );
         let entries = scan_repository(&runtime);
         let matching: Vec<_> = entries
             .iter()

@@ -35,11 +35,7 @@ fn pull_template(ref_value: &str) -> Result<(), String> {
     }
     println!("pulling template {ref_value} (this may take a while)...");
     let client = rpc::connect()?;
-    rpc::run_task(
-        &client,
-        "pull_template",
-        json!({ "ref": ref_value }),
-    )?;
+    rpc::run_task(&client, "pull_template", json!({ "ref": ref_value }))?;
     println!("pulled template {ref_value}");
     Ok(())
 }

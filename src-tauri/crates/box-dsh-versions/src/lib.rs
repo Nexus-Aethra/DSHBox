@@ -198,6 +198,10 @@ pub struct TemplateEntry {
     pub imported_at: u64,
     #[serde(default)]
     pub from_ref: Option<String>,
+    /// True when the hash directory holds a built resource list
+    /// (`list.json`) instead of a source script (`script.dsh`).
+    #[serde(default)]
+    pub built: bool,
 }
 
 pub type TemplateIndex = std::collections::BTreeMap<String, TemplateEntry>;
@@ -245,6 +249,7 @@ pub fn write_template_with_entry(
         profile: profile.to_owned(),
         imported_at,
         from_ref,
+        built: false,
     };
     let manifest = serde_json::json!({
         "name": entry.name,
@@ -280,6 +285,111 @@ pub fn collect_unreferenced_template_hash(root: &str, id: &str, index: &Template
     let dir = template_storage_root(root).join(id);
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_file(template_manifest_path(root, id));
+}
+
+pub fn built_template_list_path(root: &str, id: &str) -> PathBuf {
+    template_storage_root(root).join(id).join("list.json")
+}
+
+/// Persist a built template (the metadata-only product of `dshbox build`)
+/// into the SAME content-addressable store as source script templates —
+/// there is no separate image registry, only built templates. The id is
+/// the fnv1a64 hash of the serialised resource list; re-building under
+/// the same name retires the previous hash.
+pub fn write_built_template(
+    root: &str,
+    list: &box_api::TemplateResourceList,
+) -> Result<TemplateEntry, String> {
+    let body = serde_json::to_string(list).map_err(|error| error.to_string())?;
+    let id = template_content_hash(&body);
+    let dir = template_storage_root(root).join(&id);
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    fs::write(dir.join("list.json"), &body).map_err(|error| error.to_string())?;
+    let entry = TemplateEntry {
+        name: list.name.clone(),
+        id: id.clone(),
+        harness_ref: list.harness_ref.clone(),
+        profile: list.profile.clone(),
+        imported_at: list.created_at,
+        from_ref: Some(list.base.clone()),
+        built: true,
+    };
+    let manifest = serde_json::json!({
+        "name": entry.name,
+        "id": entry.id,
+        "harnessRef": entry.harness_ref,
+        "profile": entry.profile,
+        "importedAt": entry.imported_at,
+        "fromRef": entry.from_ref,
+        "built": true,
+    });
+    fs::write(
+        template_manifest_path(root, &id),
+        serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut index = read_template_index(root);
+    if let Some(previous) = index.insert(list.name.clone(), entry.clone()) {
+        if previous.id != entry.id {
+            collect_unreferenced_template_hash(root, &previous.id, &index);
+        }
+    }
+    write_template_index(root, &index)?;
+    Ok(entry)
+}
+
+/// Read the resource list of a built template by index name. Returns
+/// `Ok(None)` when the name is unknown or refers to a source script
+/// template (callers then fall back to the script path).
+pub fn read_built_template(
+    root: &str,
+    name: &str,
+) -> Result<Option<box_api::TemplateResourceList>, String> {
+    let index = read_template_index(root);
+    let Some(entry) = index.get(name) else {
+        return Ok(None);
+    };
+    if !entry.built {
+        return Ok(None);
+    }
+    let path = built_template_list_path(root, &entry.id);
+    if !path.is_file() {
+        return Err(format!(
+            "built template `{name}` is corrupt: {} missing",
+            path.display()
+        ));
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|error| format!("cannot parse {}: {error}", path.display()))
+}
+
+/// Every data-store digest referenced by any built template — the GC input
+/// for `dshbox template prune`.
+pub fn referenced_snapshot_digests(root: &str) -> Result<Vec<String>, String> {
+    let mut digests = Vec::new();
+    for entry in read_template_index(root).values() {
+        if !entry.built {
+            continue;
+        }
+        let path = built_template_list_path(root, &entry.id);
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(list) = serde_json::from_str::<box_api::TemplateResourceList>(&text) else {
+            continue;
+        };
+        for resource in &list.resources {
+            if let box_api::TemplateResource::Snapshot { digest, .. } = resource {
+                digests.push(digest.clone());
+            }
+        }
+    }
+    digests.sort();
+    digests.dedup();
+    Ok(digests)
 }
 
 pub fn installed_versions(root: &str) -> BoxResult<Vec<String>> {

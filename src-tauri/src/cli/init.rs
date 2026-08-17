@@ -13,11 +13,11 @@ const STARTER_BOXFILE: &str = "\
 #
 # The layout mirrors a Dockerfile: `FROM` points at a base template,
 # `PROFILE` selects the runtime context, and `ADD` lines layer plugins,
-# skills, or data on top. Build & run the container with:
+# skills, or data on top. Build & run with:
 #
-#   1. dshbox pull template <ref>     # fetch a base template once
-#   2. dshbox build ./boxfile.dsh     # materialise a container
-#   3. dshbox run <template>          # create + start from a template
+#   1. dshbox pull template <ref>              # fetch a base template once
+#   2. dshbox build ./boxfile.dsh --name my-app # build a TEMPLATE (no container)
+#   3. dshbox run my-app                        # create + start a container
 #
 # See `dshbox help` for the full workflow.
 #
@@ -37,12 +37,12 @@ PROFILE web
 # container. The source can be any of the following shapes; comment out
 # the ones you don't need.
 #
-#   plugin     npm-style JavaScript plugin (mounted at @plugin)
-#   skill      SKILL.md-style knowledge pack (mounted at @skill)
+#   plugin     npm-style JavaScript plugin installed in the selected profile
+#   skill      SKILL.md-style knowledge pack installed in profile/skills
 #   data       payload copied into the container's data dir (never linked)
 #
 #   bare name          name of an entry already in the local repository;
-#                      e.g. `ADD plugin @my-plugin`
+#                      e.g. `ADD plugin my-plugin` or `ADD plugin @scope/my-plugin`
 #   GitHub short form  github.com/<owner>/<repo>[@<ref>]; a tag is
 #                      optional (defaults to HEAD); e.g.
 #                      `ADD plugin github.com/foo/bar@v1.0.0`
@@ -54,8 +54,8 @@ PROFILE web
 # ── Examples (uncomment the ones you want) ───────────────────────────────
 #
 # From the local repository (already imported with `dshbox plugin import`)
-# ADD plugin @my-plugin
-# ADD skill @my-skill
+# ADD plugin my-plugin
+# ADD skill my-skill
 #
 # From a public GitHub repo (optionally pinned to a tag)
 # ADD plugin github.com/deepseek-ai/deepseek-harness-plugin@v1.0.0
@@ -75,7 +75,10 @@ PROFILE web
 ";
 
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
-    if matches!(arguments.first().map(String::as_str), Some("help" | "--help" | "-h")) {
+    if matches!(
+        arguments.first().map(String::as_str),
+        Some("help" | "--help" | "-h")
+    ) {
         println!("dshbox init [path] [--force]");
         println!();
         println!("Write a sample `boxfile.dsh` to PATH (default: ./boxfile.dsh).");

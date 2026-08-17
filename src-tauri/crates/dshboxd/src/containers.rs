@@ -25,23 +25,43 @@ use std::{
 /// not have to leave the container to consult documentation.
 const BOXFILE_GUIDE_SKILL: &str = r#"---
 name: boxfile-guide
-description: How to author a DSH Box boxfile (`.dsh`) — directives, source shapes, and best practices.
+description: Use when authoring or reviewing a reproducible DSH Box template (`.dsh`), choosing ADD sources, or deciding between a template extension and a one-off plugin install.
 ---
 
 # DSH Box Boxfile Guide
 
 A **boxfile** is a `.dsh` script describing one container. It mirrors a
 Dockerfile: a base template provides the runtime layout, and `ADD` lines
-layer extensions on top. Building produces an **image** (metadata only:
-plugins are referenced from the shared repository, every other resource is
-snapshotted into the data store); containers are created from images:
+layer extensions on top. Building produces a **built template** (metadata
+only: plugins are referenced from the shared repository, every other
+resource is snapshotted into the data store); containers are created from
+built templates — there is no separate "image" concept, just templates:
 
 ```
 dshbox init              # generate a starter boxfile in the cwd
 dshbox pull template <ref>
-dshbox build ./boxfile.dsh --name my-image
-dshbox run my-image      # or a template name (builds implicitly)
+dshbox build ./boxfile.dsh --name my-app
+dshbox run my-app        # or a script template name (materialises live)
 ```
+
+## When to use this Box skill
+
+Use this skill when a request needs a **reproducible template change**:
+
+* create or revise a `.dsh` boxfile;
+* decide whether an extension belongs in `ADD plugin`, `ADD skill`, or
+  `ADD data`;
+* make the same plugins, skills, and data available every time a template is
+  built and run; or
+* select a source shape, destination override, base template, or profile.
+
+Do **not** use a boxfile just to operate an existing container. Use
+`dshbox ps`, `dshbox container start|stop|open|logs`, or the desktop UI for
+that. For a one-off plugin needed only by one already-created container, use
+`dshbox plugin install <container> <source> --profile <profile>` instead.
+Import a reusable extension with `dshbox plugin import <source>` first, then
+reference its plain package name (for example `my-plugin` or
+`@scope/my-plugin`) from `ADD` when it belongs in a template.
 
 ## Directives
 
@@ -79,15 +99,16 @@ ADD data ./datasets/seed.csv
 
 | kind   | meaning                                                        |
 | ------ | -------------------------------------------------------------- |
-| plugin | npm-style JavaScript plugin (mounted at `@plugin`)             |
-| skill  | SKILL.md-style knowledge pack (mounted at `@skill`)            |
+| plugin | npm-style JavaScript plugin installed in the selected profile |
+| skill  | SKILL.md-style knowledge pack installed in `profile/skills`   |
 | data   | payload copied into the container data dir (never linked)      |
 
 `source` accepts any of:
 
 | shape              | example                                            |
 | ------------------ | -------------------------------------------------- |
-| bare name          | `ADD plugin @my-plugin` (already in the repository) |
+| bare name          | `ADD plugin my-plugin` (already in the repository)  |
+| scoped bare name   | `ADD plugin @scope/my-plugin`                        |
 | GitHub short form  | `ADD plugin github.com/foo/bar@v1.0.0`              |
 | local absolute     | `ADD plugin /home/me/code/my-plugin`               |
 | local relative     | `ADD plugin ./relative/path` or `../relative/path` |
@@ -100,8 +121,8 @@ The trailing `@<dest>` is an optional destination path override.
 
 * Always pin a tag (`github.com/foo/bar@v1.0.0`) for reproducibility; a
   bare ref resolves to HEAD and drifts with every pull.
-* Keep one boxfile per container; reuse base templates instead of
-  duplicating ADD lists across multiple boxfiles.
+* Keep one boxfile per reproducible workload; give each built template a
+  clear name and reuse base templates instead of duplicating ADD lists.
 * Use `dshbox plugin ls` to check what is already in the local repository
   before reaching for a GitHub short form.
 * Data payloads (`ADD data ...`) are copied verbatim — never linked — so
@@ -118,21 +139,16 @@ local daemon, so the same state is shared with the desktop GUI.
 # Workflow
 dshbox init                              # scaffold a boxfile.dsh here
 dshbox pull template <owner/repo>[:tag]  # fetch a base template
-dshbox build [boxfile.dsh] [--name img]  # build an IMAGE (no container yet)
-dshbox run <image|template>              # create + start a container
-
-# Images
-dshbox image ls                          # list the local image registry
-dshbox image show <name>                 # print an image's resource list
-dshbox image rm <name>                   # remove an image
-dshbox image prune                       # GC unreferenced snapshots
+dshbox build [boxfile.dsh] [--name tpl]  # build a TEMPLATE (no container yet)
+dshbox run <template>                    # create + start a container
 
 # Templates
-dshbox template ls                       # list local templates
-dshbox template show <name>              # print a template's script
+dshbox template ls                       # list templates (script + built)
+dshbox template show <name>              # script body or resource list
 dshbox template export <name> [dest]     # save a template as tarball
 dshbox template import <file.tar.gz>     # install a template tarball
 dshbox template rm <name>                # remove a template
+dshbox template prune                    # GC unreferenced snapshots
 
 # Extensions
 dshbox plugin ls                         # list repository plugins/skills
@@ -142,6 +158,7 @@ dshbox bundle ls                         # list extension bundles
 # This container
 dshbox ps                                # list containers + status
 dshbox container url <id>                # webview URL of a running host
+dshbox container open <id>               # open it in a DSH Box window
 dshbox container logs <id>               # tail the DSH host log
 dshbox container stop <id>               # stop a running container
 dshbox container start <id>              # start a stopped container
@@ -354,7 +371,10 @@ pub(crate) fn write_dshbox_context_snapshot(
     fs::rename(&patch_tmp, &patch_path)
         .map_err(|error| format!("cannot rename {}: {error}", patch_tmp.display()))?;
 
-    Ok(DshContextFiles { snapshot_path, patch_path })
+    Ok(DshContextFiles {
+        snapshot_path,
+        patch_path,
+    })
 }
 
 /// Extract the `apiKeyEnv` names that the DSH settings UI wrote into
@@ -450,15 +470,26 @@ pub(crate) fn preflight_profile_plugins(
         let Some(entry) = plugin_runtime_entry(&plugin_manifest) else {
             continue;
         };
-        if plugin_directory.join(&entry).is_file() {
+        // Repository plugins expose `node_modules/` as a link. Resolve its
+        // parent before invoking pnpm: running in the container-side hybrid
+        // directory makes pnpm try to remove that link interactively.
+        let source_directory = plugin_source_directory(&plugin_directory);
+        let entry_path = source_directory.join(&entry);
+        let rebuild = plugin_source_is_newer_than_entry(&source_directory, &entry_path)?;
+        if entry_path.is_file() && !rebuild {
             continue;
         }
         if let Some(task) = task {
             task.update(format!("Preparing plugin {bundle}"), 32);
+            let reason = if rebuild {
+                "is older than its source"
+            } else {
+                "is missing"
+            };
             task.log(&format!(
-                "plugin {bundle} entry {entry} is missing; installing dependencies and building its source"
+                "plugin {bundle} entry {entry} {reason}; installing dependencies and building its source"
             ));
-            prepare_plugin_source(&plugin_directory, bundle, &entry, task)?;
+            prepare_plugin_source(&source_directory, bundle, &entry, rebuild, task)?;
         } else {
             return Err(format!(
                 "plugin {bundle} has no built entry {entry}; start it from DSH Box so it can be prepared"
@@ -466,6 +497,13 @@ pub(crate) fn preflight_profile_plugins(
         }
     }
     Ok(())
+}
+
+fn plugin_source_directory(plugin_directory: &Path) -> PathBuf {
+    fs::canonicalize(plugin_directory.join("node_modules"))
+        .ok()
+        .and_then(|modules| modules.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| plugin_directory.to_path_buf())
 }
 
 pub(crate) fn plugin_runtime_entry(manifest: &serde_json::Value) -> Option<String> {
@@ -485,6 +523,7 @@ pub(crate) fn prepare_plugin_source(
     directory: &Path,
     name: &str,
     entry: &str,
+    rebuild: bool,
     task: &TaskContext,
 ) -> Result<(), String> {
     let pnpm = resolve_toolchain("pnpm")?;
@@ -503,6 +542,7 @@ pub(crate) fn prepare_plugin_source(
             "--dir",
             directory.to_string_lossy().as_ref(),
             "install",
+            "--force",
             frozen,
         ])
         .stdout(Stdio::from(
@@ -519,18 +559,13 @@ pub(crate) fn prepare_plugin_source(
             "plugin {name} dependency installation exited with {status}"
         ));
     }
-    if directory.join(entry).is_file() {
+    if !rebuild && directory.join(entry).is_file() {
         return Ok(());
     }
-    if plugin_has_script(directory, "build")? {
+    if let Some(script) = plugin_build_script(directory)? {
         task.update(format!("Building plugin {name}"), 38);
         let mut build = command_for_toolchain(&pnpm)
-            .args([
-                "--dir",
-                directory.to_string_lossy().as_ref(),
-                "run",
-                "build",
-            ])
+            .args(["--dir", directory.to_string_lossy().as_ref(), "run", script])
             .stdout(Stdio::from(
                 log.try_clone().map_err(|error| error.to_string())?,
             ))
@@ -551,14 +586,61 @@ pub(crate) fn prepare_plugin_source(
     }
 }
 
-pub(crate) fn plugin_has_script(directory: &Path, script: &str) -> Result<bool, String> {
+/// Returns true when an already-built entry predates a source file.  Linked
+/// source directories are intentionally followed: repository-backed plugins
+/// expose `src/` and `lib/` through links inside each container profile.
+fn plugin_source_is_newer_than_entry(directory: &Path, entry: &Path) -> Result<bool, String> {
+    let Ok(entry_modified) = fs::metadata(entry).and_then(|metadata| metadata.modified()) else {
+        return Ok(false);
+    };
+    plugin_source_tree_is_newer(directory, entry_modified)
+}
+
+fn plugin_source_tree_is_newer(
+    directory: &Path,
+    entry_modified: SystemTime,
+) -> Result<bool, String> {
+    for item in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let item = item.map_err(|error| error.to_string())?;
+        let name = item.file_name();
+        if matches!(
+            name.to_str(),
+            Some(".git" | "node_modules" | "lib" | "dist" | "build" | "out" | ".cache")
+        ) {
+            continue;
+        }
+        let path = item.path();
+        let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.is_dir() {
+            if plugin_source_tree_is_newer(&path, entry_modified)? {
+                return Ok(true);
+            }
+        } else if metadata.is_file()
+            && metadata.modified().map_err(|error| error.to_string())? > entry_modified
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Prefer the conventional build script, but accept `prepare` as the build
+/// hook. Some DSH plugins (including dsh-better-sidebar) use tsdown solely
+/// through `prepare`.
+fn plugin_build_script(directory: &Path) -> Result<Option<&'static str>, String> {
     let manifest: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(directory.join("package.json"))
             .map_err(|error| format!("cannot read plugin manifest: {error}"))?,
     )
     .map_err(|error| format!("cannot parse plugin manifest: {error}"))?;
-    Ok(manifest
-        .pointer(&format!("/scripts/{script}"))
-        .and_then(serde_json::Value::as_str)
-        .is_some())
+    for script in ["build", "prepare"] {
+        if manifest
+            .pointer(&format!("/scripts/{script}"))
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        {
+            return Ok(Some(script));
+        }
+    }
+    Ok(None)
 }

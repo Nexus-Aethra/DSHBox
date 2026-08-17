@@ -230,11 +230,17 @@ fn repair_resources_on_startup(root: &str) {
 }
 
 fn run_inner() -> Result<(), String> {
+    let initial_container = env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|arguments| arguments[0] == "--open-container")
+        .map(|arguments| arguments[1].clone())
+        .filter(|id| is_safe_identifier(id));
     tauri::Builder::default()
         .manage(ContainerManager::default())
         .manage(TaskManager::default())
         .manage(ResourceStateManager::default())
-        .setup(|app| {
+        .setup(move |app| {
             let resources = app
                 .path()
                 .resource_dir()
@@ -291,7 +297,7 @@ fn run_inner() -> Result<(), String> {
                 }
             }
             write_startup_log("desktop setup completed");
-            if env::args().any(|argument| argument == "--tray") {
+            if env::args().any(|argument| argument == "--tray") || initial_container.is_some() {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
                 }
@@ -301,6 +307,14 @@ fn run_inner() -> Result<(), String> {
             }
             let handle = app.handle().clone();
             thread::spawn(move || refresh_global_state(&handle));
+            if let Some(id) = initial_container.clone() {
+                let client = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = open_dsh_front_for_client(id, client).await {
+                        write_startup_log(&format!("CLI container open failed: {error}"));
+                    }
+                });
+            }
 
             // Graceful shutdown: on SIGTERM / SIGINT / Ctrl-C, persist the
             // local (toolchain-install) task state so the next launch can

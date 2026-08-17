@@ -1,20 +1,27 @@
-//! `dshbox build [path]` — build an IMAGE from a boxfile (or `.dsh`
-//! script). The image is metadata only (docs/specs/image-build.md); use
-//! `dshbox run <image>` afterwards to create and start a container.
-//! The default filename lookup mirrors `Dockerfile` conventions:
+//! `dshbox build [path]` — build a BUILT TEMPLATE from a boxfile (or
+//! `.dsh` script). The product is metadata only (docs/specs/image-build.md):
+//! plugins are referenced from the shared repository, every other kind is
+//! snapshotted into the data store — all registered in the single template
+//! store. Use `dshbox run <template>` afterwards to create and start a
+//! container. The default filename lookup mirrors `Dockerfile` conventions:
 //! `./boxfile` → `./Boxfile` → `./.boxfile` in the current working
 //! directory.
 
 use std::path::PathBuf;
 
+use box_scheduler::TaskRecord;
+
 use super::flag_value;
-use super::image;
+use super::rpc;
 
 /// Default filenames searched when no path argument is given.
 const DEFAULT_BOXFILE_NAMES: &[&str] = &["boxfile", "Boxfile", ".boxfile"];
 
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
-    if matches!(arguments.first().map(String::as_str), Some("help" | "--help" | "-h")) {
+    if matches!(
+        arguments.first().map(String::as_str),
+        Some("help" | "--help" | "-h")
+    ) {
         print_help();
         return Ok(());
     }
@@ -32,12 +39,36 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         }
     };
     let output_path = flag_value(arguments, "--output", "");
-    let container_name = flag_value(arguments, "--name", "");
-    image::build(
-        &script_path,
-        opt(&output_path),
-        opt(&container_name),
-    )
+    let template_name = flag_value(arguments, "--name", "");
+    enqueue(&script_path, opt(&output_path), opt(&template_name))
+}
+
+/// Enqueue the build on the daemon and wait for it. `--name` names the
+/// built template (default: the boxfile's NAME line); `--output`
+/// additionally exports a portable `.dshimage` archive.
+pub(crate) fn enqueue(
+    script_path: &str,
+    output_path: Option<String>,
+    template_name: Option<String>,
+) -> Result<(), String> {
+    // The daemon runs with a different CWD; resolve every path here.
+    let script = rpc::absolutize_path(script_path);
+    let output = output_path.map(|path| rpc::absolutize_path(&path));
+    let client = rpc::connect()?;
+    let value = rpc::call(
+        &client,
+        "enqueue_build",
+        serde_json::json!({
+            "scriptPath": script,
+            "outputPath": output,
+            "containerName": template_name,
+        }),
+    )?;
+    let task: TaskRecord = serde_json::from_value(value)
+        .map_err(|error| format!("invalid task record from daemon: {error}"))?;
+    rpc::wait_task(&client, &task.id)?;
+    println!("built template from {script_path}");
+    Ok(())
 }
 
 fn find_default_boxfile() -> Result<String, String> {
@@ -54,13 +85,17 @@ fn find_default_boxfile() -> Result<String, String> {
 }
 
 fn opt(value: &str) -> Option<String> {
-    if value.is_empty() { None } else { Some(value.to_owned()) }
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
 }
 
 fn print_help() {
-    println!("dshbox build [path] [--file <path>] [--name <image>] [--output <path.dshimage>]");
+    println!("dshbox build [path] [--file <path>] [--name <template>] [--output <path.dshimage>]");
     println!();
-    println!("Parse a boxfile and build an IMAGE from it (no container is created).");
+    println!("Parse a boxfile and build a TEMPLATE from it (no container is created).");
     println!("Plugins are referenced from the shared repository; every other kind");
     println!("is snapshotted into the data store (docs/specs/image-build.md).");
     println!();
@@ -68,5 +103,5 @@ fn print_help() {
     println!("  {}", DEFAULT_BOXFILE_NAMES.join(", "));
     println!();
     println!("Boxfile format is the same as .dsh (FROM / PROFILE / NAME / ADD lines).");
-    println!("Use 'dshbox run <image>' afterwards to create and start a container.");
+    println!("Use 'dshbox run <template>' afterwards to create and start a container.");
 }

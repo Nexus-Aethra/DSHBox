@@ -1,8 +1,8 @@
 # Template system
 
 Updated: 2026-08-17 (corrections: `data` kind is implemented, FROM chain
-depth is 4, install flow goes through `pull_template`, the image build
-pipeline is specified separately in `docs/specs/image-build.md`)
+depth is 4, install flow goes through `pull_template`, the built-template
+build pipeline is specified separately in `docs/specs/image-build.md`)
 
 A **template** is DSH Box's unit of container construction. Everything in the
 Resources tab is a template — including the "Harness" entry, which is just the
@@ -39,7 +39,7 @@ ignored. The directives, in source order:
 ```text
 FROM <ref>             # required, exactly once
 PROFILE <name>         # required, exactly once
-NAME <name>            # optional, defaults to "image"
+NAME <name>            # optional, names the built template
 VERSION <version>      # optional, defaults to "latest"
 LABEL key=value        # optional, repeatable
 DEF <name> @<path>     # optional, repeatable
@@ -79,8 +79,8 @@ today are `plugin`, `skill`, and `data`.
 - **data** — materialised into the content-addressed data store
   (`<root>/data/<digest>/`, fnv1a64 digest) and copied per-container under
   `extensions/data/<name>`. Implemented in `crates/dshboxd/src/data.rs`
-  (`materialize_data_add`); orphaned blobs are reclaimed by `dshbox image
-  data prune`.
+  (`materialize_data_add`); orphaned blobs are reclaimed by `dshbox
+  template prune`.
 - **session** — reserved for cross-container migration (`ADD session
   container1` would copy another container's session history). Not yet wired
   through the script parser; the manifest schema already supports it via
@@ -154,13 +154,15 @@ content already exists in the archive.
    kept for the build path).
 2. **Extend** — the user runs `dshbox init` or copies the base template and
    adds `ADD` / `DEF` lines.
-3. **Build / run** — `dshbox build` produces a metadata-only **image**
-   (resolving the `FROM` chain up to **four** levels): plugins are recorded
-   as references into the shared repository, every other kind is hashed
-   into the data store as a snapshot. `dshbox run <image>` then creates and
-   starts a container (plugins linked, snapshots hard-copied); a template
-   name still works and builds implicitly. An optional `--output` exports a
-   portable `.dshimage` archive. Full design: `docs/specs/image-build.md`.
+3. **Build / run** — `dshbox build` produces a metadata-only **built
+   template** (resolving the `FROM` chain up to **four** levels): plugins
+   are recorded as references into the shared repository, every other kind
+   is hashed into the data store as a snapshot, and the result lands in the
+   same content-addressable store as script templates. `dshbox run
+   <template>` then creates and starts a container from either form — a
+   built template materialises from its resource list, a script template is
+   parsed and materialised live. An optional `--output` exports a portable
+   `.dshimage` archive. Full design: `docs/specs/image-build.md`.
 4. **Start** — the daemon creates the container directory, links/copies the
    materialised extensions into the profile, writes the `dsh-box-context`
    snapshot + patch, and spawns the DSH Host against that profile.
@@ -179,8 +181,9 @@ The Resources tab in the UI reflects this model directly:
   Pull one into a template with `ADD plugin <name>`.
 - **Bundles** — saved selections of plugin entries; useful for sharing a
   curated toolchain across containers.
-- **Template** — the local templates directory. You can pick a `.dsh` file,
-  preview its operations, and queue a build.
+- **Template** — the local templates directory (both forms live in one
+  index: script templates and the built templates `dshbox build` produces).
+  You can pick a `.dsh` file, preview its operations, and queue a build.
 
 When you click the "Harness" tab, you are looking at templates; the Resources
 page is the only place where the older "harness" terminology survives, and

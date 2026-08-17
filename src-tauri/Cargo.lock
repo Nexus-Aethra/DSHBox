@@ -192,6 +192,7 @@ dependencies = [
 name = "box-dsh-versions"
 version = "0.1.0"
 dependencies = [
+ "box-api",
  "box-foundation",
  "box-runtime",
  "box-toolchains",
@@ -225,7 +226,6 @@ dependencies = [
 name = "box-image"
 version = "0.1.0"
 dependencies = [
- "box-dsh-versions",
  "box-extensions",
  "flate2",
  "serde",

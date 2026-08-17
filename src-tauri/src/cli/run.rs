@@ -1,8 +1,9 @@
-//! `dshbox run <image|template>` — create a container from a local image
-//! (preferred) or template, then start it through the daemon, mirroring
-//! the UI's create-then-start flow.
+//! `dshbox run <template>` — create a container from a local template and
+//! start it through the daemon, mirroring the UI's create-then-start flow.
+//! Both template forms work: a BUILT template (product of `dshbox build`)
+//! materialises by linking repository references and hard-copying data
+//! snapshots; a source script template is parsed and materialised live.
 
-use box_image::registry::ImageEntry;
 use box_scheduler::TaskRecord;
 use serde_json::json;
 
@@ -10,51 +11,35 @@ use super::{flag_value, rpc};
 
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     if arguments.is_empty() {
-        return Err("expected an image or template name".to_owned());
+        return Err("expected a template name".to_owned());
     }
     if matches!(arguments[0].as_str(), "help" | "--help" | "-h") {
-        println!("dshbox run <image|template> [--name <name>] [--profile <name>]");
+        println!("dshbox run <template> [--name <name>] [--profile <name>]");
         println!();
-        println!("Create a container from a local image (registry) or template and");
-        println!("start it. A name matching a built image wins over a template.");
+        println!("Create a container from a local template (built or script) and start it.");
         return Ok(());
     }
-    let base = arguments[0].clone();
-    let name = flag_value(arguments, "--name", &base);
+    let template = arguments[0].clone();
+    let name = flag_value(arguments, "--name", &template);
     let profile = flag_value(arguments, "--profile", "");
     let profile = if profile.is_empty() {
         None
     } else {
         Some(profile)
     };
+    // Materialize + start happens inside one daemon task so progress and
+    // log lines match the UI's task panel exactly. The daemon resolves
+    // whether the template is built (resource list) or a source script.
     let client = rpc::connect()?;
-    // Image-first resolution: a built image of this name shadows any
-    // template with the same name.
-    let images_value = rpc::call(&client, "list_images", json!({}))?;
-    let images: Vec<ImageEntry> = serde_json::from_value(images_value)
-        .map_err(|error| format!("invalid image list from daemon: {error}"))?;
-    let value = if images.iter().any(|entry| entry.name == base) {
-        rpc::call(
-            &client,
-            "create_container_from_image",
-            json!({
-                "name": name.clone(),
-                "image": base,
-            }),
-        )?
-    } else {
-        // Materialize + start happens inside one daemon task so progress
-        // and log lines match the UI's task panel exactly.
-        rpc::call(
-            &client,
-            "create_container_from_template",
-            json!({
-                "name": name.clone(),
-                "template": base,
-                "profile": profile,
-            }),
-        )?
-    };
+    let value = rpc::call(
+        &client,
+        "create_container_from_template",
+        json!({
+            "name": name.clone(),
+            "template": template,
+            "profile": profile,
+        }),
+    )?;
     let task: TaskRecord = serde_json::from_value(value)
         .map_err(|error| format!("invalid task record from daemon: {error}"))?;
     rpc::wait_task(&client, &task.id)?;

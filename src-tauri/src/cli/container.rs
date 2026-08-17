@@ -5,12 +5,13 @@
 //! stdout/stderr captured during the last start attempt; `url` resolves the
 //! webview URL once the host is up; `start`/`stop`/`rebuild` enqueue the
 //! corresponding daemon task; `describe` dumps the full state (status, URL,
-//! host PID, profiles/plugins/skills scan); `open` launches the system
-//! browser at the URL; `rm` stops and deletes the container.
+//! host PID, profiles/plugins/skills scan); `open` asks a desktop client to
+//! create the DSH webview window; `rm` stops and deletes the container.
 
 use box_api::ContainerDescription;
 use box_scheduler::TaskRecord;
 use serde_json::{json, Value};
+use std::process::Command;
 
 use super::rpc;
 
@@ -23,7 +24,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         println!("dshbox container url <id>              print the webview URL of a running container");
         println!("dshbox container describe <id> [--json]   print detailed container info");
         println!("dshbox container show <id> [--json]    alias for describe");
-        println!("dshbox container open <id>             open the running container in the system browser");
+        println!("dshbox container open <id>             open the running container in a DSH Box window");
         println!("dshbox container start <id>            start the DSH host of a stopped container");
         println!("dshbox container stop <id>             stop a running container");
         println!("dshbox container rebuild <id>          re-materialise extensions and restart");
@@ -198,18 +199,23 @@ fn print_description_text(value: &Value) {
     }
 }
 
-/// Open the running container in the system browser. Uses the same
-/// `webbrowser` crate as the desktop's `open_dsh_front_browser` Tauri
-/// command — both paths must work on Linux/macOS/Windows.
+/// Open the running container through a desktop client. The CLI and Tauri
+/// client are separate processes, so launch the client with a private
+/// hand-off argument; it calls its own `open_dsh_front` implementation.
 fn open(id: &str) -> Result<(), String> {
     let client = rpc::connect()?;
     let value = rpc::call(&client, "container_url", json!({ "id": id }))?;
-    let url = value["url"]
+    let _url = value["url"]
         .as_str()
         .ok_or_else(|| format!("container is not running: {id}"))?
         .to_owned();
-    webbrowser::open(&url).map_err(|error| format!("cannot open system browser: {error}"))?;
-    println!("opened {url}");
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("cannot locate DSH Box client executable: {error}"))?;
+    Command::new(executable)
+        .args(["ui", "--open-container", id])
+        .spawn()
+        .map_err(|error| format!("cannot launch DSH Box client: {error}"))?;
+    println!("opening {id} in DSH Box");
     Ok(())
 }
 
