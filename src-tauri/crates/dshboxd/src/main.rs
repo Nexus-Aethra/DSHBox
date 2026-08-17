@@ -193,12 +193,6 @@ fn write_http_error(stream: &mut TcpStream, status: u16, reason: &str) {
     let _ = stream.flush();
 }
 
-#[cfg(unix)]
-fn main() {
-    run();
-}
-
-#[cfg(windows)]
 fn main() {
     run();
 }
