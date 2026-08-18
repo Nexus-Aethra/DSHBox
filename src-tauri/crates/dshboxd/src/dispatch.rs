@@ -837,8 +837,17 @@ fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<Value, S
         status: String::new(),
     };
     for record in box_extensions::read_extension_records(&container) {
+        // Skills are not reference-counted; skip to avoid decrementing
+        // a counter slot that was never incremented.
+        if record.kind != box_extensions::ExtensionKind::Plugin {
+            continue;
+        }
         if let Some(repository_id) = record.repository_id {
-            box_extensions::decrement_reference(Path::new(&root), &repository_id)?;
+            box_extensions::decrement_reference(
+                Path::new(&root),
+                &repository_id,
+                box_extensions::ReferenceKind::Container,
+            )?;
         }
     }
     std::fs::remove_dir_all(&directory)

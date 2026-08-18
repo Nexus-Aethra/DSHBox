@@ -21,7 +21,7 @@ use box_extensions::transfer::{
 };
 use box_extensions::{
     extension_digest, repository_root, scan_repository, write_repository_index, ExtensionKind,
-    RepositoryExtension,
+    ReferenceKind, RepositoryExtension,
 };
 use box_foundation::{now_seconds, read_config};
 use box_image::{
@@ -1382,6 +1382,28 @@ pub(crate) fn remove_template(name: &str) -> Result<(), String> {
             used_by.len(),
             used_by.join(", ")
         ));
+    }
+    // Release template-side references recorded by the resource entries
+    // baked into the built template. Container-side references are
+    // already gone (the guard above rejected if any container holds
+    // this template, and every container decrement happens on the
+    // container-removal path).
+    if entry.built {
+        if let Ok(Some(list)) = box_dsh_versions::read_built_template(&root, name) {
+            for resource in &list.resources {
+                if let box_api::TemplateResource::Reference { entry_id, name: rname, .. } = resource {
+                    if let Err(error) = box_extensions::decrement_reference(
+                        Path::new(&root),
+                        entry_id,
+                        box_extensions::ReferenceKind::Template,
+                    ) {
+                        eprintln!(
+                            "warning: cannot release template reference to `{rname}` ({entry_id}): {error}"
+                        );
+                    }
+                }
+            }
+        }
     }
     index.remove(name);
     write_template_index(&root, &index)?;

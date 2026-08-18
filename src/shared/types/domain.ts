@@ -40,8 +40,10 @@ export type ResourceSnapshot = {
   containers: DshContainer[]
   containerExtensions: Record<string, ContainerExtensions>
   extensionRepository: RepositoryExtension[]
-  // id -> number of containers currently linking the repository entry
-  repositoryReferences?: Record<string, number>
+  // id -> composite reference count (containers + templates). Each owner
+  // type is tracked separately so the UI badge can split "used by N
+  // container(s)" and "referenced by M template(s)".
+  repositoryReferences?: Record<string, { containers: number; templates: number }>
   tasks: TaskRecord[]
   resources: Record<string, ResourceState>
   scannedAt: number

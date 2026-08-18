@@ -9,7 +9,7 @@ export function useResources(
   const [plugins, setPlugins] = useState<RepositoryExtension[]>([])
   const [bundles, setBundles] = useState<ExtensionBundle[]>([])
   const [scriptPreview, setScriptPreview] = useState<PreviewScriptResult | null>(null)
-  const [references, setReferences] = useState<Record<string, number>>({})
+  const [references, setReferences] = useState<Record<string, { containers: number; templates: number }>>({})
 
   // Page-scoped loading: no mount-time prefetch. Every section/tab loads
   // its own data when the user enters it (see App.tsx `loadSection` and the

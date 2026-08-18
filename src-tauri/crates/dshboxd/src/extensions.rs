@@ -9,8 +9,9 @@ use box_extensions::transfer::{
     append_plugin_archive, archive_content_root, copy_extension_source, extract_extension_tarball,
 };
 use box_extensions::{
-    detect_extension_kind, read_bundles, remove_plugin_record, repository_root, scan_repository,
-    write_bundles, write_repository_index, ExtensionKind, RepositoryExtension,
+    detect_extension_kind, read_bundles, read_extension_records, remove_plugin_record,
+    repository_root, scan_repository, write_bundles, write_repository_index, ExtensionKind,
+    RepositoryExtension,
 };
 use box_foundation::{is_safe_identifier, mirror_url, now_seconds, read_config};
 use box_runtime::shallow_clone_with_cancel;
@@ -149,7 +150,15 @@ pub(crate) fn link_repository_extension(
                 source_path,
                 task,
             )?;
-            box_extensions::increment_reference(Path::new(&root), &entry.id)?;
+            // A plugin linked from a template owns one template-side
+            // reference. Direct `plugin install <container>` is handled
+            // by `install_container_extension` / `container_plugin_add`
+            // and increments the container counter instead.
+            box_extensions::increment_reference(
+                Path::new(&root),
+                &entry.id,
+                box_extensions::ReferenceKind::Template,
+            )?;
         }
         ExtensionKind::Skill => {
             // Skills stay per-container copies: install_container_skill
@@ -558,6 +567,19 @@ pub(crate) fn install_container_extension(
             install_container_plugin(&container, profile, source_kind, source, extracted, task)
         }
     }?;
+    // Container-side reference: only counted when the source is a
+    // repository entry. Local / tarball installs aren't shared, so
+    // their `repository_id` is None and prune wouldn't see them anyway.
+    if source_kind == "repository" {
+        let root = read_config()?
+            .runtime_directory
+            .ok_or("DSH Box storage is not configured")?;
+        box_extensions::increment_reference(
+            Path::new(&root),
+            source,
+            box_extensions::ReferenceKind::Container,
+        )?;
+    }
     let _ = fs::remove_dir_all(staging);
     task.update("Refreshing container extensions", 95);
     Ok(())
@@ -686,7 +708,26 @@ pub(crate) fn remove_repository_plugin(id: &str, profile: &str, name: &str) -> R
     if link.exists() {
         fs::remove_dir_all(&link).map_err(|error| error.to_string())?;
     }
+    // Decrement BEFORE removing the per-container record so the
+    // repository_id is still available. Repository-backed plugins lose
+    // their container-side reference here; local / tarball installs have
+    // no `repository_id` and the decrement is a no-op.
+    let repository_id = read_extension_records(&container)
+        .into_iter()
+        .find(|record| {
+            record.kind == ExtensionKind::Plugin
+                && record.profile.as_deref() == Some(profile)
+                && record.name == name
+        })
+        .and_then(|record| record.repository_id);
     remove_plugin_record(&container, profile, name)?;
+    if let Some(repository_id) = repository_id.as_deref() {
+        box_extensions::decrement_reference(
+            Path::new(&root),
+            repository_id,
+            box_extensions::ReferenceKind::Container,
+        )?;
+    }
     Ok(())
 }
 

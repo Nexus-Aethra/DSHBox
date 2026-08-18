@@ -32,12 +32,13 @@ type Text = {
   deleteBundleConfirm: (name: string) => string; deletePluginConfirm: (name: string) => string
   deletePluginWithRefs: (name: string, refs: string) => string
   usedByContainers: (n: number) => string
+  usedByTemplates: (n: number) => string
 }
 
 type Props = {
   plugins: RepositoryExtension[]
   bundles: ExtensionBundle[]
-  references: Record<string, number>
+  references: Record<string, { containers: number; templates: number }>
   dshVersions: DshVersion[]
   installedDshVersions: string[]
   installingVersion: string | null
@@ -236,7 +237,8 @@ export function ResourcesPage({
                     <Badge variant="primary">{entry.kind}</Badge>
                     <code>{entry.version ?? '—'}</code>
                     {isGithub(entry.source) && <Badge variant="primary">{text.githubOnly}</Badge>}
-                    {(references[entry.id] ?? 0) > 0 && <Badge variant="neutral">{text.usedByContainers(references[entry.id] ?? 0)}</Badge>}
+                    {(references[entry.id]?.containers ?? 0) > 0 && <Badge variant="neutral">{text.usedByContainers(references[entry.id]?.containers ?? 0)}</Badge>}
+                    {(references[entry.id]?.templates ?? 0) > 0 && <Badge variant="neutral">{text.usedByTemplates(references[entry.id]?.templates ?? 0)}</Badge>}
                     <Button variant="secondary" size="sm" onClick={() => { void onExportPlugin(entry) }}>{text.exportPlugin}</Button>
                     <Button variant="danger" size="sm" onClick={() => { requestDeletePlugin(entry) }}>{text.remove}</Button>
                   </div>

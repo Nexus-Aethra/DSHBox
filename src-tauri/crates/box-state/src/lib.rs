@@ -67,15 +67,33 @@ pub struct ResourceSnapshot {
     pub container_extensions: BTreeMap<String, ContainerExtensions>,
     #[serde(default)]
     pub extension_repository: Vec<RepositoryExtension>,
-    /// Reference counts for repository extensions (how many containers
-    /// currently link each entry). Drives the UI's usage badge and protects
-    /// entries from `plugin prune`.
+    /// Reference counts for repository extensions: how many containers and
+    /// built templates currently link each entry. Drives the UI's usage
+    /// badge and protects entries from `plugin prune`. Empty values
+    /// (containers+templates=0) are pruned on read.
     #[serde(default)]
-    pub repository_references: BTreeMap<String, u32>,
+    pub repository_references: BTreeMap<String, RepositoryReferenceCount>,
     pub tasks: Vec<TaskRecord>,
     pub resources: BTreeMap<String, ResourceState>,
     pub scanned_at: u64,
     pub updated_at: u64,
+}
+
+/// Mirror of `box_extensions::ReferenceCount` for the UI snapshot. Kept
+/// in this crate (instead of imported from `box-extensions`) so the UI can
+/// be compiled independently from the backend storage types.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryReferenceCount {
+    #[serde(default)]
+    pub containers: u32,
+    #[serde(default)]
+    pub templates: u32,
+}
+
+impl RepositoryReferenceCount {
+    pub fn total(&self) -> u32 {
+        self.containers + self.templates
+    }
 }
 
 impl Default for ResourceSnapshot {
@@ -219,7 +237,24 @@ impl ResourceStateManager {
                 .map(|container| (container.id.clone(), scan_container_extensions(container)))
                 .collect();
             state.extension_repository = config.runtime_directory.as_deref().map(|runtime| scan_repository(std::path::Path::new(runtime))).unwrap_or_default();
-            state.repository_references = config.runtime_directory.as_deref().map(|runtime| box_extensions::read_references(std::path::Path::new(runtime))).unwrap_or_default();
+            state.repository_references = config
+                .runtime_directory
+                .as_deref()
+                .map(|runtime| {
+                    box_extensions::read_references(std::path::Path::new(runtime))
+                        .into_iter()
+                        .map(|(id, count)| {
+                            (
+                                id,
+                                RepositoryReferenceCount {
+                                    containers: count.containers,
+                                    templates: count.templates,
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             state.containers = containers;
             state.scanned_at = now_seconds();
         });

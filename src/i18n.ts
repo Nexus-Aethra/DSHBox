@@ -30,6 +30,7 @@ const COPY = {
     importTemplate: 'Import template', exportTemplate: 'Export tarball', removeTemplate: 'Remove template', browseExport: 'Choose export destination',
     deleteTemplateConfirm: (name: string) => `Delete template "${name}"? This cannot be undone.`,
     usedByContainers: (n: number) => `used by ${n} container${n === 1 ? '' : 's'}`,
+    usedByTemplates: (n: number) => `referenced by ${n} template${n === 1 ? '' : 's'}`,
   },
   'zh-CN': {
     versions: 'DSH 版本代码', container: 'DSH 容器', settings: '设置',
@@ -60,6 +61,7 @@ const COPY = {
     importTemplate: '导入模板', exportTemplate: '导出 tarball', removeTemplate: '删除模板', browseExport: '选择导出位置',
     deleteTemplateConfirm: (name: string) => `删除模板 "${name}"?此操作无法撤销。`,
     usedByContainers: (n: number) => `被 ${n} 个容器使用`,
+    usedByTemplates: (n: number) => `被 ${n} 个模板引用`,
   },
 } as const
 

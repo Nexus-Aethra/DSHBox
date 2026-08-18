@@ -145,27 +145,108 @@ pub fn write_repository_index(runtime: &Path, entries: &[RepositoryExtension]) -
 
 // ── Reference counting ────────────────────────────────────────────────────
 // Persistent per-entry reference counter stored at
-// `<root>/repository/references.json`. Every container that links a
-// repository entry into its extensions owns one reference; `dshbox plugin
-// prune` removes only entries whose count reached zero, so running
-// containers never keep dangling links.
+// `<root>/repository/references.json`. Each entry tracks TWO independent
+// counts: how many containers currently link it, and how many built
+// templates reference it. A plugin is removable only when both counts are
+// zero, so a plugin referenced by a template (but never installed into a
+// container) survives `plugin prune`.
+//
+// The on-disk format used to be `BTreeMap<entry_id, u32>`; the new format
+// is `BTreeMap<entry_id, ReferenceCount { containers, templates }>`.
+// `#[serde(default)]` on the struct accepts legacy numeric files and
+/// promotes them to `containers = N, templates = 0` on the next write.
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceCount {
+    #[serde(default)]
+    pub containers: u32,
+    #[serde(default)]
+    pub templates: u32,
+}
+
+impl ReferenceCount {
+    pub fn total(self) -> u32 {
+        self.containers + self.templates
+    }
+
+    fn bump(self, kind: ReferenceKind) -> Self {
+        match kind {
+            ReferenceKind::Container => Self {
+                containers: self.containers + 1,
+                templates: self.templates,
+            },
+            ReferenceKind::Template => Self {
+                containers: self.containers,
+                templates: self.templates + 1,
+            },
+        }
+    }
+
+    fn drop_one(self, kind: ReferenceKind) -> Self {
+        match kind {
+            ReferenceKind::Container => Self {
+                containers: self.containers.saturating_sub(1),
+                templates: self.templates,
+            },
+            ReferenceKind::Template => Self {
+                containers: self.containers,
+                templates: self.templates.saturating_sub(1),
+            },
+        }
+    }
+}
+
+/// Which owner is gaining or losing a reference. Container references are
+/// recorded against one container's `extensions.json`; template references
+/// are recorded against one built template's `list.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReferenceKind {
+    Container,
+    Template,
+}
 
 pub fn references_path(runtime: &Path) -> PathBuf {
     repository_root(runtime).join("references.json")
 }
 
-/// Read the persisted reference map (id → container count). Missing or
-/// malformed files read as empty, mirroring `scan_repository`.
-pub fn read_references(runtime: &Path) -> BTreeMap<String, u32> {
-    fs::read_to_string(references_path(runtime))
-        .ok()
-        .and_then(|source| serde_json::from_str(&source).ok())
-        .unwrap_or_default()
+/// Read the persisted reference map. Legacy `u32` values are accepted and
+/// promoted to `containers: N, templates: 0`. Missing or malformed files
+/// read as empty, mirroring `scan_repository`.
+pub fn read_references(runtime: &Path) -> BTreeMap<String, ReferenceCount> {
+    let raw = match fs::read_to_string(references_path(runtime)) {
+        Ok(text) => text,
+        Err(_) => return BTreeMap::new(),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return BTreeMap::new(),
+    };
+    let mut out = BTreeMap::new();
+    if let Some(object) = value.as_object() {
+        for (key, entry) in object {
+            // Legacy: numeric value (old single-counter format).
+            if let Some(n) = entry.as_u64() {
+                out.insert(
+                    key.clone(),
+                    ReferenceCount {
+                        containers: u32::try_from(n).unwrap_or(u32::MAX),
+                        templates: 0,
+                    },
+                );
+                continue;
+            }
+            // Current: {"containers": N, "templates": M}.
+            if let Ok(parsed) = serde_json::from_value::<ReferenceCount>(entry.clone()) {
+                out.insert(key.clone(), parsed);
+            }
+        }
+    }
+    out
 }
 
 pub fn write_references(
     runtime: &Path,
-    references: &BTreeMap<String, u32>,
+    references: &BTreeMap<String, ReferenceCount>,
 ) -> Result<(), String> {
     let path = references_path(runtime);
     fs::create_dir_all(path.parent().ok_or("references has no parent")?)
@@ -177,41 +258,55 @@ pub fn write_references(
     .map_err(|error| error.to_string())
 }
 
-/// Record that one more container links `entry_id`. Missing entries start
-/// at 1.
-pub fn increment_reference(runtime: &Path, entry_id: &str) -> Result<(), String> {
+/// Record that one more owner (container or template) links `entry_id`.
+/// Missing entries start at 1 in the chosen field.
+pub fn increment_reference(
+    runtime: &Path,
+    entry_id: &str,
+    kind: ReferenceKind,
+) -> Result<(), String> {
     let mut references = read_references(runtime);
-    *references.entry(entry_id.to_owned()).or_insert(0) += 1;
+    let entry = references.entry(entry_id.to_owned()).or_default();
+    *entry = entry.bump(kind);
     write_references(runtime, &references)
 }
 
-/// Record that one container stopped linking `entry_id`. The count is
-/// saturating (never goes below zero); returns the remaining count.
-pub fn decrement_reference(runtime: &Path, entry_id: &str) -> Result<u32, String> {
+/// Record that one owner stopped linking `entry_id`. Each field is
+/// saturating (never goes below zero); returns the remaining total.
+pub fn decrement_reference(
+    runtime: &Path,
+    entry_id: &str,
+    kind: ReferenceKind,
+) -> Result<u32, String> {
     let mut references = read_references(runtime);
-    let count = references.entry(entry_id.to_owned()).or_insert(0);
-    *count = count.saturating_sub(1);
-    let remaining = *count;
+    let entry = references.entry(entry_id.to_owned()).or_default();
+    *entry = entry.drop_one(kind);
+    let remaining = entry.total();
     write_references(runtime, &references)?;
     Ok(remaining)
 }
 
-/// Repository ids whose reference count is zero — candidates for
-/// `remove_repository_extension`. Entries absent from the map count as
-/// unused, so a fresh store prunes nothing extra.
+/// Repository ids whose reference count is zero (containers AND templates
+/// both at zero) — candidates for `remove_repository_extension`. Entries
+/// absent from the map count as unused, so a fresh store prunes nothing
+/// extra.
 pub fn unused_repository_ids(runtime: &Path) -> Vec<String> {
     let references = read_references(runtime);
     let entries = scan_repository(runtime);
     entries
         .into_iter()
-        .filter(|entry| references.get(&entry.id).copied().unwrap_or(0) == 0)
+        .filter(|entry| references.get(&entry.id).map(|count| count.total()).unwrap_or(0) == 0)
         .map(|entry| entry.id)
         .collect()
 }
 
-/// How many containers currently reference `entry_id` (0 when absent).
+/// How many owners currently reference `entry_id` (0 when absent).
+/// Sums both container and template references.
 pub fn reference_count(runtime: &Path, entry_id: &str) -> u32 {
-    read_references(runtime).get(entry_id).copied().unwrap_or(0)
+    read_references(runtime)
+        .get(entry_id)
+        .map(|count| count.total())
+        .unwrap_or(0)
 }
 
 /// One entry inside an exported extension bundle.
@@ -702,19 +797,36 @@ mod tests {
         assert_eq!(reference_count(&root, "img-a"), 0);
         assert!(unused_repository_ids(&root).is_empty());
 
-        increment_reference(&root, "img-a").unwrap();
-        increment_reference(&root, "img-a").unwrap();
-        increment_reference(&root, "img-b").unwrap();
+        // Container references increment the container counter.
+        increment_reference(&root, "img-a", ReferenceKind::Container).unwrap();
+        increment_reference(&root, "img-a", ReferenceKind::Container).unwrap();
         assert_eq!(reference_count(&root, "img-a"), 2);
+
+        // Template references go into a separate field.
+        increment_reference(&root, "img-b", ReferenceKind::Template).unwrap();
         assert_eq!(reference_count(&root, "img-b"), 1);
 
         // Map survives a fresh read (persisted on disk).
-        assert_eq!(read_references(&root).len(), 2);
+        let snapshot = read_references(&root);
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot["img-a"].containers, 2);
+        assert_eq!(snapshot["img-b"].templates, 1);
 
-        // Decrement is saturating and returns the remaining count.
-        assert_eq!(decrement_reference(&root, "img-a").unwrap(), 1);
-        assert_eq!(decrement_reference(&root, "img-a").unwrap(), 0);
-        assert_eq!(decrement_reference(&root, "img-a").unwrap(), 0);
+        // Decrement only touches the named owner type; cross-decrement is a no-op.
+        assert_eq!(
+            decrement_reference(&root, "img-a", ReferenceKind::Container).unwrap(),
+            1
+        );
+        assert_eq!(
+            decrement_reference(&root, "img-a", ReferenceKind::Container).unwrap(),
+            0
+        );
+        assert_eq!(
+            decrement_reference(&root, "img-a", ReferenceKind::Container).unwrap(),
+            0
+        );
+        // Template owner slot is untouched by container decrements.
+        assert_eq!(read_references(&root)["img-a"].templates, 0);
 
         // Zero-count entries are reported by unused_repository_ids when
         // they exist in the repository index.
@@ -736,11 +848,32 @@ mod tests {
         .unwrap();
         assert_eq!(unused_repository_ids(&root), vec!["img-a"]);
 
-        // Incrementing again removes it from the unused set.
-        increment_reference(&root, "img-a").unwrap();
+        // Incrementing either field removes it from the unused set.
+        increment_reference(&root, "img-a", ReferenceKind::Container).unwrap();
         assert!(unused_repository_ids(&root).is_empty());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_numeric_references_promote_to_containers() {
+        let root = std::env::temp_dir().join(format!("dshbox-references-legacy-{}", now_seconds()));
+        fs::create_dir_all(repository_root(&root)).unwrap();
+        // Old format: `{"img-a": 3}` — must be promoted to containers=3.
+        std::fs::write(references_path(&root), "{\"img-a\": 3}").unwrap();
+        let map = read_references(&root);
+        assert_eq!(map["img-a"].containers, 3);
+        assert_eq!(map["img-a"].templates, 0);
+        assert_eq!(reference_count(&root, "img-a"), 3);
+
+        // A subsequent write upgrades the on-disk format to the new shape.
+        increment_reference(&root, "img-a", ReferenceKind::Template).unwrap();
+        let raw = std::fs::read_to_string(references_path(&root)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["img-a"]["containers"], 3);
+        assert_eq!(parsed["img-a"]["templates"], 1);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
