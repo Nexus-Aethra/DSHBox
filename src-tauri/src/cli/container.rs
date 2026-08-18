@@ -17,7 +17,7 @@ use super::rpc;
 
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     let Some(action) = arguments.first().map(String::as_str) else {
-        return Err("expected container logs|url|describe|show|open|start|stop|rebuild|rm".to_owned());
+        return Err("expected container logs|url|describe|show|open|start|stop|restart|rebuild|rm".to_owned());
     };
     if matches!(action, "help" | "--help" | "-h") {
         println!("dshbox container logs <id>             tail the DSH host log");
@@ -27,6 +27,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         println!("dshbox container open <id>             open the running container in a DSH Box window");
         println!("dshbox container start <id>            start the DSH host of a stopped container");
         println!("dshbox container stop <id>             stop a running container");
+        println!("dshbox container restart <id>          restart a stopped/crashed host (no rebuild)");
         println!("dshbox container rebuild <id>          re-materialise extensions and restart");
         println!("dshbox container rm <id>               stop and delete the container");
         return Ok(());
@@ -42,6 +43,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         "open" => open(&id),
         "start" => start(&id),
         "stop" => stop(&id),
+        "restart" => restart(&id),
         "rebuild" => rebuild(&id),
         "rm" | "remove" => remove(&id),
         other => Err(format!("unknown container action: {other}")),
@@ -225,6 +227,10 @@ fn start(id: &str) -> Result<(), String> {
 
 fn stop(id: &str) -> Result<(), String> {
     enqueue_lifecycle(id, "enqueue_container_stop", "container-stop")
+}
+
+fn restart(id: &str) -> Result<(), String> {
+    enqueue_lifecycle(id, "enqueue_container_restart", "container-restart")
 }
 
 fn rebuild(id: &str) -> Result<(), String> {

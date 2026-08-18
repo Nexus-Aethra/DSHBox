@@ -308,6 +308,17 @@ pub(crate) fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .icon(icon)
         .tooltip("dshbox")
         .menu(&menu)
+        // Tauri 2 fires both `on_menu_event` (right-click on Windows /
+        // click on Linux) and `on_tray_icon_event` (left-click on
+        // Windows / click on macOS). Without the icon-event handler
+        // a double-click on the Windows tray does nothing — there is
+        // no built-in mapping to "open main window". macOS users never
+        // notice because their default click already raises the menu.
+        .on_tray_icon_event(|tray, event| {
+            if let tauri::tray::TrayIconEvent::DoubleClick { .. } = event {
+                show_main_window(tray.app_handle());
+            }
+        })
         .on_menu_event(|app, event| match event.id().as_ref() {
             "tray-open" => show_main_window(app),
             "tray-start-daemon" => {

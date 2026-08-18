@@ -3,9 +3,175 @@
 use box_foundation::{suppress_console_window, BoxResult};
 use git2::{build::RepoBuilder, FetchOptions, RemoteCallbacks};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
+
+/// Add `directory` to the user's PATH (HKCU\Environment\Path on
+/// Windows, `~/.config/.../path` on Linux, `~/Library/.../path` on
+/// macOS) so subsequent shells and agent-runner subprocesses can
+/// resolve `dshbox` without a fresh install. Existing entries are
+/// preserved verbatim; the new directory is appended (PATH lookup
+/// order doesn't matter for our use case — there is only one
+/// `dshbox.exe` in the world for any given user).
+///
+/// Returns `Ok(())` if the directory was already present or just
+/// added; `Err(message)` if the registry / rc-file is unreadable.
+///
+/// Idempotent: repeated calls do not produce duplicate entries.
+pub fn add_to_user_path(directory: &Path) -> BoxResult<()> {
+    #[cfg(target_os = "windows")]
+    {
+        add_to_user_path_windows(directory)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        add_to_user_path_posix(directory)
+    }
+}
+
+/// True if `executable` is reachable on `PATH` for the current
+/// process. Used by the desktop launch path to decide whether to
+/// offer the user a one-shot PATH patch (Windows NSIS installer does
+/// not put `dshbox.exe` on PATH by default).
+pub fn command_on_path(name: &str) -> bool {
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    for entry in std::env::split_paths(&paths) {
+        let candidate = entry.join(name);
+        if candidate.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+/// The directory that should be added to PATH so that running
+/// `dshbox` from any shell resolves to *this* executable. Used by the
+/// self-bootstrap check that runs on `dshbox ui` startup. Falls back
+/// to `None` if the running binary's location cannot be determined.
+pub fn self_install_directory() -> Option<PathBuf> {
+    std::env::current_exe().ok().and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+#[cfg(target_os = "windows")]
+fn add_to_user_path_windows(directory: &Path) -> BoxResult<()> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    let directory_string = directory.to_string_lossy().into_owned();
+    let environment = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(
+            "Environment",
+            winreg::enums::KEY_READ | winreg::enums::KEY_WRITE,
+        )
+        .map_err(|error| format!("cannot open HKCU\\Environment: {error}"))?;
+    let current: String = environment
+        .get_value("Path")
+        .unwrap_or_default();
+    // Registry stores Path as either REG_SZ or REG_EXPAND_SZ. We use
+    // REG_EXPAND_SZ so future edits that introduce env vars stay
+    // valid. Split on `;` (the only separator HKCU\Environment\Path
+    // recognises) and compare case-insensitively — `C:\Program Files\DSH Box`
+    // and `c:\program files\dsh box` are the same directory to Windows.
+    let already_present = current
+        .split(';')
+        .any(|entry| entry.trim().eq_ignore_ascii_case(&directory_string));
+    if already_present {
+        return Ok(());
+    }
+    let separator = if current.is_empty() || current.ends_with(';') {
+        ""
+    } else {
+        ";"
+    };
+    let updated = format!("{current}{separator}{directory_string}");
+    environment
+        .set_value("Path", &updated)
+        .map_err(|error| format!("cannot write HKCU\\Environment\\Path: {error}"))?;
+    // Broadcast WM_SETTINGCHANGE so already-open Explorer windows
+    // and (some) console hosts refresh their cached environment.
+    // New shells must still be opened for the change to apply to them.
+    broadcast_setting_change();
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn broadcast_setting_change() {
+    // The full Win32 declaration is heavy; the bare call we need is
+    // `SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", ...)`.
+    // We use LoadLibraryW + GetProcAddress to keep the build
+    // dependency-free of the windows-sys crate.
+    extern "system" {
+        fn LoadLibraryW(library: *const u16) -> *mut core::ffi::c_void;
+        fn GetProcAddress(module: *mut core::ffi::c_void, name: *const u8)
+            -> Option<unsafe extern "system" fn() -> isize>;
+        fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
+    }
+    let user32: Vec<u16> = "user32.dll\0".encode_utf16().collect();
+    let module = unsafe { LoadLibraryW(user32.as_ptr()) };
+    if module.is_null() {
+        return;
+    }
+    let symbol = unsafe { GetProcAddress(module, b"SendMessageTimeoutW\0".as_ptr()) };
+    let Some(send_message) = symbol else {
+        unsafe {
+            FreeLibrary(module);
+        }
+        return;
+    };
+    type SendMessageTimeoutW = unsafe extern "system" fn(
+        hwnd: isize,
+        msg: u32,
+        wparam: usize,
+        lparam: *const u16,
+        flags: u32,
+        timeout: u32,
+        result: *mut isize,
+    ) -> isize;
+    let send: SendMessageTimeoutW = unsafe { core::mem::transmute(send_message) };
+    let payload: Vec<u16> = "Environment\0".encode_utf16().collect();
+    let mut result = 0_isize;
+    unsafe {
+        send(
+            0xffff, // HWND_BROADCAST
+            0x001A, // WM_SETTINGCHANGE
+            0,
+            payload.as_ptr(),
+            0x0002, // SMTO_ABORTIFHUNG
+            1000,
+            &mut result,
+        );
+        FreeLibrary(module);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn add_to_user_path_posix(directory: &Path) -> BoxResult<()> {
+    let directory_string = directory.to_string_lossy().into_owned();
+    let home = std::env::var_os("HOME").ok_or("HOME is unset; cannot patch PATH")?;
+    let home_path = PathBuf::from(home);
+    for rc in [".bashrc", ".zshrc", ".profile"] {
+        let candidate = home_path.join(rc);
+        if !candidate.is_file() {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&candidate)
+            .map_err(|error| format!("cannot read {rc}: {error}"))?;
+        // Idempotent: skip if the exact path is already exported.
+        let already = contents.lines().any(|line| {
+            line.contains(&directory_string) && line.contains("PATH")
+        });
+        if already {
+            return Ok(());
+        }
+        // Append a guarded block so a future uninstall can find it.
+        let addition = format!(
+            "\n# Added by dshbox setup-path\nexport PATH=\"$PATH:{directory_string}\"\n"
+        );
+        std::fs::write(&candidate, format!("{contents}{addition}"))
+            .map_err(|error| format!("cannot append to {rc}: {error}"))?;
+        return Ok(());
+    }
+    Err("no shell rc file found (.bashrc / .zshrc / .profile)".to_owned())
+}
 
 pub trait ProcessRunner: Send + Sync {
     fn run(

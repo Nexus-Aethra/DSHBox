@@ -13,12 +13,15 @@ use super::rpc;
 
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     let Some(action) = arguments.first().map(String::as_str) else {
-        return Err("expected template ls|show|import|export|rm|prune".to_owned());
+        return Err("expected template ls|show|info|import|export|rm|prune".to_owned());
     };
     if matches!(action, "help" | "--help" | "-h") {
         println!("dshbox template ls");
         println!(
             "dshbox template show <name>         script body, or the resource list when built"
+        );
+        println!(
+            "dshbox template info <name>         build timestamp, id, version, labels"
         );
         println!("dshbox template import <archive.tar.gz> [--name <name>]");
         println!("dshbox template export <name> [<dest.tar.gz>]");
@@ -31,6 +34,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     match action {
         "ls" | "list" => list(),
         "show" | "cat" => show(arguments.get(1).ok_or("expected a template name")?),
+        "info" => info(arguments.get(1).ok_or("expected a template name")?),
         "import" => import(
             arguments.get(1).ok_or("expected an archive path")?,
             &arguments[2..],
@@ -157,6 +161,56 @@ fn prune() -> Result<(), String> {
         for digest in &removed {
             println!("pruned snapshot {digest}");
         }
+    }
+    Ok(())
+}
+
+fn info(name: &str) -> Result<(), String> {
+    let client = rpc::connect()?;
+    let value = rpc::call(&client, "template_info", json!({ "name": name }))?;
+
+    println!("name:        {}", value["name"].as_str().unwrap_or("-"));
+    println!("id:          {}", value["id"].as_str().unwrap_or("-"));
+    println!("built:       {}", value["built"].as_bool().unwrap_or(false));
+
+    if value["built"].as_bool() == Some(true) {
+        println!("base:        {}", value["base"].as_str().unwrap_or("-"));
+        println!("profile:     {}", value["profile"].as_str().unwrap_or("-"));
+        println!(
+            "harness:     {}",
+            value["harnessRef"].as_str().unwrap_or("-")
+        );
+        println!(
+            "schemaVer:   {}",
+            value["schemaVersion"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "createdAt:   {} ({})",
+            value["createdAt"].as_u64().unwrap_or(0),
+            value["createdAtIso"].as_str().unwrap_or("-")
+        );
+        println!(
+            "resources:   {}",
+            value["resources"].as_u64().unwrap_or(0)
+        );
+        if let Some(labels) = value["labels"].as_object() {
+            if !labels.is_empty() {
+                println!("labels:");
+                for (k, v) in labels {
+                    println!("  {}: {}", k, v.as_str().unwrap_or("-"));
+                }
+            }
+        }
+    } else {
+        println!("profile:     {}", value["profile"].as_str().unwrap_or("-"));
+        println!(
+            "harness:     {}",
+            value["harnessRef"].as_str().unwrap_or("-")
+        );
+        println!(
+            "importedAt:  {}",
+            value["importedAt"].as_u64().unwrap_or(0)
+        );
     }
     Ok(())
 }

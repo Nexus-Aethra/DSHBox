@@ -14,8 +14,10 @@ pub mod plugin;
 pub mod pull;
 pub mod rpc;
 pub mod run;
+pub mod setup_path;
 pub mod template;
 
+use crate::desktop;
 use serde_json::json;
 use std::env;
 
@@ -33,9 +35,27 @@ pub fn run() -> Option<i32> {
     }
     // Only launch the GUI when the user explicitly asks for it.
     if arguments.len() == 1 && matches!(arguments[0].as_str(), "ui" | "--tray") {
+        // Best-effort PATH bootstrap. The desktop path is the entry
+        // point most first-time users hit; if they then open a
+        // terminal and find `dshbox` missing, that's a bug we'd be
+        // hiding. Add the install dir to HKCU\Environment\Path (Windows)
+        // / shell rc (POSIX) silently if possible, with a one-line
+        // hint when something goes wrong.
+        bootstrap_path_hint();
         return None;
     }
     if arguments.is_empty() {
+        // Windows users launch the EXE by double-clicking the desktop
+        // icon or a Start Menu tile. Neither carries CLI arguments, so
+        // the bare `dshbox.exe` invocation hits this branch and would
+        // otherwise just print help and exit — making the icon a
+        // no-op. Linux and macOS have proper `.desktop` files that
+        // invoke `dshbox ui` explicitly, so they keep the help-on-
+        // empty-args behaviour. Treat bare invocation on Windows as
+        // `dshbox ui` so the GUI actually appears.
+        if cfg!(target_os = "windows") {
+            return None;
+        }
         print_help();
         return Some(0);
     }
@@ -56,6 +76,7 @@ pub fn run() -> Option<i32> {
         "container" => container::command(&arguments[1..]),
         "image" => image::command(&arguments[1..]),
         "rpc" => raw_rpc(&arguments[1..]),
+        "setup-path" => setup_path::command(&arguments[1..]),
         "template" => template::command(&arguments[1..]),
         "resources" => {
             eprintln!("warning: 'dshbox resources' is deprecated; 'plugin' and 'bundle' cover its actions.");
@@ -186,6 +207,7 @@ fn print_help() {
     println!("  dshbox container url <id>                 print the webview URL of a running container");
     println!("  dshbox container start <id>               start the DSH host of a stopped container");
     println!("  dshbox container stop <id>                stop a running container");
+    println!("  dshbox container restart <id>             restart a stopped/crashed host (no rebuild)");
     println!("  dshbox container rebuild <id>             re-materialise extensions and restart");
     println!("  dshbox container rm <id>                  stop and delete the container");
     println!();
@@ -206,6 +228,9 @@ fn print_help() {
     println!("Configuration:");
     println!("  dshbox config <action>     show or set runtime, mirror, and registry");
     println!();
+    println!("First-run PATH setup:");
+    println!("  dshbox setup-path          add dshbox install dir to PATH (Windows HKCU / POSIX shell rc)");
+    println!();
     println!("Run 'dshbox <command> help' for action-level usage.");
 }
 
@@ -216,4 +241,42 @@ pub(crate) fn flag_value(arguments: &[String], flag: &str, default: &str) -> Str
         .find(|pair| pair[0] == flag)
         .map(|pair| pair[1].clone())
         .unwrap_or_else(|| default.to_owned())
+}
+
+/// One-shot PATH bootstrap that runs when the user launches the
+/// desktop GUI. If the running binary's directory is not on the
+/// inherited `PATH`, register it so a subsequent terminal /
+/// agent-runner can resolve `dshbox`. Failures are logged to the
+/// startup log instead of being surfaced: the GUI must keep
+/// launching even when the registry is locked.
+fn bootstrap_path_hint() {
+    use box_runtime::{add_to_user_path, command_on_path, self_install_directory};
+    let Some(directory) = self_install_directory() else {
+        return;
+    };
+    if !directory.is_dir() {
+        return;
+    }
+    let binary_name = if cfg!(target_os = "windows") {
+        "dshbox.exe"
+    } else {
+        "dshbox"
+    };
+    if command_on_path(binary_name) {
+        return;
+    }
+    if let Err(error) = add_to_user_path(&directory) {
+        desktop::write_startup_log(&format!("setup-path bootstrap failed: {error}"));
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    desktop::write_startup_log(&format!(
+        "added {} to HKCU\\Environment\\Path; new shells will see `dshbox`",
+        directory.display()
+    ));
+    #[cfg(not(target_os = "windows"))]
+    desktop::write_startup_log(&format!(
+        "appended {} to user PATH via shell rc; restart shell to use `dshbox`",
+        directory.display()
+    ));
 }
