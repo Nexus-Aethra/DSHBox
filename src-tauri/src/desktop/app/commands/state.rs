@@ -1,11 +1,24 @@
 use super::super::*;
 
 /// Returns the complete application read model for lists and diagnostics.
+///
+/// `extension_repository` is read fresh from disk on every call rather than
+/// returned from the in-memory snapshot. The Tauri desktop and the dshboxd
+/// daemon are separate processes: a build task completed in the daemon updates
+/// `<runtime>/repository/index.json` but the desktop has no event telling it
+/// to refresh its cached snapshot. Reading from disk here (a single JSON read)
+/// keeps the UI in sync with whatever the daemon and the CLI have done.
 #[tauri::command]
 pub(crate) fn list_resource_states(
     resources: tauri::State<ResourceStateManager>,
 ) -> Result<ResourceSnapshot, String> {
-    resources.snapshot()
+    let mut snapshot = resources.snapshot()?;
+    if let Some(runtime) = &snapshot.runtime_directory {
+        let runtime = std::path::Path::new(runtime);
+        let entries = box_extensions::scan_repository(runtime);
+        snapshot.extension_repository = entries;
+    }
+    Ok(snapshot)
 }
 
 /// Returns one resource addressed by its scheduler-compatible key.
@@ -31,4 +44,27 @@ pub(crate) fn get_container_details(
 pub(crate) fn refresh_resource_state(app: tauri::AppHandle) -> Result<ResourceSnapshot, String> {
     refresh_global_state(&app);
     app.state::<ResourceStateManager>().snapshot()
+}
+
+/// One entry of the content-addressed data store (image tab). Shared
+/// through box-api with the daemon that serializes it.
+pub(crate) use box_api::DataEntry;
+
+/// Lists data-store entries via the daemon.
+#[tauri::command]
+pub(crate) fn list_data_entries() -> Result<Vec<DataEntry>, String> {
+    let client = connect()?;
+    let value = call(&client, "list_data_entries", serde_json::json!({}))?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("invalid data entries from daemon: {error}"))
+}
+
+/// Garbage-collects orphaned data-store blobs via the daemon. Returns the
+/// removed content digests.
+#[tauri::command]
+pub(crate) fn prune_orphaned_data() -> Result<Vec<String>, String> {
+    let client = connect()?;
+    let value = call(&client, "prune_orphaned_data", serde_json::json!({}))?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("invalid prune response from daemon: {error}"))
 }

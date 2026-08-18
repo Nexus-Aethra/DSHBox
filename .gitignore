@@ -1,7 +1,26 @@
-node_modules/
-dist/
-src-tauri/target/
-src-tauri/resources/runtime/*
-src-tauri/resources/server/*
-!src-tauri/resources/runtime/.gitkeep
-!src-tauri/resources/server/.gitkeep
+/node_modules/
+/dist/
+/src-tauri/target/
+/src-tauri/resources/runtime/*
+/src-tauri/resources/server/*
+/src-tauri/resources/plugins/*
+!/src-tauri/resources/runtime/.gitkeep
+!/src-tauri/resources/server/.gitkeep
+!/src-tauri/resources/plugins/.gitkeep
+/src-tauri/crates/box-dsh-context/dsh-box-context/dist/
+/src-tauri/crates/box-dsh-context/dsh-box-context/node_modules/
+/src-tauri/.build-stamp
+# Local debugging / build leftovers: never commit these.
+/.e2e-dbg/
+/.tmp/
+/.bundle-tmp/
+.bundle-verify.log
+.e2e-*.log
+/src-tauri/*.dsh.tar.gz
+# ZCode session plans: ephemeral, regenerated every session.
+/.zcode/
+# Throwaway packaging artefacts.
+/dshbox-*.tgz
+# Vite build output (dist is bundled into the desktop binary by Tauri's
+# beforeBuildCommand; never edit files under this directory).
+/src-tauri/dist/

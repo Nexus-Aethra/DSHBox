@@ -1,6 +1,6 @@
 //! Local single-user control plane shared by the DSH Box desktop app and server.
 
-use box_foundation::{config_path, now_seconds, suppress_console_window, BoxResult};
+use box_foundation::{config_path, now_seconds, BoxResult};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -14,7 +14,24 @@ pub struct ServerDiscovery {
     pub token: String,
     pub pid: u32,
     pub started_at: u64,
-    pub endpoint: String,
+    #[serde(default)]
+    pub port: u16,
+    /// Unix domain socket path. Legacy field from older daemon builds;
+    /// kept for backward-compatible deserialization of stale discovery files.
+    #[serde(default, skip_serializing)]
+    pub endpoint: Option<String>,
+}
+
+impl Default for ServerDiscovery {
+    fn default() -> Self {
+        Self {
+            token: String::new(),
+            pid: 0,
+            started_at: 0,
+            port: 0,
+            endpoint: None,
+        }
+    }
 }
 
 pub fn server_directory() -> BoxResult<PathBuf> {
@@ -28,10 +45,6 @@ pub fn discovery_path() -> BoxResult<PathBuf> {
     Ok(server_directory()?.join("discovery.json"))
 }
 
-pub fn default_endpoint() -> BoxResult<PathBuf> {
-    Ok(server_directory()?.join("dshboxd.sock"))
-}
-
 pub fn read_discovery() -> BoxResult<Option<ServerDiscovery>> {
     let path = discovery_path()?;
     if !path.exists() {
@@ -42,14 +55,15 @@ pub fn read_discovery() -> BoxResult<Option<ServerDiscovery>> {
         .map_err(|error| error.to_string())
 }
 
-pub fn write_discovery(endpoint: impl Into<String>) -> BoxResult<ServerDiscovery> {
+pub fn write_discovery(port: u16) -> BoxResult<ServerDiscovery> {
     let directory = server_directory()?;
     fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let discovery = ServerDiscovery {
         token: uuid::Uuid::new_v4().to_string(),
         pid: process::id(),
         started_at: now_seconds(),
-        endpoint: endpoint.into(),
+        port,
+        endpoint: None,
     };
     let temporary = directory.join("discovery.json.tmp");
     fs::write(
@@ -99,7 +113,7 @@ pub fn service_status() -> ServiceStatus {
     #[cfg(target_os = "windows")]
     {
         let mut command = Command::new("schtasks");
-        suppress_console_window(&mut command);
+        box_foundation::suppress_console_window(&mut command);
         let running = command
             .args(["/Query", "/TN", "dshboxd", "/FO", "LIST"])
             .output()
@@ -148,7 +162,7 @@ pub fn install_user_service(executable: &std::path::Path) -> BoxResult<()> {
     {
         let task = format!("\"{}\" --service", executable.display());
         let mut create = Command::new("schtasks");
-        suppress_console_window(&mut create);
+        box_foundation::suppress_console_window(&mut create);
         let output = create
             .args([
                 "/Create", "/TN", "dshboxd", "/TR", &task, "/SC", "ONLOGON", "/RL", "LIMITED", "/F",
@@ -159,7 +173,7 @@ pub fn install_user_service(executable: &std::path::Path) -> BoxResult<()> {
             return Err(String::from_utf8_lossy(&output.stderr).into_owned());
         }
         let mut run = Command::new("schtasks");
-        suppress_console_window(&mut run);
+        box_foundation::suppress_console_window(&mut run);
         let _ = run.args(["/Run", "/TN", "dshboxd"]).output();
         return Ok(());
     }
@@ -182,10 +196,10 @@ pub fn restart_user_service() -> BoxResult<()> {
     #[cfg(target_os = "windows")]
     {
         let mut end = Command::new("schtasks");
-        suppress_console_window(&mut end);
+        box_foundation::suppress_console_window(&mut end);
         let _ = end.args(["/End", "/TN", "dshboxd"]).output();
         let mut run = Command::new("schtasks");
-        suppress_console_window(&mut run);
+        box_foundation::suppress_console_window(&mut run);
         let output = run
             .args(["/Run", "/TN", "dshboxd"])
             .output()
@@ -235,7 +249,7 @@ fn run_systemctl(args: &[&str]) -> BoxResult<()> {
 #[cfg(target_os = "windows")]
 fn run_schtasks(args: &[&str]) -> BoxResult<()> {
     let mut command = Command::new("schtasks");
-    suppress_console_window(&mut command);
+    box_foundation::suppress_console_window(&mut command);
     let output = command
         .args(args)
         .output()

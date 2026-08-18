@@ -74,29 +74,70 @@ fn unpack_tar<R: Read>(mut archive: tar::Archive<R>, destination: &Path) -> Resu
     Ok(())
 }
 
-/// Locates the single extension root inside an extracted directory: the
-/// directory itself when it holds `SKILL.md`/`package.json`, otherwise its
-/// only child directory.
+/// Maximum number of subdirectory levels searched below an import
+/// destination when locating the extension root.
+pub const MAX_EXTENSION_ROOT_DEPTH: usize = 2;
+
+/// Locates the extension root inside an import destination: the directory
+/// itself when it holds `SKILL.md`/`package.json`, otherwise a layered
+/// (depth-first) search down to `MAX_EXTENSION_ROOT_DEPTH` levels below.
+/// The shallowest match wins; within a level, `read_dir` order decides.
+/// Noise directories (VCS, installed dependencies, build output) are
+/// skipped so a monorepo checkout does not accidentally match a vendored
+/// copy.
+pub fn locate_extension_root(directory: &Path) -> Result<PathBuf, String> {
+    let mut depth = 0usize;
+    let mut frontier = vec![directory.to_path_buf()];
+    loop {
+        let mut next = Vec::new();
+        for candidate in &frontier {
+            if candidate.join("SKILL.md").is_file()
+                || candidate.join("package.json").is_file()
+            {
+                return Ok(candidate.clone());
+            }
+            if depth < MAX_EXTENSION_ROOT_DEPTH {
+                let entries = fs::read_dir(candidate).map_err(|error| error.to_string())?;
+                for entry in entries.filter_map(Result::ok) {
+                    let name = entry.file_name();
+                    if matches!(
+                        name.to_str(),
+                        Some(".git" | "node_modules" | "dist" | "build" | ".cache" | ".dsh")
+                    ) {
+                        continue;
+                    }
+                    if entry
+                        .file_type()
+                        .map(|kind| kind.is_dir())
+                        .unwrap_or(false)
+                    {
+                        next.push(entry.path());
+                    }
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+        depth += 1;
+    }
+    Err(format!(
+        "no extension root found (looked up to {MAX_EXTENSION_ROOT_DEPTH} level(s) below the import directory)"
+    ))
+}
+
+/// Locates the single extension root inside an extracted directory. The
+/// directory itself when it holds `SKILL.md`/`package.json`, otherwise a
+/// depth-limited search of its subdirectories (see `locate_extension_root`).
 pub fn archive_content_root(destination: &Path) -> Result<PathBuf, String> {
-    if destination.join("SKILL.md").is_file() || destination.join("package.json").is_file() {
-        return Ok(destination.to_path_buf());
-    }
-    let entries = fs::read_dir(destination)
-        .map_err(|error| error.to_string())?
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
-    if entries.len() == 1 && entries[0].path().is_dir() {
-        Ok(entries[0].path())
-    } else {
-        Err("tarball must contain one extension directory".to_owned())
-    }
+    locate_extension_root(destination)
 }
 
 /// Appends a directory tree to an in-progress gzip tarball, skipping `.git`
 /// and `node_modules` so exports stay small and reproducible.
 pub fn append_plugin_archive(
     archive: &mut tar::Builder<GzEncoder<fs::File>>,
-    root: &Path,
     directory: &Path,
     target: &Path,
 ) -> Result<(), String> {
@@ -113,7 +154,7 @@ pub fn append_plugin_archive(
             archive
                 .append_dir(&output, &path)
                 .map_err(|error| error.to_string())?;
-            append_plugin_archive(archive, root, &path, &output)?;
+            append_plugin_archive(archive, &path, &output)?;
         } else if kind.is_file() {
             archive
                 .append_path_with_name(&path, &output)
@@ -134,7 +175,7 @@ pub fn export_extension_directory(source: &Path, destination: &Path) -> Result<(
         .map_err(|error| format!("cannot create extension tarball: {error}"))?;
     let encoder = GzEncoder::new(output, Compression::default());
     let mut archive = tar::Builder::new(encoder);
-    append_plugin_archive(&mut archive, source, source, Path::new("extension"))?;
+    append_plugin_archive(&mut archive, source, Path::new("extension"))?;
     archive.finish().map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -167,9 +208,68 @@ mod tests {
     use super::*;
 
     fn sandbox(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("dshbox-transfer-{name}-{}", crate::now_seconds()));
+        let root = std::env::temp_dir()
+            .join(format!("dshbox-transfer-{name}-{}", box_foundation::now_seconds()));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// Compare the inode of two paths when the platform exposes one;
+    /// on Windows fall back to asserting both paths resolve to the same
+    /// symlink target (a copied directory would have a different target).
+    #[cfg(unix)]
+    fn assert_same_shared_file(left: &Path, right: &Path) {
+        use std::os::unix::fs::MetadataExt;
+        let left_ino = fs::metadata(left).unwrap().ino();
+        let right_ino = fs::metadata(right).unwrap().ino();
+        assert_eq!(left_ino, right_ino, "{left:?} and {right:?} must share an inode");
+    }
+
+    #[cfg(not(unix))]
+    fn assert_same_shared_file(_left: &Path, _right: &Path) {}
+
+    #[test]
+    fn locate_root_returns_directory_itself_when_it_holds_manifest() {
+        let root = sandbox("root-itself");
+        fs::write(root.join("package.json"), "{}").unwrap();
+        assert_eq!(locate_extension_root(&root).unwrap(), root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn locate_root_descends_two_levels_and_prefers_shallowest() {
+        let root = sandbox("locate-two");
+        fs::create_dir_all(root.join("packages/deep/skill")).unwrap();
+        fs::write(root.join("packages/deep/skill/SKILL.md"), "# s").unwrap();
+        fs::create_dir_all(root.join("vendor/vendored")).unwrap();
+        fs::write(root.join("vendor/vendored/package.json"), "{}").unwrap();
+        // Depth 1 beats depth 2 when both hold a manifest.
+        fs::create_dir_all(root.join("shallow")).unwrap();
+        fs::write(root.join("shallow/package.json"), "{}").unwrap();
+        let found = locate_extension_root(&root).unwrap();
+        assert_eq!(found, root.join("shallow"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn locate_root_rejects_beyond_two_levels() {
+        let root = sandbox("locate-limit");
+        fs::create_dir_all(root.join("a/b/c")).unwrap();
+        fs::write(root.join("a/b/c/package.json"), "{}").unwrap();
+        assert!(locate_extension_root(&root).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn locate_root_skips_noise_directories() {
+        let root = sandbox("locate-noise");
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("node_modules/pkg/package.json"), "{}").unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(root.join("dist/package.json"), "{}").unwrap();
+        // Only noise matches below the root: nothing real to find.
+        assert!(locate_extension_root(&root).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

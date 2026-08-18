@@ -3,9 +3,175 @@
 use box_foundation::{suppress_console_window, BoxResult};
 use git2::{build::RepoBuilder, FetchOptions, RemoteCallbacks};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
+
+/// Add `directory` to the user's PATH (HKCU\Environment\Path on
+/// Windows, `~/.config/.../path` on Linux, `~/Library/.../path` on
+/// macOS) so subsequent shells and agent-runner subprocesses can
+/// resolve `dshbox` without a fresh install. Existing entries are
+/// preserved verbatim; the new directory is appended (PATH lookup
+/// order doesn't matter for our use case — there is only one
+/// `dshbox.exe` in the world for any given user).
+///
+/// Returns `Ok(())` if the directory was already present or just
+/// added; `Err(message)` if the registry / rc-file is unreadable.
+///
+/// Idempotent: repeated calls do not produce duplicate entries.
+pub fn add_to_user_path(directory: &Path) -> BoxResult<()> {
+    #[cfg(target_os = "windows")]
+    {
+        add_to_user_path_windows(directory)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        add_to_user_path_posix(directory)
+    }
+}
+
+/// True if `executable` is reachable on `PATH` for the current
+/// process. Used by the desktop launch path to decide whether to
+/// offer the user a one-shot PATH patch (Windows NSIS installer does
+/// not put `dshbox.exe` on PATH by default).
+pub fn command_on_path(name: &str) -> bool {
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    for entry in std::env::split_paths(&paths) {
+        let candidate = entry.join(name);
+        if candidate.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+/// The directory that should be added to PATH so that running
+/// `dshbox` from any shell resolves to *this* executable. Used by the
+/// self-bootstrap check that runs on `dshbox ui` startup. Falls back
+/// to `None` if the running binary's location cannot be determined.
+pub fn self_install_directory() -> Option<PathBuf> {
+    std::env::current_exe().ok().and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+#[cfg(target_os = "windows")]
+fn add_to_user_path_windows(directory: &Path) -> BoxResult<()> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    let directory_string = directory.to_string_lossy().into_owned();
+    let environment = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(
+            "Environment",
+            winreg::enums::KEY_READ | winreg::enums::KEY_WRITE,
+        )
+        .map_err(|error| format!("cannot open HKCU\\Environment: {error}"))?;
+    let current: String = environment
+        .get_value("Path")
+        .unwrap_or_default();
+    // Registry stores Path as either REG_SZ or REG_EXPAND_SZ. We use
+    // REG_EXPAND_SZ so future edits that introduce env vars stay
+    // valid. Split on `;` (the only separator HKCU\Environment\Path
+    // recognises) and compare case-insensitively — `C:\Program Files\DSH Box`
+    // and `c:\program files\dsh box` are the same directory to Windows.
+    let already_present = current
+        .split(';')
+        .any(|entry| entry.trim().eq_ignore_ascii_case(&directory_string));
+    if already_present {
+        return Ok(());
+    }
+    let separator = if current.is_empty() || current.ends_with(';') {
+        ""
+    } else {
+        ";"
+    };
+    let updated = format!("{current}{separator}{directory_string}");
+    environment
+        .set_value("Path", &updated)
+        .map_err(|error| format!("cannot write HKCU\\Environment\\Path: {error}"))?;
+    // Broadcast WM_SETTINGCHANGE so already-open Explorer windows
+    // and (some) console hosts refresh their cached environment.
+    // New shells must still be opened for the change to apply to them.
+    broadcast_setting_change();
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn broadcast_setting_change() {
+    // The full Win32 declaration is heavy; the bare call we need is
+    // `SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", ...)`.
+    // We use LoadLibraryW + GetProcAddress to keep the build
+    // dependency-free of the windows-sys crate.
+    extern "system" {
+        fn LoadLibraryW(library: *const u16) -> *mut core::ffi::c_void;
+        fn GetProcAddress(module: *mut core::ffi::c_void, name: *const u8)
+            -> Option<unsafe extern "system" fn() -> isize>;
+        fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
+    }
+    let user32: Vec<u16> = "user32.dll\0".encode_utf16().collect();
+    let module = unsafe { LoadLibraryW(user32.as_ptr()) };
+    if module.is_null() {
+        return;
+    }
+    let symbol = unsafe { GetProcAddress(module, b"SendMessageTimeoutW\0".as_ptr()) };
+    let Some(send_message) = symbol else {
+        unsafe {
+            FreeLibrary(module);
+        }
+        return;
+    };
+    type SendMessageTimeoutW = unsafe extern "system" fn(
+        hwnd: isize,
+        msg: u32,
+        wparam: usize,
+        lparam: *const u16,
+        flags: u32,
+        timeout: u32,
+        result: *mut isize,
+    ) -> isize;
+    let send: SendMessageTimeoutW = unsafe { core::mem::transmute(send_message) };
+    let payload: Vec<u16> = "Environment\0".encode_utf16().collect();
+    let mut result = 0_isize;
+    unsafe {
+        send(
+            0xffff, // HWND_BROADCAST
+            0x001A, // WM_SETTINGCHANGE
+            0,
+            payload.as_ptr(),
+            0x0002, // SMTO_ABORTIFHUNG
+            1000,
+            &mut result,
+        );
+        FreeLibrary(module);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn add_to_user_path_posix(directory: &Path) -> BoxResult<()> {
+    let directory_string = directory.to_string_lossy().into_owned();
+    let home = std::env::var_os("HOME").ok_or("HOME is unset; cannot patch PATH")?;
+    let home_path = PathBuf::from(home);
+    for rc in [".bashrc", ".zshrc", ".profile"] {
+        let candidate = home_path.join(rc);
+        if !candidate.is_file() {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&candidate)
+            .map_err(|error| format!("cannot read {rc}: {error}"))?;
+        // Idempotent: skip if the exact path is already exported.
+        let already = contents.lines().any(|line| {
+            line.contains(&directory_string) && line.contains("PATH")
+        });
+        if already {
+            return Ok(());
+        }
+        // Append a guarded block so a future uninstall can find it.
+        let addition = format!(
+            "\n# Added by dshbox setup-path\nexport PATH=\"$PATH:{directory_string}\"\n"
+        );
+        std::fs::write(&candidate, format!("{contents}{addition}"))
+            .map_err(|error| format!("cannot append to {rc}: {error}"))?;
+        return Ok(());
+    }
+    Err("no shell rc file found (.bashrc / .zshrc / .profile)".to_owned())
+}
 
 pub trait ProcessRunner: Send + Sync {
     fn run(
@@ -98,6 +264,9 @@ pub fn detect_proxy_url() -> Option<String> {
     None
 }
 
+// Windows-only helper: ProxyServer values from the registry often carry no
+// scheme; normalize them before handing them to the HTTP client.
+#[allow(dead_code)]
 fn with_http_scheme(server: &str) -> String {
     let server = server.trim();
     if server.starts_with("http://")
@@ -122,6 +291,10 @@ fn clone_once(
     // repositories are useful for tests and development; public remotes stay shallow.
     if !Path::new(url).is_dir() {
         fetch.depth(1);
+        // Shallow fetches only pull the default branch's tip commit; without
+        // this call `revparse_single("v0.12.2")` cannot resolve tags
+        // because the `refs/tags/v0.12.2` pointer is never downloaded.
+        fetch.download_tags(git2::AutotagOption::All);
     }
     let mut callbacks = RemoteCallbacks::new();
     let cancelled_for_progress = std::sync::Arc::clone(&cancelled);
@@ -148,17 +321,33 @@ fn clone_once(
     }
     let mut builder = RepoBuilder::new();
     builder.fetch_options(fetch);
-    if let Some(revision) = revision {
-        builder.branch(revision);
-    }
     let repository = builder
         .clone(url, destination)
         .map_err(|error| format!("Git clone failed: {error}"))?;
-    let commit = repository
-        .head()
-        .map_err(|error| format!("cannot resolve cloned revision: {error}"))?
-        .peel_to_commit()
-        .map_err(|error| format!("cannot resolve cloned commit: {error}"))?;
+    // Resolve the requested revision after clone. RepoBuilder::branch only
+    // matches refs/heads, so it silently misses tags and trips with
+    // `reference 'refs/remotes/origin/<ref>' not found`. revparse_single
+    // walks the usual tag → branch → commit resolution order instead.
+    let commit = if let Some(revision) = revision {
+        let object = repository
+            .revparse_single(revision)
+            .map_err(|error| format!("cannot resolve revision `{revision}`: {error}"))?;
+        repository
+            .checkout_tree(&object, None)
+            .map_err(|error| format!("cannot checkout `{revision}`: {error}"))?;
+        repository
+            .set_head_detached(object.id())
+            .map_err(|error| format!("cannot detach HEAD to `{revision}`: {error}"))?;
+        object
+            .peel_to_commit()
+            .map_err(|error| format!("cannot resolve cloned commit: {error}"))?
+    } else {
+        repository
+            .head()
+            .map_err(|error| format!("cannot resolve cloned revision: {error}"))?
+            .peel_to_commit()
+            .map_err(|error| format!("cannot resolve cloned commit: {error}"))?
+    };
     Ok(commit.id().to_string())
 }
 
@@ -207,6 +396,97 @@ pub fn remove_checkout(destination: &Path) {
     }
 }
 
+/// List the tags a public remote advertises, without downloading any
+/// objects — libgit2's equivalent of `git ls-remote --tags`, keeping the
+/// project free of any dependency on a system git executable. Like the
+/// clone path, remote listings try the detected system proxy first and
+/// fall back to a direct connection; a local directory is read from its
+/// `refs/tags/` namespace directly.
+pub fn list_remote_tags(url: &str) -> BoxResult<Vec<String>> {
+    // Local repositories (tests / development): read tags off disk instead
+    // of negotiating a smart-protocol connection with ourselves.
+    if Path::new(url).is_dir() {
+        let repository = git2::Repository::open(url)
+            .map_err(|error| format!("cannot open local repository: {error}"))?;
+        let mut tags = Vec::new();
+        for reference in repository
+            .references()
+            .map_err(|error| format!("cannot list local refs: {error}"))?
+            .flatten()
+        {
+            if let Some(tag) = reference.name().and_then(|name| name.strip_prefix("refs/tags/")) {
+                tags.push(tag.to_owned());
+            }
+        }
+        tags.sort();
+        return Ok(tags);
+    }
+    let proxy = detect_proxy_url();
+    if let Some(proxy_url) = proxy.as_deref() {
+        match list_remote_tags_once(url, Some(proxy_url)) {
+            Ok(tags) => return Ok(tags),
+            Err(error) => {
+                // The proxy may be stale or blocking git; retry directly.
+                if let Ok(tags) = list_remote_tags_once(url, None) {
+                    return Ok(tags);
+                }
+                return Err(error);
+            }
+        }
+    }
+    list_remote_tags_once(url, None)
+}
+
+fn list_remote_tags_once(url: &str, proxy_url: Option<&str>) -> BoxResult<Vec<String>> {
+    // An anonymous remote on a throwaway bare repository is enough to run
+    // the ref advertisement; nothing is persisted or fetched.
+    let scratch = std::env::temp_dir().join(format!(
+        "dsh-box-lsremote-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let repository = git2::Repository::init_bare(&scratch)
+        .map_err(|error| format!("cannot prepare git session: {error}"))?;
+    let result = (|| -> BoxResult<Vec<String>> {
+        let mut remote = repository
+            .remote_anonymous(url)
+            .map_err(|error| format!("cannot resolve remote {url}: {error}"))?;
+        let mut proxy = git2::ProxyOptions::new();
+        match proxy_url {
+            Some(proxy_url) => {
+                proxy.url(proxy_url);
+            }
+            None => {
+                proxy.auto();
+            }
+        }
+        let connection = remote
+            .connect_auth(git2::Direction::Fetch, None, Some(proxy))
+            .map_err(|error| format!("cannot reach {url}: {error}"))?;
+        let mut tags = Vec::new();
+        for head in connection
+            .list()
+            .map_err(|error| format!("cannot list refs of {url}: {error}"))?
+        {
+            let name = head.name();
+            // Skip peeled tag objects (`refs/tags/v1^{}`); the plain ref
+            // already names the tag.
+            if let Some(tag) = name.strip_prefix("refs/tags/") {
+                if !tag.ends_with("^{}") {
+                    tags.push(tag.to_owned());
+                }
+            }
+        }
+        tags.sort();
+        Ok(tags)
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +521,34 @@ mod tests {
         let commit = shallow_clone(source.to_str().unwrap(), &destination, None).unwrap();
         assert!(destination.join("README.md").is_file());
         assert_eq!(commit.len(), 40);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn list_remote_tags_reads_local_repository_tags() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-box-lstags-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let repository = Repository::init(&root).unwrap();
+        fs::write(root.join("README.md"), "tagged").unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        index.write().unwrap();
+        let tree = repository.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = Signature::now("DSH Box", "box@example.invalid").unwrap();
+        let commit_id = repository
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .unwrap();
+        let commit = repository.find_commit(commit_id).unwrap();
+        repository.tag("v0.1.0", commit.as_object(), &signature, "release", false).unwrap();
+        repository.tag("v0.2.0", commit.as_object(), &signature, "release", false).unwrap();
+        let tags = list_remote_tags(root.to_str().unwrap()).unwrap();
+        assert_eq!(tags, vec!["v0.1.0".to_owned(), "v0.2.0".to_owned()]);
         let _ = fs::remove_dir_all(root);
     }
 }

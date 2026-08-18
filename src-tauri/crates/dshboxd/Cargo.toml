@@ -8,5 +8,24 @@ name = "dshboxd"
 path = "src/main.rs"
 
 [dependencies]
+box-api = { path = "../box-api" }
+box-containers = { path = "../box-containers" }
+box-dsh-context = { path = "../box-dsh-context" }
+box-dsh-versions = { path = "../box-dsh-versions" }
+box-extensions = { path = "../box-extensions" }
+box-foundation = { path = "../box-foundation" }
+box-image = { path = "../box-image" }
+box-runtime = { path = "../box-runtime" }
+box-scheduler = { path = "../box-scheduler" }
 box-server-core = { path = "../box-server-core" }
+box-state = { path = "../box-state" }
+box-toolchains = { path = "../box-toolchains" }
+flate2 = "1.1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
+tar = "0.4"
+
+[dev-dependencies]
+tempfile = "3.13"

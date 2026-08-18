@@ -1,0 +1,19 @@
+#!/bin/sh
+# PATH entry for the dshbox daemon shipped inside the DSH Box resources.
+# The real daemon lives at /usr/lib/dshbox/resources/server/<target>/dshboxd
+# (deb/rpm install it only as a bundled resource), so this wrapper resolves
+# it regardless of the target subdirectory and points the daemon at its
+# bundled runtime via DSHBOX_RESOURCE_DIR.
+
+set -eu
+
+for candidate in /usr/lib/dshbox/resources/server/*/dshboxd; do
+  if [ -x "$candidate" ]; then
+    DSHBOX_RESOURCE_DIR="${candidate%/server/*}"
+    export DSHBOX_RESOURCE_DIR
+    exec "$candidate" "$@"
+  fi
+done
+
+echo "dshboxd: bundled daemon is missing; reinstall DSH Box" >&2
+exit 1

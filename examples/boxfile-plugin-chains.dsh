@@ -1,0 +1,110 @@
+# DSH Box boxfile — exercise every `ADD plugin` source spec shape
+#
+# This boxfile is the canonical reference for what `ADD plugin <src>`
+# accepts. Each line below uses a DIFFERENT spec shape and a DIFFERENT
+# real package, so a successful build exercises every branch of the
+# pipeline: parse → fetch → npm pack → import into repository →
+# workspace install.
+#
+#   * "verified" lines use real packages that were actually pulled
+#     during integration testing. Local placeholders are prepared by
+#     the README's setup snippet.
+#   * Lines that need a source you must provide yourself are marked
+#     `[needs your source]` and left commented by default.
+#
+# Run end-to-end:
+#
+#   dshbox pull template github.com/deepseek-ai/deepseek-harness:latest
+#   dshbox build ./boxfile-plugin-chains.dsh --name dshbox-plugin-chains
+#   dshbox run dshbox-plugin-chains
+#
+# NOTE — duplicate names are rejected: `dshbox plugin install ...`
+# refuses "plugin is already installed in profile web". So this file
+# deliberately avoids naming the same package twice; each shape uses a
+# unique target.
+
+FROM github.com/deepseek-ai/deepseek-harness:latest
+PROFILE web
+NAME dshbox-plugin-chains
+VERSION 1.0.0
+LABEL maintainer=dshbox@local
+LABEL example=plugin-source-shapes
+
+# ────────────────────────────────────────────────────────────────────
+# 1. GitHub short-form, tagged release          [verified]
+#    `github.com/<owner>/<repo>:<tag>` pastes straight from a GitHub
+#    release page. The `:vX.Y.Z` becomes `ref_` on ParsedSource::Github.
+# ────────────────────────────────────────────────────────────────────
+ADD plugin github.com/omdsh-dev/DSH-better-sidebar
+
+# ────────────────────────────────────────────────────────────────────
+# 2. `git:` prefix as explicit git intent       [verified]
+#    `git:` is dshbox's own prefix (ParsedSource::GitPrefix); the
+#    remainder is forwarded verbatim to the git resolver.
+#    `git:github.com/owner/repo:ref` is equivalent to the bare
+#    short-form above, just explicit.
+# ────────────────────────────────────────────────────────────────────
+ADD plugin git:github.com/bowenliang123/dsh-context:main
+
+# ────────────────────────────────────────────────────────────────────
+# 3. `npm:` registry package, version-pinned    [verified]
+#    `npm:<spec>` fetches from the npm registry. The remainder is the
+#    npm spec grammar — name, optional @version, optional tag.
+#    Pinned to an exact version so a rebuild doesn't drift.
+# ────────────────────────────────────────────────────────────────────
+ADD plugin npm:dsh-honcho-memory@0.4.0
+
+# ────────────────────────────────────────────────────────────────────
+# 4. npm aggregator bundle (umbrella package)   [verified]
+#    `@linxin666/dsh-web-ui-all` is an umbrella: one npm name expands
+#    to ~14 independent DSH plugins at runtime. DSH Box handles the
+#    workspace promotion automatically; you only write the npm name.
+# ────────────────────────────────────────────────────────────────────
+ADD plugin npm:@linxin666/dsh-web-ui-all
+
+# ────────────────────────────────────────────────────────────────────
+# 5. `npm:` alias — `my-name@npm:real-pkg@ver`  [verified]
+#    Install real-pkg under the alias my-name. Multiple plugins may
+#    need different versions of the same library; aliasing keeps them
+#    side-by-side. The whole token is forwarded to npm verbatim.
+# ────────────────────────────────────────────────────────────────────
+ADD plugin pet-alias@npm:@linxin666/dsh-pet
+
+# ────────────────────────────────────────────────────────────────────
+# 6. Local directory (absolute path)            [needs your source]
+#    A path starting with `/` is an absolute directory. The directory
+#    must contain a Cordis plugin `package.json` (or SKILL.md for a
+#    skill). Useful for in-progress plugins — no registry push needed.
+#    The README's setup snippet prepares /tmp/dsh-local-plugin-placeholder.
+# ────────────────────────────────────────────────────────────────────
+# ADD plugin /tmp/dsh-local-plugin-placeholder
+
+# ────────────────────────────────────────────────────────────────────
+# 7. `file:` URL — local filesystem tarball     [needs your source]
+#    `file:///abs/path.tar.gz` is a tarball (NOT a directory). The
+#    build reads the archive and unpacks it. Must be npm-pack-shaped
+#    (a `npm pack` of an existing plugin works).
+# ────────────────────────────────────────────────────────────────────
+# ADD plugin file:///tmp/dsh-archive-placeholder.tar.gz
+
+# ────────────────────────────────────────────────────────────────────
+# 8. `https://` remote tarball                  [needs your source]
+#    Any http(s) URL is fetched and unpacked as a tarball. The
+#    tarball must contain a top-level package.json (npm pack shape).
+# ────────────────────────────────────────────────────────────────────
+# ADD plugin https://example.com/dsh-remote-plugin-1.0.0.tgz
+
+# ────────────────────────────────────────────────────────────────────
+# 9. Bare name (previously `dshbox plugin import`)  [needs your source]
+#    Once registered via `dshbox plugin import <source>`, the bare
+#    name is reproducible across boxfiles without any URL. Lookup is
+#    against `~/.dsh-box/repository/plugins/`.
+# ────────────────────────────────────────────────────────────────────
+# ADD plugin dsh-better-sidebar-from-repo
+
+# Skills (one per ADD, optional — demonstrates the `skill` kind works
+# alongside  plugin):
+# ADD skill github.com/team/team-conventions
+
+# Data payloads: pure `cp`, requires explicit destination.
+# ADD data ./local-prompts/        @profile/prompts

@@ -21,9 +21,13 @@ pub(crate) fn save_runtime_directory(
     // would turn every later join into `D:containers`, which resolves against
     // each child process's current drive and crashes bundled Node/pnpm.
     let normalized = normalize_runtime_directory(&directory)?;
-    let mut config = read_config()?;
-    config.runtime_directory = Some(normalized);
-    write_config(&config)?;
+    let client = connect()?;
+    call(
+        &client,
+        "save_runtime_directory",
+        serde_json::json!({ "runtimeDirectory": normalized }),
+    )?;
+    let config = read_config()?;
     refresh_global_state(&app);
     Ok(config)
 }
@@ -46,10 +50,16 @@ pub(crate) fn save_mirror_settings(
     npm_registry: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<BoxConfig, String> {
-    let mut config = read_config()?;
-    config.github_mirror = normalize_optional_url(github_mirror);
-    config.npm_registry = normalize_optional_url(npm_registry);
-    write_config(&config)?;
+    let client = connect()?;
+    call(
+        &client,
+        "save_mirror_settings",
+        serde_json::json!({
+            "githubMirror": normalize_optional_url(github_mirror),
+            "npmRegistry": normalize_optional_url(npm_registry),
+        }),
+    )?;
+    let config = read_config()?;
     refresh_global_state(&app);
     Ok(config)
 }

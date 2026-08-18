@@ -1,8 +1,22 @@
 {
   "bundle": {
     "resources": {
+      "../dist/": "dist/",
       "resources/runtime/linux-x64/": "runtime/linux-x64/",
-      "resources/server/linux-x64/": "server/linux-x64/"
+      "resources/server/linux-x64/": "server/linux-x64/",
+      "resources/plugins/linux-x64/": "plugins/linux-x64/"
+    },
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/bin/dshboxd": "../scripts/packaging/dshboxd"
+        }
+      },
+      "rpm": {
+        "files": {
+          "/usr/bin/dshboxd": "../scripts/packaging/dshboxd"
+        }
+      }
     }
   }
 }

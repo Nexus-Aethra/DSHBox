@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import type { BoxConfig, ContainerExtensions, DshContainer, DshVersion, ExtensionBundle, Language, ResourceSnapshot, ResourceState, ServerServiceStatus, TaskRecord, ToolchainStatus, WorkspaceExtension } from '../types/domain'
+import type { BoxConfig, ContainerExtensions, DataEntry, DshContainer, DshVersion, ExtensionBundle, HarnessUpgradeReport, Language, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, ResourceState, ServerServiceStatus, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
 
 type ToolchainPayload = { id: string; name: string; managedVersion: string | null }
 
@@ -12,15 +12,23 @@ export const boxApi = {
   saveLanguage: (language: Language) => invoke<BoxConfig>('save_language', { language }),
   saveMirrorSettings: (githubMirror: string | null, npmRegistry: string | null) => invoke<BoxConfig>('save_mirror_settings', { githubMirror, npmRegistry }),
   getServerServiceStatus: () => invoke<ServerServiceStatus>('get_server_service_status'),
+  getDaemonStatus: () => invoke<boolean>('get_daemon_status'),
   restartServerService: () => invoke<void>('restart_server_service'),
   detectToolchains: async () => (await invoke<ToolchainPayload[]>('detect_toolchains')).map(({ id, name, managedVersion }) => ({ id, name, version: managedVersion })),
   listDshVersions: () => invoke<DshVersion[]>('list_dsh_versions'),
   enqueueDshCatalogRefresh: () => invoke<TaskRecord>('enqueue_dsh_catalog_refresh'),
-  enqueueDshVersionInstall: (version: string) => invoke<TaskRecord>('enqueue_dsh_version_install', { version }),
-  openDshFrontBrowser: (id: string) => invoke<void>('open_dsh_front_browser', { id }),
   uninstallDshVersion: (version: string) => invoke<BoxConfig>('uninstall_dsh_version', { version }),
   listInstalledDshVersions: () => invoke<string[]>('list_installed_dsh_versions'),
+  pullTemplate: (version: string) => invoke<TaskRecord>('enqueue_pull_template', { version }),
+  openDshFrontBrowser: (id: string) => invoke<void>('open_dsh_front_browser', { id }),
+  upgradeLegacyResources: () => invoke<HarnessUpgradeReport[]>('upgrade_legacy_resources'),
   createContainer: (name: string, version: string, profile: string) => invoke<DshContainer>('create_dsh_container', { request: { name, version, profile } }),
+    listTemplates: () => invoke<TemplateInfo[]>('list_templates'),
+    readTemplate: (name: string) => invoke<{ name: string; text: string }>('read_template', { name }),
+    importTemplate: (archive: string, name: string | null) => invoke<string>('import_template', { request: { archive, name } }),
+    exportTemplate: (name: string, destination: string | null) => invoke<string>('export_template', { request: { name, destination } }),
+    removeTemplate: (name: string) => invoke<string>('remove_template', { request: { name } }),
+    createContainerFromTemplate: (name: string, template: string, profile: string | null) => invoke<TaskRecord>('enqueue_template_container', { request: { name, template, profile } }),
   listContainers: () => invoke<DshContainer[]>('list_dsh_containers'),
   getContainerDetails: (id: string) => invoke<ContainerExtensions | null>('get_container_details', { id }),
   addContainerProfile: (id: string, profile: string) => invoke<DshContainer>('add_dsh_container_profile', { id, profile }),
@@ -41,8 +49,11 @@ export const boxApi = {
   enqueuePluginExport: (sourceContainerId: string, sourcePath: string, destination: string) => invoke<TaskRecord>('enqueue_plugin_export', { request: { sourceContainerId, sourcePath, destination } }),
   removeRepositoryPlugin: (id: string, profile: string, name: string) => invoke<void>('remove_repository_plugin', { id, profile, name }),
   listResourceStates: () => invoke<ResourceSnapshot>('list_resource_states'),
+  listRepositoryReferenceCounts: () => invoke<RepositoryReferenceRow[]>('list_repository_reference_counts'),
   getResourceState: (key: string) => invoke<ResourceState | null>('get_resource_state', { key }),
   refreshResourceState: () => invoke<ResourceSnapshot>('refresh_resource_state'),
+  listDataEntries: () => invoke<DataEntry[]>('list_data_entries'),
+  pruneOrphanedData: () => invoke<string[]>('prune_orphaned_data'),
   deleteContainer: (id: string) => invoke<void>('delete_dsh_container', { id }),
   enqueueContainerStart: (id: string) => invoke<TaskRecord>('enqueue_container_start', { id }),
   enqueueContainerStop: (id: string) => invoke<TaskRecord>('enqueue_container_stop', { id }),
@@ -56,6 +67,12 @@ export const boxApi = {
   readContainerLog: (id: string, log: 'host' | 'rebuild' | 'webview') => invoke<string>('read_container_log', { id, log }),
   chooseDirectory: (title: string) => open({ directory: true, multiple: false, title }),
   chooseExtensionArchive: (title: string) => open({ multiple: false, title, filters: [{ name: 'Tar archives', extensions: ['tar', 'tgz', 'gz', 'xz'] }] }),
+  chooseScriptFile: (title: string) => open({ multiple: false, title, filters: [{ name: 'DSH build scripts', extensions: ['dsh'] }] }),
   choosePluginExport: (title: string, defaultPath: string) => save({ title, defaultPath, filters: [{ name: 'Tarball', extensions: ['tar.gz'] }] }),
   listenTask: <T>(event: string, listener: (payload: T) => void) => listen<T>(event, ({ payload }) => listener(payload)),
+  // Image (dshimage) commands
+  previewImageScript: (path: string) => invoke<PreviewScriptResult>('preview_image_script_command', { path }),
+  enqueueImageBuild: (scriptPath: string, outputPath?: string | null, containerName?: string | null) => invoke<TaskRecord>('enqueue_image_build', { request: { scriptPath, outputPath, containerName } }),
+  enqueueImageCommit: (containerId: string, outputPath: string, name: string, version: string) => invoke<TaskRecord>('enqueue_image_commit_stub', { request: { containerId, outputPath, name, version } }),
+  enqueueImageLoad: (archivePath: string) => invoke<TaskRecord>('enqueue_image_load_stub', { request: { archivePath } }),
 }

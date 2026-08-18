@@ -7,6 +7,7 @@ use box_foundation::now_seconds;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -142,7 +143,326 @@ pub fn write_repository_index(runtime: &Path, entries: &[RepositoryExtension]) -
     fs::write(path, serde_json::to_string_pretty(entries).map_err(|error| error.to_string())?).map_err(|error| error.to_string())
 }
 
-/// One entry inside an exported extension bundle.
+// ── Owner-id references ───────────────────────────────────────────────────
+// Persistent per-entry owner-id map stored at
+// `<root>/repository/references.json`. Each entry tracks which containers
+// and which built templates currently link it; an entry is removable only
+// when both sets are empty, so a plugin referenced by a template (but
+// never installed into a container) survives `plugin prune`.
+//
+// The on-disk shape is `{containers: [id1, id2], templates: [id3]}`. The
+// in-memory type is `BTreeSet<String>`, so `add(insert) / remove(erase)`
+// are no-ops when the id is already (or no longer) present — we never
+// have to reason about saturation or drift.
+//
+// Reads are unverified: callers get whatever is on disk. Every write
+// (add / remove / prune / rm / template delete / container delete) goes
+// through `reconcile_owner_index` first, which rebuilds the map from the
+// canonical sources (each container's `extensions.json` and each built
+// template's `list.json`) and prunes / adds anything stale. That makes
+// the index crash-safe: a missing or torn file is fixed the next time
+// the user mutates anything, with no separate "gc" command required.
+
+/// Set of owner ids (containers or templates) referencing one entry.
+pub type OwnerSet = BTreeSet<String>;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceCount {
+    #[serde(default)]
+    pub containers: OwnerSet,
+    #[serde(default)]
+    pub templates: OwnerSet,
+}
+
+impl ReferenceCount {
+    /// Total number of owners (containers + templates). Kept as `u32`
+    /// for back-compat with the old numeric snapshot.
+    pub fn total(&self) -> u32 {
+        (self.containers.len() + self.templates.len()) as u32
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.containers.is_empty() && self.templates.is_empty()
+    }
+
+    /// Returns true when the id was newly inserted.
+    pub fn add(&mut self, kind: ReferenceKind, owner_id: &str) -> bool {
+        match kind {
+            ReferenceKind::Container => self.containers.insert(owner_id.to_owned()),
+            ReferenceKind::Template => self.templates.insert(owner_id.to_owned()),
+        }
+    }
+
+    /// Returns true when the id was actually removed.
+    pub fn remove(&mut self, kind: ReferenceKind, owner_id: &str) -> bool {
+        match kind {
+            ReferenceKind::Container => self.containers.remove(owner_id),
+            ReferenceKind::Template => self.templates.remove(owner_id),
+        }
+    }
+}
+
+/// Which owner is gaining or losing a reference. Container references are
+/// recorded against one container's `extensions.json`; template references
+/// are recorded against one built template's `list.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReferenceKind {
+    Container,
+    Template,
+}
+
+/// Summary returned by `reconcile_owner_index` so callers / tests can
+/// confirm drift was repaired.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    pub owners_rebuilt: usize,
+    pub containers_added: usize,
+    pub containers_pruned: usize,
+    pub templates_added: usize,
+    pub templates_pruned: usize,
+}
+
+pub fn references_path(runtime: &Path) -> PathBuf {
+    repository_root(runtime).join("references.json")
+}
+
+/// Read the persisted owner-id map. The legacy numeric format
+/// (`{"id": 3}`) is accepted but ignored — its value is dropped and the
+/// entry reads as empty. The next write upgrades the on-disk shape.
+/// Missing or malformed files read as empty, mirroring `scan_repository`.
+pub fn read_references(runtime: &Path) -> BTreeMap<String, ReferenceCount> {
+    let raw = match fs::read_to_string(references_path(runtime)) {
+        Ok(text) => text,
+        Err(_) => return BTreeMap::new(),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return BTreeMap::new(),
+    };
+    let mut out = BTreeMap::new();
+    let Some(object) = value.as_object() else {
+        return out;
+    };
+    for (key, entry) in object {
+        // Legacy: bare numeric value (old single-counter format). Drop it.
+        if entry.is_number() {
+            continue;
+        }
+        // Legacy v2: `{"containers": N, "templates": M}` — numeric ids were
+        // never valid, so treat the numbers as zero and rewrite on next save.
+        if let Some(object) = entry.as_object() {
+            let mut rebuilt = ReferenceCount::default();
+            if let Some(arr) = object.get("containers").and_then(Value::as_array) {
+                for item in arr {
+                    if let Some(id) = item.as_str() {
+                        rebuilt.containers.insert(id.to_owned());
+                    }
+                }
+            }
+            if let Some(arr) = object.get("templates").and_then(Value::as_array) {
+                for item in arr {
+                    if let Some(id) = item.as_str() {
+                        rebuilt.templates.insert(id.to_owned());
+                    }
+                }
+            }
+            out.insert(key.clone(), rebuilt);
+        }
+    }
+    out
+}
+
+pub fn write_references(
+    runtime: &Path,
+    references: &BTreeMap<String, ReferenceCount>,
+) -> Result<(), String> {
+    let path = references_path(runtime);
+    fs::create_dir_all(path.parent().ok_or("references has no parent")?)
+        .map_err(|error| error.to_string())?;
+    fs::write(
+        path,
+        serde_json::to_string_pretty(references).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Record that `owner_id` now references `entry_id`. Idempotent: inserting
+/// an id that already exists is a no-op (returns `false`), so callers do
+/// not need to read-modify-write defensively.
+pub fn add_reference_owner(
+    runtime: &Path,
+    entry_id: &str,
+    kind: ReferenceKind,
+    owner_id: &str,
+) -> Result<(), String> {
+    let mut references = read_references(runtime);
+    let entry = references.entry(entry_id.to_owned()).or_default();
+    entry.add(kind, owner_id);
+    write_references(runtime, &references)
+}
+
+/// Record that `owner_id` no longer references `entry_id`. Idempotent:
+/// removing an absent id is a no-op, so the call never panics on drift.
+pub fn remove_reference_owner(
+    runtime: &Path,
+    entry_id: &str,
+    kind: ReferenceKind,
+    owner_id: &str,
+) -> Result<(), String> {
+    let mut references = read_references(runtime);
+    if let Some(entry) = references.get_mut(entry_id) {
+        entry.remove(kind, owner_id);
+        if entry.is_empty() {
+            references.remove(entry_id);
+        }
+    }
+    write_references(runtime, &references)
+}
+
+/// Rebuild the on-disk owner-id map from the canonical sources (every
+/// container's `extensions.json` and every built template's `list.json`)
+/// and write it back. Call this before any mutation so a torn file, a
+/// crash between the half-step of "install plugin" and "record owner",
+/// or a manual edit never produces a permanently-stuck counter.
+///
+/// Returns a report of what changed so callers can log it. The function
+/// is best-effort about per-source failures (a corrupt `extensions.json`
+/// or `list.json` is logged and skipped) — the rest of the system still
+/// gets rebuilt.
+pub fn reconcile_owner_index(runtime: &Path) -> Result<ReconcileReport, String> {
+    let root_str = runtime
+        .to_str()
+        .ok_or_else(|| "runtime directory is not valid UTF-8".to_owned())?;
+
+    let mut truth: BTreeMap<String, ReferenceCount> = BTreeMap::new();
+
+    // Container-side owners: every container's per-container extension
+    // records that carry a `repository_id` count as one container owner
+    // for that plugin.
+    if let Ok(containers) = box_containers::scan_containers(root_str) {
+        for container in containers.values() {
+            let records = read_extension_records(container);
+            for record in records {
+                if record.kind != ExtensionKind::Plugin {
+                    continue;
+                }
+                let Some(repository_id) = record.repository_id.as_deref() else {
+                    continue;
+                };
+                truth
+                    .entry(repository_id.to_owned())
+                    .or_default()
+                    .containers
+                    .insert(container.id.clone());
+            }
+        }
+    }
+
+    // Template-side owners: every built template's `list.json` Reference
+    // resource counts as one template owner for the referenced plugin.
+    let template_index = box_dsh_versions::read_template_index(root_str);
+    for (name, entry) in &template_index {
+        if !entry.built {
+            continue;
+        }
+        let list = match box_dsh_versions::read_built_template(root_str, name) {
+            Ok(Some(list)) => list,
+            Ok(None) => continue,
+            Err(_) => continue,
+        };
+        for resource in &list.resources {
+            if let box_api::TemplateResource::Reference { entry_id, .. } = resource {
+                truth
+                    .entry(entry_id.clone())
+                    .or_default()
+                    .templates
+                    .insert(entry.id.clone());
+            }
+        }
+    }
+
+    // Diff against the current on-disk map so we can report drift.
+    let current = read_references(runtime);
+    let mut report = ReconcileReport::default();
+    report.owners_rebuilt = truth.len();
+    for (id, true_set) in &truth {
+        let cur = current.get(id);
+        let containers_added = match cur {
+            Some(prev) => true_set.containers.difference(&prev.containers).count(),
+            None => true_set.containers.len(),
+        };
+        let containers_pruned = match cur {
+            Some(prev) => prev.containers.difference(&true_set.containers).count(),
+            None => 0,
+        };
+        let templates_added = match cur {
+            Some(prev) => true_set.templates.difference(&prev.templates).count(),
+            None => true_set.templates.len(),
+        };
+        let templates_pruned = match cur {
+            Some(prev) => prev.templates.difference(&true_set.templates).count(),
+            None => 0,
+        };
+        report.containers_added += containers_added;
+        report.containers_pruned += containers_pruned;
+        report.templates_added += templates_added;
+        report.templates_pruned += templates_pruned;
+    }
+    // Owners present on disk but with no current reference are pruned too;
+    // we count them by walking the current map.
+    for (id, cur) in &current {
+        if truth.contains_key(id) {
+            continue;
+        }
+        report.containers_pruned += cur.containers.len();
+        report.templates_pruned += cur.templates.len();
+    }
+
+    write_references(runtime, &truth)?;
+    Ok(report)
+}
+
+/// Repository ids whose reference set is empty (no container AND no
+/// template) — candidates for `remove_repository_extension`. Entries
+/// absent from the map count as unused, so a fresh store prunes nothing
+/// extra.
+pub fn unused_repository_ids(runtime: &Path) -> Vec<String> {
+    let references = read_references(runtime);
+    let entries = scan_repository(runtime);
+    entries
+        .into_iter()
+        .filter(|entry| references.get(&entry.id).map(|count| count.is_empty()).unwrap_or(true))
+        .map(|entry| entry.id)
+        .collect()
+}
+
+/// How many owners currently reference `entry_id` (0 when absent).
+/// Sums both container and template references.
+pub fn reference_count(runtime: &Path, entry_id: &str) -> u32 {
+    read_references(runtime)
+        .get(entry_id)
+        .map(|count| count.total())
+        .unwrap_or(0)
+}
+
+/// One row of the owner-detail payload surfaced by
+/// `list_repository_reference_counts`. The on-disk `ReferenceCount` keeps
+/// the raw `BTreeSet<String>`; this struct is the wire-shape view that
+/// the desktop and CLI consume so they can render "used by container X
+/// and template Y" without having to round-trip through the daemon for
+/// every entry.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryReferenceRow {
+    pub id: String,
+    pub kind: ExtensionKind,
+    pub name: String,
+    pub version: Option<String>,
+    #[serde(default)]
+    pub containers: Vec<String>,
+    #[serde(default)]
+    pub templates: Vec<String>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BundleEntry {
@@ -585,6 +905,7 @@ mod tests {
             name: "One".to_owned(),
             version: "latest".to_owned(),
             profile: "web".to_owned(),
+            template: None,
             directory: root.to_string_lossy().into_owned(),
             status: "stopped".to_owned(),
         }
@@ -618,6 +939,199 @@ mod tests {
         assert!(found.profiles[0].plugins[1].diagnostic.is_some());
         assert_eq!(found.skills[0].name, "demo");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reference_owners_are_added_removed_and_idempotent() {
+        let root = std::env::temp_dir().join(format!("dshbox-references-test-{}", now_seconds()));
+        fs::create_dir_all(repository_root(&root)).unwrap();
+
+        // Absent entries count as zero.
+        assert_eq!(reference_count(&root, "img-a"), 0);
+        assert!(unused_repository_ids(&root).is_empty());
+
+        // Adding a container owner twice for two distinct ids produces a
+        // count of 2 (the set dedupes identical ids, so the second add
+        // for the same id is a no-op).
+        add_reference_owner(&root, "img-a", ReferenceKind::Container, "container-1").unwrap();
+        add_reference_owner(&root, "img-a", ReferenceKind::Container, "container-2").unwrap();
+        add_reference_owner(&root, "img-a", ReferenceKind::Container, "container-2").unwrap();
+        assert_eq!(reference_count(&root, "img-a"), 2);
+
+        // Template owners live in their own set.
+        add_reference_owner(&root, "img-a", ReferenceKind::Template, "tpl-1").unwrap();
+        assert_eq!(reference_count(&root, "img-a"), 3);
+
+        // Persistence: a fresh read sees both sets.
+        let snapshot = read_references(&root);
+        assert_eq!(snapshot["img-a"].containers.len(), 2);
+        assert_eq!(snapshot["img-a"].templates.len(), 1);
+
+        // Removing one container id leaves the other intact.
+        remove_reference_owner(&root, "img-a", ReferenceKind::Container, "container-1").unwrap();
+        assert_eq!(read_references(&root)["img-a"].containers.len(), 1);
+
+        // Removing an unknown id is a no-op (no panic on drift).
+        remove_reference_owner(&root, "img-a", ReferenceKind::Container, "ghost").unwrap();
+        assert_eq!(read_references(&root)["img-a"].containers.len(), 1);
+
+        // Cross-kind removal does not touch the other set.
+        remove_reference_owner(&root, "img-a", ReferenceKind::Container, "container-2").unwrap();
+        assert_eq!(read_references(&root)["img-a"].templates.len(), 1);
+
+        // Empty entries are dropped from the on-disk map so the file
+        // stays compact for the unused check.
+        remove_reference_owner(&root, "img-a", ReferenceKind::Template, "tpl-1").unwrap();
+        assert!(read_references(&root).get("img-a").is_none());
+
+        // An entry with at least one owner survives unused_repository_ids.
+        write_repository_index(
+            &root,
+            &[RepositoryExtension {
+                id: "img-a".to_owned(),
+                kind: ExtensionKind::Plugin,
+                name: "a".to_owned(),
+                version: None,
+                description: None,
+                content_digest: "d".to_owned(),
+                source_path: "missing".to_owned(),
+                imported_at: 0,
+                diagnostic: None,
+                source: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(unused_repository_ids(&root), vec!["img-a"]);
+        add_reference_owner(&root, "img-a", ReferenceKind::Template, "tpl-1").unwrap();
+        assert!(unused_repository_ids(&root).is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_numeric_references_are_dropped_on_read() {
+        let root = std::env::temp_dir().join(format!("dshbox-references-legacy-{}", now_seconds()));
+        fs::create_dir_all(repository_root(&root)).unwrap();
+        // Oldest format: bare numeric value. Reads as empty; a subsequent
+        // write drops the entry from the file entirely.
+        std::fs::write(references_path(&root), "{\"img-a\": 3}").unwrap();
+        assert!(read_references(&root).is_empty());
+
+        add_reference_owner(&root, "img-a", ReferenceKind::Template, "tpl-x").unwrap();
+        let raw = std::fs::read_to_string(references_path(&root)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["img-a"]["templates"], serde_json::json!(["tpl-x"]));
+        assert!(parsed["img-a"].get("containers").is_none()
+            || parsed["img-a"]["templates"].as_array().unwrap().len() == 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconcile_rebuilds_owner_map_from_canonical_sources() {
+        let root = std::env::temp_dir().join(format!(
+            "dshbox-reconcile-test-{}",
+            now_seconds()
+        ));
+        let home = std::env::temp_dir().join(format!("dshbox-reconcile-home-{}", now_seconds()));
+        fs::create_dir_all(repository_root(&root)).unwrap();
+        fs::create_dir_all(home.join(".dsh-box")).unwrap();
+        fs::write(
+            home.join(".dsh-box/config.json"),
+            serde_json::json!({ "runtimeDirectory": root.to_string_lossy() }).to_string(),
+        ).unwrap();
+        let prev_home = std::env::var("HOME").ok();
+        // SAFETY: single-threaded test, restored on drop.
+        unsafe { std::env::set_var("HOME", &home) };
+
+        // Build a container workspace with one repository-linked plugin.
+        let container_root = root.join("instances/container-alpha");
+        fs::create_dir_all(&container_root).unwrap();
+        // `box_containers::scan_containers` only returns containers
+        // that have a `container.json` sidecar; write one so the
+        // reconcile pass sees `container-alpha` as a live owner.
+        fs::write(
+            container_root.join("container.json"),
+            serde_json::json!({
+                "id": "container-alpha",
+                "name": "alpha",
+                "version": "v1",
+                "profile": "web",
+                "directory": container_root.to_string_lossy(),
+                "status": "stopped",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let record = ExtensionRecord {
+            kind: ExtensionKind::Plugin,
+            name: "@scope/repo-plugin".to_owned(),
+            source_kind: "repository".to_owned(),
+                source: "img-real".to_owned(),
+                profile: Some("web".to_owned()),
+                path: "/repo/path".to_owned(),
+                installed_at: now_seconds(),
+                repository_id: Some("img-real".to_owned()),
+                content_digest: None,
+            };
+            write_extension_record(
+                &DshContainer {
+                    id: "container-alpha".to_owned(),
+                    name: "alpha".to_owned(),
+                    version: "v1".to_owned(),
+                    profile: "web".to_owned(),
+                    template: None,
+                    directory: container_root.to_string_lossy().into_owned(),
+                    status: "stopped".to_owned(),
+                },
+                record,
+            )
+            .unwrap();
+
+        // Pre-seed references.json with stale entries that disagree with
+        // the canonical sources.
+        let mut seeded = BTreeMap::new();
+        seeded.insert(
+            "img-real".to_owned(),
+            ReferenceCount {
+                containers: BTreeSet::from(["container-ghost".to_owned()]),
+                ..ReferenceCount::default()
+            },
+        );
+        seeded.insert(
+            "img-orphan".to_owned(),
+            ReferenceCount {
+                templates: BTreeSet::from(["tpl-orphan".to_owned()]),
+                ..ReferenceCount::default()
+            },
+        );
+        write_references(&root, &seeded).unwrap();
+
+        let report = reconcile_owner_index(&root).unwrap();
+        // The pre-seeded ghost container owner for `img-real` is
+        // dropped because no real container references it; the real
+        // container-alpha owner is added because the seed didn't
+        // know about it.
+        assert_eq!(report.containers_pruned, 1, "stale container owner dropped");
+        assert_eq!(report.containers_added, 1, "real container owner added");
+        // `img-orphan` has no canonical reference, so the whole entry
+        // (its template owner set) is wiped from the on-disk map.
+        assert_eq!(report.templates_pruned, 1, "orphan entry dropped");
+
+        let after = read_references(&root);
+        assert_eq!(
+            after["img-real"].containers,
+            BTreeSet::from(["container-alpha".to_owned()])
+        );
+        assert!(after.get("img-orphan").is_none());
+
+        if let Some(value) = prev_home {
+            unsafe { std::env::set_var("HOME", value) };
+        } else {
+            unsafe { std::env::remove_var("HOME") };
+        }
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]

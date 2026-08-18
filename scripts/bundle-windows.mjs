@@ -8,6 +8,7 @@ const environment = {
 }
 
 for (const [command, args] of [
+  ['pnpm', ['plugin:build']],
   ['pnpm', ['runtime:prepare']],
   ['pnpm', ['server:prepare']],
   ['pnpm', ['tauri', 'build', '--bundles', 'nsis', '--target', 'x86_64-pc-windows-gnu', '--config', 'src-tauri/tauri.windows.conf.json']],

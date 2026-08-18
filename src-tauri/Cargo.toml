@@ -1,6 +1,6 @@
 [package]
 name = "dshbox"
-version = "0.1.0"
+version = "0.1.1"
 description = "Managed DeepSeek Harness desktop runtime"
 authors = ["Nexus-Aethra"]
 edition = "2021"
@@ -9,14 +9,18 @@ default-run = "dshbox"
 [workspace]
 members = [
   "crates/box-foundation",
+  "crates/box-api",
   "crates/box-scheduler",
   "crates/box-runtime",
   "crates/box-toolchains",
   "crates/box-dsh-versions",
   "crates/box-containers",
   "crates/box-extensions",
+  "crates/box-image",
   "crates/box-state",
   "crates/box-server-core",
+  "crates/box-client",
+  "crates/box-dsh-context",
   "crates/dshboxd",
   "tools/runtime-packager",
 ]
@@ -36,7 +40,9 @@ dirs = "6.0.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 uuid = { version = "1.18", features = ["v4"] }
+ctrlc = "3.4"
 tar = "0.4"
 flate2 = "1.1"
 tauri = { version = "2.10.2", features = ["tray-icon"] }
@@ -44,14 +50,18 @@ tauri-plugin-dialog = "2.4.0"
 webbrowser = "1.0"
 xz2 = "0.1"
 box-foundation = { path = "crates/box-foundation" }
+box-api = { path = "crates/box-api" }
 box-scheduler = { path = "crates/box-scheduler" }
 box-runtime = { path = "crates/box-runtime" }
 box-toolchains = { path = "crates/box-toolchains" }
 box-dsh-versions = { path = "crates/box-dsh-versions" }
 box-containers = { path = "crates/box-containers" }
 box-extensions = { path = "crates/box-extensions" }
+box-image = { path = "crates/box-image" }
 box-state = { path = "crates/box-state" }
 box-server-core = { path = "crates/box-server-core" }
+box-client = { path = "crates/box-client" }
+box-dsh-context = { path = "crates/box-dsh-context" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.45", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }

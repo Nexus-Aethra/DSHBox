@@ -1,0 +1,53 @@
+# DSH Box template build script
+# Syntax:
+#   FROM <harness-source>          required
+#   PROFILE <name>                 required
+#   NAME <template-name>           optional
+#   VERSION <version>              optional
+#   LABEL key=value                optional, repeatable
+#   DEF <name> @<path>            optional, repeatable (path alias)
+#   ADD plugin|skill|data <src> [@<dest>]   one or more
+#
+# <src> for ADD lines accepts any spec pnpm accepts:
+#   bare name          `cordis-plugin-bar` (already in the local repository)
+#                      `@scope/name` is also accepted
+#   GitHub short form  `github.com/owner/repo[@ref]` — defaults to HEAD;
+#                      pin with `@v1.2.3` or `:v1.2.3` for reproducibility
+#   npm registry       `npm:@linxin666/dsh-web-ui-all` or `npm:react@18`
+#   git / git+ssh      `git+ssh://git@host/owner/repo#ref`
+#   local directory    `/abs/path` or `./relative` or `../relative`
+#   local tarball      `file:///abs/path/archive.tar.gz`
+#   remote tarball     `https://example.com/archive.tar.gz`
+#   workspace alias    `workspace:*` (a sibling workspace entry)
+#   pnpm alias         `alias@npm:real-package@version`
+#
+# Anything the upstream `pnpm add` accepts is accepted here: paste a URL
+# someone shared with you, the GitHub URL from a release page, or the
+# `npm:foo` form. DSH Box routes the spec through the install-handler
+# crate so the source path, fetch strategy, and post-install
+# reconciliation can never drift across boxfile / CLI / UI.
+
+FROM github.com/deepseek-ai/deepseek-harness:latest
+PROFILE web
+NAME team-stack
+VERSION 1.0.0
+LABEL maintainer=alice@example.com
+
+# Override default install paths (optional)
+# DEF plugin @profile/profiles/web/node_modules
+# DEF skill  @profile/skills
+
+# Plugins: installed into node_modules
+# — GitHub short form (recommended for reproducibility)
+ADD plugin github.com/team/cordis-plugin-foo@v1.2.3
+# — npm registry (any spec pnpm accepts)
+ADD plugin npm:@linxin666/dsh-web-ui-all
+# — Local repository entry already imported with `dshbox plugin import`
+ADD plugin cordis-plugin-bar
+
+# Skills: installed into profile/skills
+ADD skill github.com/team/team-conventions
+
+# Data: pure cp, requires explicit destination
+# ADD data ./local-sessions/ @profile/sessions
+# ADD data container-xxx@/profile/keys.yaml @profile/apikeys.yaml

@@ -28,6 +28,12 @@ pub struct BoxConfig {
     /// set, spawned pnpm/npm toolchains receive `npm_config_registry`.
     #[serde(default)]
     pub npm_registry: Option<String>,
+    /// SHA-256 of the bundled plugins manifest Box wrote into
+    /// `<runtimeDirectory>/plugins/node_modules/` on the last vendor pass.
+    /// `initialize_bundled_plugins` compares this against the current
+    /// resource manifest and skips the copy when they match.
+    #[serde(default)]
+    pub plugins_manifest_digest: Option<String>,
 }
 
 fn default_language() -> String {
@@ -43,6 +49,7 @@ impl Default for BoxConfig {
             toolchain_sources: BTreeMap::new(),
             github_mirror: None,
             npm_registry: None,
+            plugins_manifest_digest: None,
         }
     }
 }
@@ -176,15 +183,52 @@ pub fn now_seconds() -> u64 {
         .as_secs()
 }
 
-/// Rewrites a URL through a user-configured mirror prefix. The mirror is used
-/// verbatim as the prefix (e.g. `https://gh-proxy.com`), so the caller must
-/// supply a mirror that supports prefix-style rewriting of the target host.
+/// Rewrites a URL through a user-configured mirror. Two shapes are accepted:
+///
+/// 1. **Proxy prefix** such as `https://gh-proxy.com`: the original URL is
+///    appended after a slash (`<proxy>/<original-url>`), which is how common
+///    GitHub accelerators expose both the web UI and the REST API.
+/// 2. **Direct host** such as `https://api.github.com` or `https://github.com`:
+///    treated as "no mirror" and the URL passes through unchanged. The
+///    upstream URLs already use these hosts, so a prefix would duplicate the
+///    authority (`https://github.com/https://api.github.com/...`) and 404.
+///
 /// An empty or absent mirror leaves the URL unchanged.
 pub fn mirror_url(url: &str, mirror: Option<&str>) -> String {
-    match mirror.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(mirror) => format!("{}/{}", mirror.trim_end_matches('/'), url),
-        None => url.to_owned(),
+    let Some(mirror) = mirror.map(str::trim).filter(|value| !value.is_empty()) else {
+        return url.to_owned();
+    };
+    let mirror = mirror.trim_end_matches('/');
+    if matches!(extract_host(mirror), Some(host) if is_official_github_host(host)) {
+        return url.to_owned();
     }
+    format!("{mirror}/{url}")
+}
+
+/// Pulls the host portion out of a `scheme://host[/path]` value. Accepts a
+/// bare hostname (`gh-proxy.com` or `api.github.com`) too; in that case the
+/// whole value is the host.
+fn extract_host(value: &str) -> Option<&str> {
+    let after_scheme = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .unwrap_or(value);
+    Some(after_scheme.split('/').next().unwrap_or(after_scheme))
+}
+
+/// Hosts that already back GitHub web/API traffic. Pointing the mirror at one
+/// of them is a misconfiguration (the original URLs are absolute), so the
+/// request is passed through unchanged.
+fn is_official_github_host(host: &str) -> bool {
+    matches!(
+        host,
+        "github.com"
+            | "api.github.com"
+            | "raw.githubusercontent.com"
+            | "codeload.github.com"
+            | "objects.githubusercontent.com"
+            | "gist.github.com"
+    )
 }
 
 /// Normalizes a user-entered mirror/registry value: trims whitespace and maps
@@ -199,7 +243,7 @@ pub fn normalize_optional_url(value: Option<String>) -> Option<String> {
 /// desktop app is a GUI process without a console; spawned console children
 /// (node, pnpm, schtasks, ...) would otherwise each pop a black terminal
 /// window. No-op on other platforms.
-pub fn suppress_console_window(command: &mut std::process::Command) {
+pub fn suppress_console_window(_command: &mut std::process::Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -218,7 +262,6 @@ pub fn is_safe_identifier(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn drive_root_normalizes_to_absolute() {
@@ -251,13 +294,13 @@ mod tests {
         fs::create_dir_all(&temp).unwrap();
         let input = temp.to_string_lossy().into_owned();
         let result = normalize_runtime_directory(&input).unwrap();
-        let mut expected = fs::canonicalize(&temp).unwrap();
+        let expected = fs::canonicalize(&temp).unwrap();
         #[cfg(windows)]
-        {
+        let expected = {
             // The stored value intentionally drops the verbatim prefix that
             // `std::fs::canonicalize` adds on Windows.
-            expected = PathBuf::from(without_verbatim(&expected));
-        }
+            PathBuf::from(without_verbatim(&expected))
+        };
         assert_eq!(
             PathBuf::from(&result),
             expected,
@@ -279,5 +322,63 @@ mod tests {
     fn nonexistent_directory_is_rejected() {
         let missing = env::temp_dir().join("dsh-box-normalize-missing-xyz");
         assert!(normalize_runtime_directory(&missing.to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn mirror_url_passthrough_when_unset() {
+        assert_eq!(
+            mirror_url("https://api.github.com/repos/x/y/tags", None),
+            "https://api.github.com/repos/x/y/tags"
+        );
+        assert_eq!(
+            mirror_url("https://api.github.com/repos/x/y/tags", Some("")),
+            "https://api.github.com/repos/x/y/tags"
+        );
+        assert_eq!(
+            mirror_url("https://api.github.com/repos/x/y/tags", Some("   ")),
+            "https://api.github.com/repos/x/y/tags"
+        );
+    }
+
+    #[test]
+    fn mirror_url_passthrough_for_official_github_hosts() {
+        // The user pointed the mirror at GitHub itself; the original URLs
+        // already use these hosts, so a prefix would duplicate the
+        // authority and produce a 404.
+        let url = "https://api.github.com/repos/deepseek-ai/deepseek-harness/tags?per_page=100";
+        for mirror in [
+            "https://api.github.com",
+            "https://github.com",
+            "http://github.com",
+            "api.github.com",
+            "  https://github.com/  ",
+        ] {
+            assert_eq!(mirror_url(url, Some(mirror)), url, "mirror: {mirror}");
+        }
+    }
+
+    #[test]
+    fn mirror_url_prefix_for_proxy() {
+        // Third-party accelerators expect `<proxy>/<original-url>`.
+        assert_eq!(
+            mirror_url(
+                "https://api.github.com/repos/x/y/tags?per_page=100",
+                Some("https://gh-proxy.com")
+            ),
+            "https://gh-proxy.com/https://api.github.com/repos/x/y/tags?per_page=100"
+        );
+        // Trailing slashes are stripped so the result is well-formed.
+        assert_eq!(
+            mirror_url(
+                "https://github.com/owner/repo.git",
+                Some("https://gh-proxy.com/")
+            ),
+            "https://gh-proxy.com/https://github.com/owner/repo.git"
+        );
+        // Bare hostnames (no scheme) are still treated as a proxy.
+        assert_eq!(
+            mirror_url("https://github.com/owner/repo.git", Some("gh-proxy.com")),
+            "gh-proxy.com/https://github.com/owner/repo.git"
+        );
     }
 }

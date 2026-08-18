@@ -1,15 +1,15 @@
+use box_dsh_context::{
+    render_patch_yml, render_snapshot, DshContextFiles, DEFAULT_ORDER, PATCH_FILENAME,
+    SNAPSHOT_FILENAME,
+};
 use box_containers::{
     container_directory, scan_containers, CreateDshContainerRequest, DshContainer,
 };
 use box_dsh_versions::{
-    installed_versions as installed_dsh_versions, version_directory as dsh_version_directory,
-    DshVersion, DSH_REPOSITORY, DSH_TAGS_API,
+    version_directory as dsh_version_directory,
+    upgrade_legacy_harness, DshVersion, DSH_REPOSITORY,
 };
-use box_extensions::{
-    detect_extension_kind, directory_size, extension_digest, read_bundles, remove_plugin_record,
-    repository_root, scan_repository, scan_workspace_extensions, write_bundles, write_extension_record, write_repository_index,
-    BundleEntry, ExtensionBundle, ExtensionKind, ExtensionRecord, RepositoryExtension,
-};
+use box_extensions::{scan_workspace_extensions, ExtensionBundle};
 use box_foundation::{
     is_safe_identifier, mirror_url, normalize_optional_url, normalize_runtime_directory,
     now_seconds, read_config, strip_verbatim_prefix, suppress_console_window, write_config,
@@ -23,19 +23,15 @@ use box_server_core::{
 };
 use box_state::{ResourceSnapshot, ResourceState, ResourceStateManager};
 use box_toolchains::{is_known_toolchain, ToolchainStatus};
-use flate2::{write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
     env, fs,
     ffi::OsString,
-    io::{BufRead, BufReader},
-    net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, OnceLock},
+    process::Command,
+    sync::OnceLock,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tauri::{Manager, WindowEvent};
 use xz2::read::XzDecoder;
@@ -43,17 +39,19 @@ use xz2::read::XzDecoder;
 mod bundles;
 mod commands;
 mod containers;
+mod rpc;
 mod extensions;
-mod lifecycle;
+pub(crate) mod image;
+pub(crate) mod lifecycle;
 mod services;
 mod tasks;
 mod toolchains;
 mod versions;
 
 pub(crate) use bundles::*;
-pub(crate) use commands::versions::install_dsh_version_with_cancel;
 pub(crate) use containers::*;
 pub(crate) use extensions::*;
+pub(crate) use rpc::*;
 pub(crate) use lifecycle::*;
 pub(crate) use services::*;
 pub(crate) use tasks::*;
@@ -149,11 +147,6 @@ pub(crate) struct ToolchainInstallStatus {
     lines: Vec<String>,
 }
 
-#[derive(Deserialize)]
-pub(crate) struct GitHubTag {
-    name: String,
-}
-
 #[allow(dead_code)]
 #[derive(Deserialize)]
 pub(crate) struct NodeRelease {
@@ -161,19 +154,13 @@ pub(crate) struct NodeRelease {
     files: Vec<String>,
 }
 
-pub(crate) struct ManagedHost {
-    child: Child,
-    url: String,
-    /// Descendant pids of the host process tree, collected after launch. The
-    /// pnpm wrapper's tsx layer exits quickly, orphaning the node host from
-    /// the tree `taskkill /T` walks, so Stop kills these recorded pids too.
-    tree: Arc<Mutex<Vec<u32>>>,
-}
-
+/// Local container-manager stub kept only as the `tauri::State` slot type in
+/// command signatures. The daemon owns container hosts now, so the running
+/// map is gone; this type exists purely to keep the frontend-facing command
+/// surface unchanged.
 #[derive(Default)]
-pub(crate) struct ContainerManager {
-    running: Mutex<BTreeMap<String, ManagedHost>>,
-}
+pub(crate) struct ContainerManager {}
+
 
 pub(super) fn run() {
     if let Err(error) = run_inner() {
@@ -182,18 +169,92 @@ pub(super) fn run() {
     }
 }
 
+/// Startup repair pass for the template system:
+/// 1. `upgrade_legacy_harness` corrects legacy harness metadata and
+///    generates a base template per installed version.
+/// 2. Containers created before the template system are bound to the base
+///    template of their harness version when one exists locally; containers
+///    that cannot be bound fall back to the startup validation error.
+///
+/// Every step is best-effort and logged; failures never block startup.
+fn repair_resources_on_startup(root: &str) {
+    match upgrade_legacy_harness(root) {
+        Ok(reports) => {
+            for report in reports {
+                if report.template_created {
+                    write_startup_log(&format!(
+                        "generated base template {}",
+                        report.template_path
+                    ));
+                }
+            }
+        }
+        Err(error) => write_startup_log(&format!("legacy harness upgrade failed: {error}")),
+    }
+    let instances = PathBuf::from(root).join("instances");
+    let mut bound = 0usize;
+    if let Ok(entries) = fs::read_dir(&instances) {
+        for entry in entries.filter_map(Result::ok) {
+            let container_file = entry.path().join("container.json");
+            let Ok(metadata) = fs::read_to_string(&container_file) else {
+                continue;
+            };
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&metadata) else {
+                continue;
+            };
+            if value["template"].is_string() || value["image"].is_string() {
+                continue;
+            }
+            let Some(version) = value["version"].as_str().map(str::to_owned) else {
+                continue;
+            };
+            let template_path =
+                box_dsh_versions::templates_directory(root).join(format!("{version}.dsh"));
+            if !template_path.is_file() {
+                continue;
+            }
+            value["template"] = serde_json::Value::String(version.clone());
+            let updated = serde_json::to_string_pretty(&value).unwrap_or(metadata);
+            if fs::write(&container_file, updated).is_ok() {
+                bound += 1;
+                write_startup_log(&format!(
+                    "bound container {} to template {version}",
+                    entry.file_name().to_string_lossy()
+                ));
+            }
+        }
+    }
+    if bound > 0 {
+        write_startup_log(&format!("bound {bound} container(s) to base templates"));
+    }
+}
+
 fn run_inner() -> Result<(), String> {
+    let initial_container = env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|arguments| arguments[0] == "--open-container")
+        .map(|arguments| arguments[1].clone())
+        .filter(|id| is_safe_identifier(id));
     tauri::Builder::default()
         .manage(ContainerManager::default())
         .manage(TaskManager::default())
         .manage(ResourceStateManager::default())
-        .setup(|app| {
+        .setup(move |app| {
             let resources = app
                 .path()
                 .resource_dir()
                 .map_err(|error| error.to_string())?;
             write_startup_log(&format!("resource directory: {}", resources.display()));
-            initialize_bundled_runtime(resources).map_err(|error| { write_startup_log(&format!("bundled runtime initialization failed: {error}")); error })?;
+            initialize_bundled_runtime(resources.clone()).map_err(|error| { write_startup_log(&format!("bundled runtime initialization failed: {error}")); error })?;
+            // Vendored Cordis plugins live in the Tauri resource and need to be
+            // copied into the runtime directory on first launch (and after every
+            // resource change). Errors are non-fatal: a container can still start
+            // without the plugin, just without structured container metadata in
+            // the system prompt.
+            if let Err(error) = initialize_bundled_plugins(&resources) {
+                write_startup_log(&format!("bundled plugins initialization skipped: {error}"));
+            }
             if let Ok(runtime) = bundled_runtime() {
                 write_startup_log(&format!(
                     "bundled runtime ready: node {} at {}, npm {}, pnpm {}",
@@ -209,7 +270,18 @@ fn run_inner() -> Result<(), String> {
                     .map_err(|error| error.to_string())?,
             );
             if server.is_file() {
-                if let Err(error) = install_user_service(&server) { write_startup_log(&format!("dshboxd service installation failed: {error}")); }
+                #[cfg(unix)]
+                link_daemon_into_path(&server);
+                if let Err(error) = install_user_service(&server) {
+                    write_startup_log(&format!("dshboxd service installation failed: {error}"));
+                    // Platforms without a per-user service manager (macOS)
+                    // and broken service setups still get a running daemon.
+                    #[cfg(unix)]
+                    spawn_daemon_fallback(&server);
+                }
+                // Protocol handshake: restart a daemon built in a different
+                // build batch (stale binary left over from before an upgrade).
+                reconcile_daemon_build(&server);
             } else {
                 write_startup_log(&format!("dshboxd sidecar is missing: {}", server.display()));
             }
@@ -219,8 +291,13 @@ fn run_inner() -> Result<(), String> {
                 }
             }
             setup_tray(app.handle())?;
+            if let Ok(config) = read_config() {
+                if let Some(root) = config.runtime_directory {
+                    repair_resources_on_startup(&root);
+                }
+            }
             write_startup_log("desktop setup completed");
-            if env::args().any(|argument| argument == "--tray") {
+            if env::args().any(|argument| argument == "--tray") || initial_container.is_some() {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
                 }
@@ -230,6 +307,30 @@ fn run_inner() -> Result<(), String> {
             }
             let handle = app.handle().clone();
             thread::spawn(move || refresh_global_state(&handle));
+            if let Some(id) = initial_container.clone() {
+                let client = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = open_dsh_front_for_client(id, client).await {
+                        write_startup_log(&format!("CLI container open failed: {error}"));
+                    }
+                });
+            }
+
+            // Graceful shutdown: on SIGTERM / SIGINT / Ctrl-C, persist the
+            // local (toolchain-install) task state so the next launch can
+            // resume it. The daemon owns container hosts, so there is nothing
+            // to stop here.
+            let shutdown_handle = app.handle().clone();
+            ctrlc::set_handler(move || {
+                write_startup_log("shutdown signal received; persisting task state");
+                if let Ok(paths) = task_paths() {
+                    let _ = shutdown_handle.state::<TaskManager>().persist(&paths);
+                }
+                write_startup_log("shutdown complete");
+                std::process::exit(0);
+            })
+            .map_err(|error| format!("cannot register signal handler: {error}"))?;
+
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
@@ -239,6 +340,7 @@ fn run_inner() -> Result<(), String> {
             commands::config::save_language,
             commands::config::save_mirror_settings,
             get_server_service_status,
+            get_daemon_status,
             restart_server_service,
             start_server_service,
             stop_server_service,
@@ -248,7 +350,8 @@ fn run_inner() -> Result<(), String> {
             commands::toolchains::run_toolchain_command,
             enqueue_toolchain_install,
             commands::versions::list_dsh_versions,
-            enqueue_dsh_version_install,
+            commands::versions::upgrade_legacy_resources,
+            enqueue_pull_template,
             enqueue_dsh_catalog_refresh,
             commands::versions::uninstall_dsh_version,
             commands::versions::list_installed_dsh_versions,
@@ -260,6 +363,8 @@ fn run_inner() -> Result<(), String> {
             commands::state::get_container_details,
             commands::state::list_resource_states,
             commands::state::refresh_resource_state,
+            commands::state::list_data_entries,
+            commands::state::prune_orphaned_data,
             delete_dsh_container,
             enqueue_container_start,
             enqueue_container_stop,
@@ -279,8 +384,19 @@ fn run_inner() -> Result<(), String> {
             create_extension_bundle,
             delete_extension_bundle,
             remove_repository_extension,
+            list_repository_reference_counts,
             enqueue_plugin_export,
             remove_repository_plugin,
+            image::enqueue_image_build,
+            image::enqueue_image_commit_stub,
+            image::enqueue_image_load_stub,
+            image::preview_image_script_command,
+            image::list_templates,
+            image::read_template,
+            image::import_template,
+            image::export_template,
+            image::remove_template,
+            image::enqueue_template_container,
             list_tasks,
             cancel_task,
             delete_task,

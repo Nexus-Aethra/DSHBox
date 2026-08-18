@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { pickText } from '../i18n'
 import { boxApi } from '../shared/api/box-api'
-import type { BoxConfig, DshVersion, Language, ServerServiceStatus, ToolchainStatus } from '../shared/types/domain'
+import type { BoxConfig, DshVersion, HarnessUpgradeReport, Language, ServerServiceStatus, ToolchainStatus } from '../shared/types/domain'
 
 export const INITIAL_CONFIG: BoxConfig = { runtimeDirectory: null, selectedDshVersion: null, language: 'en', toolchainSources: {}, githubMirror: null, npmRegistry: null }
 
@@ -24,6 +24,8 @@ export function useSettings(onError: (message: string | null) => void) {
   const [loadingVersions, setLoadingVersions] = useState(false)
   const [installingVersion, setInstallingVersion] = useState<string | null>(null)
   const [installedDshVersions, setInstalledDshVersions] = useState<string[]>([])
+  const [upgradingResources, setUpgradingResources] = useState(false)
+  const [upgradeReport, setUpgradeReport] = useState<HarnessUpgradeReport[] | null>(null)
   const [githubMirror, setGithubMirror] = useState('')
   const [npmRegistry, setNpmRegistry] = useState('')
   const [npmRegistryCustom, setNpmRegistryCustom] = useState('')
@@ -32,12 +34,10 @@ export function useSettings(onError: (message: string | null) => void) {
 
   useEffect(() => {
     void boxApi.loadConfig().then(setConfig).catch((reason: unknown) => { onError(String(reason)) }).finally(() => { setLoading(false) })
-    void refreshToolchains()
     void boxApi.getServerServiceStatus().then(setServerService).catch(() => undefined)
-    // Load the data for the default section up front: the nav buttons only
-    // fetch when clicked, so without this the first page stays empty until
-    // the user switches away and back.
-    void loadInstalledDshVersions()
+    // Page-scoped loading: toolchains and DSH versions are fetched when the
+    // user enters the section/tab that renders them (App.tsx `loadSection`),
+    // not up front — the gate above only needs config + service status.
   }, [])
 
   // Keep the mirror settings form in sync when the saved config changes.
@@ -54,12 +54,22 @@ export function useSettings(onError: (message: string | null) => void) {
 
   async function loadDshVersions(): Promise<void> {
     setLoadingVersions(true)
-    try { setDshVersions(await boxApi.listDshVersions()); onError(null) } catch (reason) { onError(String(reason)) } finally { setLoadingVersions(false) }
+    try {
+      const versions = await boxApi.listDshVersions()
+      // `latest` (the default branch) is a virtual entry the Harness tab
+      // always offers first: pulling without a tag resolves to it, so the
+      // option must exist even when the repo carries no tags at all.
+      if (!versions.some((version) => version.name === 'latest')) {
+        versions.unshift({ name: 'latest', installed: false })
+      }
+      setDshVersions(versions)
+      onError(null)
+    } catch (reason) { onError(String(reason)) } finally { setLoadingVersions(false) }
   }
 
   async function installDshVersion(version: string): Promise<void> {
     setInstallingVersion(version)
-    try { await boxApi.enqueueDshVersionInstall(version); onError(null) } catch (reason) { onError(String(reason)) } finally { setInstallingVersion(null) }
+    try { await boxApi.pullTemplate(version); onError(null) } catch (reason) { onError(String(reason)) } finally { setInstallingVersion(null) }
   }
 
   async function refreshDshCatalog(): Promise<void> {
@@ -73,6 +83,19 @@ export function useSettings(onError: (message: string | null) => void) {
 
   async function loadInstalledDshVersions(): Promise<void> {
     try { const versions = await boxApi.listInstalledDshVersions(); setInstalledDshVersions(versions) } catch (reason) { onError(String(reason)) }
+  }
+
+  // Explicit legacy-data migration: upgrades old harness records to the
+  // standard reference and generates base templates, then refreshes the
+  // version list so the Harness tab reflects the new state.
+  async function upgradeResources(): Promise<void> {
+    setUpgradingResources(true)
+    try {
+      const report = await boxApi.upgradeLegacyResources()
+      setUpgradeReport(report)
+      await loadDshVersions()
+      onError(null)
+    } catch (reason) { onError(String(reason)) } finally { setUpgradingResources(false) }
   }
 
   async function chooseRuntimeDirectory(): Promise<void> {
@@ -92,13 +115,25 @@ export function useSettings(onError: (message: string | null) => void) {
     } catch (reason) { onError(String(reason)) }
   }
 
-  async function saveMirrorSettings(): Promise<void> {
+  async function saveGithubMirror(): Promise<void> {
     setSavingMirror(true)
     try {
       const registry = npmRegistry === '__custom__' ? npmRegistryCustom.trim() : npmRegistry
       const config = await boxApi.saveMirrorSettings(githubMirror.trim() || null, registry || null)
       setConfig(config)
-      setNpmRegistry(registry)
+      onError(null)
+    } catch (reason) { onError(String(reason)) } finally { setSavingMirror(false) }
+  }
+
+  /// npm registry is a selection (not a free-form text field), so save it
+  /// immediately — users do not want to pair a dropdown with a Save button.
+  async function saveNpmRegistry(): Promise<void> {
+    const registry = npmRegistry === '__custom__' ? npmRegistryCustom.trim() : npmRegistry
+    if (registry === config.npmRegistry) return
+    setSavingMirror(true)
+    try {
+      const config = await boxApi.saveMirrorSettings(githubMirror.trim() || null, registry || null)
+      setConfig(config)
       onError(null)
     } catch (reason) { onError(String(reason)) } finally { setSavingMirror(false) }
   }
@@ -110,9 +145,10 @@ export function useSettings(onError: (message: string | null) => void) {
   return {
     config, setConfig, loading, toolchains, detecting, expandedToolchain, setExpandedToolchain,
     dshVersions, loadingVersions, installingVersion, installedDshVersions, setInstalledDshVersions,
+    upgradingResources, upgradeReport, upgradeResources,
     githubMirror, setGithubMirror, npmRegistry, setNpmRegistry, npmRegistryCustom, setNpmRegistryCustom,
     savingMirror, serverService, refreshToolchains, loadDshVersions, installDshVersion,
     refreshDshCatalog, uninstallDshVersion, loadInstalledDshVersions, chooseRuntimeDirectory,
-    changeLanguage, saveMirrorSettings, restartServerService,
+    changeLanguage, saveGithubMirror, saveNpmRegistry, restartServerService,
   }
 }

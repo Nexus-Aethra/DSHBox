@@ -1,27 +1,59 @@
 //! Command-line interface for DSH Box.
 //!
-//! No arguments launches the desktop UI; every other invocation is a command.
+//! No arguments prints help; `dshbox ui` launches the desktop GUI.
 //! Long-running commands reuse the same `box_scheduler` task machinery as the
 //! UI task queue, so progress, log, and cancel semantics stay identical.
 
+pub mod build;
 pub mod bundle;
 pub mod config;
-pub mod dsh;
+pub mod container;
+pub mod image;
+pub mod init;
 pub mod plugin;
+pub mod pull;
+pub mod rpc;
+pub mod run;
+pub mod setup_path;
+pub mod template;
 
-use box_dsh_versions::installed_versions;
-use box_extensions::{read_bundles, scan_repository};
-use box_foundation::{read_config, BoxPaths};
-use box_scheduler::{run_queued, TaskContext, TaskManager, TaskNotifier};
-use serde_json::Value;
-use std::{env, path::Path, sync::Arc};
+use crate::desktop;
+use serde_json::json;
+use std::env;
 
 pub fn run() -> Option<i32> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
-    if arguments.is_empty()
-        || arguments.len() == 1 && matches!(arguments[0].as_str(), "ui" | "--tray")
+    // `container open` starts a GUI client with this private hand-off
+    // argument. The desktop process then creates the DSH webview itself;
+    // the CLI must never fall back to a system browser.
+    if arguments.len() == 3
+        && arguments[0] == "ui"
+        && arguments[1] == "--open-container"
+        && !arguments[2].is_empty()
     {
         return None;
+    }
+    // Only launch the GUI when the user explicitly asks for it.
+    if arguments.len() >= 1
+        && (arguments[0] == "ui" || arguments[0] == "--tray")
+    {
+        bootstrap_path_hint();
+        return None;
+    }
+    if arguments.is_empty() {
+        // Windows users launch the EXE by double-clicking the desktop
+        // icon or a Start Menu tile. Neither carries CLI arguments, so
+        // the bare `dshbox.exe` invocation hits this branch and would
+        // otherwise just print help and exit — making the icon a
+        // no-op. Linux and macOS have proper `.desktop` files that
+        // invoke `dshbox ui` explicitly, so they keep the help-on-
+        // empty-args behaviour. Treat bare invocation on Windows as
+        // `dshbox ui` so the GUI actually appears.
+        if cfg!(target_os = "windows") {
+            return None;
+        }
+        print_help();
+        return Some(0);
     }
     let result = match arguments[0].as_str() {
         "--version" | "-V" => {
@@ -30,10 +62,22 @@ pub fn run() -> Option<i32> {
         }
         "ps" => print_containers(),
         "info" => print_info(),
-        "dsh" => dsh::command(&arguments[1..]),
+        "pull" => pull::command(&arguments[1..]),
         "plugin" => plugin::command(&arguments[1..]),
         "bundle" => bundle::command(&arguments[1..]),
+        "build" => build::command(&arguments[1..]),
+        "init" => init::command(&arguments[1..]),
+        "run" => run::command(&arguments[1..]),
         "config" => config::command(&arguments[1..]),
+        "container" => container::command(&arguments[1..]),
+        "image" => image::command(&arguments[1..]),
+        "rpc" => raw_rpc(&arguments[1..]),
+        "setup-path" => setup_path::command(&arguments[1..]),
+        "template" => template::command(&arguments[1..]),
+        "resources" => {
+            eprintln!("warning: 'dshbox resources' is deprecated; 'plugin' and 'bundle' cover its actions.");
+            Err("'dshbox resources' has been removed; use 'dshbox plugin ...' or 'dshbox bundle ...'".to_owned())
+        }
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -47,12 +91,36 @@ pub fn run() -> Option<i32> {
     Some(0)
 }
 
+/// Raw RPC escape hatch: `dshbox rpc <method> [json-params]` forwards one
+/// request to the daemon verbatim and pretty-prints the response. This is
+/// the curl-equivalent debugging tool for the 50+ RPC methods — no typed
+/// command needed to poke any endpoint.
+fn raw_rpc(arguments: &[String]) -> Result<(), String> {
+    let method = arguments
+        .first()
+        .filter(|value| !value.is_empty())
+        .ok_or("usage: dshbox rpc <method> [json-params]")?;
+    let params: serde_json::Value = match arguments.get(1) {
+        Some(raw) => serde_json::from_str(raw)
+            .map_err(|error| format!("invalid JSON params: {error}"))?,
+        None => serde_json::json!({}),
+    };
+    if !params.is_object() {
+        return Err("params must be a JSON object".to_owned());
+    }
+    let client = rpc::connect()?;
+    let value = rpc::call(&client, method, params)?;
+    println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+    Ok(())
+}
+
 fn print_containers() -> Result<(), String> {
-    let root = read_config()?
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
+    let client = rpc::connect()?;
+    let value = rpc::call(&client, "list_containers", json!({}))?;
+    let containers: Vec<box_containers::DshContainer> = serde_json::from_value(value)
+        .map_err(|error| format!("invalid container list from daemon: {error}"))?;
     println!("ID\tNAME\tVERSION\tSTATUS");
-    for container in box_containers::scan_containers(&root)?.into_values() {
+    for container in containers {
         println!(
             "{}\t{}\t{}\t{}",
             container.id, container.name, container.version, container.status
@@ -62,23 +130,30 @@ fn print_containers() -> Result<(), String> {
 }
 
 fn print_info() -> Result<(), String> {
-    let config = read_config()?;
-    println!("DSH Box {}", env!("CARGO_PKG_VERSION"));
-    match &config.runtime_directory {
+    let client = rpc::connect()?;
+    let info = rpc::call(&client, "get_info", json!({}))?;
+    println!("DSH Box {}", info["version"].as_str().unwrap_or("?"));
+    match info["runtimeDirectory"].as_str() {
         Some(root) => {
             println!("runtime directory: {root}");
-            println!("installed DSH versions: {}", installed_versions(root)?.len());
             println!(
-                "containers: {}",
-                box_containers::scan_containers(root)?.len()
+                "installed DSH versions: {}",
+                info["dshVersions"].as_u64().unwrap_or(0)
             );
-            println!("repository entries: {}", scan_repository(Path::new(root)).len());
-            println!("bundles: {}", read_bundles(Path::new(root)).len());
+            println!("containers: {}", info["containers"].as_u64().unwrap_or(0));
+            println!(
+                "repository entries: {}",
+                info["repositoryEntries"].as_u64().unwrap_or(0)
+            );
+            println!("bundles: {}", info["bundles"].as_u64().unwrap_or(0));
             println!(
                 "github mirror: {}",
-                config.github_mirror.as_deref().unwrap_or("-")
+                info["githubMirror"].as_str().unwrap_or("-")
             );
-            println!("npm registry: {}", config.npm_registry.as_deref().unwrap_or("-"));
+            println!(
+                "npm registry: {}",
+                info["npmRegistry"].as_str().unwrap_or("-")
+            );
         }
         None => println!("runtime directory: not configured"),
     }
@@ -88,80 +163,71 @@ fn print_info() -> Result<(), String> {
 fn print_help() {
     println!("dshbox [command] [options]");
     println!();
-    println!("No command launches the desktop UI. The CLI shares the same task");
-    println!("queue as the UI; long operations print progress to stderr.");
+    println!("DSH Box is a docker-style container runtime. The three-step workflow is");
+    println!("pull a base template, build a template from a boxfile, then create a");
+    println!("container from the built template and run it.");
     println!();
-    println!("Global:");
-    println!("  dshbox --version            print the DSH Box version");
-    println!("  dshbox info                 show storage and resource summary");
-    println!("  dshbox ps                   list containers");
-    println!("  dshbox help                 print this help");
+    println!("Quick start (build one template and run it):");
+    println!("  1. dshbox init              generate a starter boxfile.dsh in the cwd");
+    println!("  2. dshbox pull template github.com/<owner>/<repo>[:tag]");
+    println!("     fetch a base template; tag defaults to `:latest` when omitted");
+    println!("  3. dshbox build [boxfile.dsh] [--name <template>]");
+    println!("     build a TEMPLATE from a boxfile (FROM <base> + ADD instructions):");
+    println!("     plugins are referenced from the repository, other resources are");
+    println!("     snapshotted into the data store — no container is created yet");
+    println!("  4. dshbox run <template> [--name <container>]");
+    println!("     create a container from the template and start it (built and");
+    println!("     script templates both work)");
     println!();
-    println!("DSH runtimes:");
-    println!("  dshbox dsh ls               list installed DSH versions");
-    println!("  dshbox dsh search           list remote DSH versions from the catalog");
-    println!("  dshbox dsh refresh          refresh the remote catalog");
-    println!("  dshbox dsh install <tag>    clone and install a DSH version");
-    println!("  dshbox dsh rm <tag>         uninstall a DSH version");
+    println!("Common commands:");
+    println!("  dshbox --version           print the DSH Box version");
+    println!("  dshbox info                show storage and resource summary");
+    println!("  dshbox ps                  list running and stopped containers");
+    println!("  dshbox help                print this help");
+    println!("  dshbox rpc <method> [json] raw daemon RPC call, pretty-printed (debug)");
+    println!("  dshbox ui                  launch the desktop GUI");
+    println!();
+    println!("Pull:");
+    println!("  dshbox pull template <ref>  fetch a template by reference and generate its base .dsh");
+    println!("                              (e.g. `github.com/deepseek-ai/deepseek-harness:latest`)");
+    println!();
+    println!("Build and run:");
+    println!("  dshbox init [path] [--force]  write a starter boxfile.dsh to PATH (default ./boxfile.dsh)");
+    println!("  dshbox build [path]           build a template from a boxfile (default ./boxfile)");
+    println!("  dshbox run <template>         create a container from a template and start it");
+    println!();
+    println!("Container lifecycle:");
+    println!("  dshbox container describe <id> [--json]   print detailed container info");
+    println!("  dshbox container open <id>                open the running container in a DSH Box window");
+    println!("  dshbox container logs <id>                tail the DSH host log");
+    println!("  dshbox container url <id>                 print the webview URL of a running container");
+    println!("  dshbox container start <id>               start the DSH host of a stopped container");
+    println!("  dshbox container stop <id>                stop a running container");
+    println!("  dshbox container restart <id>             restart a stopped/crashed host (no rebuild)");
+    println!("  dshbox container rebuild <id>             re-materialise extensions and restart");
+    println!("  dshbox container rm <id>                  stop and delete the container");
+    println!();
+    println!("Templates:");
+    println!("  dshbox template ls                      list templates (script + built forms)");
+    println!("  dshbox template show <name>             print the script body or resource list");
+    println!("  dshbox template import <file.tar.gz>    install a template from a tarball");
+    println!("  dshbox template export <name> [dest]    write a template to a tarball");
+    println!("  dshbox template rm <name>              remove a template (refuses if in use)");
+    println!("  dshbox template prune                  GC data-store snapshots no template uses");
     println!();
     println!("Plugins and skills:");
-    println!("  dshbox plugin ls                        list repository entries");
-    println!("  dshbox plugin ls <container> [--profile <name>]");
-    println!("  dshbox plugin import <source>           import from GitHub URL, directory, or tarball");
-    println!("  dshbox plugin export <id> <dest.tar.gz> export a repository entry");
-    println!("  dshbox plugin rm <id>                   remove a repository entry");
-    println!("  dshbox plugin install <container> <source> [--profile <name>]");
+    println!("  dshbox plugin <action>     manage repository entries (ls / import / export / rm / prune / install)");
     println!();
     println!("Bundles:");
-    println!("  dshbox bundle ls                        list bundles");
-    println!("  dshbox bundle create <name> --plugin <id> [--plugin <id> ...]");
-    println!("  dshbox bundle rm <id>                   delete a bundle");
-    println!("  dshbox bundle save <id> <dest.tar.gz> [--mode quick|full]");
-    println!("  dshbox bundle load <archive> [--conflict keep|overwrite]");
+    println!("  dshbox bundle <action>     manage bundles (ls / create / rm / save / load)");
     println!();
     println!("Configuration:");
-    println!("  dshbox config show");
-    println!("  dshbox config set runtime <dir>");
-    println!("  dshbox config set mirror.github <url>");
-    println!("  dshbox config set mirror.npm <url>");
-}
-
-/// Runs a worker function through the same queued-task machinery as the UI.
-/// Progress and log lines go to stderr; the final result is returned after
-/// the worker completes, so CLI commands behave like their UI counterparts.
-pub(crate) fn run_task(
-    kind: &str,
-    resource_keys: Vec<String>,
-    params: Value,
-    work: impl FnOnce(&TaskContext) -> Result<(), String> + Send + 'static,
-) -> Result<(), String> {
-    let config = read_config()?;
-    let paths = BoxPaths::from_config(&config)?;
-    let manager = TaskManager::default();
-    let task = manager.enqueue(&paths, kind, resource_keys, params)?;
-    run_queued(&manager, &paths, Arc::new(CliNotifier), &task.id, work);
-    let finished = manager.task(&task.id)?;
-    match finished.status.as_str() {
-        "succeeded" => Ok(()),
-        "cancelled" => Err("task cancelled".to_owned()),
-        _ => Err(finished
-            .error
-            .unwrap_or_else(|| format!("task failed at {}", finished.stage))),
-    }
-}
-
-/// Progress reporter that forwards scheduler stages and logs to stderr so
-/// stdout stays reserved for command output.
-pub(crate) struct CliNotifier;
-
-impl TaskNotifier for CliNotifier {
-    fn stage(&self, _task_id: &str, stage: &str, progress: u8) {
-        eprintln!("[{progress:>3}%] {stage}");
-    }
-
-    fn log(&self, _task_id: &str, line: &str) {
-        eprintln!("  {line}");
-    }
+    println!("  dshbox config <action>     show or set runtime, mirror, and registry");
+    println!();
+    println!("First-run PATH setup:");
+    println!("  dshbox setup-path          add dshbox install dir to PATH (Windows HKCU / POSIX shell rc)");
+    println!();
+    println!("Run 'dshbox <command> help' for action-level usage.");
 }
 
 /// Reads a `--flag <value>` pair, falling back to the default.
@@ -171,4 +237,42 @@ pub(crate) fn flag_value(arguments: &[String], flag: &str, default: &str) -> Str
         .find(|pair| pair[0] == flag)
         .map(|pair| pair[1].clone())
         .unwrap_or_else(|| default.to_owned())
+}
+
+/// One-shot PATH bootstrap that runs when the user launches the
+/// desktop GUI. If the running binary's directory is not on the
+/// inherited `PATH`, register it so a subsequent terminal /
+/// agent-runner can resolve `dshbox`. Failures are logged to the
+/// startup log instead of being surfaced: the GUI must keep
+/// launching even when the registry is locked.
+fn bootstrap_path_hint() {
+    use box_runtime::{add_to_user_path, command_on_path, self_install_directory};
+    let Some(directory) = self_install_directory() else {
+        return;
+    };
+    if !directory.is_dir() {
+        return;
+    }
+    let binary_name = if cfg!(target_os = "windows") {
+        "dshbox.exe"
+    } else {
+        "dshbox"
+    };
+    if command_on_path(binary_name) {
+        return;
+    }
+    if let Err(error) = add_to_user_path(&directory) {
+        desktop::write_startup_log(&format!("setup-path bootstrap failed: {error}"));
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    desktop::write_startup_log(&format!(
+        "added {} to HKCU\\Environment\\Path; new shells will see `dshbox`",
+        directory.display()
+    ));
+    #[cfg(not(target_os = "windows"))]
+    desktop::write_startup_log(&format!(
+        "appended {} to user PATH via shell rc; restart shell to use `dshbox`",
+        directory.display()
+    ));
 }
