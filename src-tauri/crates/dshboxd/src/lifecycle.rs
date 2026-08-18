@@ -22,10 +22,13 @@ use std::{
     fs,
     net::TcpListener,
     path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+use crate::host::{self, ContainerHostRecord, HostState};
 
 /// Start the DSH host for `id` and wait until its frontend answers.
 /// The running map is the daemon-owned registry; containers already
@@ -70,6 +73,8 @@ pub(crate) fn start_dsh_container_inner(
         .as_str()
         .ok_or("container has no version")?;
     let profile = value["profile"].as_str().unwrap_or("web");
+    let name = value["name"].as_str().unwrap_or(id).to_owned();
+    let template = value["template"].as_str().map(str::to_owned);
     repair_known_profile_template(&directory, profile)?;
     let workspace = ensure_container_workspace(&directory)?;
     let context_files = write_dshbox_context_snapshot(&directory, &value, profile)?;
@@ -191,11 +196,42 @@ pub(crate) fn start_dsh_container_inner(
             .current_dir(&workspace)
             .env("DSH_HOME", directory.join("profile"))
             .env("NODE_PATH", plugins_node_modules.as_os_str());
+        // Detach the host into its own process group so cleanup can reach
+        // every descendant with a single `kill(-pgid, ...)`. Linux/macOS
+        // use `setsid`; Windows relies on `CREATE_NEW_PROCESS_GROUP` so
+        // `taskkill /T` walks the tree the same way.
+        make_process_group_leader(&mut command);
         let mut child = spawn_forwarding_log(&mut command, &log_path, task)
             .map_err(|error| format!("cannot start DSH host: {error}"))?;
+        let host_pid = child.id();
+        let host_pgid = process_group_id(&child);
+        // Persist a starting record before the readiness probe begins so
+        // a daemon crash mid-start still leaves something for the next
+        // run to reconcile against.
+        let initial = host::initial_record(
+            id,
+            &name,
+            template.as_deref(),
+            profile,
+            host_pid,
+            host_pgid,
+            port,
+            &url,
+        );
+        let _ = host::write_host_record(&initial);
+        let pid_path = PathBuf::from(&directory).join("state").join("host.pid");
+        if let Some(parent) = pid_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(error) = fs::write(&pid_path, host_pid.to_string()) {
+            if let Some(task) = task {
+                task.log(&format!("warning: cannot write host pid file: {error}"));
+            }
+        }
         let ready = (0..80).any(|attempt| {
             if task.map(TaskContext::cancelled).unwrap_or(false) {
-                crate::toolchains::kill_process_tree(child.id());
+                terminate_process_group(host_pgid);
+                let _ = child.kill();
                 let _ = child.wait();
                 return false;
             }
@@ -216,22 +252,20 @@ pub(crate) fn start_dsh_container_inner(
             available
         });
         if ready {
-            let tree = Arc::new(Mutex::new(Vec::new()));
-            let collector_tree = tree.clone();
-            let root_pid = child.id();
-            std::thread::spawn(move || {
-                collect_process_descendants(root_pid, collector_tree, Duration::from_secs(2));
+            // Bump the record to `Ready` and spawn the long-running
+            // watcher that keeps `lastSeen` fresh and flips to
+            // `Crashed` when the host disappears.
+            let snapshot = host::read_host_record(id)
+                .ok()
+                .flatten()
+                .unwrap_or(initial.clone());
+            let _ = host::compare_and_swap_host_record(id, &snapshot, |on_disk| {
+                let mut next = on_disk.clone();
+                next.state = HostState::Ready;
+                next.last_seen = box_foundation::now_seconds();
+                next
             });
-            let pid_path =
-                PathBuf::from(&directory).join("state").join("host.pid");
-            if let Some(parent) = pid_path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            if let Err(error) = fs::write(&pid_path, child.id().to_string()) {
-                if let Some(task) = task {
-                    task.log(&format!("warning: cannot write host pid file: {error}"));
-                }
-            }
+            spawn_health_watcher(id, url.clone());
             running
                 .lock()
                 .map_err(|_| "container manager lock failed")?
@@ -240,7 +274,6 @@ pub(crate) fn start_dsh_container_inner(
                     ManagedHost {
                         child,
                         url: url.clone(),
-                        tree,
                     },
                 );
             if let Some(task) = task {
@@ -249,10 +282,26 @@ pub(crate) fn start_dsh_container_inner(
             return Ok(url);
         }
         if task.map(TaskContext::cancelled).unwrap_or(false) {
+            let _ = host::compare_and_swap_host_record(id, &initial, |on_disk| {
+                let mut next = on_disk.clone();
+                next.state = HostState::Stopped;
+                next
+            });
             return Err("task cancelled while waiting for DSH host".to_owned());
         }
-        crate::toolchains::kill_process_tree(child.id());
-        let _ = child.wait();
+        terminate_process_group(host_pgid);
+        let _ = child.kill();
+        let exit_status = child.wait().ok();
+        let (code, signal) = exit_status
+            .map(host::exit_status_to_parts)
+            .unwrap_or((-1, None));
+        let _ = host::compare_and_swap_host_record(id, &initial, |on_disk| {
+            let mut next = on_disk.clone();
+            next.state = HostState::Crashed;
+            next.exit_status = Some(code);
+            next.exit_signal = signal;
+            next
+        });
         if attempt == 1 && built {
             if let Some(task) = task {
                 task.update("Rebuilding DSH frontend", 60);
@@ -261,7 +310,6 @@ pub(crate) fn start_dsh_container_inner(
             built = false;
             continue;
         }
-        let pid_path = PathBuf::from(&directory).join("state").join("host.pid");
         let _ = fs::remove_file(&pid_path);
         return Err(format!(
             "DSH host did not become ready; inspect {}",
@@ -270,8 +318,9 @@ pub(crate) fn start_dsh_container_inner(
     }
 }
 
-/// Stop a running container host: kill the recorded tree and drop the
-/// persisted PID file.
+/// Stop a running container host: send SIGTERM to the process group,
+/// wait up to 5s for graceful exit, escalate to SIGKILL, and update the
+/// `host.json` state to `Stopped`.
 pub(crate) fn stop_dsh_container(
     id: &str,
     manager: &ContainerManager,
@@ -282,24 +331,23 @@ pub(crate) fn stop_dsh_container(
         .map_err(|_| "container manager lock failed")?
         .remove(id);
     if let Some(mut host) = host {
-        crate::toolchains::kill_process_tree(host.child.id());
+        terminate_process_group_grouped(&host.child);
         let _ = host.child.wait();
-        let descendants = host
-            .tree
-            .lock()
-            .map(|tree| tree.clone())
-            .unwrap_or_default();
-        for &pid in &descendants {
-            let _ = std::process::Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .status();
-        }
+        // After wait() the OS has reaped the host; no zombie can remain
+        // because the whole process group was killed.
     }
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
     let pid_path = container_directory(&root, id).join("state").join("host.pid");
     let _ = fs::remove_file(&pid_path);
+    if let Ok(Some(snapshot)) = host::read_host_record(id) {
+        let _ = host::compare_and_swap_host_record(id, &snapshot, |on_disk| {
+            let mut next = on_disk.clone();
+            next.state = HostState::Stopped;
+            next
+        });
+    }
     Ok(())
 }
 
@@ -489,83 +537,356 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> 
     Ok(())
 }
 
-/// Watches the process table for a short window and records every descendant
-/// of `root` into `tree`, so Stop can finish the job on orphaned hosts.
-fn collect_process_descendants(root: u32, tree: Arc<Mutex<Vec<u32>>>, total: Duration) {
-    let started = std::time::Instant::now();
-    while started.elapsed() < total {
-        let procs = process_table();
-        if let Ok(mut guard) = tree.lock() {
-            let mut frontier = vec![root];
-            while let Some(parent) = frontier.pop() {
-                for &(pid, ppid) in &procs {
-                    if pid != root && ppid == parent && !guard.contains(&pid) {
-                        guard.push(pid);
-                        frontier.push(pid);
+/// Watches the host URL and writes back to `host.json`.
+///
+/// Every `PROBE_INTERVAL` (2s by default) the thread:
+///   1. Reads the current record (snapshot).
+///   2. Calls `try_wait` on the host PID via `kill -0`. ESRCH = dead,
+///      bump `state` to `Crashed` with the captured exit info and exit
+///      the loop.
+///   3. Otherwise HTTP GETs the URL. On 2xx, bumps `last_seen` and
+///      `probe_count`, resets `unhealthy_count`. On transport failure
+///      or non-2xx, increments `unhealthy_count`; after `UNHEALTHY_THRESHOLD`
+///      consecutive failures, marks the host `Crashed` and exits.
+///
+/// The watcher never auto-restarts — a `Crashed` record is a tombstone
+/// the user clears with `dshbox container start` (which spawns a fresh
+/// watcher for the new generation).
+fn spawn_health_watcher(id: &str, url: String) {
+    let id_owned = id.to_owned();
+    std::thread::spawn(move || {
+        const PROBE_INTERVAL: Duration = Duration::from_secs(2);
+        const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+        const UNHEALTHY_THRESHOLD: u32 = 2;
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(PROBE_TIMEOUT)
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                eprintln!("watcher[{id_owned}]: cannot build http client: {error}");
+                return;
+            }
+        };
+        loop {
+            thread::sleep(PROBE_INTERVAL);
+            let Some(snapshot) = host::read_host_record(&id_owned).ok().flatten() else {
+                // Record gone — the user deleted the container.
+                return;
+            };
+            // Step 1: liveness probe via PID file (cross-platform via
+            // `kill -0` on unix; Windows equivalent below).
+            if !pid_alive(snapshot.host_pid) {
+                let _ = host::compare_and_swap_host_record(&id_owned, &snapshot, |on_disk| {
+                    let mut next = on_disk.clone();
+                    next.state = HostState::Crashed;
+                    next.exit_status = Some(-1);
+                    next.exit_signal = None;
+                    next
+                });
+                return;
+            }
+            // Step 2: HTTP probe.
+            let healthy = client
+                .get(&url)
+                .send()
+                .map(|response| response.status().is_success())
+                .unwrap_or(false);
+            let _ = host::compare_and_swap_host_record(&id_owned, &snapshot, |on_disk| {
+                let mut next = on_disk.clone();
+                next.probe_count = on_disk.probe_count.saturating_add(1);
+                if healthy {
+                    next.last_seen = box_foundation::now_seconds();
+                    next.unhealthy_count = 0;
+                    if matches!(next.state, HostState::Starting | HostState::Ready) {
+                        next.state = HostState::Running;
                     }
+                } else {
+                    next.unhealthy_count = on_disk.unhealthy_count.saturating_add(1);
+                    if next.unhealthy_count >= UNHEALTHY_THRESHOLD
+                        && matches!(next.state, HostState::Starting | HostState::Ready | HostState::Running)
+                    {
+                        next.state = HostState::Crashed;
+                    }
+                }
+                next
+            });
+            // Exit if we just marked the host Crashed — keep loop
+            // tight; nothing more to do until the user restarts.
+            if let Ok(Some(latest)) = host::read_host_record(&id_owned) {
+                if matches!(latest.state, HostState::Crashed | HostState::Stopped) {
+                    return;
                 }
             }
         }
-        thread::sleep(Duration::from_millis(300));
+    });
+}
+
+/// Cross-platform PID liveness probe with a distinguishing error
+/// channel. Unix uses `kill -0` + stderr parsing (the shell prints
+/// "kill: <pid>: No such process" on ESRCH); Windows returns ACCESS_DENIED
+/// from `OpenProcess` for foreign PIDs.
+///
+/// Linux/macOS refinement: a PID that exists but is in the Z (zombie)
+/// state is treated as dead — the parent never `wait()`ed for it, so
+/// no live work is happening. ESRCH from `kill -0` only catches
+/// fully-reaped entries.
+fn pid_alive(pid: u32) -> bool {
+    matches!(probe_pid(pid), PidProbe::Alive)
+}
+
+/// Detach the child into its own process group so the daemon can later
+/// kill the whole subtree with a single `kill(-pgid, SIGTERM)`.
+fn make_process_group_leader(command: &mut Command) {
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            // setsid() makes this process the leader of a new session
+            // and process group; pgid == pid afterwards.
+            libc_setsid();
+            Ok(())
+        });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_PROCESS_GROUP allows taskkill /T to walk the tree.
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
 }
 
-/// Snapshot of (pid, parent pid) pairs for every process on the system.
-#[cfg(target_os = "windows")]
-fn process_table() -> Vec<(u32, u32)> {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
-    };
-    let mut table = Vec::new();
+#[cfg(unix)]
+fn libc_setsid() {
+    // libc::setsid — pulled in via the platform libc shim. We use the
+    // raw syscall via the `libc` crate if available, otherwise fall
+    // back to an unsafe extern declaration. dshboxd already depends
+    // on libc transitively (reqwest, ring); declare locally to keep
+    // the dependency surface explicit.
+    extern "C" {
+        fn setsid() -> i32;
+    }
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
-            return table;
+        let _ = setsid();
+    }
+}
+
+/// Returns the pgid of `child`. On unix we use `getpgid(pid)` rather
+/// than assuming `pid == pgid` — Node/Electron-style runtimes can call
+/// `setpgid` after `setsid`, which leaves the host detached from the
+/// group we set up. If the lookup fails we fall back to the pid so
+/// cleanup still has something to target.
+fn process_group_id(child: &Child) -> i32 {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        extern "C" {
+            fn getpgid(pid: i32) -> i32;
         }
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        if Process32FirstW(snapshot, &mut entry) != 0 {
-            loop {
-                table.push((entry.th32ProcessID, entry.th32ParentProcessID));
-                if Process32NextW(snapshot, &mut entry) == 0 {
+        let pgid = unsafe { getpgid(pid) };
+        if pgid > 0 {
+            pgid
+        } else {
+            pid
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// Best-effort termination of a process group. Falls through to direct
+/// kill of `child` on Windows (no process group concept) and on any
+/// platform where the pgid == 0 sentinel is passed.
+fn terminate_process_group_grouped(child: &Child) {
+    let pgid = process_group_id(child);
+    if pgid > 0 {
+        terminate_process_group(pgid);
+    }
+    // Also kill the host PID directly in case `setsid` didn't take
+    // effect (e.g. the child re-execed into something else).
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    // Brief grace window; if still alive, escalate.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if !pid_alive(child.id()) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &child.id().to_string()])
+        .status();
+}
+
+/// Terminate a process group by pgid. Used during shutdown when we
+/// no longer have the `Child` handle (only the recorded pgid).
+fn terminate_process_group(pgid: i32) {
+    if pgid <= 0 {
+        return;
+    }
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &format!("-{pgid}")])
+        .status();
+}
+
+/// Scan every persisted `host.json` and reconcile it against the live
+/// process table. Called once at daemon startup so that a previous
+/// daemon's death doesn't leave stale "running" records behind.
+///
+///   - `Crashed` / `Stopped` → leave alone; the user is expected to
+///     clear them via `dshbox container start` or `rm`.
+///   - `Starting` / `Ready` / `Running` with PID dead → remove the
+///     record so `start` can rebuild it.
+///   - `Starting` / `Ready` / `Running` with PID alive but EPERM'd
+///     (PID was recycled by an unrelated process) → mark `Orphaned`.
+///   - `Orphaned` is left as-is; user must restart to clear.
+pub(crate) fn reconcile_orphan_containers() {
+    let records = match host::list_all_host_records() {
+        Ok(r) => r,
+        Err(error) => {
+            eprintln!("reconcile: cannot list host.json files: {error}");
+            return;
+        }
+    };
+    for record in records {
+        if !matches!(
+            record.state,
+            HostState::Starting | HostState::Ready | HostState::Running
+        ) {
+            continue;
+        }
+        match probe_pid(record.host_pid) {
+            PidProbe::Alive => {
+                // PID exists; the recorded host may still be running
+                // on another machine or after a daemon crash. Trust the
+                // watcher to decide its fate.
+            }
+            PidProbe::Esrch => {
+                eprintln!(
+                    "reconcile: {} host PID {} is gone; dropping stale record",
+                    record.id, record.host_pid
+                );
+                host::remove_host_record(&record.id);
+                // Also remove the legacy host.pid file so callers that
+                // still consult it don't trip over a phantom running
+                // container.
+                if let Ok(config) = read_config() {
+                if let Some(root) = config.runtime_directory {
+                    let pid_path = container_directory(&root, &record.id)
+                        .join("state")
+                        .join("host.pid");
+                    let _ = fs::remove_file(pid_path);
+                }
+            }
+            }
+            PidProbe::Eperm => {
+                eprintln!(
+                    "reconcile: {} host PID {} exists but is not ours; flagging orphaned",
+                    record.id, record.host_pid
+                );
+                let _ = host::compare_and_swap_host_record(
+                    &record.id,
+                    &record,
+                    |on_disk| {
+                        let mut next = on_disk.clone();
+                        next.state = HostState::Orphaned;
+                        next
+                    },
+                );
+            }
+        }
+    }
+}
+
+enum PidProbe {
+    Alive,
+    Esrch,
+    Eperm,
+}
+
+/// Cross-platform PID existence probe with a distinguishing error
+/// channel. Unix uses `kill -0` + stderr parsing (the shell prints
+/// "kill: <pid>: No such process" on ESRCH); Windows returns ACCESS_DENIED
+/// from `OpenProcess` for foreign PIDs.
+fn probe_pid(pid: u32) -> PidProbe {
+    #[cfg(unix)]
+    {
+        // Fast path: /proc/<pid> missing ⇒ fully gone. Reading
+        // /proc avoids locale-sensitive shell error parsing.
+        if std::fs::read_to_string(format!("/proc/{pid}/status")).is_err() {
+            return PidProbe::Esrch;
+        }
+        // Distinguish zombie (R → Z) from alive. A zombie PID
+        // technically responds to kill -0 with success, so the
+        // status check alone misreports it as alive.
+        if let Ok(status_text) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in status_text.lines() {
+                if let Some(rest) = line.strip_prefix("State:") {
+                    if rest.trim().starts_with('Z') {
+                        return PidProbe::Esrch;
+                    }
                     break;
                 }
             }
         }
-        CloseHandle(snapshot);
+        let output = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .output();
+        match output {
+            Ok(result) if result.status.success() => PidProbe::Alive,
+            Ok(result) => {
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                // kill(1) prints one of these regardless of LANG — the
+                // translation happens in the shell wrapper, not in
+                // kill itself.
+                if stderr.contains("No such process")
+                    || stderr.contains("ESRCH")
+                    || stderr.contains("does not exist")
+                {
+                    PidProbe::Esrch
+                } else {
+                    PidProbe::Eperm
+                }
+            }
+            Err(_) => PidProbe::Esrch,
+        }
     }
-    table
-}
-
-/// Snapshot of (pid, parent pid) pairs read from `/proc` (Linux). macOS has
-/// no /proc, so the read fails and the table stays empty — a safe no-op.
-#[cfg(not(target_os = "windows"))]
-fn process_table() -> Vec<(u32, u32)> {
-    let mut table = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return table;
-    };
-    for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn OpenProcess(
+                access: u32,
+                inherit: i32,
+                pid: u32,
+            ) -> *mut core::ffi::c_void;
+            fn GetLastError() -> u32;
+            fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const ERROR_ACCESS_DENIED: u32 = 5;
+        const ERROR_INVALID_PARAMETER: u32 = 87;
+        let handle = unsafe {
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
         };
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        // stat format: pid (comm) state ppid ...; comm may contain spaces.
-        let Some(close) = stat.rfind(')') else {
-            continue;
-        };
-        let Some(ppid) = stat[close + 1..]
-            .split_whitespace()
-            .nth(1)
-            .and_then(|value| value.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        table.push((pid, ppid));
+        if !handle.is_null() {
+            unsafe {
+                CloseHandle(handle);
+            }
+            PidProbe::Alive
+        } else {
+            let error = unsafe { GetLastError() };
+            if error == ERROR_ACCESS_DENIED {
+                PidProbe::Eperm
+            } else {
+                PidProbe::Esrch
+            }
+        }
     }
-    table
 }

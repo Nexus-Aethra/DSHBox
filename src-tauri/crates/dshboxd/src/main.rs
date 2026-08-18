@@ -11,6 +11,7 @@ mod containers;
 mod data;
 mod dispatch;
 mod extensions;
+mod host;
 mod image;
 mod lifecycle;
 mod state;
@@ -19,12 +20,13 @@ mod test_support;
 mod toolchains;
 mod versions;
 
-use box_server_core::{remove_discovery, write_discovery};
+use box_server_core::{read_discovery, remove_discovery, write_discovery, ServerDiscovery};
 use state::{initialize_bundled_plugins, initialize_bundled_runtime, DaemonState};
 use std::{
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     sync::Arc,
+    time::Duration,
 };
 
 pub fn run() {
@@ -34,6 +36,17 @@ pub fn run() {
     if let Err(error) = initialize_bundled_plugins() {
         eprintln!("warning: bundled plugins unavailable: {error}");
     }
+
+    // Prevent multiple daemon instances: read the existing discovery file,
+    // TCP-connect to the recorded port, and check whether the process
+    // still responds. If it does, this is a second invocation against a
+    // live daemon — exit immediately. If the port is dead (connection
+    // refused / timeout), the discovery file is stale; remove it and
+    // proceed with a fresh bind.
+    if let Some(_existing) = ensure_single_instance() {
+        return;
+    }
+
     let state = match DaemonState::load() {
         Ok(state) => Arc::new(state),
         Err(error) => {
@@ -41,6 +54,16 @@ pub fn run() {
             std::process::exit(1);
         }
     };
+
+    // Scan persisted host.json records and reconcile each one against
+    // the live process table. A record in `starting`/`ready`/`running`
+    // whose PID no longer exists means the previous daemon died while
+    // the container was up; we drop the stale record so a future
+    // `container start` rebuilds it from scratch. A record whose PID
+    // exists but returns EPERM (Unix) / `OpenProcess` access denied
+    // (Windows) is flagged `orphaned` — the PID has been recycled by
+    // an unrelated process and we cannot trust the URL anymore.
+    crate::lifecycle::reconcile_orphan_containers();
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind DSH Box daemon TCP");
     let port = listener.local_addr().expect("get local port").port();
@@ -191,6 +214,45 @@ fn write_http_error(stream: &mut TcpStream, status: u16, reason: &str) {
         body_str
     );
     let _ = stream.flush();
+}
+
+/// Prevent multiple daemon instances from competing on the same discovery file.
+///
+/// On startup, reads the previously written discovery.json. If a port is
+/// recorded, TCP-connects to it. A successful connect means the previous
+/// daemon is still alive and already serving — this invocation is a
+/// duplicate and should exit immediately. A failed connect (refused /
+/// timeout) means the previous daemon died ungracefully and left a stale
+/// discovery file behind — remove it and proceed with a fresh bind.
+///
+/// Returns `Some(discovery)` when an older daemon is confirmed alive
+/// (caller should exit). Returns `None` when no conflict exists (caller
+/// should proceed to bind and write a new discovery).
+fn ensure_single_instance() -> Option<ServerDiscovery> {
+    let existing = match read_discovery() {
+        Ok(Some(discovery)) => discovery,
+        Ok(None) => return None,
+        Err(_) => return None,
+    };
+
+    let addr = format!("127.0.0.1:{}", existing.port);
+    match TcpStream::connect_timeout(&addr.parse::<std::net::SocketAddr>().ok()?, Duration::from_millis(250)) {
+        Ok(_) => {
+            // Port is reachable — old daemon is alive. Log and signal exit.
+            eprintln!(
+                "dshboxd: daemon already running on {} (pid {}) — exiting",
+                addr,
+                existing.pid
+            );
+            Some(existing)
+        }
+        Err(_) => {
+            // Port unreachable — stale discovery from a crashed daemon.
+            eprintln!("dshboxd: removing stale discovery at {} (pid {}) — proceeding", addr, existing.pid);
+            remove_discovery();
+            None
+        }
+    }
 }
 
 fn main() {

@@ -19,6 +19,7 @@ use crate::image::{
     materialize_template_container, prune_template_snapshots, read_template, remove_template,
     BuildImageRequest, CreateTemplateContainerRequest,
 };
+use crate::host;
 use crate::lifecycle::{
     rebuild_dsh_container_with_task, start_dsh_container_inner, stop_dsh_container,
 };
@@ -28,7 +29,9 @@ use crate::versions::{
     upgrade_legacy_resources,
 };
 use box_api::ContainerDescription;
-use box_dsh_versions::{installed_versions, parse_template_ref};
+use box_dsh_versions::{
+    installed_versions, parse_template_ref, read_built_template, read_template_index,
+};
 use box_extensions::{read_bundles, scan_container_extensions, scan_repository};
 use box_foundation::{now_seconds, read_config, write_config};
 use box_scheduler::{run_queued, TaskContext, TaskRecord};
@@ -111,6 +114,10 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
             let name = request["name"].as_str().unwrap_or("").to_owned();
             read_template_list(&name)
         }
+        Some("template_info") => {
+            let name = request["name"].as_str().unwrap_or("").to_owned();
+            template_info(&name)
+        }
         Some("prune_template_snapshots") => {
             prune_template_snapshots().map(|removed| json!({ "removed": removed }))
         }
@@ -118,6 +125,7 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("enqueue_container_start") => enqueue_container_start(state, request),
         Some("enqueue_container_stop") => enqueue_container_stop(state, request),
         Some("enqueue_container_rebuild") => enqueue_container_rebuild(state, request),
+        Some("enqueue_container_restart") => enqueue_container_restart(state, request),
         Some("delete_container") => delete_container_rpc(state, request),
         Some("describe_container") => describe_container_rpc(state, request),
         Some("upgrade_legacy_resources") => upgrade_legacy_resources().map(|reports| json!(reports)),
@@ -511,6 +519,93 @@ fn read_template_list(name: &str) -> Result<Value, String> {
     Ok(json!(list))
 }
 
+/// Rich metadata for one built template: build timestamp, template version,
+/// content-addressed id (manifest hash), base, profile, resource count, and
+/// the parsed labels. Script templates (pulled/imported) return a slimmer
+/// payload with just name, id, and imported timestamp — they have no build
+/// metadata to speak of.
+fn template_info(name: &str) -> Result<Value, String> {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    if name.is_empty() {
+        return Err("expected a template name".to_string());
+    }
+    let root = read_config()?
+        .runtime_directory
+        .ok_or("DSH Box storage is not configured")?;
+
+    let index = read_template_index(&root);
+    let entry = index
+        .get(name)
+        .ok_or_else(|| format!("template `{name}` not found"))?;
+
+    let entry = entry.clone();
+
+    // Script templates have no built-template manifest.
+    if !entry.built {
+        return Ok(json!({
+            "name": entry.name,
+            "id": entry.id,
+            "profile": entry.profile,
+            "harnessRef": entry.harness_ref,
+            "built": false,
+            "importedAt": entry.imported_at,
+        }));
+    }
+
+    let built = read_built_template(&root, name)?
+        .ok_or_else(|| format!("template `{name}` is marked built but has no manifest"))?;
+
+    // Format ISO-ish timestamp from UNIX epoch seconds (no chrono dep).
+    let created_iso = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(built.created_at))
+        .map(|ts| {
+            let secs = ts
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let days = secs / 86400;
+            let tod = secs % 86400;
+            let h = tod / 3600;
+            let m = (tod % 3600) / 60;
+            let s = tod % 60;
+
+            let z: i64 = days as i64 + 719468;
+            let era = if z >= 0 { z } else { z - 146096 } / 146096;
+            let doe = z - era * 146096;
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+            let y = yoe as i32 + (era * 400) as i32;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let mut month = mp as i32 + 1;
+            let mut year = y as i32;
+            if mp >= 10 {
+                month -= 12;
+                year += 1;
+            }
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                year, month, d, h, m, s
+            )
+        })
+        .unwrap_or_else(|| built.created_at.to_string());
+
+    Ok(json!({
+        "name": built.name,
+        "id": entry.id,
+        "built": true,
+        "base": built.base,
+        "profile": built.profile,
+        "harnessRef": built.harness_ref,
+        "schemaVersion": built.schema_version,
+        "createdAt": built.created_at,
+        "createdAtIso": created_iso,
+        "resources": built.resources.len(),
+        "labels": built.labels,
+    }))
+}
+
 /// Parse a string array parameter.
 fn string_array(value: &Value) -> Vec<String> {
     value
@@ -678,6 +773,40 @@ fn enqueue_container_rebuild(state: &DaemonState, request: &Value) -> Result<Val
             task.update("Rebuilding DSH runtime", 10);
             task.check_cancelled()?;
             rebuild_dsh_container_with_task(id, &containers, Some(task))
+        },
+    )
+}
+
+/// Manual restart of a container that has been marked `Crashed` (or
+/// `Stopped`) by the health watcher. Unlike `rebuild`, this keeps the
+/// existing build artifacts and just re-spawns the host. The host
+/// watcher detects the new PID automatically because
+/// `start_dsh_container_inner` always allocates a fresh record before
+/// spawning the readiness probe.
+fn enqueue_container_restart(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    let id = request["id"].as_str().unwrap_or("").to_owned();
+    if id.is_empty() {
+        return Err("expected a container id".to_owned());
+    }
+    let containers = state.containers.clone();
+    let params = json!({ "id": id.clone() });
+    enqueue_task_worker(
+        state,
+        "container-restart",
+        vec![format!("container:{id}")],
+        params,
+        move |task| {
+            task.update("Stopping old host", 10);
+            task.check_cancelled()?;
+            // Best-effort stop; ignore "not running" errors so a
+            // restart can be issued against a Crashed record.
+            let _ = stop_dsh_container(&id, containers.as_ref());
+            // Drop the tombstone so the next start treats this as a
+            // fresh launch instead of inheriting a stale generation.
+            host::remove_host_record(&id);
+            task.update("Starting DSH host", 30);
+            task.check_cancelled()?;
+            start_dsh_container_inner(&id, &containers.running, Some(task)).map(|_| ())
         },
     )
 }

@@ -19,7 +19,6 @@ use std::{
 pub(crate) struct ManagedHost {
     pub(crate) child: Child,
     pub(crate) url: String,
-    pub(crate) tree: Arc<Mutex<Vec<u32>>>,
 }
 
 /// Registry of containers running inside this daemon process. The daemon
