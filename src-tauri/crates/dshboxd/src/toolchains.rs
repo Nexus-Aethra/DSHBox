@@ -72,6 +72,12 @@ pub(crate) fn command_for_toolchain(toolchain: &ResolvedToolchain) -> Command {
     // are set below; everything else is inherited from the daemon process.
     // We explicitly strip the known troublemakers so every toolchain child
     // starts with a clean, predictable environment.
+    // On Windows, `SHELL` points to Git Bash (`D:\Git\bin\bash.exe`) which
+    // confuses pnpm's lifecycle runner into executing extensionless shell
+    // shims (with WSL-style `/mnt/d/...` paths) instead of the correct
+    // `.cmd` Windows shims.  On Linux/macOS `SHELL` is essential for
+    // npm/pnpm lifecycle scripts, so we only strip it on Windows.
+    #[cfg(windows)]
     command.env_remove("SHELL");
     command.env_remove("NODE_PATH");
 
