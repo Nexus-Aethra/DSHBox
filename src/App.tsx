@@ -232,17 +232,19 @@ export function MainApp() {
             const task = activeTaskFor(`container:${container.id}`)
             const busy = task !== undefined
             const running = container.status === 'running'
+            const corrupted = container.status === 'corrupted'
+            const statusText = busy ? task.stage : (running ? text.running : corrupted ? text.corrupted : text.stopped)
             return (
               <section key={container.id} className="version-row">
                 <button type="button" className="container-summary" onClick={() => { void containers.showContainerDetails(container) }}>
                   <strong>{container.name}</strong>
-                  <p className="container-meta">{container.version} · {container.profile} · {busy ? task.stage : running ? text.running : text.stopped}</p>
+                  <p className="container-meta">{container.version} · {container.profile} · {statusText}</p>
                 </button>
                 <div className="container-actions">
-                  <Button shape="icon" variant="ghost" className={running ? 'icon-action running' : 'icon-action'} aria-label={running ? text.stop : text.start} title={running ? text.stop : text.start} disabled={busy} onClick={() => { void containers.toggleContainer(container) }}>
+                  <Button shape="icon" variant="ghost" className={running ? 'icon-action running' : 'icon-action'} aria-label={running ? text.stop : (corrupted ? text.rebuild : text.start)} title={running ? text.stop : (corrupted ? text.rebuild : text.start)} disabled={busy} onClick={() => { corrupted ? void containers.rebuildContainer(container) : void containers.toggleContainer(container) }}>
                     {running ? <span aria-hidden="true" className="pause-icon" /> : <span aria-hidden="true" className="play-icon" />}
                   </Button>
-                  <Button shape="icon" variant="ghost" className="icon-action" aria-label={text.open} title={text.open} disabled={!running || busy} onClick={() => { void containers.openContainer(container) }}>
+                  <Button shape="icon" variant="ghost" className="icon-action" aria-label={text.open} title={text.open} disabled={!running || busy || corrupted} onClick={() => { void containers.openContainer(container) }}>
                     <span aria-hidden="true" className="open-icon">↗</span>
                   </Button>
                   <div className="container-menu-wrap">

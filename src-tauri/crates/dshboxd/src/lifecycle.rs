@@ -105,6 +105,19 @@ pub(crate) fn start_dsh_container_inner(
         task.update("Preparing DSH host", 25);
         task.check_cancelled()?;
     }
+    // Write a Corrupted sentinel before preflight: if plugin build
+    // fails here, the container still has a host.json so the UI can
+    // distinguish "failed to prepare" from "user stopped it". Once the
+    // host actually spawns, we overwrite it with the Starting record.
+    let _ = std::fs::create_dir_all(directory.join("state"))
+        .map_err(|error| format!("cannot create host state directory: {error}"));
+    let _ = host::write_corrupted_record(
+        id,
+        &name,
+        template.as_deref(),
+        profile,
+        "container created; preflight not yet complete",
+    );
     preflight_profile_plugins(&directory, profile, task)?;
     if let Some(task) = task {
         task.check_cancelled()?;

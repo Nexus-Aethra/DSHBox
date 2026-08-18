@@ -44,6 +44,13 @@ pub enum HostState {
     /// Daemon restart found the recorded PID alive but EPERM'd
     /// (likely re-used by an unrelated process). Requires manual restart.
     Orphaned,
+    /// Container was created but never reached a healthy host process —
+    /// e.g. a plugin build/preflight step failed before the host was
+    /// spawned. The directory and metadata exist but the container is
+    /// not startable until the user fixes the underlying issue (rebuild,
+    /// delete-and-recreate, etc.). Distinct from `Stopped` (user action)
+    /// and `Crashed` (host process died after starting).
+    Corrupted,
 }
 
 /// Persisted shape of `state/host.json`.
@@ -304,6 +311,50 @@ pub fn describe_exit(status: Option<i32>, signal: Option<i32>) -> String {
     }
 }
 
+/// Write a `host.json` whose state is `Corrupted` — used as a sentinel
+/// before preflight so that a failure there leaves a distinguishable
+/// record instead of no record at all (which the UI would show as
+/// `Stopped`, conflating "never started" with "user stopped it").
+pub fn write_corrupted_record(
+    id: &str,
+    name: &str,
+    template: Option<&str>,
+    profile: &str,
+    reason: &str,
+) -> BoxResult<()> {
+    let root = read_config()?
+        .runtime_directory
+        .ok_or("DSH Box storage is not configured")?;
+    let path = host_record_path(&root, id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create host state directory: {error}"))?;
+    }
+    let record = ContainerHostRecord {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        template: template.map(str::to_owned),
+        profile: profile.to_owned(),
+        host_pid: 0,
+        host_pgid: 0,
+        host_port: 0,
+        host_url: String::new(),
+        started_at: now_seconds(),
+        last_seen: 0,
+        state: HostState::Corrupted,
+        generation: 1,
+        exit_status: None,
+        exit_signal: None,
+        unhealthy_count: 0,
+        probe_count: 0,
+    };
+    // Store the failure reason in the record via a diagnostic field if
+    // one exists; otherwise we rely on the task log. For now the record
+    // alone is enough for the UI to distinguish the state.
+    let _ = reason; // suppress unused warning; diagnostic is in task log
+    write_host_record_in(&root, &record)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,4 +483,6 @@ mod tests {
         std::mem::forget(dir);
         path
     }
+
+
 }

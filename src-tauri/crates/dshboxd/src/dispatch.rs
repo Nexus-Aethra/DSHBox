@@ -19,7 +19,7 @@ use crate::image::{
     materialize_template_container, prune_template_snapshots, read_template, remove_template,
     BuildImageRequest, CreateTemplateContainerRequest,
 };
-use crate::host;
+use crate::host::{self, HostState};
 use crate::lifecycle::{
     rebuild_dsh_container_with_task, start_dsh_container_inner, stop_dsh_container,
 };
@@ -241,6 +241,14 @@ fn list_containers(state: &DaemonState) -> Result<Value, String> {
     for container in &mut containers {
         container.status = if running.contains(&container.id) {
             "running".to_owned()
+        } else if matches!(
+            host::read_host_record(&container.id)
+                .ok()
+                .flatten()
+                .map(|r| r.state),
+            Some(HostState::Corrupted)
+        ) {
+            "corrupted".to_owned()
         } else {
             "stopped".to_owned()
         };

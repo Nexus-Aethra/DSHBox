@@ -808,14 +808,27 @@ fn plugin_build_script(directory: &Path) -> Result<Option<&'static str>, String>
             .map_err(|error| format!("cannot read plugin manifest: {error}"))?,
     )
     .map_err(|error| format!("cannot parse plugin manifest: {error}"))?;
-    for script in ["build", "prepare"] {
-        if manifest
-            .pointer(&format!("/scripts/{script}"))
-            .and_then(serde_json::Value::as_str)
-            .is_some()
-        {
-            return Ok(Some(script));
+        // Some plugins ship without their build-time toolchain (e.g.
+    // tsconfig.build.json) in the published tarball. Prefer prepare
+    // over build when both exist so tsdown alone can succeed.
+    let has_build = manifest
+        .pointer("/scripts/build")
+        .and_then(serde_json::Value::as_str)
+        .is_some();
+    let has_prepare = manifest
+        .pointer("/scripts/prepare")
+        .and_then(serde_json::Value::as_str)
+        .is_some();
+    match (has_build, has_prepare) {
+        (true, false) => Ok(Some("build")),
+        (false, true) => Ok(Some("prepare")),
+        (true, true) => {
+            // Both present: prefer prepare because it is the npm-side
+            // contract that works from published tarballs. Fall back to
+            // build only if prepare doesn't produce the entry — but
+            // the caller only picks one script, so we commit to prepare.
+            Ok(Some("prepare"))
         }
+        (false, false) => Ok(None),
     }
-    Ok(None)
 }
