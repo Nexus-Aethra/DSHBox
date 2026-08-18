@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import type { BoxConfig, ContainerExtensions, DataEntry, DshContainer, DshVersion, ExtensionBundle, HarnessUpgradeReport, Language, PreviewScriptResult, ResourceSnapshot, ResourceState, ServerServiceStatus, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
+import type { BoxConfig, ContainerExtensions, DataEntry, DshContainer, DshVersion, ExtensionBundle, HarnessUpgradeReport, Language, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, ResourceState, ServerServiceStatus, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
 
 type ToolchainPayload = { id: string; name: string; managedVersion: string | null }
 
@@ -49,6 +49,7 @@ export const boxApi = {
   enqueuePluginExport: (sourceContainerId: string, sourcePath: string, destination: string) => invoke<TaskRecord>('enqueue_plugin_export', { request: { sourceContainerId, sourcePath, destination } }),
   removeRepositoryPlugin: (id: string, profile: string, name: string) => invoke<void>('remove_repository_plugin', { id, profile, name }),
   listResourceStates: () => invoke<ResourceSnapshot>('list_resource_states'),
+  listRepositoryReferenceCounts: () => invoke<RepositoryReferenceRow[]>('list_repository_reference_counts'),
   getResourceState: (key: string) => invoke<ResourceState | null>('get_resource_state', { key }),
   refreshResourceState: () => invoke<ResourceSnapshot>('refresh_resource_state'),
   listDataEntries: () => invoke<DataEntry[]>('list_data_entries'),

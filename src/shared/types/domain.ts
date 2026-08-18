@@ -21,6 +21,10 @@ export type ContainerSkill = { name: string; description: string | null; path: s
 export type ContainerExtensions = { containerId: string; profiles: ProfileExtensions[]; skills: ContainerSkill[]; diagnostics: string[]; scannedAt: number }
 export type ExtensionKind = 'plugin' | 'skill'
 export type RepositoryExtension = { id: string; kind: ExtensionKind; name: string; version: string | null; description: string | null; contentDigest: string; sourcePath: string; importedAt: number; diagnostic: string | null; source: string | null }
+// Detailed per-entry owner ids surfaced by the daemon for `dshbox plugin
+// refs` and the resources-page owner popover. The on-disk file keeps the
+// raw sets; the snapshot view above projects them to counts.
+export type RepositoryReferenceRow = { id: string; name: string; kind: ExtensionKind; version: string | null; containers: string[]; templates: string[] }
 export type BundleEntry = { repositoryId: string; kind: ExtensionKind; name: string; version: string | null; source: string | null; size: number; diagnostic: string | null }
 export type ExtensionBundle = { id: string; name: string; entries: BundleEntry[]; createdAt: number }
 export type WorkspaceExtension = { kind: ExtensionKind; name: string; version: string | null; description: string | null; relativePath: string; contentDigest: string; diagnostic: string | null }

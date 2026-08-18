@@ -204,7 +204,9 @@ dependencies = [
 name = "box-extensions"
 version = "0.1.0"
 dependencies = [
+ "box-api",
  "box-containers",
+ "box-dsh-versions",
  "box-foundation",
  "flate2",
  "serde",

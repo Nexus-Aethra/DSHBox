@@ -109,15 +109,25 @@ pub(crate) fn find_repository_entry_by_identity(
 /// Install a repository entry into a container profile (plugin) or skill root.
 /// Plugins are installed via `dsh plugin add` with the repository source path;
 /// skills are copied into a per-container directory.
+///
+/// `template_id` identifies the template the link was triggered by when
+/// this call originates from `materialize_built_template`. Passing
+/// `Some(id)` records the template as an owner of the repository entry;
+/// passing `None` skips the bookkeeping (the caller is a direct
+/// `plugin install <container>` and only the container owns the entry).
 pub(crate) fn link_repository_extension(
     container_id: &str,
     profile: Option<&str>,
     repository_id: &str,
+    template_id: Option<&str>,
     task: &TaskContext,
 ) -> Result<(), String> {
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
+    // Reconcile before mutating so the on-disk owner map matches the
+    // canonical sources after any prior crash or stale write.
+    let _ = box_extensions::reconcile_owner_index(Path::new(&root));
     let entry = scan_repository(Path::new(&root))
         .into_iter()
         .find(|entry| entry.id == repository_id)
@@ -150,15 +160,29 @@ pub(crate) fn link_repository_extension(
                 source_path,
                 task,
             )?;
-            // A plugin linked from a template owns one template-side
-            // reference. Direct `plugin install <container>` is handled
-            // by `install_container_extension` / `container_plugin_add`
-            // and increments the container counter instead.
-            box_extensions::increment_reference(
-                Path::new(&root),
-                &entry.id,
-                box_extensions::ReferenceKind::Template,
-            )?;
+            // A plugin linked from a template records the template as
+            // one of its template-side owners. Direct `plugin install
+            // <container>` flows through `install_container_extension`
+            // / `container_plugin_add` and records the container
+            // owner there instead — passing `template_id = None` here
+            // skips the bookkeeping on that path.
+            if let Some(template_id) = template_id {
+                box_extensions::add_reference_owner(
+                    Path::new(&root),
+                    &entry.id,
+                    box_extensions::ReferenceKind::Template,
+                    template_id,
+                )?;
+            } else {
+                // Direct (non-template) link from CLI: record the
+                // container as the owner so `plugin prune` keeps it.
+                box_extensions::add_reference_owner(
+                    Path::new(&root),
+                    &entry.id,
+                    box_extensions::ReferenceKind::Container,
+                    container_id,
+                )?;
+            }
         }
         ExtensionKind::Skill => {
             // Skills stay per-container copies: install_container_skill
@@ -402,17 +426,39 @@ pub(crate) fn remove_repository_extension(id: &str) -> Result<(), String> {
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
+    // Reconcile first so a torn or stale references.json cannot block a
+    // legitimate delete.
+    let _ = box_extensions::reconcile_owner_index(Path::new(&root));
     let mut entries = scan_repository(Path::new(&root));
     let entry = entries
         .iter()
         .find(|entry| entry.id == id)
         .cloned()
         .ok_or("repository extension not found")?;
-    let used_by = box_extensions::reference_count(Path::new(&root), id);
-    if used_by > 0 {
+    let owners = box_extensions::read_references(Path::new(&root))
+        .get(id)
+        .cloned()
+        .unwrap_or_default();
+    if !owners.is_empty() {
+        let mut parts = Vec::new();
+        if !owners.containers.is_empty() {
+            parts.push(format!(
+                "{} container(s) [{}]",
+                owners.containers.len(),
+                owners.containers.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !owners.templates.is_empty() {
+            parts.push(format!(
+                "{} template(s) [{}]",
+                owners.templates.len(),
+                owners.templates.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
         return Err(format!(
-            "repository extension `{}` is used by {used_by} container(s); remove them first or run `dshbox plugin prune`",
-            entry.name
+            "repository extension `{}` is still referenced by {}; remove or detach them first",
+            entry.name,
+            parts.join(" and ")
         ));
     }
     fs::remove_dir_all(
@@ -437,6 +483,9 @@ pub(crate) fn prune_unused_repository_extensions() -> Result<Vec<String>, String
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
+    // Reconcile first so `unused_repository_ids` reflects the canonical
+    // truth, not whatever the previous run left on disk.
+    let _ = box_extensions::reconcile_owner_index(Path::new(&root));
     let mut removed = Vec::new();
     for id in box_extensions::unused_repository_ids(Path::new(&root)) {
         if let Err(error) = remove_repository_extension(&id) {
@@ -516,6 +565,9 @@ pub(crate) fn install_container_extension(
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
+    // Reconcile before any owner mutation so a stale file cannot cause
+    // duplicate or phantom owners.
+    let _ = box_extensions::reconcile_owner_index(Path::new(&root));
     let container = box_containers::scan_containers(&root)?
         .remove(container_id)
         .ok_or("container not found")?;
@@ -579,17 +631,19 @@ pub(crate) fn install_container_extension(
             install_container_plugin(&container, profile, source_kind, source, extracted, task)
         }
     }?;
-    // Container-side reference: only counted when the source is a
-    // repository entry. Local / tarball installs aren't shared, so
-    // their `repository_id` is None and prune wouldn't see them anyway.
+    // Container-side reference: only recorded when the source is a
+    // shared repository entry. Local / tarball installs have no
+    // `repository_id`, so the owner set never grows for them — they
+    // also never show up as `unused_repository_ids`.
     if source_kind == "repository" {
         let root = read_config()?
             .runtime_directory
             .ok_or("DSH Box storage is not configured")?;
-        box_extensions::increment_reference(
+        box_extensions::add_reference_owner(
             Path::new(&root),
             source,
             box_extensions::ReferenceKind::Container,
+            container_id,
         )?;
     }
     let _ = fs::remove_dir_all(staging);
@@ -685,6 +739,9 @@ pub(crate) fn remove_repository_plugin(id: &str, profile: &str, name: &str) -> R
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
+    // Reconcile first so the per-container record we are about to remove
+    // is reflected in the owner set we're going to update.
+    let _ = box_extensions::reconcile_owner_index(Path::new(&root));
     let container = box_containers::scan_containers(&root)?
         .remove(id)
         .ok_or("container not found")?;
@@ -720,10 +777,10 @@ pub(crate) fn remove_repository_plugin(id: &str, profile: &str, name: &str) -> R
     if link.exists() {
         fs::remove_dir_all(&link).map_err(|error| error.to_string())?;
     }
-    // Decrement BEFORE removing the per-container record so the
-    // repository_id is still available. Repository-backed plugins lose
-    // their container-side reference here; local / tarball installs have
-    // no `repository_id` and the decrement is a no-op.
+    // Release the container owner BEFORE removing the per-container
+    // record so the `repository_id` is still available. Local /
+    // tarball installs have no `repository_id`, and the remove is a
+    // no-op for them.
     let repository_id = read_extension_records(&container)
         .into_iter()
         .find(|record| {
@@ -734,10 +791,11 @@ pub(crate) fn remove_repository_plugin(id: &str, profile: &str, name: &str) -> R
         .and_then(|record| record.repository_id);
     remove_plugin_record(&container, profile, name)?;
     if let Some(repository_id) = repository_id.as_deref() {
-        box_extensions::decrement_reference(
+        box_extensions::remove_reference_owner(
             Path::new(&root),
             repository_id,
             box_extensions::ReferenceKind::Container,
+            &container.id,
         )?;
     }
     Ok(())

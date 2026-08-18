@@ -17,3 +17,10 @@
 .bundle-verify.log
 .e2e-*.log
 /src-tauri/*.dsh.tar.gz
+# ZCode session plans: ephemeral, regenerated every session.
+/.zcode/
+# Throwaway packaging artefacts.
+/dshbox-*.tgz
+# Vite build output (dist is bundled into the desktop binary by Tauri's
+# beforeBuildCommand; never edit files under this directory).
+/src-tauri/dist/

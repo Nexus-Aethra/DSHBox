@@ -77,6 +77,7 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         }
         Some("list_bundles") => list_bundles(),
         Some("list_repository_extensions") => list_repository_extensions(),
+        Some("list_repository_reference_counts") => list_repository_reference_counts_rpc(),
         Some("list_installed_dsh_versions") => list_installed_dsh_versions(),
         Some("detect_toolchains") => detect_toolchains(),
         Some("enqueue_build") => enqueue_build(state, request),
@@ -274,6 +275,41 @@ fn list_repository_extensions() -> Result<Value, String> {
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
     Ok(json!(scan_repository(std::path::Path::new(&root))))
+}
+
+/// Debugging aid: every repository entry paired with the ids of the
+/// containers and built templates currently linked to it. Reads from
+/// `references.json` exactly as it sits on disk (no reconciliation) —
+/// the read path is fast on purpose, and `plugin rm` / `plugin prune`
+/// / `template rm` / `container rm` all run `reconcile_owner_index`
+/// before they mutate.
+fn list_repository_reference_counts_rpc() -> Result<Value, String> {
+    let root = read_config()?
+        .runtime_directory
+        .ok_or("DSH Box storage is not configured")?;
+    let entries = scan_repository(std::path::Path::new(&root));
+    let references = box_extensions::read_references(std::path::Path::new(&root));
+    let rows: Vec<Value> = entries
+        .into_iter()
+        .map(|entry| {
+            let owners = references.get(&entry.id);
+            let containers: Vec<String> = owners
+                .map(|set| set.containers.iter().cloned().collect())
+                .unwrap_or_default();
+            let templates: Vec<String> = owners
+                .map(|set| set.templates.iter().cloned().collect())
+                .unwrap_or_default();
+            json!({
+                "id": entry.id,
+                "name": entry.name,
+                "kind": entry.kind,
+                "version": entry.version,
+                "containers": containers,
+                "templates": templates,
+            })
+        })
+        .collect();
+    Ok(json!(rows))
 }
 
 fn list_installed_dsh_versions() -> Result<Value, String> {
@@ -829,12 +865,18 @@ fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<Value, S
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
+    // Reconcile before mutating so a stale file does not cause the
+    // owner map to drift from the canonical sources we're about to
+    // release.
+    let _ = box_extensions::reconcile_owner_index(Path::new(&root));
     let directory = Path::new(&root).join("instances").join(&id);
     if !directory.is_dir() {
         return Err(format!("container not found: {id}"));
     }
-    // Release reference counts for repository-backed plugins linked into this
-    // container, so `plugin prune` never removes plugins still in use.
+    // Release the container from each repository plugin it currently
+    // references. Skills are skipped (they have no owner bookkeeping);
+    // local / tarball installs have no `repository_id` (the remove
+    // call is a no-op for them).
     let container = box_containers::DshContainer {
         id: id.clone(),
         name: String::new(),
@@ -845,16 +887,15 @@ fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<Value, S
         status: String::new(),
     };
     for record in box_extensions::read_extension_records(&container) {
-        // Skills are not reference-counted; skip to avoid decrementing
-        // a counter slot that was never incremented.
         if record.kind != box_extensions::ExtensionKind::Plugin {
             continue;
         }
         if let Some(repository_id) = record.repository_id {
-            box_extensions::decrement_reference(
+            box_extensions::remove_reference_owner(
                 Path::new(&root),
                 &repository_id,
                 box_extensions::ReferenceKind::Container,
+                &id,
             )?;
         }
     }
@@ -1009,7 +1050,12 @@ fn enqueue_container_extension_copy(state: &DaemonState, request: &Value) -> Res
         "container-extension-copy",
         vec!["repository:extensions".to_owned(), format!("container:{id}")],
         params,
-        move |task| link_repository_extension(&id, profile.as_deref(), &repository_id, task),
+        // `container_extension_copy` is invoked from the resources page to
+        // manually link a plugin into one container; no template is in
+        // play, so we record the container as the owner of the
+        // repository entry (None template_id triggers that branch in
+        // `link_repository_extension`).
+        move |task| link_repository_extension(&id, profile.as_deref(), &repository_id, None, task),
     )
 }
 

@@ -384,6 +384,7 @@ fn run_inner() -> Result<(), String> {
             create_extension_bundle,
             delete_extension_bundle,
             remove_repository_extension,
+            list_repository_reference_counts,
             enqueue_plugin_export,
             remove_repository_plugin,
             image::enqueue_image_build,

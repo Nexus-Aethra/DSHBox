@@ -149,6 +149,15 @@ pub(crate) fn remove_repository_extension(id: String, _tasks: tauri::State<TaskM
     Ok(())
 }
 
+/// Debugging aid exposed as a tauri command so the resources page can
+/// show a popover of owner ids alongside the snapshot counts.
+#[tauri::command]
+pub(crate) fn list_repository_reference_counts() -> Result<Vec<box_extensions::RepositoryReferenceRow>, String> {
+    let client = connect()?;
+    let value = call(&client, "list_repository_reference_counts", serde_json::json!({}))?;
+    serde_json::from_value(value).map_err(|error| format!("invalid reference counts response: {error}"))
+}
+
 #[tauri::command]
 pub(crate) fn remove_repository_plugin(
     id: String,

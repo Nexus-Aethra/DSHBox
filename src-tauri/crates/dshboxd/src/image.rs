@@ -225,6 +225,21 @@ pub(crate) fn build_image_from_script(
     };
     task.update("Writing built template", 90);
     let entry = write_built_template(&root, &list)?;
+    // Record the freshly-built template as a template-side owner of
+    // every plugin it references. Without this step the owner map would
+    // miss the build (built-template materialisation is what surfaces
+    // the reference), and `plugin prune` could delete a plugin a
+    // future container build still depends on.
+    for resource in &list.resources {
+        if let box_api::TemplateResource::Reference { entry_id, .. } = resource {
+            box_extensions::add_reference_owner(
+                Path::new(&root),
+                entry_id,
+                box_extensions::ReferenceKind::Template,
+                &entry.id,
+            )?;
+        }
+    }
 
     if let Some(output_path) = request.output_path.as_ref() {
         task.update("Writing image archive", 96);
@@ -258,6 +273,7 @@ fn materialize_built_template(
     root: &str,
     request: &CreateTemplateContainerRequest,
     list: TemplateResourceList,
+    template_id: &str,
     task: &TaskContext,
 ) -> Result<box_containers::DshContainer, String> {
     task.update("Creating container", 30);
@@ -284,6 +300,13 @@ fn materialize_built_template(
                     &container.id,
                     Some(&profile),
                     entry_id,
+                    // Materialising a built template: record the
+                    // template as an owner of the plugin so it
+                    // survives `plugin prune` while any container is
+                    // still pointing at it. The id is the built
+                    // template's hash (TemplateEntry.id), passed in by
+                    // `materialize_template_container`.
+                    Some(template_id),
                     task,
                 )
                 .map_err(|error| format!("cannot link plugin `{name}` from repository: {error}"))?;
@@ -430,7 +453,15 @@ pub(crate) fn materialize_template_container(
         .ok_or("DSH Box storage is not configured")?;
     // Built template first: the metadata-only form needs no parsing.
     if let Some(list) = read_built_template(&root, &request.template)? {
-        return materialize_built_template(&root, &request, list, task);
+        // The id we record as the template-side owner is the built
+        // template's hash id (TemplateEntry.id) — that's the same
+        // value `remove_template` and `build_image_from_script` use,
+        // so references stay consistent across the lifecycle.
+        let template_id = box_dsh_versions::read_template_index(&root)
+            .get(&request.template)
+            .map(|entry| entry.id.clone())
+            .unwrap_or_default();
+        return materialize_built_template(&root, &request, list, &template_id, task);
     }
     // Resolve through the index so any template name (including
     // `github.com/<owner>/<repo>:<tag>` aliases) finds the right script
@@ -1346,6 +1377,9 @@ pub(crate) fn remove_template(name: &str) -> Result<(), String> {
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
+    // Reconcile first so a torn references.json doesn't keep a built
+    // template pinned when the user is legitimately removing it.
+    let _ = box_extensions::reconcile_owner_index(Path::new(&root));
     let mut index = read_template_index(&root);
     let entry = index
         .get(name)
@@ -1392,10 +1426,11 @@ pub(crate) fn remove_template(name: &str) -> Result<(), String> {
         if let Ok(Some(list)) = box_dsh_versions::read_built_template(&root, name) {
             for resource in &list.resources {
                 if let box_api::TemplateResource::Reference { entry_id, name: rname, .. } = resource {
-                    if let Err(error) = box_extensions::decrement_reference(
+                    if let Err(error) = box_extensions::remove_reference_owner(
                         Path::new(&root),
                         entry_id,
                         box_extensions::ReferenceKind::Template,
+                        &entry.id,
                     ) {
                         eprintln!(
                             "warning: cannot release template reference to `{rname}` ({entry_id}): {error}"
@@ -1438,7 +1473,10 @@ fn install_from_repository_entry(
     profile: &str,
     entry: &RepositoryExtension,
 ) -> Result<(), String> {
-    link_repository_extension(&container.id, Some(profile), &entry.id, task)
+    // Script templates (no built list.json) install straight from the
+    // repository into one container, so the container — not a template
+    // — owns the reference.
+    link_repository_extension(&container.id, Some(profile), &entry.id, None, task)
 }
 
 /// Convert a `ParsedSource` variant into a pack-compatible spec string.

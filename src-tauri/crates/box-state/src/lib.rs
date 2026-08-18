@@ -244,11 +244,16 @@ impl ResourceStateManager {
                     box_extensions::read_references(std::path::Path::new(runtime))
                         .into_iter()
                         .map(|(id, count)| {
+                            // Snapshot shape: numbers only. The disk
+                            // owner sets are projected to their length
+                            // for the UI's "in use by" badge; the
+                            // detailed ids live behind the
+                            // `list_repository_reference_counts` RPC.
                             (
                                 id,
                                 RepositoryReferenceCount {
-                                    containers: count.containers,
-                                    templates: count.templates,
+                                    containers: count.containers.len() as u32,
+                                    templates: count.templates.len() as u32,
                                 },
                             )
                         })

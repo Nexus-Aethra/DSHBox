@@ -8,7 +8,7 @@ use super::rpc;
 
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     let Some(action) = arguments.first().map(String::as_str) else {
-        return Err("expected plugin ls|import|export|rm|prune|install".to_owned());
+        return Err("expected plugin ls|import|export|rm|prune|install|refs".to_owned());
     };
     if matches!(action, "help" | "--help" | "-h") {
         println!("dshbox plugin ls [container] [--profile <name>]");
@@ -16,6 +16,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         println!("dshbox plugin export <id> <dest.tar.gz>");
         println!("dshbox plugin rm <id>");
         println!("dshbox plugin prune");
+        println!("dshbox plugin refs [--verbose]");
         println!("dshbox plugin install <container> <source> [--profile <name>]");
         return Ok(());
     }
@@ -33,6 +34,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         ),
         "rm" => repository_remove(arguments.get(1).ok_or("expected a repository entry id")?),
         "prune" => repository_prune(),
+        "refs" => repository_refs(arguments.iter().skip(1).any(|arg| arg == "--verbose")),
         "install" | "add" => container_plugin_add(&arguments[1..]),
         _ => Err(format!("unknown plugin action: {action}")),
     }
@@ -92,6 +94,49 @@ fn repository_remove(id: &str) -> Result<(), String> {
     let client = rpc::connect()?;
     rpc::call(&client, "remove_repository_extension", json!({ "id": id }))?;
     println!("removed repository entry {id}");
+    Ok(())
+}
+
+/// Print every repository entry alongside the container / template ids
+/// that currently reference it. Useful when `plugin rm` or `plugin prune`
+/// reports a "still in use" error and the user wants to know which owner
+/// is blocking the delete. Pass `--verbose` to expand the id columns.
+fn repository_refs(verbose: bool) -> Result<(), String> {
+    let client = rpc::connect()?;
+    let value = rpc::call(&client, "list_repository_reference_counts", json!({}))?;
+    let rows: Vec<box_extensions::RepositoryReferenceRow> = serde_json::from_value(value)
+        .map_err(|error| format!("invalid reference rows from daemon: {error}"))?;
+    if rows.is_empty() {
+        println!("no repository entries");
+        return Ok(());
+    }
+    if verbose {
+        println!("ID\tKIND\tNAME\tVERSION\tCONTAINERS\tTEMPLATES");
+        for row in rows {
+            println!(
+                "{}\t{}\t{}\t{}\t[{}]\t[{}]",
+                row.id,
+                kind_name(&row.kind),
+                row.name,
+                row.version.as_deref().unwrap_or("-"),
+                row.containers.join(", "),
+                row.templates.join(", "),
+            );
+        }
+    } else {
+        println!("ID\tKIND\tNAME\tVERSION\tCONTAINERS\tTEMPLATES");
+        for row in rows {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                row.id,
+                kind_name(&row.kind),
+                row.name,
+                row.version.as_deref().unwrap_or("-"),
+                row.containers.len(),
+                row.templates.len(),
+            );
+        }
+    }
     Ok(())
 }
 
