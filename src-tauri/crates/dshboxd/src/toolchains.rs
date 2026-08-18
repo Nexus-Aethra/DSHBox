@@ -53,8 +53,39 @@ pub(crate) fn command_for_toolchain(toolchain: &ResolvedToolchain) -> Command {
     let mut command = Command::new(&toolchain.path);
     suppress_console_window(&mut command);
     command.args(&toolchain.arguments);
+
+    // --- Environment sanitisation (Windows) ---
+    // The daemon inherits the desktop app's environment, which on Windows
+    // commonly carries `SHELL=D:\Git\bin\bash.exe` (Git Bash) and
+    // `NODE_PATH=D:\nodejs\node_modules` (system Node.js).  Both interfere
+    // with the bundled toolchain:
+    //
+    //   - `SHELL` pointing to bash.exe can confuse pnpm's lifecycle runner
+    //     into executing the extensionless `.bin/tsc` shell shim (which has
+    //     WSL-style `/mnt/d/...` paths in its NODE_PATH) instead of the
+    //     correct `tsc.cmd` Windows shim.
+    //   - `NODE_PATH` inherited from the user's global Node.js installation
+    //     adds unexpected search paths that can shadow the project's own
+    //     `node_modules` and cause resolution failures.
+    //
+    // The bundled runtime's own env vars (PATH, npm_config_*, PNPM_STORE_DIR)
+    // are set below; everything else is inherited from the daemon process.
+    // We explicitly strip the known troublemakers so every toolchain child
+    // starts with a clean, predictable environment.
+    command.env_remove("SHELL");
+    command.env_remove("NODE_PATH");
+
+    // Expose the dshbox install directory so toolchain children (pnpm scripts,
+    // npm lifecycle hooks, plugin installers) can locate bundled resources
+    // without crawling the filesystem.  The in-container agent also sees this
+    // via the context snapshot's `paths.dshboxHome`.
+    if let Ok(install_dir) = crate::state::dshbox_install_directory() {
+        command.env("DSHBOX_HOME", install_dir.as_os_str());
+    }
+
     // Prepend the bundled runtime bin directories so child processes can
-    // resolve bare `pnpm`/`npm` commands.
+    // resolve bare `pnpm`/`npm` commands.  Also prepend the dshbox install
+    // directory so the in-container agent can invoke `dshbox` directly.
     if let Ok(runtime) = bundled_runtime() {
         if let Some(node_dir) = runtime.node.parent() {
             let pnpm_dir = node_dir.parent().map(|root| root.join("pnpm"));
@@ -62,6 +93,10 @@ pub(crate) fn command_for_toolchain(toolchain: &ResolvedToolchain) -> Command {
                 let mut parts: Vec<OsString> = vec![node_dir.as_os_str().to_owned()];
                 if let Some(pnpm_dir) = pnpm_dir {
                     parts.push(pnpm_dir.as_os_str().to_owned());
+                }
+                // Prepend dshbox home so the agent can find `dshbox` in PATH.
+                if let Ok(install_dir) = crate::state::dshbox_install_directory() {
+                    parts.insert(0, install_dir.as_os_str().to_owned());
                 }
                 parts.push(existing);
                 if let Ok(joined) = std::env::join_paths(parts) {

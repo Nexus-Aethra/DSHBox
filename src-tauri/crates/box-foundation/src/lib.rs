@@ -243,7 +243,7 @@ pub fn normalize_optional_url(value: Option<String>) -> Option<String> {
 /// desktop app is a GUI process without a console; spawned console children
 /// (node, pnpm, schtasks, ...) would otherwise each pop a black terminal
 /// window. No-op on other platforms.
-pub fn suppress_console_window(_command: &mut std::process::Command) {
+pub fn suppress_console_window(command: &mut std::process::Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

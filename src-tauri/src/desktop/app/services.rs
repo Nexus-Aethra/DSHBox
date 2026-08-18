@@ -118,7 +118,27 @@ pub(crate) fn reconcile_daemon_build(server: &Path) {
     }
     #[cfg(windows)]
     {
-        let _ = restart_user_service();
+        // Windows uses a per-user scheduled task (dshboxd) for the daemon,
+        // but schtasks /RL LIMITED is fragile: it silently fails when the
+        // task hasn't been created yet, when the user lacks rights, or
+        // when the desktop session is detached. Without a fallback the UI
+        // hangs on "Starting DSH Box server…" forever, because no
+        // discovery.json ever gets written. So on Windows we always run
+        // the scheduled task AND, if it didn't bring the daemon up,
+        // spawn the sidecar directly. The single-instance check in
+        // dshboxd keeps the duplicate from clobbering the live process.
+        match restart_user_service() {
+            Ok(()) => write_startup_log("daemon restart via scheduled task"),
+            Err(error) => write_startup_log(&format!(
+                "daemon restart via scheduled task failed ({error}); spawning directly"
+            )),
+        }
+        // Give the task a moment to start before we decide to fall back.
+        // If the task succeeded, the fallback is a no-op (daemon_alive
+        // returns true and spawn_daemon_fallback skips itself).
+        if !daemon_alive() {
+            spawn_daemon_fallback(server);
+        }
     }
     if let Some(client) = wait_for_daemon(Duration::from_secs(5)) {
         let stamp = client
@@ -148,13 +168,39 @@ pub(crate) fn spawn_daemon_fallback(server: &Path) {
     }
     let mut command = Command::new(server);
     command.arg("--service");
+    // Detach so the daemon outlives the desktop app and keeps running in
+    // the system tray. Without this, closing the main window on Windows
+    // would tear down the daemon and the UI would re-hang on the next
+    // launch.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         let _ = command.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_PROCESS_GROUP so the daemon outlives the desktop
+        // app closing and stays around in the system tray.
+        // CREATE_NO_WINDOW suppresses the flash console window every time
+        // the desktop has to fall back to spawning the daemon itself.
+        // (DETACHED_PROCESS would also suppress the window but it would
+        //  also strip the daemon of any chance to receive Ctrl+C / close
+        //  notifications, which is overkill here.)
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        // Don't keep the daemon tied to our console / pipe handles.
+        command.stdin(std::process::Stdio::null());
+        command.stdout(std::process::Stdio::null());
+        command.stderr(std::process::Stdio::null());
+    }
     match command.spawn() {
-        Ok(_) => write_startup_log(&format!("spawned dshboxd fallback: {}", server.display())),
+        Ok(child) => write_startup_log(&format!(
+            "spawned dshboxd fallback: {} (pid {})",
+            server.display(),
+            child.id()
+        )),
         Err(error) => write_startup_log(&format!("dshboxd fallback spawn failed: {error}")),
     }
 }
@@ -331,8 +377,12 @@ pub(crate) fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 let _ = restart_user_service();
             }
             "tray-quit" => {
-                // The daemon owns container hosts, so quitting the UI leaves
-                // them running under dshboxd; nothing to stop here.
+                // Quit means "I'm done with DSH Box". Leaving dshboxd
+                // running would leave orphan container hosts in the
+                // user's tray with no UI to control them; stop it
+                // alongside the UI. best-effort: errors are logged but
+                // never block exit.
+                let _ = stop_user_service();
                 app.exit(0);
             }
             _ => {}

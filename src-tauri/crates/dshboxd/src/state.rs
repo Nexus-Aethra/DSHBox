@@ -68,7 +68,7 @@ pub(crate) fn bundled_target() -> &'static str {
 /// `resources/server/<target>/dshboxd`, so the resource root is two
 /// directories up from the executable; developer builds fall back to
 /// `src-tauri/resources` relative to this crate.
-fn resource_directory() -> Result<PathBuf, String> {
+pub(crate) fn resource_directory() -> Result<PathBuf, String> {
     if let Some(root) = std::env::var_os("DSHBOX_RESOURCE_DIR") {
         return Ok(PathBuf::from(root));
     }
@@ -85,6 +85,24 @@ fn resource_directory() -> Result<PathBuf, String> {
         return Ok(dev);
     }
     Err("bundled runtime is missing; reinstall DSH Box or set DSHBOX_RESOURCE_DIR".to_owned())
+}
+
+/// Resolve the dshbox installation root directory (e.g. `D:\dshbox\`).
+///
+/// The resource directory is `<install>/resources/`, so the install root
+/// is its parent. Falls back to the resource directory itself when the
+/// layout is unconventional (developer builds, custom DSHBOX_RESOURCE_DIR).
+pub(crate) fn dshbox_install_directory() -> Result<PathBuf, String> {
+    let resource = resource_directory()?;
+    // For a deployed install: resources/ → install root is parent.
+    // For developer builds or custom env-var overrides, stay at the resource
+    // dir — the install-root concept doesn't apply in those cases.
+    if resource.ends_with("resources") || resource.ends_with("resources\\") {
+        if let Some(parent) = resource.parent() {
+            return Ok(parent.to_path_buf());
+        }
+    }
+    Ok(resource)
 }
 
 /// Initialize the bundled runtime exactly once. Called during daemon

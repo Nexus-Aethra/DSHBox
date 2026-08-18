@@ -274,9 +274,11 @@ fn run_inner() -> Result<(), String> {
                 link_daemon_into_path(&server);
                 if let Err(error) = install_user_service(&server) {
                     write_startup_log(&format!("dshboxd service installation failed: {error}"));
-                    // Platforms without a per-user service manager (macOS)
-                    // and broken service setups still get a running daemon.
-                    #[cfg(unix)]
+                    // Platforms without a per-user service manager (macOS),
+                    // broken systemd units, and Windows where the
+                    // scheduled task creation was rejected all still need
+                    // a running daemon — fall back to spawning the sidecar
+                    // directly so the UI never gets stuck waiting.
                     spawn_daemon_fallback(&server);
                 }
                 // Protocol handshake: restart a daemon built in a different

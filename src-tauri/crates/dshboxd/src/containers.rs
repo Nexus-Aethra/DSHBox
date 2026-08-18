@@ -492,10 +492,15 @@ pub(crate) fn ensure_container_workspace(directory: &Path) -> Result<PathBuf, St
 /// Render the per-container JSON snapshot Box writes on every container start.
 /// The snapshot becomes a `dsh-box:container` PromptContext section (order
 /// 130) that the agent receives as a user-role history snapshot.
+///
+/// `dshbox_home` is the absolute path to the dshbox installation directory
+/// (e.g. `D:\dshbox\`), resolved by the caller so the snapshot carries the
+/// install location for the in-container agent.
 pub(crate) fn write_dshbox_context_snapshot(
     directory: &Path,
     container: &serde_json::Value,
     profile: &str,
+    dshbox_home: &Path,
 ) -> Result<DshContextFiles, String> {
     let workspace = ensure_container_workspace(directory)?;
     let container_name = container["name"].as_str().unwrap_or("DSH Container");
@@ -526,6 +531,7 @@ pub(crate) fn write_dshbox_context_snapshot(
         &plugins_root,
         &skills_root,
         &logs_root,
+        dshbox_home,
         &api_key_envs,
     );
     // Atomic write: stage to .tmp then rename so a racing read never sees a

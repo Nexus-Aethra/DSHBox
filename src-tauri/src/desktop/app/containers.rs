@@ -88,6 +88,7 @@ pub(crate) fn write_dshbox_context_snapshot(
     directory: &Path,
     container: &serde_json::Value,
     profile: &str,
+    _dshbox_home: &Path,
 ) -> Result<DshContextFiles, String> {
     let workspace = ensure_container_workspace(directory)?;
     let container_name = container["name"].as_str().unwrap_or("DSH Container");
@@ -119,6 +120,7 @@ pub(crate) fn write_dshbox_context_snapshot(
         &plugins_root,
         &skills_root,
         &logs_root,
+        _dshbox_home,
         &api_key_envs,
     );
     // Atomic write: stage to .tmp then rename so a racing read never sees a
@@ -341,7 +343,7 @@ mod context_snapshot_tests {
             "name": "Example",
             "version": "latest",
         });
-        let files = write_dshbox_context_snapshot(&root, &metadata, "web").unwrap();
+        let files = write_dshbox_context_snapshot(&root, &metadata, "web", &root).unwrap();
         assert_eq!(files.snapshot_path, root.join("state").join(SNAPSHOT_FILENAME));
         assert_eq!(files.patch_path, root.join("state").join(PATCH_FILENAME));
         assert!(root.join("workspace").is_dir());
@@ -353,6 +355,7 @@ mod context_snapshot_tests {
         assert_eq!(snapshot["container"]["version"], "latest");
         assert_eq!(snapshot["container"]["profile"], "web");
         assert!(snapshot["paths"]["workspace"].as_str().unwrap().ends_with("workspace"));
+        assert_eq!(snapshot["paths"]["dshboxHome"], root.to_string_lossy().as_ref());
         assert_eq!(snapshot["credentials"]["providers"].as_array().unwrap().len(), 0);
 
         let patch_body = fs::read_to_string(&files.patch_path).unwrap();
@@ -378,7 +381,7 @@ mod context_snapshot_tests {
             "name": "WithCreds",
             "version": "latest",
         });
-        let files = write_dshbox_context_snapshot(&root, &metadata, "web").unwrap();
+        let files = write_dshbox_context_snapshot(&root, &metadata, "web", &root).unwrap();
         let snapshot: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&files.snapshot_path).unwrap()).unwrap();
         let providers = snapshot["credentials"]["providers"].as_array().unwrap();

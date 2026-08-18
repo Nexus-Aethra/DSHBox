@@ -15,7 +15,7 @@ use crate::toolchains::{
 use box_containers::container_directory;
 use box_dsh_context::PLUGIN_ID;
 use box_dsh_versions::version_directory as dsh_version_directory;
-use box_foundation::{is_safe_identifier, read_config};
+use box_foundation::{is_safe_identifier, read_config, suppress_console_window};
 use box_scheduler::TaskContext;
 use std::{
     collections::BTreeMap,
@@ -77,7 +77,9 @@ pub(crate) fn start_dsh_container_inner(
     let template = value["template"].as_str().map(str::to_owned);
     repair_known_profile_template(&directory, profile)?;
     let workspace = ensure_container_workspace(&directory)?;
-    let context_files = write_dshbox_context_snapshot(&directory, &value, profile)?;
+    let dshbox_home = crate::state::dshbox_install_directory()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let context_files = write_dshbox_context_snapshot(&directory, &value, profile, &dshbox_home)?;
     // DSH's Cordis loader imports loader entries through Node's ESM
     // machinery, which never consults NODE_PATH; expose the vendored
     // plugin as a real node_modules entry next to the profile.
@@ -193,12 +195,19 @@ pub(crate) fn start_dsh_container_inner(
         }
         let plugins_node_modules =
             PathBuf::from(&root).join("plugins").join("node_modules");
-        let mut command = command_for_toolchain(&pnpm);
+        // Launch the DSH host directly via `node --import tsx/esm` instead of
+        // going through `pnpm dsh`.  pnpm's lifecycle runner wraps the exit
+        // code in `[ELIFECYCLE]` and swallows the actual error message,
+        // making it impossible to diagnose startup failures.  Running the
+        // script directly lets the node process's stderr propagate to the
+        // host.log unmodified.
+        let node = resolve_toolchain("node")?;
+        let mut command = command_for_toolchain(&node);
         command
             .args([
-                "--dir",
-                source.to_string_lossy().as_ref(),
-                "dsh",
+                "--import",
+                "tsx/esm",
+                source.join("apps/cli/src/bin.ts").to_string_lossy().as_ref(),
                 "--profile",
                 profile,
                 "--patch",
@@ -206,7 +215,7 @@ pub(crate) fn start_dsh_container_inner(
                 "--patch",
                 patch.to_string_lossy().as_ref(),
             ])
-            .current_dir(&workspace)
+            .current_dir(&source)
             .env("DSH_HOME", directory.join("profile"))
             .env("NODE_PATH", plugins_node_modules.as_os_str())
             // Force chokidar into polling mode so the container host is
@@ -258,7 +267,21 @@ pub(crate) fn start_dsh_container_inner(
                 let _ = child.wait();
                 return false;
             }
-            if child.try_wait().ok().flatten().is_some() {
+            if let Some(status) = child.try_wait().ok().flatten() {
+                // DSH host exited before the 20s readiness window — log the
+                // exit code and signal so we can diagnose startup failures.
+                // The host.log captures stdout/stderr via the forwarding
+                // threads, but the exit code itself is not written there.
+                let (code, signal) = host::exit_status_to_parts(status);
+                if let Some(task) = task {
+                    if let Some(sig) = signal {
+                        task.log(&format!(
+                            "DSH host exited early (code {code}, signal {sig})"
+                        ));
+                    } else {
+                        task.log(&format!("DSH host exited early (code {code})"));
+                    }
+                }
                 return false;
             }
             if let Some(task) = task {
@@ -529,7 +552,9 @@ fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
             // this fails.
             let link_arg = format!("\"{}\"", link.display());
             let target_arg = format!("\"{}\"", target.display());
-            let output = std::process::Command::new("cmd")
+            let mut cmd = std::process::Command::new("cmd");
+            box_foundation::suppress_console_window(&mut cmd);
+            let output = cmd
                 .args(["/C", "mklink", "/J", &link_arg, &target_arg])
                 .output()?;
             if output.status.success() {
@@ -675,8 +700,12 @@ fn make_process_group_leader(command: &mut Command) {
     {
         use std::os::windows::process::CommandExt;
         // CREATE_NEW_PROCESS_GROUP allows taskkill /T to walk the tree.
+        // CREATE_NO_WINDOW suppresses the flash console window every time
+        // a container starts; without it the user sees a black cmd window
+        // pop up for ~50ms on every Start action.
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 }
 
@@ -730,9 +759,7 @@ fn terminate_process_group_grouped(child: &Child) {
     }
     // Also kill the host PID directly in case `setsid` didn't take
     // effect (e.g. the child re-execed into something else).
-    let _ = std::process::Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status();
+    terminate_host_pid(child.id());
     // Brief grace window; if still alive, escalate.
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
@@ -741,9 +768,49 @@ fn terminate_process_group_grouped(child: &Child) {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    let _ = std::process::Command::new("kill")
-        .args(["-KILL", &child.id().to_string()])
-        .status();
+    // Still alive after 5s? Force-kill.
+    terminate_host_pid_force(child.id());
+}
+
+/// Send a graceful stop signal to a single PID. On unix this is
+/// `kill -TERM`; on Windows `kill` doesn't exist, so we use `taskkill`
+/// without `/F` first to give the process a chance to clean up.
+fn terminate_host_pid(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // `taskkill /T /PID <pid>` walks the process tree without
+        // requiring `/F`, so descendants get a chance to shut down
+        // cleanly. CREATE_NO_WINDOW keeps the console hidden.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/PID", &pid.to_string()])
+            .creation_flags(0x08000000)
+            .status();
+    }
+}
+
+/// Force-kill a single PID. Used after the grace window expires.
+fn terminate_host_pid_force(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(0x08000000)
+            .status();
+    }
 }
 
 /// Terminate a process group by pgid. Used during shutdown when we
@@ -752,9 +819,21 @@ fn terminate_process_group(pgid: i32) {
     if pgid <= 0 {
         return;
     }
-    let _ = std::process::Command::new("kill")
-        .args(["-TERM", &format!("-{pgid}")])
-        .status();
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &format!("-{pgid}")])
+            .status();
+    }
+    // Windows: there is no portable process-group signal. The pgid we
+    // record is set via `CREATE_NEW_PROCESS_GROUP`, which `taskkill /T`
+    // walks. We deliberately don't issue a kill here — the per-PID
+    // helpers above handle the actual termination; the pgid is only
+    // metadata on Windows.
+    #[cfg(windows)]
+    {
+        let _ = pgid; // suppress unused-variable warning
+    }
 }
 
 /// Scan every persisted `host.json` and reconcile it against the live

@@ -46,6 +46,12 @@ pub struct DshContextFiles {
 /// `<DSH_HOME>/.credentials.yaml`; we only ship the env name (the key
 /// value stays out of the prompt path), so the agent can reference the
 /// provider without the secret ever leaving its source file.
+///
+/// `dshbox_home` is the absolute path to the dshbox installation directory
+/// (e.g. `D:\dshbox\`). The agent can use this to locate bundled resources
+/// directly from the install, bypassing the runtime data directory when
+/// needed — particularly useful on Windows where the runtime data directory
+/// may be incomplete or corrupted while the install is always intact.
 #[allow(clippy::too_many_arguments)]
 pub fn render_snapshot(
     container_id: &str,
@@ -57,6 +63,7 @@ pub fn render_snapshot(
     plugins_root: &std::path::Path,
     skills_root: &std::path::Path,
     logs_root: &std::path::Path,
+    dshbox_home: &std::path::Path,
     api_key_envs: &[String],
 ) -> String {
     let snapshot = serde_json::json!({
@@ -72,6 +79,7 @@ pub fn render_snapshot(
             "plugins": plugins_root.display().to_string(),
             "skills": skills_root.display().to_string(),
             "logs": logs_root.display().to_string(),
+            "dshboxHome": dshbox_home.display().to_string(),
         },
         "credentials": {
             "providers": api_key_envs.iter().map(|env| {
@@ -130,12 +138,14 @@ mod tests {
             &PathBuf::from("/run/plugins"),
             &PathBuf::from("/run/skills"),
             &PathBuf::from("/run/logs"),
+            &PathBuf::from("/opt/dshbox"),
             &["MINIMAX_CN_API_KEY".to_owned()],
         );
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["container"]["id"], "container-1");
         assert_eq!(v["container"]["name"], "my box");
         assert_eq!(v["paths"]["workspace"], "/run/ws");
+        assert_eq!(v["paths"]["dshboxHome"], "/opt/dshbox");
         assert_eq!(v["credentials"]["providers"][0]["apiKeyEnv"], "MINIMAX_CN_API_KEY");
     }
 

@@ -228,9 +228,126 @@ pub fn stop_user_service() -> BoxResult<()> {
     #[cfg(target_os = "linux")]
     return run_systemctl(&["--user", "stop", "dshboxd.service"]);
     #[cfg(target_os = "windows")]
-    return run_schtasks(&["/End", "/TN", "dshboxd"]);
+    {
+        // schtasks /End only knows about the daemon that the scheduled
+        // task itself spawned. When the desktop fell back to launching
+        // dshboxd directly (because schtasks /Run was rejected), there
+        // is no scheduled task for /End to stop — the live dshboxd is
+        // an orphan process the desktop spawned itself. So we try, in
+        // order:
+        //   1. graceful RPC shutdown via the discovery record (token-
+        //      checked, daemon writes its final state and reaps hosts);
+        //   2. wait up to 3s for the daemon to actually exit;
+        //   3. taskkill /F /T /PID as the last resort;
+        //   4. schtasks /End so the scheduled task itself doesn't
+        //      immediately respawn the daemon on the next login.
+        let mut stopped = false;
+        let mut last_error: Option<String> = None;
+
+        if let Ok(Some(discovery)) = read_discovery() {
+            if graceful_shutdown_via_rpc(&discovery).is_ok() {
+                for _ in 0..30 {
+                    if !pid_alive(discovery.pid) {
+                        stopped = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            if !stopped && pid_alive(discovery.pid) {
+                let mut kill = std::process::Command::new("taskkill");
+                box_foundation::suppress_console_window(&mut kill);
+                match kill.args(["/F", "/T", "/PID", &discovery.pid.to_string()]).output() {
+                    Ok(out) if out.status.success() => stopped = true,
+                    Ok(out) => last_error = Some(String::from_utf8_lossy(&out.stderr).into_owned()),
+                    Err(error) => last_error = Some(error.to_string()),
+                }
+            }
+        }
+
+        if let Err(error) = run_schtasks(&["/End", "/TN", "dshboxd"]) {
+            if !stopped {
+                last_error.get_or_insert(error);
+            }
+        }
+
+        return if stopped {
+            Ok(())
+        } else {
+            Err(last_error.unwrap_or_else(|| "dshboxd is not running".to_owned()))
+        };
+    }
     #[allow(unreachable_code)]
     Err("background service is not supported for this platform".to_owned())
+}
+
+/// Windows-only: returns true when a process with the given PID still exists.
+/// Used as the fallback path of `stop_user_service` to confirm the daemon
+/// really went away after we asked it to shut down.
+#[cfg(target_os = "windows")]
+fn pid_alive(pid: u32) -> bool {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output();
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.contains(&format!(",{pid},"))
+        }
+        Err(_) => false,
+    }
+}
+
+/// Windows-only: open a single TCP connection to the daemon's discovery
+/// port, POST `{"method":"shutdown","token":"..."}`, and return Ok(()) if
+/// the daemon answered 200. We can't pull in box-client because it
+/// already depends on box-server-core, so we hand-roll the request here.
+#[cfg(target_os = "windows")]
+fn graceful_shutdown_via_rpc(discovery: &ServerDiscovery) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let addr = format!("127.0.0.1:{}", discovery.port);
+    let mut stream = TcpStream::connect_timeout(
+        &addr.parse().map_err(|error| format!("bad discovery address: {error}"))?,
+        Duration::from_millis(500),
+    )
+    .map_err(|error| format!("connect dshboxd {addr}: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(|error| format!("set read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .map_err(|error| format!("set write timeout: {error}"))?;
+
+    let body = serde_json::json!({
+        "token": discovery.token,
+        "method": "shutdown",
+    })
+    .to_string();
+    let request = format!(
+        "POST /rpc HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("write request: {error}"))?;
+    stream.flush().map_err(|error| format!("flush: {error}"))?;
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| format!("read response: {error}"))?;
+    if response.starts_with("HTTP/1.1 200") {
+        Ok(())
+    } else {
+        Err(format!(
+            "dshboxd rejected shutdown: {}",
+            response.lines().next().unwrap_or("")
+        ))
+    }
 }
 
 #[cfg(target_os = "linux")]
