@@ -195,7 +195,17 @@ pub(crate) fn start_dsh_container_inner(
             ])
             .current_dir(&workspace)
             .env("DSH_HOME", directory.join("profile"))
-            .env("NODE_PATH", plugins_node_modules.as_os_str());
+            .env("NODE_PATH", plugins_node_modules.as_os_str())
+            // Force chokidar into polling mode so the container host is
+            // insulated from the host machine's inotify watcher budget.
+            // Linux users with many editors / dev tools (ZCode's own
+            // `zcode-host-local`, IDEs, etc.) routinely exhaust the
+            // default 65536 max_user_watches, which makes recursive
+            // `chokidar.watch` inside DSH fail with ENOSPC and crash
+            // the host — seen as "DSH host did not become ready" in
+            // the UI while the CLI path (which bypasses this watcher)
+            // still works. Polling sidesteps inotify entirely.
+            .env("CHOKIDAR_USEPOLLING", "true");
         // Detach the host into its own process group so cleanup can reach
         // every descendant with a single `kill(-pgid, ...)`. Linux/macOS
         // use `setsid`; Windows relies on `CREATE_NEW_PROCESS_GROUP` so
