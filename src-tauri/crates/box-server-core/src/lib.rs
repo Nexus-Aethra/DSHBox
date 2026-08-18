@@ -14,7 +14,24 @@ pub struct ServerDiscovery {
     pub token: String,
     pub pid: u32,
     pub started_at: u64,
+    #[serde(default)]
     pub port: u16,
+    /// Unix domain socket path. Legacy field from older daemon builds;
+    /// kept for backward-compatible deserialization of stale discovery files.
+    #[serde(default, skip_serializing)]
+    pub endpoint: Option<String>,
+}
+
+impl Default for ServerDiscovery {
+    fn default() -> Self {
+        Self {
+            token: String::new(),
+            pid: 0,
+            started_at: 0,
+            port: 0,
+            endpoint: None,
+        }
+    }
 }
 
 pub fn server_directory() -> BoxResult<PathBuf> {
@@ -46,6 +63,7 @@ pub fn write_discovery(port: u16) -> BoxResult<ServerDiscovery> {
         pid: process::id(),
         started_at: now_seconds(),
         port,
+        endpoint: None,
     };
     let temporary = directory.join("discovery.json.tmp");
     fs::write(

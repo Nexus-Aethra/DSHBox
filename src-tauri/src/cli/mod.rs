@@ -34,13 +34,9 @@ pub fn run() -> Option<i32> {
         return None;
     }
     // Only launch the GUI when the user explicitly asks for it.
-    if arguments.len() == 1 && matches!(arguments[0].as_str(), "ui" | "--tray") {
-        // Best-effort PATH bootstrap. The desktop path is the entry
-        // point most first-time users hit; if they then open a
-        // terminal and find `dshbox` missing, that's a bug we'd be
-        // hiding. Add the install dir to HKCU\Environment\Path (Windows)
-        // / shell rc (POSIX) silently if possible, with a one-line
-        // hint when something goes wrong.
+    if arguments.len() >= 1
+        && (arguments[0] == "ui" || arguments[0] == "--tray")
+    {
         bootstrap_path_hint();
         return None;
     }

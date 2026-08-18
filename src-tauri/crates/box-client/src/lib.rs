@@ -8,6 +8,8 @@
 
 use box_server_core::{read_discovery, ServerDiscovery};
 use serde_json::Value;
+use std::io::{BufReader, Read, Write};
+use std::net::TcpStream;
 
 /// Response frame every daemon method returns.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -81,9 +83,6 @@ impl RpcClient {
 
     /// Send one JSON request via HTTP POST /rpc; returns the parsed response frame.
     fn exchange(&self, request: Value) -> Result<RpcResponse, String> {
-        use std::io::{BufReader, Read, Write};
-        use std::net::TcpStream;
-
         let addr = format!("127.0.0.1:{}", self.port);
         let mut stream = TcpStream::connect(&addr)
             .map_err(|error| format!("cannot connect to dshboxd at {}: {error}", addr))?;
@@ -106,7 +105,6 @@ impl RpcClient {
             .read_to_string(&mut response_str)
             .map_err(|error| format!("dshboxd read error: {error}"))?;
 
-        // Parse HTTP response: find header/body boundary
         let mut boundary = None;
         for (i, _) in response_str.match_indices("\r\n\r\n") {
             boundary = Some(i + 4);
@@ -117,7 +115,6 @@ impl RpcClient {
             None => return Err("dshboxd response parse error: missing header/body boundary".to_string()),
         };
 
-        // Read status line to detect non-200
         let status_line = response_str[..boundary].lines().next().unwrap_or("");
         if !status_line.starts_with("HTTP/1.1 200") {
             let body_part = &response_str[boundary..];
