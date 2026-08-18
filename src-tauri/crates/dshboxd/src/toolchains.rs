@@ -82,6 +82,13 @@ pub(crate) fn command_for_toolchain(toolchain: &ResolvedToolchain) -> Command {
             let pnpm_root = PathBuf::from(runtime_dir).join("pnpm");
             let _ = std::fs::create_dir_all(&pnpm_root);
             command.env("PNPM_STORE_DIR", pnpm_root.join("store"));
+            // npm is used by `fetch_extension_via_npm_pack` for GitHub/Git
+            // URL plugin sources. Without pinning its cache, `npm pack`
+            // leaks into `~/.npm/_cacache/` and can collide with other
+            // npm instances when doing concurrent `git --mirror` clones.
+            let npm_cache = pnpm_root.join("npm-cache");
+            let _ = std::fs::create_dir_all(&npm_cache);
+            command.env("npm_config_cache", npm_cache);
         }
     }
     command
