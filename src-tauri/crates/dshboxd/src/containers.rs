@@ -808,27 +808,35 @@ fn plugin_build_script(directory: &Path) -> Result<Option<&'static str>, String>
             .map_err(|error| format!("cannot read plugin manifest: {error}"))?,
     )
     .map_err(|error| format!("cannot parse plugin manifest: {error}"))?;
-        // Some plugins ship without their build-time toolchain (e.g.
-    // tsconfig.build.json) in the published tarball. Prefer prepare
-    // over build when both exist so tsdown alone can succeed.
-    let has_build = manifest
-        .pointer("/scripts/build")
-        .and_then(serde_json::Value::as_str)
-        .is_some();
-    let has_prepare = manifest
-        .pointer("/scripts/prepare")
-        .and_then(serde_json::Value::as_str)
-        .is_some();
-    match (has_build, has_prepare) {
-        (true, false) => Ok(Some("build")),
-        (false, true) => Ok(Some("prepare")),
-        (true, true) => {
-            // Both present: prefer prepare because it is the npm-side
-            // contract that works from published tarballs. Fall back to
-            // build only if prepare doesn't produce the entry — but
-            // the caller only picks one script, so we commit to prepare.
-            Ok(Some("prepare"))
+
+    let get_script = |name: &str| -> Option<String> {
+        manifest
+            .pointer(&format!("/scripts/{name}"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+
+    // Skip scripts that are known non-builders: they need .git, a network
+    // dependency, or are purely hook utilities. husky is the most common
+    // offender — `dsh-context` sets `prepare: husky` for git hooks but its
+    // actual build lives in `build`.
+    let is_buildable = |script: &str| -> bool {
+        !script.starts_with("husky")
+            && !script.starts_with("lint-staged")
+    };
+
+    // Prefer `prepare` (npm lifecycle hook, works from tarballs) when it
+    // looks like a real build command; otherwise fall back to `build`.
+    if let Some(s) = get_script("prepare") {
+        if is_buildable(&s) {
+            return Ok(Some("prepare"));
         }
-        (false, false) => Ok(None),
     }
+    if let Some(s) = get_script("build") {
+        if is_buildable(&s) {
+            return Ok(Some("build"));
+        }
+    }
+    Ok(None)
 }
+
