@@ -17,8 +17,19 @@ if (isFresh(destination, sources, force)) {
   process.exit(0)
 }
 
-const rustTarget = env.DSH_BOX_RUST_TARGET
 const windows = target.startsWith('win-')
+
+// A running daemon locks its binary, causing `Text file busy` (os error 26)
+// when tauri-build later copies resources/server/<target>/dshboxd. Stop it
+// before rebuilding so the copy succeeds.
+if (!windows) {
+  const kill = spawnSync('pkill', ['-f', 'dshboxd'], { stdio: 'ignore' })
+  if (kill.status === null) {
+    console.log('no running dshboxd to stop')
+  }
+}
+
+const rustTarget = env.DSH_BOX_RUST_TARGET
 
 // Every real rebuild starts a new build batch: stamp it with the epoch
 // seconds so the daemon and the desktop client embedded in the same batch
