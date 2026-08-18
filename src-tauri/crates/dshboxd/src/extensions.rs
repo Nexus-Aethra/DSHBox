@@ -88,7 +88,7 @@ pub(crate) fn repository_metadata(
 /// not versioned, so the version slot is ignored. Missing or invalid
 /// entries (`diagnostic` set) are skipped so a stale failure does not
 /// poison the cache hit path.
-fn find_repository_entry_by_identity(
+pub(crate) fn find_repository_entry_by_identity(
     root: &str,
     kind: &ExtensionKind,
     name: &str,

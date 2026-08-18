@@ -6,15 +6,23 @@
 //! dependency; the daemon owns the single execution context.
 
 use crate::containers::create_dsh_container_sync;
-use crate::extensions::{import_into_repository, link_repository_extension};
+use crate::extensions::{
+    import_into_repository, link_repository_extension,
+    find_repository_entry_by_identity,
+};
 use box_dsh_versions::{
     collect_unreferenced_template_hash, harness_template_path, read_built_template,
     read_template_index, referenced_snapshot_digests, template_index_path,
     template_storage_root, templates_directory, write_built_template, write_template_index,
     TemplateEntry,
 };
-use box_extensions::transfer::{extract_extension_tarball, locate_extension_root};
-use box_extensions::{repository_root, scan_repository, ExtensionKind, RepositoryExtension};
+use box_extensions::transfer::{
+    append_plugin_archive, copy_extension_source, extract_extension_tarball, locate_extension_root,
+};
+use box_extensions::{
+    extension_digest, repository_root, scan_repository, write_repository_index, ExtensionKind,
+    RepositoryExtension,
+};
 use box_foundation::{now_seconds, read_config};
 use box_image::{
     compile_manifest, parse_script, parse_source_token, write_dshimage, AddKind,
@@ -686,11 +694,25 @@ pub(crate) fn lookup_template_path(root: &str, name: &str) -> Result<PathBuf, St
     Err(format!("template not found: {name}"))
 }
 
-/// Import a template tarball (the format produced by `export_template`).
-/// The archive is unpacked to a staging directory, validated, then stored
-/// under `<root>/templates/<content-hash>/script.dsh` and registered in
-/// the index under `name` (or the archive stem when not provided).
-pub(crate) fn import_template(archive: &str, name: Option<String>) -> Result<String, String> {
+/// Import a template tarball. Two wire formats are accepted:
+///
+/// * Legacy — a single `<name>.dsh` file at the archive top level
+///   (the only form `export_template` used to produce).
+/// * Rich — `format: "dsh-template-export", version: 2` — packs the
+///   harness runtime source, every referenced plugin/skill, every
+///   snapshot data payload, and the template manifest so the
+///   receiving machine can reconstruct the template without pulling
+///   anything.
+///
+/// On import each kind of artefact is idempotent: if the harness
+/// runtime is already installed locally, if a repository entry of
+/// the same `(kind, name, version)` exists, or if a data snapshot of
+/// the same digest already sits in the data store, we skip it.
+pub(crate) fn import_template(
+    archive: &str,
+    name: Option<String>,
+    _conflict: &str,
+) -> Result<String, String> {
     if archive.trim().is_empty() {
         return Err("template archive path cannot be empty".to_owned());
     }
@@ -709,63 +731,380 @@ pub(crate) fn import_template(archive: &str, name: Option<String>) -> Result<Str
         let _ = std::fs::remove_dir_all(&staging);
         return Err(error);
     }
-    // The archive must contain exactly one .dsh file at the top level.
-    let dsh_files: Vec<PathBuf> = std::fs::read_dir(&staging)
+
+    let manifest_path = staging.join("manifest.json");
+    if manifest_path.is_file() {
+        if let Ok(text) = std::fs::read_to_string(&manifest_path) {
+            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) {
+                if manifest
+                    .get("format")
+                    .and_then(|v| v.as_str())
+                    == Some("dsh-template-export")
+                    && manifest
+                        .get("version")
+                        .and_then(|v| v.as_u64())
+                        == Some(2)
+                {
+                    let result = import_template_rich(&root, &staging, &manifest, name);
+                    let _ = std::fs::remove_dir_all(&staging);
+                    return result;
+                }
+            }
+        }
+    }
+
+    import_template_legacy(&root, &staging, name)
+}
+
+/// Rich-format template import. Reads `manifest.json` from the staged
+/// archive root and reconstructs: harness runtime, template manifest,
+/// plugins/skills into the repository, and data snapshots into the
+/// data store. Every step is idempotent on identity.
+fn import_template_rich(
+    root: &str,
+    staging: &Path,
+    manifest: &serde_json::Value,
+    caller_name: Option<String>,
+) -> Result<String, String> {
+    let target_name = match caller_name {
+        Some(n) if !n.is_empty() => n,
+        _ => manifest
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("template")
+            .to_owned(),
+    };
+    if !is_safe_template_name(&target_name) {
+        return Err(format!("invalid template name `{target_name}`"));
+    }
+    if read_template_index(root).contains_key(&target_name) {
+        return Err(format!(
+            "template `{target_name}` already exists; remove it first or pick a different --name"
+        ));
+    }
+
+    let built = manifest.get("built").and_then(|v| v.as_bool()).unwrap_or(false);
+    let harness_ref: Option<String> = manifest
+        .get("harnessRef")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let harness_version: Option<String> = manifest
+        .get("harnessVersion")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let harness_from: Option<String> = manifest
+        .get("harnessFrom")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let harness_commit: Option<String> = manifest
+        .get("harnessCommit")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let profile = manifest
+        .get("profile")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let from_ref: Option<String> = manifest
+        .get("base")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+
+    // 1. Harness runtime — copy into <root>/runtimes/<version>/source/
+    //    if not already installed. `harnessVersion` is the actual runtime
+    //    dir name; `harnessRef` is the template's base tag ("latest", etc).
+    let version_for_copy = harness_version.as_ref().or(harness_ref.as_ref());
+    if let Some(ref version) = version_for_copy {
+        let runtime_dir = box_dsh_versions::version_directory(root, version);
+        let marker = runtime_dir.join(".dshbox-runtime.json");
+        if !marker.is_file() {
+            let src = staging.join("runtimes").join(version);
+            if src.is_dir() {
+                std::fs::create_dir_all(&runtime_dir)
+                    .map_err(|error| error.to_string())?;
+                copy_extension_source(&src, &runtime_dir)?;
+                let meta = serde_json::json!({
+                    "version": version,
+                    "from": harness_from.as_deref().unwrap_or("imported:template-export"),
+                    "commit": harness_commit.as_deref().unwrap_or("unknown"),
+                });
+                std::fs::write(&marker, serde_json::to_string(&meta).unwrap())
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    }
+
+    // 2. Template manifest.
+    let template_dir = staging.join("template");
+    if built {
+        let list_path = template_dir.join("list.json");
+        if !list_path.is_file() {
+            return Err("built template archive is missing template/list.json".to_string());
+        }
+        let text = std::fs::read_to_string(&list_path).map_err(|error| error.to_string())?;
+        let mut list: box_api::TemplateResourceList =
+            serde_json::from_str(&text).map_err(|error| format!("invalid list.json: {error}"))?;
+        list.name = target_name.clone();
+        if let Some(h) = &harness_ref {
+            list.harness_ref = Some(h.clone());
+        }
+        list.profile = profile.clone();
+        box_dsh_versions::write_built_template(root, &list)?;
+    } else {
+        let script_path = template_dir.join(format!("{}.dsh", target_name));
+        let text = if script_path.is_file() {
+            std::fs::read_to_string(&script_path).map_err(|error| error.to_string())?
+        } else {
+            let fallback = template_dir.join("script.dsh");
+            if fallback.is_file() {
+                std::fs::read_to_string(&fallback).map_err(|error| error.to_string())?
+            } else {
+                return Err("script template archive is missing template/<name>.dsh".to_string());
+            }
+        };
+        box_dsh_versions::write_template_with_entry(
+            root,
+            &target_name,
+            &text,
+            harness_ref,
+            &profile,
+            from_ref,
+            now_seconds(),
+        )?;
+    }
+
+    // 3. Plugins / skills — for each Reference resource, import if missing.
+    let resources: Vec<serde_json::Value> = manifest
+        .get("resources")
+        .and_then(|v| v.as_array())
+        .map(|a| a.clone())
+        .unwrap_or_default();
+    for item in &resources {
+        let mode = item.get("mode").and_then(|v| v.as_str());
+        let name_str = item.get("name").and_then(|v| v.as_str());
+        let version_str = item.get("version").and_then(|v| v.as_str()).map(str::to_owned);
+        let kind_str = item.get("kind").and_then(|v| v.as_str()).unwrap_or("plugin");
+        if mode != Some("reference") || name_str.is_none() {
+            continue;
+        }
+        let name_str = name_str.unwrap();
+        let kind: ExtensionKind = match kind_str {
+            "skill" => ExtensionKind::Skill,
+            _ => ExtensionKind::Plugin,
+        };
+        // If the entry already exists by identity and is healthy, skip.
+        if let Some(existing) =
+            find_repository_entry_by_identity(root, &kind, name_str, version_str.as_deref())
+        {
+            if existing.diagnostic.is_none() {
+                continue;
+            }
+        }
+        let src = staging
+            .join(match kind {
+                ExtensionKind::Plugin => "plugins",
+                ExtensionKind::Skill => "skills",
+            })
+            .join(name_str);
+        if src.is_dir() {
+            import_extension_to_repository(
+                root,
+                &kind,
+                name_str,
+                version_str.as_deref(),
+                &src,
+            )?;
+        }
+    }
+
+    // 4. Data snapshots — for each Snapshot resource, restore if missing.
+    for item in &resources {
+        let mode = item.get("mode").and_then(|v| v.as_str());
+        let digest = item.get("digest").and_then(|v| v.as_str());
+        if mode != Some("snapshot") || digest.is_none() {
+            continue;
+        }
+        let digest = digest.unwrap();
+        let store_dir = crate::data::data_root(Path::new(root));
+        if store_dir.join(digest).is_dir() {
+            continue;
+        }
+        let src = staging.join("data").join(digest);
+        if src.is_dir() {
+            std::fs::create_dir_all(&store_dir).map_err(|error| error.to_string())?;
+            copy_extension_source(&src, &store_dir.join(digest))?;
+            register_data_entry(root, digest)?;
+        }
+    }
+
+    eprintln!(
+        "imported template `{target_name}` with {count} resources",
+        count = resources.len()
+    );
+    Ok(target_name)
+}
+
+/// Import an extension directory into the repository index. Synchronous
+/// variant of `import_into_repository` — used by the template import
+/// path which doesn't have a TaskContext available.
+fn import_extension_to_repository(
+    root: &str,
+    kind: &ExtensionKind,
+    name: &str,
+    version: Option<&str>,
+    source: &Path,
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let entry_id = format!(
+        "import-{}-{}",
+        now_seconds(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let destination = repository_root(Path::new(root))
+        .join(match kind {
+            ExtensionKind::Plugin => "plugins",
+            ExtensionKind::Skill => "skills",
+        })
+        .join(&entry_id)
+        .join("source");
+    if destination.exists() {
+        return Err(format!("repository entry already exists: {entry_id}"));
+    }
+    std::fs::create_dir_all(destination.parent().ok_or("destination has no parent")?)
+        .map_err(|error| error.to_string())?;
+    copy_extension_source(source, &destination)?;
+    let digest = extension_digest(&destination)?;
+    let mut entries = scan_repository(Path::new(root));
+    entries.push(RepositoryExtension {
+        id: entry_id.clone(),
+        kind: kind.clone(),
+        name: name.to_owned(),
+        version: version.map(str::to_owned),
+        description: None,
+        content_digest: digest,
+        source_path: destination.to_string_lossy().into_owned(),
+        imported_at: now_seconds(),
+        diagnostic: None,
+        source: Some(source.to_string_lossy().into_owned()),
+    });
+    write_repository_index(Path::new(root), &entries)?;
+    Ok(())
+}
+
+/// Register a data entry in `<root>/data/index.json` so it appears in
+/// the listing and isn't pruned.
+fn register_data_entry(root: &str, digest: &str) -> Result<(), String> {
+    let store = crate::data::data_root(Path::new(root));
+    let path_str = store.join(digest).to_string_lossy().to_string();
+    let entry_json: serde_json::Value = serde_json::json!({
+        "name": digest,
+        "digest": digest,
+        "importedAt": now_seconds(),
+        "source": path_str,
+    });
+    let index_path = store.join("index.json");
+    let mut index: serde_json::Map<String, serde_json::Value> =
+        std::fs::read_to_string(&index_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+    index.insert(digest.to_string(), entry_json);
+    std::fs::create_dir_all(index_path.parent().ok_or("data index has no parent")?)
+        .map_err(|error| error.to_string())?;
+    std::fs::write(
+        &index_path,
+        serde_json::to_string_pretty(&index).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Legacy-format import (single `<name>.dsh` at archive top level).
+/// Called by `import_template` when the archive lacks a rich manifest.
+fn import_template_legacy(
+    root: &str,
+    staging: &Path,
+    name: Option<String>,
+) -> Result<String, String> {
+    let clean = || {
+        let _ = std::fs::remove_dir_all(staging);
+    };
+    let dsh_files: Vec<PathBuf> = std::fs::read_dir(staging)
         .map_err(|error| format!("cannot read staged archive: {error}"))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("dsh"))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|v| v.to_str())
+                    == Some("dsh")
+        })
         .collect();
     if dsh_files.is_empty() {
-        let _ = std::fs::remove_dir_all(&staging);
+        clean();
         return Err("template archive contains no .dsh file".to_owned());
     }
     if dsh_files.len() > 1 {
-        let _ = std::fs::remove_dir_all(&staging);
+        clean();
         return Err("template archive contains multiple .dsh files".to_owned());
     }
-    let source = dsh_files.into_iter().next().expect("non-empty");
+    let source = dsh_files.into_iter().next().unwrap();
     let target_name = match name {
-        Some(name) if !name.is_empty() => name,
+        Some(n) if !n.is_empty() => n,
         _ => source
             .file_stem()
-            .and_then(|value| value.to_str())
+            .and_then(|v| v.to_str())
             .map(str::to_owned)
             .ok_or_else(|| "template archive is missing a filename stem".to_owned())?,
     };
     if !is_safe_template_name(&target_name) {
-        let _ = std::fs::remove_dir_all(&staging);
+        clean();
         return Err(format!("invalid template name `{target_name}`"));
     }
-    if read_template_index(&root).contains_key(&target_name) {
-        let _ = std::fs::remove_dir_all(&staging);
+    if read_template_index(root).contains_key(&target_name) {
+        clean();
         return Err(format!(
             "template `{target_name}` already exists; remove it first or pick a different --name"
         ));
     }
     let text = std::fs::read_to_string(&source).map_err(|error| error.to_string())?;
-    // Best-effort metadata from the script header; falls back to the
-    // tarball's filename when parsing fails (e.g. unsupported directives).
     let (harness_ref, profile) = match parse_script(&text, Path::new(".")) {
         Ok(script) => (script.harness_ref, script.profile),
         Err(_) => (None, String::new()),
     };
     let entry = box_dsh_versions::write_template_with_entry(
-        &root,
+        root,
         &target_name,
         &text,
         harness_ref,
         &profile,
-        Some(format!("imported:{archive}")),
+        Some(format!("imported:legacy-archive")),
         now_seconds(),
     )?;
-    let _ = std::fs::remove_dir_all(&staging);
+    clean();
     Ok(entry.name)
 }
 
-/// Export a local template to a gzip tarball. The default destination is
-/// `./<name>.dsh.tar.gz` in the current working directory; an explicit path
-/// is honoured verbatim (must end in `.tar.gz`).
+/// Export a template to a gzip tarball that carries everything a
+/// receiving machine needs to reconstruct it without network access:
+/// the harness runtime source, every referenced plugin/skill, every
+/// snapshot data payload, and the template manifest. The archive
+/// layout is:
+///
+/// ```text
+/// my-template.tar.gz
+///   manifest.json              — format, version, name, harnessRef,
+///                                resources, dataDigests, exportedAt
+///   template/
+///     <name>.dsh  |  list.json — the template body (script) or its
+///                                resource list (built)
+///   runtimes/<version>/...     — harness source tree (no .git/)
+///   plugins/<name>/...         — each Reference plugin's source tree
+///   skills/<name>/...
+///   data/<digest>/...          — each Snapshot data payload
+/// ```
 pub(crate) fn export_template(name: &str, destination: Option<String>) -> Result<String, String> {
     if !is_safe_template_name(name) {
         return Err("invalid template name".to_owned());
@@ -773,16 +1112,19 @@ pub(crate) fn export_template(name: &str, destination: Option<String>) -> Result
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
-    let source = lookup_template_path(&root, name)?;
-    if !source.is_file() {
-        return Err(format!("template not found: {name}"));
-    }
+
+    let index = read_template_index(&root);
+    let entry = index
+        .get(name)
+        .ok_or_else(|| format!("template `{name}` not found"))?;
+    let entry = entry.clone();
+
     let dest_str = match destination {
         Some(value) if !value.is_empty() => value,
         _ => format!("./{name}.dsh.tar.gz"),
     };
     let dest_path = Path::new(&dest_str);
-    if dest_path.extension().and_then(|value| value.to_str()) != Some("gz") {
+    if dest_path.extension().and_then(|v| v.to_str()) != Some("gz") {
         return Err("template export destination must end in .tar.gz".to_owned());
     }
     if let Some(parent) = dest_path.parent() {
@@ -790,17 +1132,206 @@ pub(crate) fn export_template(name: &str, destination: Option<String>) -> Result
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
     }
-    let output = std::fs::File::create(dest_path).map_err(|error| format!("cannot create template archive: {error}"))?;
+
+    let output = std::fs::File::create(dest_path)
+        .map_err(|error| format!("cannot create template archive: {error}"))?;
     let encoder = flate2::write::GzEncoder::new(output, flate2::Compression::default());
     let mut archive = tar::Builder::new(encoder);
+
+    // Collect resources and data digests from the manifest (built templates)
+    // or from the script body (script templates, no embedded resources).
+    let (resources_json, data_digests) = if entry.built {
+        let list = box_dsh_versions::read_built_template(&root, name)?
+            .ok_or_else(|| format!("template `{name}` is marked built but has no manifest"))?;
+        let mut res = Vec::new();
+        let mut digests = Vec::new();
+        for r in &list.resources {
+            match r {
+                TemplateResource::Reference {
+                    kind,
+                    name: ref_name,
+                    version,
+                    entry_id,
+                } => {
+                    res.push(serde_json::json!({
+                        "mode": "reference",
+                        "kind": kind,
+                        "name": ref_name,
+                        "version": version,
+                        "entryId": entry_id,
+                    }));
+                }
+                TemplateResource::Snapshot {
+                    kind,
+                    name: ref_name,
+                    digest,
+                    destination: dest,
+                } => {
+                    digests.push(digest.clone());
+                    res.push(serde_json::json!({
+                        "mode": "snapshot",
+                        "kind": kind,
+                        "name": ref_name,
+                        "digest": digest,
+                        "destination": dest,
+                    }));
+                }
+            }
+        }
+        (serde_json::json!(res), digests)
+    } else {
+        (
+            serde_json::json!(Vec::<serde_json::Value>::new()),
+            Vec::new(),
+        )
+    };
+
+    // Harness metadata for the manifest. Use `selected_dsh_version` from
+    // config — that's the ACTUAL runtime directory under `runtimes/`.
+    // `harness_ref` is the base template name (e.g. "latest"), not the
+    // runtime version string.
+    let installed_versions = box_dsh_versions::installed_versions(&root).unwrap_or_default();
+    let runtime_version: String = installed_versions
+        .first()
+        .map(|v| v.clone())
+        .unwrap_or_default();
+    let (harness_from, harness_commit): (Option<String>, Option<String>) =
+        if !runtime_version.is_empty() {
+            let path = box_dsh_versions::version_directory(&root, &runtime_version);
+            let meta_path = path.join(".dshbox-runtime.json");
+            std::fs::read_to_string(&meta_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .map(|m| {
+                    (
+                        m.get("from")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_owned),
+                        m.get("commit")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_owned),
+                    )
+                })
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+
+    let manifest = serde_json::json!({
+        "format": "dsh-template-export",
+        "version": 2,
+        "name": name,
+        "base": entry.from_ref,
+        "profile": entry.profile,
+        "harnessRef": entry.harness_ref,
+        "harnessVersion": runtime_version,
+        "harnessFrom": harness_from,
+        "harnessCommit": harness_commit,
+        "createdAt": entry.imported_at,
+        "exportedAt": now_seconds(),
+        "built": entry.built,
+        "resources": resources_json,
+        "dataDigests": serde_json::json!(data_digests),
+    });
+    let manifest_bytes = serde_json::to_string_pretty(&manifest).unwrap();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(manifest_bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
     archive
-        .append_path_with_name(&source, format!("{name}.dsh"))
-        .map_err(|error| format!("cannot archive template: {error}"))?;
+        .append_data(&mut header, "manifest.json", manifest_bytes.as_bytes())
+        .map_err(|error| format!("cannot write manifest: {error}"))?;
+
+    // Template body.
+    if entry.built {
+        if let Ok(Some(list)) = box_dsh_versions::read_built_template(&root, name) {
+            let body = serde_json::to_string(&list).unwrap();
+            let mut h = tar::Header::new_gnu();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            archive
+                .append_data(&mut h, "template/list.json", body.as_bytes())
+                .map_err(|error| format!("cannot archive list.json: {error}"))?;
+        }
+    } else {
+        let source = lookup_template_path(&root, name)?;
+        if source.is_file() {
+            archive
+                .append_path_with_name(&source, format!("template/{}.dsh", name))
+                .map_err(|error| format!("cannot archive template script: {error}"))?;
+        }
+    }
+
+    // Harness runtime source. Use `runtime_version` (the actual directory
+    // under `runtimes/`) rather than `harness_ref` (which is the base
+    // template name like "latest", not the runtime dir).
+    if !runtime_version.is_empty() {
+        let src = box_dsh_versions::version_directory(&root, &runtime_version);
+        if src.is_dir() {
+            append_plugin_archive(
+                &mut archive,
+                &src,
+                &PathBuf::from("runtimes").join(&runtime_version),
+            )?;
+        }
+    }
+
+    // Plugins / skills.
+    let repository = scan_repository(Path::new(&root));
+    let resources_array: Vec<serde_json::Value> =
+        resources_json.as_array().cloned().unwrap_or_default();
+    for item in &resources_array {
+        let mode = item.get("mode").and_then(|v| v.as_str());
+        if mode != Some("reference") {
+            continue;
+        }
+        let kind_str = item.get("kind").and_then(|v| v.as_str()).unwrap_or("plugin");
+        let ref_name = item.get("name").and_then(|v| v.as_str());
+        let entry_id = item.get("entryId").and_then(|v| v.as_str());
+        if ref_name.is_none() || entry_id.is_none() {
+            continue;
+        }
+        let ref_name = ref_name.unwrap();
+        let entry_id = entry_id.unwrap();
+        let kind: ExtensionKind = match kind_str {
+            "skill" => ExtensionKind::Skill,
+            _ => ExtensionKind::Plugin,
+        };
+        let existing = repository.iter().find(|e| e.id == entry_id && e.name == ref_name);
+        let Some(existing) = existing else {
+            continue;
+        };
+        if existing.diagnostic.is_some() {
+            continue;
+        }
+        let src_path = Path::new(&existing.source_path);
+        if !src_path.is_dir() {
+            continue;
+        }
+        let target = PathBuf::from(match kind {
+            ExtensionKind::Plugin => "plugins",
+            ExtensionKind::Skill => "skills",
+        })
+        .join(ref_name);
+        append_plugin_archive(&mut archive, src_path, &target)?;
+    }
+
+    // Data snapshots.
+    let data_store = crate::data::data_root(Path::new(&root));
+    for digest in &data_digests {
+        let src = data_store.join(digest);
+        if src.is_dir() {
+            append_plugin_archive(&mut archive, &src, &PathBuf::from("data").join(digest))?;
+        }
+    }
+
     archive
         .into_inner()
         .map_err(|error| format!("cannot finalize template archive: {error}"))?
         .finish()
         .map_err(|error| format!("cannot finalize gzip stream: {error}"))?;
+
     Ok(dest_path.to_string_lossy().into_owned())
 }
 

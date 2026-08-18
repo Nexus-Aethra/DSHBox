@@ -63,7 +63,8 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("import_template") => {
             let archive = request["archive"].as_str().unwrap_or("").to_owned();
             let name = request["name"].as_str().map(str::to_owned).filter(|value| !value.is_empty());
-            import_template(&archive, name).map(|name| json!({ "name": name }))
+            import_template(&archive, name, "rename")
+                .map(|name| json!({ "name": name }))
         }
         Some("export_template") => {
             let name = request["name"].as_str().unwrap_or("").to_owned();
