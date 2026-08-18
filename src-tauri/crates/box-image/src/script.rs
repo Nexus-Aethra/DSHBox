@@ -450,6 +450,15 @@ pub fn parse_source_token(
         });
     }
 
+    // npm alias form `my-alias@npm:real-pkg@ver` — the `@` is part of
+    // the npm alias grammar, not a version delimiter. Catch it before the
+    // bare-name split misreads it as `BareName{name, version:"npm:..."}`.
+    if token.contains("@npm:") {
+        return Ok(ParsedSource::Passthrough {
+            spec: token.to_owned(),
+        });
+    }
+
     // Last-resort passthrough: tokens starting with a pnpm-specific prefix
     // or containing `://` (git+https, git+ssh) are forwarded verbatim so
     // pnpm handles the full syntax. A bare `name[:version]` or

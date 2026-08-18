@@ -13,7 +13,7 @@ use box_dsh_versions::{
     template_storage_root, templates_directory, write_built_template, write_template_index,
     TemplateEntry,
 };
-use box_extensions::transfer::extract_extension_tarball;
+use box_extensions::transfer::{extract_extension_tarball, locate_extension_root};
 use box_extensions::{repository_root, scan_repository, ExtensionKind, RepositoryExtension};
 use box_foundation::{now_seconds, read_config};
 use box_image::{
@@ -164,9 +164,9 @@ pub(crate) fn build_image_from_script(
                     import_into_repository(task, path)?
                 }
                 parsed => {
-                    let spec = parsed_source_to_pnpm_spec(&parsed)
+                    let spec = parsed_source_to_pack_spec(&parsed)
                         .map_err(|e| format!("cannot convert source to spec: {e}"))?;
-                    fetch_extension_via_pnpm_pack(task, &spec, &ExtensionKind::Plugin)?
+                    fetch_extension_via_npm_pack(task, &spec, &ExtensionKind::Plugin)?
                 }
             };
             inline_blobs.push((entry.content_digest.clone(), PathBuf::from(&entry.source_path)));
@@ -516,9 +516,9 @@ fn materialize_ops(
                 )?;
             }
             parsed => {
-                let spec = parsed_source_to_pnpm_spec(&parsed)
+                let spec = parsed_source_to_pack_spec(&parsed)
                     .map_err(|e| format!("cannot convert source to spec: {e}"))?;
-                let entry = fetch_extension_via_pnpm_pack(task, &spec, &ext_kind)?;
+                let entry = fetch_extension_via_npm_pack(task, &spec, &ext_kind)?;
                 install_from_repository_entry(task, container, &script.profile, &entry)?;
             }
         }
@@ -888,8 +888,8 @@ fn install_from_repository_entry(
     link_repository_extension(&container.id, Some(profile), &entry.id, task)
 }
 
-/// Convert a `ParsedSource` variant into a pnpm-compatible spec string.
-fn parsed_source_to_pnpm_spec(source: &ParsedSource) -> Result<String, String> {
+/// Convert a `ParsedSource` variant into a pack-compatible spec string.
+fn parsed_source_to_pack_spec(source: &ParsedSource) -> Result<String, String> {
     match source {
         ParsedSource::Github { url, ref_ } => {
             // Extract host/owner/repo from https://host/owner/repo
@@ -905,7 +905,11 @@ fn parsed_source_to_pnpm_spec(source: &ParsedSource) -> Result<String, String> {
             } else {
                 return Err(format!("unsupported git host: {url}"));
             };
-            let spec = format!("{}{}", prefix, &host[prefix.len()..]);
+            let spec = format!(
+                "{}{}",
+                prefix,
+                &host[host.find('/').unwrap_or(0) + 1..]
+            );
             match ref_ {
                 Some(r) => Ok(format!("{spec}#{}", r)),
                 None => Ok(spec),
@@ -920,28 +924,36 @@ fn parsed_source_to_pnpm_spec(source: &ParsedSource) -> Result<String, String> {
         }
         ParsedSource::LocalDir { path } => Ok(format!("file:{}", path.display())),
         ParsedSource::GitPrefix { ref_ } => {
-            // `git:` prefix (DSHBox-specific) carries a `host/owner/repo` short form.
+            // `git:` prefix (DSHBox-specific) carries a `host/owner/repo[:tag|@ref]`
+            // short form. Split off the ref, build the pnpm-style prefix spec,
+            // then append `#ref`. pnpm's `github:` / `gitlab:` / `bitbucket:`
+            // grammar uses `#`, not `:` or `@`.
             let ref_str = ref_.as_str();
-            let prefix = if ref_str.starts_with("github.com/") {
+            let (repo_part, ref_part) =
+                ref_str.rfind([':', '@']).map_or((ref_str, None), |pos| {
+                    let tail = &ref_str[pos + 1..];
+                    if tail.is_empty() {
+                        (ref_str, None)
+                    } else {
+                        (&ref_str[..pos], Some(tail))
+                    }
+                });
+            let prefix = if repo_part.starts_with("github.com/") {
                 "github:"
-            } else if ref_str.starts_with("gitlab.com/") {
+            } else if repo_part.starts_with("gitlab.com/") {
                 "gitlab:"
-            } else if ref_str.starts_with("bitbucket.org/") {
+            } else if repo_part.starts_with("bitbucket.org/") {
                 "bitbucket:"
             } else {
                 return Err(format!("unsupported git: host: {ref_str}"));
             };
-            let spec = format!("{}{}", prefix, &ref_str[ref_str.find('/').unwrap_or(0) + 1..]);
-            match ref_.rfind([':', '@']) {
-                Some(pos) => {
-                    let separator = &ref_str[pos..pos + 1];
-                    let tail = &ref_str[pos + 1..];
-                    if tail.is_empty() {
-                        Ok(spec)
-                    } else {
-                        Ok(format!("{spec}{separator}{tail}"))
-                    }
-                }
+            let spec = format!(
+                "{}{}",
+                prefix,
+                &repo_part[repo_part.find('/').unwrap_or(0) + 1..]
+            );
+            match ref_part {
+                Some(r) => Ok(format!("{spec}#{r}")),
                 None => Ok(spec),
             }
         }
@@ -951,7 +963,7 @@ fn parsed_source_to_pnpm_spec(source: &ParsedSource) -> Result<String, String> {
     }
 }
 
-fn fetch_extension_via_pnpm_pack(
+fn fetch_extension_via_npm_pack(
     task: &TaskContext,
     spec: &str,
     _kind: &ExtensionKind,
@@ -965,11 +977,16 @@ fn fetch_extension_via_pnpm_pack(
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
 
-    let pnpm = crate::toolchains::resolve_toolchain("pnpm")
-        .map_err(|e| format!("cannot resolve pnpm: {e}"))?;
-    task.log(&format!("packing extension source via pnpm: {spec}"));
+    let npm = crate::toolchains::resolve_toolchain("npm")
+        .map_err(|e| format!("cannot resolve npm: {e}"))?;
+    task.log(&format!("packing extension source via npm: {spec}"));
 
-    let mut cmd = command_for_toolchain(&pnpm);
+    // npm pack fetches from npm registry, GitHub, git URLs, and local files/
+    // directories — it is the one command that handles every DSH plugin
+    // spec shape natively. It skips lifecycle scripts (postpack/prepare),
+    // so we always get source-only tarballs. Lifecycle deps are installed
+    // later by import_into_repository via pnpm install.
+    let mut cmd = command_for_toolchain(&npm);
     cmd.args([
         "pack",
         spec,
@@ -978,31 +995,34 @@ fn fetch_extension_via_pnpm_pack(
     ]);
     let output = cmd
         .output()
-        .map_err(|e| format!("pnpm pack failed: {e}"))?;
+        .map_err(|e| format!("npm pack failed: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            "pnpm pack exited with non-zero status".to_string()
-        } else {
-            stderr
-        });
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        return Err(format!("npm pack exited with non-zero status: {detail}"));
     }
 
-    // pnpm pack produces a tarball in staging; extract it and import.
+    // npm pack produces a tarball in staging; extract it and import.
     let packed: Vec<PathBuf> = std::fs::read_dir(&staging)
         .map_err(|e| format!("cannot read staging dir: {e}"))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()).is_some())
         .collect();
     if packed.is_empty() {
-        return Err("pnpm pack produced no tarball".to_string());
+        return Err("npm pack produced no tarball".to_string());
     }
-    let destination = staging.join("source");
+let destination = staging.join("source");
     let _ = std::fs::remove_dir_all(&destination);
     std::fs::create_dir_all(&destination).map_err(|e| format!("cannot create source dir: {e}"))?;
     extract_extension_tarball(&packed[0], &destination)
         .map_err(|e| format!("cannot extract tarball: {e}"))?;
-    import_into_repository(task, &destination)
+    // npm pack prefixes tarball contents with `package/`, so the actual
+    // extension root may be one level deep. `locate_extension_root` finds
+    // the real root (up to 2 levels) by looking for package.json/SKILL.md.
+    let content_root = locate_extension_root(&destination)
+        .map_err(|e| format!("cannot locate extension root in tarball: {e}"))?;
+    import_into_repository(task, &content_root)
 }
 
 fn write_archive(

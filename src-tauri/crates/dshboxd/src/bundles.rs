@@ -139,54 +139,13 @@ pub(crate) fn install_container_plugin(
 
     task.update("Installing DSH plugin", 60);
     task.log(&format!("adding plugin {name} to profile {profile}"));
-    let root = read_config()?
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    let dsh_source = dsh_version_directory(&root, &container.version);
-    let pnpm = resolve_toolchain("pnpm")?;
-    let task_record = task.manager.task(&task.task_id)?;
-    let log = fs::OpenOptions::new()
-        .append(true)
-        .open(&task_record.log_path)
-        .map_err(|error| error.to_string())?;
-    let mut child = command_for_toolchain(&pnpm)
-        .args([
-            "--dir",
-            dsh_source.to_string_lossy().as_ref(),
-            "dsh",
-            "plugin",
-            "--profile",
-            profile,
-            "add",
-            plugin_source.to_string_lossy().as_ref(),
-        ])
-        .env(
-            "DSH_HOME",
-            PathBuf::from(&container.directory).join("profile"),
-        )
-        .stdout(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .stderr(Stdio::from(log))
-        .spawn()
-        .map_err(|error| format!("cannot start plugin install: {error}"))?;
-    let status = wait_for_process(&mut child, Some(task), "installing plugin")?;
-    if !status.success() {
-        return Err(format!("dsh plugin add exited with {status}"));
-    }
-    // `dsh plugin add` registers the plugin as a `link:` reference in the
-    // profile's package.json. pnpm 11 with `nodeLinker: hoisted` does NOT
-    // traverse `link:` to resolve transitive dependencies, so the plugin's
-    // own deps end up invisible to the DSH loader. Re-register the plugin
-    // as a workspace member with `workspace:*` so pnpm hoists its
-    // dependency closure into the profile's node_modules.
-    promote_plugin_to_workspace_member(
-        &profile_dir,
-        &plugin_source,
-        &name,
-        &pnpm,
-        task,
-    )?;
+    // Register the plugin directly as a pnpm workspace member instead of
+    // going through `dsh plugin add`. The DSH CLI's `plugin add` internally
+    // runs `pnpm add <link:path>` with cwd=profile_dir, which triggers
+    // ERR_PNPM_ADDING_TO_ROOT in pnpm 11 (refuses to add deps to workspace
+    // root). Direct registration adds the plugin as `workspace:*` and runs
+    // `pnpm install` which has no such restriction.
+    register_plugin_directly(&profile_dir, &plugin_source, &name, task)?;
     write_extension_record(
         container,
         ExtensionRecord {
@@ -211,80 +170,127 @@ fn is_github_source(source: &str) -> bool {
     source.trim_start().starts_with("https://github.com/")
 }
 
-/// Switch a freshly-added plugin from DSH's `link:` reference to a pnpm
-/// `workspace:*` member, then rewrite the profile's `pnpm-workspace.yaml`
-/// to include the plugin's source directory. This is the only reliable way
-/// to get a plugin's transitive dependencies into the profile's
-/// `node_modules` under pnpm 11 `nodeLinker: hoisted`: `link:` references
-/// are treated as opaque and their dependency graph is ignored.
+/// Register a plugin as a pnpm workspace member directly, bypassing
+/// `dsh plugin add`. Steps:
+/// 1. Update profile package.json: add `workspace:*` dependency + DSH bundles entry
+/// 2. Update profile pnpm-workspace.yaml: add plugin source to `packages:`
+/// 3. Run `pnpm install` in the profile directory to hoist deps
 ///
-/// The original `link:` reference is preserved as a fallback (renamed under
-/// the workspace comment) so tools that read the manifest continue to find
-/// the resolved package name, but the active dependency is `workspace:*`.
-///
-/// Idempotent: a profile that already lists the plugin's source under
-/// `packages:` and references it via `workspace:*` is left untouched.
-fn promote_plugin_to_workspace_member(
+/// This avoids ERR_PNPM_ADDING_TO_ROOT because `pnpm install` (not `pnpm add`)
+/// doesn't refuse to touch the workspace root — it only installs what's
+/// declared in the manifest.
+fn register_plugin_directly(
     profile_dir: &Path,
     plugin_source: &Path,
     plugin_name: &str,
-    pnpm: &crate::toolchains::ResolvedToolchain,
     task: &TaskContext,
 ) -> Result<(), String> {
     let manifest_path = profile_dir.join("package.json");
     let workspace_manifest = profile_dir.join("pnpm-workspace.yaml");
-    if !manifest_path.is_file() || !workspace_manifest.is_file() {
-        return Err(format!(
-            "profile at {} is missing package.json or pnpm-workspace.yaml",
-            profile_dir.display()
-        ));
+    if !manifest_path.is_file() {
+        return Err(format!("profile at {} is missing package.json", profile_dir.display()));
     }
+
+    // --- Step 1: Update package.json ---
+    let manifest_text =
+        fs::read_to_string(&manifest_path).map_err(|error| format!("cannot read package.json: {error}"))?;
+    let mut manifest: serde_json::Value = serde_json::from_str(&manifest_text)
+        .map_err(|error| format!("cannot parse package.json: {error}"))?;
+
+    // Add to dependencies
+    let needs_install = {
+        let mut deps = match manifest
+            .get("dependencies")
+            .and_then(serde_json::Value::as_object)
+        {
+            Some(obj) => obj.clone(),
+            None => serde_json::Map::new(),
+        };
+        let mut changed = false;
+        match deps.get(plugin_name) {
+            None | Some(serde_json::Value::Null) => {
+                deps.insert(plugin_name.to_string(), serde_json::Value::String("workspace:*".to_owned()));
+                changed = true;
+            }
+            Some(existing) if existing.as_str() == Some("workspace:*") => {}
+            _ => {
+                deps.insert(plugin_name.to_string(), serde_json::Value::String("workspace:*".to_owned()));
+                changed = true;
+            }
+        }
+        if changed {
+            manifest["dependencies"] = serde_json::Value::Object(deps);
+        }
+        changed
+    };
+
+    // Add to dsh.profile.bundles if not already listed
+    let needs_bundle = {
+        let bundles = manifest
+            .pointer_mut("/dsh/profile/bundles")
+            .and_then(serde_json::Value::as_array_mut);
+        if let Some(bundles_arr) = bundles {
+            !bundles_arr.iter().any(|b| b.as_str() == Some(plugin_name))
+        } else {
+            false
+        }
+    };
+
+    if needs_bundle {
+        // Add plugin to dsh.profile.bundles
+        let bundles = manifest
+            .pointer_mut("/dsh/profile/bundles")
+            .and_then(serde_json::Value::as_array_mut);
+        if let Some(bundles_arr) = bundles {
+            bundles_arr.push(serde_json::Value::String(plugin_name.to_string()));
+        }
+    }
+
+    if needs_install || needs_bundle {
+        let serialized = serde_json::to_string_pretty(&manifest)
+            .unwrap_or_else(|_| manifest_text.to_owned());
+        fs::write(&manifest_path, serialized)
+            .map_err(|error| format!("cannot write package.json: {error}"))?;
+    }
+
+    // --- Step 2: Update pnpm-workspace.yaml ---
     let plugin_source_string = plugin_source.to_string_lossy().into_owned();
-    let workspace_text = fs::read_to_string(&workspace_manifest)
-        .map_err(|error| format!("cannot read {}: {error}", workspace_manifest.display()))?;
-    let mut new_workspace = workspace_text.clone();
-    if workspace_text.contains(&plugin_source_string) {
-        // Already a workspace member: skip the rewrite but still ensure
-        // the package.json entry uses `workspace:*` (a half-finished
-        // previous attempt may have only done the workspace side).
+    if workspace_manifest.is_file() {
+        let ws_text = fs::read_to_string(&workspace_manifest)
+            .map_err(|error| format!("cannot read workspace yaml: {error}"))?;
+        let mut updated = ws_text.clone();
+        if !updated.contains(&plugin_source_string) {
+            updated = inject_workspace_package(&updated, &plugin_source_string);
+        }
+        // Ensure build scripts are allowed (node-pty etc.)
+        if !updated.contains("dangerouslyAllowAllBuilds") {
+            let trailing = if updated.ends_with('\n') { "" } else { "\n" };
+            updated.push_str(&format!("{trailing}dangerouslyAllowAllBuilds: true\n"));
+        }
+        if updated != ws_text {
+            fs::write(&workspace_manifest, &updated)
+                .map_err(|error| format!("cannot write workspace yaml: {error}"))?;
+        }
     } else {
-        new_workspace = inject_workspace_package(&workspace_text, &plugin_source_string);
+        // Create minimal workspace yaml
+        let content = format!(
+            "packages:\n  - .\n  - {}\nnodeLinker: hoisted\n\
+             ignore-workspace-root-check: true\ndangerouslyAllowAllBuilds: true\n",
+            plugin_source_string
+        );
+        fs::write(&workspace_manifest, content)
+            .map_err(|error| format!("cannot create workspace yaml: {error}"))?;
     }
-    // pnpm ≥10 blocks postinstall/build scripts of third-party dependencies
-    // unless explicitly approved (ERR_PNPM_IGNORED_BUILDS). Native modules
-    // (`cpu-features`, `ssh2`, `cloudflared`) only work after their
-    // native-binding step runs, so the container profile must elevate the
-    // trust level to `dangerouslyAllowAllBuilds: true`. The plugin's own
-    // source dir already carries this from `install_plugin_dependencies`,
-    // but the hoist walk at the profile level now sees deps that the
-    // plugin didn't install itself, so the profile needs the same flag.
-    if !new_workspace.contains("dangerouslyAllowAllBuilds") {
-        let trailing = if new_workspace.ends_with('\n') { "" } else { "\n" };
-        new_workspace.push_str(&format!(
-            "{trailing}dangerouslyAllowAllBuilds: true\n"
-        ));
-    }
-    if new_workspace != workspace_text {
-        fs::write(&workspace_manifest, &new_workspace)
-            .map_err(|error| format!("cannot write {}: {error}", workspace_manifest.display()))?;
-    }
-    let manifest_text = fs::read_to_string(&manifest_path)
-        .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
-    let new_manifest = switch_dependency_to_workspace(&manifest_text, plugin_name);
-    if new_manifest != manifest_text {
-        fs::write(&manifest_path, new_manifest)
-            .map_err(|error| format!("cannot write {}: {error}", manifest_path.display()))?;
-    }
+
+    // --- Step 3: Run pnpm install in profile dir ---
+    let pnpm = resolve_toolchain("pnpm")?;
+    task.log(&format!("installing plugin dependencies for {plugin_name}"));
     let task_record = task.manager.task(&task.task_id)?;
     let log = fs::OpenOptions::new()
         .append(true)
         .open(&task_record.log_path)
         .map_err(|error| error.to_string())?;
-    task.log(&format!(
-        "promoting plugin {plugin_name} to workspace member at {}",
-        plugin_source_string
-    ));
-    let mut child = command_for_toolchain(pnpm)
+    let mut child = command_for_toolchain(&pnpm)
         .args([
             "--dir",
             profile_dir.to_string_lossy().as_ref(),
@@ -296,12 +302,10 @@ fn promote_plugin_to_workspace_member(
         ))
         .stderr(Stdio::from(log))
         .spawn()
-        .map_err(|error| format!("cannot start workspace install: {error}"))?;
+        .map_err(|error| format!("cannot start pnpm install: {error}"))?;
     let status = wait_for_process(&mut child, Some(task), "installing plugin dependencies")?;
     if !status.success() {
-        return Err(format!(
-            "workspace install for plugin {plugin_name} exited with {status}"
-        ));
+        return Err(format!("pnpm install for plugin {plugin_name} exited with {status}"));
     }
     Ok(())
 }
@@ -435,39 +439,6 @@ fn inject_workspace_package(workspace_text: &str, new_path: &str) -> String {
 /// expected indent.
 fn indented_match(observed: usize, expected: &str) -> bool {
     observed == expected.len()
-}
-
-/// Replace the `link:...` (or `file:...`) reference for `plugin_name` in
-/// the profile's `package.json` with `workspace:*`. If the plugin is
-/// already a `workspace:*` reference, the JSON is returned unchanged.
-fn switch_dependency_to_workspace(manifest_text: &str, plugin_name: &str) -> String {
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(manifest_text) else {
-        return manifest_text.to_owned();
-    };
-    let Some(deps) = value
-        .get_mut("dependencies")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return manifest_text.to_owned();
-    };
-    let Some(entry) = deps.get_mut(plugin_name) else {
-        return manifest_text.to_owned();
-    };
-    let Some(current) = entry.as_str() else {
-        return manifest_text.to_owned();
-    };
-    if current == "workspace:*" {
-        return manifest_text.to_owned();
-    }
-    *entry = serde_json::Value::String("workspace:*".to_owned());
-    let mut serialized = serde_json::to_string_pretty(&value)
-        .unwrap_or_else(|_| manifest_text.to_owned());
-    // Match the surrounding repo's package.json style: trailing newline
-    // so user-level editors and pnpm both see a file ending in a newline.
-    if !serialized.ends_with('\n') {
-        serialized.push('\n');
-    }
-    serialized
 }
 
 /// Create a bundle from repository entry ids (docker-style: name + picks).
@@ -941,7 +912,7 @@ pub(crate) fn install_container_bundle(
 
 #[cfg(test)]
 mod tests {
-    use super::{inject_workspace_package, switch_dependency_to_workspace};
+    use super::inject_workspace_package;
 
     #[test]
     fn inject_workspace_package_appends_to_block_sequence() {
@@ -956,7 +927,7 @@ mod tests {
 
     #[test]
     fn inject_workspace_package_handles_inline_flow_sequence() {
-        // Entrys are preserved verbatim from the source flow sequence so
+        // Entries are preserved verbatim from the source flow sequence so
         // pnpm sees the same intent; the only change is the conversion to
         // a block sequence with the new entry appended.
         let input = "packages: ['.', '../shared']\n";
@@ -972,27 +943,5 @@ mod tests {
         let input = "nodeLinker: hoisted\n";
         let output = inject_workspace_package(input, "/path/to/plugin");
         assert_eq!(output, input);
-    }
-
-    #[test]
-    fn switch_dependency_to_workspace_replaces_link() {
-        let input = r#"{
-  "dependencies": {
-    "@linxin666/dsh-web-ui-all": "link:/path/to/source"
-  }
-}"#;
-        let output = switch_dependency_to_workspace(input, "@linxin666/dsh-web-ui-all");
-        assert!(output.contains("\"workspace:*\""));
-        assert!(!output.contains("link:"));
-    }
-
-    #[test]
-    fn switch_dependency_to_workspace_is_idempotent() {
-        let once = switch_dependency_to_workspace(
-            r#"{"dependencies": {"p": "link:/x"}}"#,
-            "p",
-        );
-        let twice = switch_dependency_to_workspace(&once, "p");
-        assert_eq!(once, twice);
     }
 }
