@@ -224,17 +224,29 @@ pub(crate) fn import_into_repository(
         ));
         return Ok(existing);
     }
-    let entry_id = format!("img-{}", task.task_id);
-    let destination = repository_root(Path::new(&root))
-        .join(match kind {
-            ExtensionKind::Plugin => "plugins",
-            ExtensionKind::Skill => "skills",
-        })
-        .join(&entry_id)
-        .join("source");
-    if destination.exists() {
-        return Err(format!("repository entry already exists: {entry_id}"));
-    }
+    // `img-<task_id>` is unique per task, but a single build task imports
+    // multiple plugins. If the task-level id is already on disk (a
+    // previous ADD in the same build), append a counter to avoid the
+    // collision. The repository index is keyed by `name+version` anyway;
+    // the `img-*` name is just a filesystem convenience.
+    let base_id = format!("img-{}", task.task_id);
+    let mut entry_id = base_id.clone();
+    let mut counter = 1usize;
+    let destination = loop {
+        let dest = repository_root(Path::new(&root))
+            .join(match kind {
+                ExtensionKind::Plugin => "plugins",
+                ExtensionKind::Skill => "skills",
+            })
+            .join(&entry_id)
+            .join("source");
+        if dest.exists() {
+            counter += 1;
+            entry_id = format!("{}-{}", base_id, counter);
+            continue;
+        }
+        break dest;
+    };
     fs::create_dir_all(destination.parent().ok_or("destination has no parent")?)
         .map_err(|error| error.to_string())?;
     copy_extension_source(source, &destination)?;
