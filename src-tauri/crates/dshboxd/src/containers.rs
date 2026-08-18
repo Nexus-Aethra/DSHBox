@@ -734,7 +734,7 @@ pub(crate) fn prepare_plugin_source(
     if !rebuild && directory.join(entry).is_file() {
         return Ok(());
     }
-    if let Some(script) = plugin_build_script(directory)? {
+    if let Some(script) = plugin_build_script(directory, entry)? {
         task.update(format!("Building plugin {name}"), 38);
         let mut build = command_for_toolchain(&pnpm)
             .args(["--dir", directory.to_string_lossy().as_ref(), "run", script])
@@ -753,7 +753,9 @@ pub(crate) fn prepare_plugin_source(
         Ok(())
     } else {
         Err(format!(
-            "plugin {name} build completed but did not create its declared entry {entry}"
+            "plugin {name} entry {entry} is missing and no runnable build script was found; \
+             check that the plugin's npm tarball includes `src/` (and `scripts/` if \
+             `build` references a custom script)"
         ))
     }
 }
@@ -799,10 +801,27 @@ fn plugin_source_tree_is_newer(
     Ok(false)
 }
 
-/// Prefer the conventional build script, but accept `prepare` as the build
-/// hook. Some DSH plugins (including dsh-better-sidebar) use tsdown solely
-/// through `prepare`.
-fn plugin_build_script(directory: &Path) -> Result<Option<&'static str>, String> {
+/// Select a build script for a plugin whose entry file is missing or stale.
+///
+/// Rules (in priority order):
+/// 1. If the declared entry already exists, skip the build entirely — the
+///    entry was produced by a prior lifecycle step (e.g. `pnpm install`
+///    running `prepare: tsdown`) and running `build` again may clean and
+///    rebuild it with scripts that don't exist in the tarball.
+/// 2. Prefer `build` (community convention for producing the runtime entry)
+///    over `prepare` (npm lifecycle hook that also fires on `pnpm install`).
+/// 3. Reject scripts that are known non-builders: husky, lint-staged,
+///    npm-only hooks.
+/// 4. Reject scripts whose command references files that don't exist in
+///    the source directory (e.g. `node scripts/build.mjs` when
+///    `scripts/build.mjs` is missing from the npm tarball).
+///
+/// If no buildable script is found, return `None` so the caller knows the
+/// entry cannot be produced and should report a clear error.
+fn plugin_build_script(
+    directory: &Path,
+    entry: &str,
+) -> Result<Option<&'static str>, String> {
     let manifest: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(directory.join("package.json"))
             .map_err(|error| format!("cannot read plugin manifest: {error}"))?,
@@ -816,25 +835,73 @@ fn plugin_build_script(directory: &Path) -> Result<Option<&'static str>, String>
             .map(str::to_owned)
     };
 
-    // Skip scripts that are known non-builders: they need .git, a network
-    // dependency, or are purely hook utilities. husky is the most common
-    // offender — `dsh-context` sets `prepare: husky` for git hooks but its
-    // actual build lives in `build`.
-    let is_buildable = |script: &str| -> bool {
-        !script.starts_with("husky")
-            && !script.starts_with("lint-staged")
+    // 1. Entry already present — no need to build. A prior lifecycle step
+    // (usually `pnpm install` running `prepare: tsdown`) already produced
+    // it. Running `build` again may fail if the tarball doesn't include
+    // the scripts/build files (npm's `files` whitelist).
+    if directory.join(entry).is_file() {
+        return Ok(None);
+    }
+
+    // Known non-builders: git hook installers and lint orchestration. They
+    // require `.git`, a network dependency, or are purely hook utilities.
+    let is_non_builder = |script: &str| -> bool {
+        script.starts_with("husky")
+            || script.starts_with("lint-staged")
+            || script.starts_with("pre-commit")
     };
 
-    // Prefer `prepare` (npm lifecycle hook, works from tarballs) when it
-    // looks like a real build command; otherwise fall back to `build`.
-    if let Some(s) = get_script("prepare") {
-        if is_buildable(&s) {
-            return Ok(Some("prepare"));
+    /// Check whether a build command can actually run: the files it
+    /// references (config files, entry source, build scripts) must exist
+    /// in the source directory. npm tarballs filter by the `files` field,
+    /// so a `build` script may reference files that were never packed.
+    fn command_can_run(script: &str, directory: &Path) -> bool {
+        let trimmed = script.trim();
+        // `tsdown` / `tsdown --...` compiles `src/index.ts` to `lib/`.
+        // It needs `src/` present; the config is optional (tsdown defaults
+        // to `src/index.ts`). Without `src/`, it will error.
+        if trimmed.starts_with("tsdown") || trimmed == "tsdown" {
+            return directory.join("src").is_dir();
         }
+        // `node <file>` — `<file>` must exist.
+        if let Some(arg) = trimmed
+            .strip_prefix("node ")
+            .or_else(|| trimmed.strip_prefix("node\t"))
+        {
+            let rel = arg.split_whitespace().next().unwrap_or("");
+            if rel.is_empty() {
+                return false;
+            }
+            return directory.join(rel).is_file();
+        }
+        // `tsc <flags>` — needs a tsconfig or `src/`.
+        if trimmed.starts_with("tsc") {
+            return directory.join("src").is_dir()
+                || directory.join("tsconfig.json").is_file()
+                || directory.join("tsconfig.build.json").is_file();
+        }
+        // `npm run <sub>` / `pnpm <sub>` — recurse into the sub-command.
+        if let Some(sub) = trimmed.strip_prefix("npm run ") {
+            return command_can_run(sub, directory);
+        }
+        if let Some(sub) = trimmed.strip_prefix("pnpm ") {
+            return command_can_run(sub, directory);
+        }
+        // Default: assume it can run (e.g. `rolldown`, `esbuild`).
+        true
     }
-    if let Some(s) = get_script("build") {
-        if is_buildable(&s) {
-            return Ok(Some("build"));
+
+    // Try `build` first (community convention), then `prepare` (lifecycle
+    // hook that also runs on install). Both must be buildable and runnable.
+    for name in &["build", "prepare"] {
+        if let Some(script) = get_script(name) {
+            if is_non_builder(&script) {
+                continue;
+            }
+            if !command_can_run(&script, directory) {
+                continue;
+            }
+            return Ok(Some(*name));
         }
     }
     Ok(None)
