@@ -514,6 +514,32 @@ pub(crate) fn container_plugin_add(
     let pnpm = resolve_toolchain("pnpm")?;
     task.update("Installing DSH plugin", 60);
     task.log(&format!("adding plugin {spec} to profile {profile}"));
+
+    // Ensure the profile's pnpm-workspace.yaml allows build scripts
+    // (dangerouslyAllowAllBuilds: true) so pnpm ≥10 does not block
+    // native module compilation (e.g. node-pty) with ERR_PNPM_IGNORED_BUILDS.
+    let profile_dir = PathBuf::from(&container.directory)
+        .join("profile")
+        .join("profiles")
+        .join(profile);
+    let workspace_manifest = profile_dir.join("pnpm-workspace.yaml");
+    let needs_rewrite = match fs::read_to_string(&workspace_manifest) {
+        Ok(content) => !content.contains("dangerouslyAllowAllBuilds"),
+        Err(_) => true,
+    };
+    if needs_rewrite {
+        let ws_content = if workspace_manifest.is_file() {
+            let text = fs::read_to_string(&workspace_manifest)
+                .map_err(|error| format!("cannot read workspace yaml: {error}"))?;
+            let trailing = if text.ends_with('\n') { "" } else { "\n" };
+            format!("{text}{trailing}dangerouslyAllowAllBuilds: true\n")
+        } else {
+            "packages:\n  - .\n\nnodeLinker: hoisted\ndangerouslyAllowAllBuilds: true\n".to_owned()
+        };
+        fs::write(&workspace_manifest, &ws_content)
+            .map_err(|error| format!("cannot write workspace manifest: {error}"))?;
+    }
+
     let task_record = task.manager.task(&task.task_id)?;
     let log = fs::OpenOptions::new()
         .append(true)

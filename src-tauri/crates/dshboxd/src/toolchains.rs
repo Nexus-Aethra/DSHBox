@@ -109,6 +109,11 @@ pub(crate) fn command_for_toolchain(toolchain: &ResolvedToolchain) -> Command {
         if let Some(registry) = config.npm_registry.as_deref() {
             command.env("npm_config_registry", registry);
         }
+        // pnpm v11 blocks build scripts by default, failing with
+        // `ERR_PNPM_IGNORED_BUILDS` when installing packages that ship
+        // native modules (e.g. `node-pty`).  Disable the check so
+        // plugin installs work without manual `pnpm approve-builds`.
+        command.env("pnpm_config_verify_deps_before_run", "false");
         // Pin pnpm's store under DSHBox's runtime directory so the cache
         // moves with the install and is removed on uninstall — the default
         // `~/.local/share/pnpm/store` would otherwise scatter outside of

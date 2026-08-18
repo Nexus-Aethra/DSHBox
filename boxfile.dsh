@@ -77,3 +77,4 @@ PROFILE web
 # Data payloads are copied verbatim (never linked into the repository)
 # ADD data file:///home/me/models/model.bin
 # ADD data ./datasets/seed.csv
+ADD plugin dsh-better-sidebar
