@@ -1,11 +1,24 @@
 use super::super::*;
 
 /// Returns the complete application read model for lists and diagnostics.
+///
+/// `extension_repository` is read fresh from disk on every call rather than
+/// returned from the in-memory snapshot. The Tauri desktop and the dshboxd
+/// daemon are separate processes: a build task completed in the daemon updates
+/// `<runtime>/repository/index.json` but the desktop has no event telling it
+/// to refresh its cached snapshot. Reading from disk here (a single JSON read)
+/// keeps the UI in sync with whatever the daemon and the CLI have done.
 #[tauri::command]
 pub(crate) fn list_resource_states(
     resources: tauri::State<ResourceStateManager>,
 ) -> Result<ResourceSnapshot, String> {
-    resources.snapshot()
+    let mut snapshot = resources.snapshot()?;
+    if let Some(runtime) = &snapshot.runtime_directory {
+        let runtime = std::path::Path::new(runtime);
+        let entries = box_extensions::scan_repository(runtime);
+        snapshot.extension_repository = entries;
+    }
+    Ok(snapshot)
 }
 
 /// Returns one resource addressed by its scheduler-compatible key.
