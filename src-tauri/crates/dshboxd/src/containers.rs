@@ -24,19 +24,99 @@ use std::{
 /// The body covers every supported directive and source shape so users do
 /// not have to leave the container to consult documentation.
 const BOXFILE_GUIDE_SKILL: &str = r#"---
-name: boxfile-guide
-description: Use when writing, reviewing, or fixing a DSH Box boxfile (`.dsh`) for a 模板/容器, choosing ADD sources for 插件/技能/数据, or running `dshbox init` / `dshbox build` / `dshbox run` to 构筑 and start a template-based container.
+name: dshbox-guide
+description: Use when working with DSH Box — authoring a boxfile (`.dsh`), choosing ADD sources for 插件/技能/数据, running `dshbox` commands to manage templates and containers, or troubleshooting anything that touches container lifecycle, plugins, skills, or the dshbox daemon.
 ---
 
-# DSH Box Boxfile Guide (编写 boxfile → 构筑 template → 启动容器)
+# DSH Box Guide (用 dshbox 管理 DSH 容器)
 
-A **boxfile** is a `.dsh` script that describes one DSH Box **容器** in plain text — base 模板, profile, name, plugins, skills, data — and `dshbox build` turns it into a reproducible **template** you can spin up any number of containers from. It mirrors a Dockerfile: `FROM` picks the base template (already pulled into DSH Box's local store), `PROFILE` picks the runtime layout, `NAME` names the built template, and `ADD` lines layer 插件 (`plugin`), 技能 (`skill`), and `data` on top.
+`dshbox` 是 DSH 容器**外部**的管理 CLI——它装模板、拉插件、起停容器、跑 boxfile build/run 全链路。`dsh` 是 DSH 容器**内部**的 agent CLI——你在容器里跟 agent 对话时调的是 `dsh`,不是 `dshbox`。
 
-> 提示: `dshbox` 与 `dsh`(DSH 自身的 CLI)不是同一个程序。所有容器管理(init / pull / build / run / ps / logs / start / stop)走 **`dshbox`**;`dsh` 是 DSH 容器内部的 agent CLI。
+> 记住这条边界: **容器管理走 `dshbox`;容器内跟 agent 对话走 `dsh`。** 容器里 `dshbox` 也在 PATH 上(它是 thin RPC client,跟本地 daemon 通讯),但你日常基本不会直接调它。
 
-## §1 — 一份完整可跑的 boxfile
+`dshbox` 命令分四组:**Workflow**(init / pull / build / run 起一个完整容器)、**Template 管理**(template ls / show / rm)、**Plugin & Skill**(plugin ls / import / install / skill install)、**Container 操作**(ps / container start / stop / restart / rm / logs / url)。完整列表 `dshbox help`。
 
-复制下面这段到 `boxfile.dsh`,**不动任何字符** 就能跑通"init → build → run"全链路。它做了三件事:从官方 deepseek-harness 起一个 web 容器、起一个叫 `web-with-dsh-ui` 的模板、加一个真实存在的 dsh-web-ui 插件:
+## §0 — 一个 30 秒能跑通的完整流程
+
+下面四步把官方 `deepseek-harness` 拉下来,加一个 GitHub 公开插件,启动一个 web 容器并自动弹 webview:
+
+```bash
+dshbox init                                                     # 生成 boxfile.dsh 模板
+dshbox pull template github.com/deepseek-ai/deepseek-harness:latest   # 拉 base 进本地 store
+dshbox build ./boxfile.dsh --name web-with-dsh-ui              # 构筑 built template
+dshbox run web-with-dsh-ui                                      # 创建并启动容器
+```
+
+如果 `dsh` 在 PATH 上找不到(常见于 Windows 安装后): `dshbox setup-path` 然后**新开一个 terminal**。
+
+## §1 — `dshbox` CLI 速查
+
+### 容器全生命周期(最常用)
+
+| 命令 | 作用 |
+|---|---|
+| `dshbox init [path] [--force]` | 生成 starter `boxfile.dsh`(已存在则拒绝覆盖) |
+| `dshbox pull template <ref>` | 把 base template 拉进本地 store(`github.com/<owner>/<repo>[:tag]`);build 之前必须先做这一步 |
+| `dshbox build [boxfile.dsh] [--name tpl]` | 构筑 built template;`--name` 省略时用 boxfile 里的 `NAME` 行,再省则用脚本文件名 |
+| `dshbox run <template> [--force]` | 从 built template 创建并启动容器;同一个 template 可以 run 出多个独立容器 |
+| `dshbox ps` | 列出所有容器 + 当前 state(`starting` / `ready` / `running` / `crashed` / `stopped` / `orphaned`) |
+| `dshbox container url <id>` | 取运行中容器的 webview URL |
+| `dshbox container open <id>` | 在 DSH Box 桌面窗口里打开容器 webview |
+| `dshbox container logs <id>` | tail 容器 host 进程日志 |
+| `dshbox container start <id>` | 启动已 stopped 的容器 |
+| `dshbox container stop <id>` | 停止运行中容器(优雅 kill process group) |
+| `dshbox container restart <id>` | 启动被 watcher 标 `crashed` 的容器;不重建 build artifacts |
+| `dshbox container rebuild <id>` | 重建容器:重跑 `pnpm install` + `pnpm build`,然后重启 |
+| `dshbox container rm <id>` | stop + 删目录(`rm` / `remove` 同义) |
+
+### Template 管理
+
+| 命令 | 作用 |
+|---|---|
+| `dshbox template ls` | 列出 script template 和 built template |
+| `dshbox template show <name>` | 看脚本正文或资源清单 |
+| `dshbox template rm <name>` | 删 template(被容器引用会拒绝) |
+| `dshbox template prune` | GC 无人引用的 snapshot |
+
+### Plugin / Skill / Data / Bundle
+
+| 命令 | 作用 |
+|---|---|
+| `dshbox plugin ls` | 仓库里的 plugin / skill 列表(`Extensions.json`) |
+| `dshbox plugin import <source>` | 从 dir / tarball / github / npm 拉进仓库(后续 ADD 用 bare name) |
+| `dshbox plugin install <container-id> <source> [--profile web]` | 给一个已运行的容器临时多装一个 plugin |
+| `dshbox plugin rm <name>` | 从仓库删除 entry |
+| `dshbox skill install <container-id> <source>` | 同 plugin,但走 SKILL.md frontmatter 路径 |
+| `dshbox bundle ls / create / rm / save / load` | bundle(多扩展打包)管理 |
+| `dshbox bundle install <container-id> <bundle-id>` | 一次把整个 bundle 灌进容器 |
+
+### 配置 / 元信息 / 调试
+
+| 命令 | 作用 |
+|---|---|
+| `dshbox config show` | 读 `~/.dsh-box/config.json` |
+| `dshbox config set runtime <dir>` | 改 runtimeDirectory |
+| `dshbox config set mirror.github <url>` | GitHub 镜像 |
+| `dshbox config set mirror.npm <url>` | npm registry 镜像 |
+| `dshbox info` | 摘要:storage 大小、bundled runtime、registry 等 |
+| `dshbox --version` / `dsh -V` | 版本号 |
+| `dshbox rpc <method> [json]` | 直发 raw JSON-RPC,debug 用 |
+| `dshbox setup-path` | Windows:写 `HKCU\Environment\Path`;POSIX:append 到 shell rc |
+| `dshbox ui` | 启动桌面 GUI(Tauri WebView);Windows 下双击 EXE 也会走这条路径 |
+
+### 子命令约定
+
+- `dsh <command> help` 看某个 command 的 action 级帮助,例如 `dshbox container help`、`dshbox run help`。
+- `dsh --help` / `dsh -h` 同样打顶层帮助。
+- `dsh` 的所有选项分两类:路径类(`--config`,`--name`, ...)和开关类(`--force`,`--json`,...)。
+
+## §2 — Boxfile (`.dsh`) 写法
+
+`boxfile.dsh` 是 DSH Box 的 Dockerfile 等价物:plain text 描述一个 template,从 `FROM` 起 base、`PROFILE` 选 runtime 布局、`NAME` 给模板起名,`ADD` 把 插件 / 技能 / 数据 layer 上去。
+
+### 一份完整可跑的 boxfile
+
+复制下面这段到 `boxfile.dsh`,**不动任何字符** 就能跑通"init → build → run"全链路:
 
 ```dsh
 # ── base ───────────────────────────────────────────────────────────
@@ -52,35 +132,12 @@ PROFILE web
 NAME web-with-dsh-ui
 
 # ── extensions (插件 / 技能 / 数据) ───────────────────────────────
-# 加一个真实仓库插件:来源用 GitHub short-form `host/owner/repo:tag`。
-# 这条 ADD 在 build 阶段会 import 进 repository,run 阶段安装到 profile/profiles/web/node_modules。
 ADD plugin github.com/zhu1090093659/dsh-web-ui:latest
-
-# ── 数据按需取消注释;data 不会进 repository,原样拷进容器 ──────
-# ADD data ./local-prompts/ @profile/prompts
 ```
 
-跑这套 boxfile 的 4 步命令:
+跑这套 boxfile 的 4 步命令前面 §0 已经给了。
 
-```bash
-# 1. 生成(不覆盖已有 boxfile.dsh;想覆盖就加 --force)
-dshbox init
-
-# 2. 把 base template 拉进 DSH Box 的本地 template store(一次性,离线可重 build)
-dshbox pull template github.com/deepseek-ai/deepseek-harness:latest
-
-# 3. 构筑 built template;--name 可省略(省略则用 NAME 那行的值,或脚本文件名)
-dshbox build ./boxfile.dsh --name web-with-dsh-ui
-
-# 4. 从 built template 创建一个容器并启动;同一个 template 可以 run 出多个容器
-dshbox run web-with-dsh-ui
-```
-
-> 顺序很关键:`pull template` 必须先于 `build`(`FROM github.com/...` 在 build 时需要去本地 store 找 base)。`run` 直接接受 template name;脚本型 template(没有走 `build` 的)也可以直接 `run`,启动时按需 materialise。
-
-## §2 — Directives 速查
-
-boxfile 支持 7 条指令。前 4 条决定**整个 template 长什么样**,后 3 条是**可选元数据或定制**。
+### 7 条 directive
 
 | 指令 | 必填 | 作用 | 例子 |
 |---|---|---|---|
@@ -100,155 +157,190 @@ boxfile 支持 7 条指令。前 4 条决定**整个 template 长什么样**,后
 | `skill`  | `@profile/skills` | 技能安装目录(= `$DSH_HOME/skills`) |
 | `data`   | (无默认值,必须显式 `@<dest>`) | 数据载荷 |
 
-## §3 — ADD 完整语法
+### ADD 完整语法
 
 ```
 ADD <plugin|skill|data> <source> [@<destination>]
 ```
 
-`<source>` 接受下面所有形态——这一节是 **DSH Box 完整的 spec 集**,对应 pnpm `add` 接受的子集(去掉 workspace 自引用和 runtime specifier,因为我们不替 DSH 管 profile 工作区)。`@<destination>` 是可选覆盖,data 必须写。
+`<source>` 接受下面所有形态——这一节是 **DSH Box 完整的 spec 集**,对应 pnpm `add` 接受的子集(去掉 workspace 自引用和 runtime specifier)。
 
-### 简单形态(直接粘浏览器地址栏)
+**简单形态(直接粘浏览器地址栏):**
 
-| shape | 例子 | 何时用 |
-|---|---|---|
-| **GitHub short-form(最推荐)** | `ADD plugin github.com/zhu1090093659/dsh-web-ui:latest` | 公开仓库;`:tag` 是 dshbox 官方写法 |
-| GitHub short-form 备用 `@` | `ADD plugin github.com/zhu1090093659/dsh-web-ui@main` | 想跟 branch/commit 时用 |
-| local relative | `ADD plugin ./plugins/my-plugin` | boxfile 同目录或上级目录 |
-| local absolute | `ADD plugin /home/me/code/my-plugin` | 任意绝对路径 |
-| local tarball | `ADD plugin file:///home/me/backups/foo.tar.gz` | 已经下好的 .tar.gz |
-| remote tarball | `ADD plugin https://example.com/foo.tar.gz` | 任意 https 下载链接 |
-| bare name(仓库已有) | `ADD plugin my-plugin` 或 `ADD plugin @scope/my-plugin` | 先 `dshbox plugin import` 再用名字 |
-| container path | `ADD data container-xxx@/profile/keys.yaml @profile/apikeys.yaml` | 从其它容器拷文件 |
+| shape | 例子 |
+|---|---|
+| **GitHub short-form(最推荐)** | `ADD plugin github.com/zhu1090093659/dsh-web-ui:latest` |
+| GitHub `@` 备用 | `ADD plugin github.com/zhu1090093659/dsh-web-ui@main` |
+| local relative | `ADD plugin ./plugins/my-plugin` |
+| local absolute | `ADD plugin /home/me/code/my-plugin` |
+| local tarball | `ADD plugin file:///home/me/backups/foo.tar.gz` |
+| remote tarball | `ADD plugin https://example.com/foo.tar.gz` |
+| bare name(仓库已有) | `ADD plugin my-plugin` 或 `ADD plugin @scope/my-plugin` |
+| container path | `ADD data container-xxx@/profile/keys.yaml @profile/apikeys.yaml` |
 
-### 带前缀的形态(与 DSH 官方 / pnpm `add` 完全对齐)
+**带前缀的形态(与 pnpm `add` / DSH 官方一一对应):**
 
-| prefix | 例子 | 何时用 |
-|---|---|---|
-| `git:` | `ADD plugin git:github.com/owner/repo:v1.2.3` | `git:` 后面必须是 `host/owner/repo[:tag\|@ref]`;等同 GitHub short-form 的显式版本 |
-| `github:` | `ADD plugin github:owner/repo#v1.0` | pnpm 风格短格式;`#ref` 而非 `:tag`(两种都接受) |
-| `gitlab:` / `bitbucket:` | `ADD plugin gitlab:owner/repo` | 其它 git 托管平台 |
-| `git+https://...` | `ADD plugin git+https://example.com/team/repo.git` | 任意 git URL |
-| `npm:` | `ADD plugin npm:@scope/name@1.2.3` | npm registry 包;走 `dist.tarball` 拉镜像(不走 `pnpm pack`) |
-| `npm:`(重命名 / alias) | `ADD plugin yarn@npm:yarn@1.22.22` | `my-alias@npm:<real-pkg>` 把别的包以别名装上 |
-| `workspace:*` | `ADD plugin my-pkg@workspace:*` | 当前 profile 的 `pnpm-workspace.yaml` 里声明的本地包 |
-| `workspace:^` / `workspace:~` | `ADD plugin my-pkg@workspace:^` | workspace protocol(pnpm 9+) |
-| `file:./path` | `ADD plugin file:./plugins/my-plugin` | 等同本地路径 copy |
-| `link:../path` | `ADD plugin link:../shared-plugin` | pnpm link 语义(symlink,不复制) |
+| prefix | 例子 |
+|---|---|
+| `git:` | `ADD plugin git:github.com/owner/repo:v1.2.3` |
+| `github:` | `ADD plugin github:owner/repo#v1.0`(pnpm 风格,用 `#ref`) |
+| `gitlab:` / `bitbucket:` | `ADD plugin gitlab:owner/repo` |
+| `git+https://...` | `ADD plugin git+https://example.com/team/repo.git` |
+| `npm:` | `ADD plugin npm:@scope/name@1.2.3`(走 `dist.tarball` 拉镜像) |
+| `npm:` alias | `ADD plugin yarn@npm:yarn@1.22.22` |
+| `workspace:*` | `ADD plugin my-pkg@workspace:*` |
+| `workspace:^` / `workspace:~` | `ADD plugin my-pkg@workspace:^`(pnpm 9+) |
+| `file:./path` | `ADD plugin file:./plugins/my-plugin` |
+| `link:../path` | `ADD plugin link:../shared-plugin` |
 
-### `git:` / `npm:` 前缀的语义差异
+### `git:` / `npm:` / `github:` 怎么选
 
-`git:` 是 **dshbox 自己**的 prefix(语义跟隐式 GitHub short-form 等价,但**显式**)。`github:` / `gitlab:` / `bitbucket:` 是 **pnpm / DSH 官方**的 prefix(与上游安装命令一一对应,README 文档里直接抄过来就能用)。`npm:` 同时存在两种身份——`npm:@scope/name` 是 npm registry;`npm:` 后面跟别名时是 registry rename alias。
+| 上游 README 推荐 | boxfile 推荐写法 |
+|---|---|
+| `npm install xxx` / `pnpm add xxx` | `ADD plugin npm:@scope/name@<version>` |
+| `pnpm add github:owner/repo` | `ADD plugin github:owner/repo#v1.0` 或 `git:github.com/owner/repo:v1.2.3` |
+| `pnpm add file:./my-plugin` | `ADD plugin file:./plugins/my-plugin` 或 `ADD plugin ./plugins/my-plugin` |
+| `pnpm add link:../sibling` | `ADD plugin link:../sibling-plugin` |
+| `pnpm add my-pkg@workspace:*` | `ADD plugin my-pkg@workspace:*` |
+| 仓库 README 给 `yarn@npm:yarn@1.22.22` 别名 | `ADD plugin yarn@npm:yarn@1.22.22` |
+| 仓库和 npm 都发布,npm 落后 | 优先 `git:github.com/...`,锁到 commit/tag |
+| 只在 npm 发,仓库是 mirror | 用 `npm:...` |
 
-`git:` / `npm:` / `workspace:` / `file:` / `link:` 前缀**只对 `ADD plugin` 有意义**;`ADD data` 不支持前缀形态(会报清晰错误)。
+`git:` 是 dshbox 自己的 prefix,语义跟隐式 GitHub short-form 等价但显式。`github:` / `gitlab:` / `bitbucket:` 是 pnpm / DSH 官方 prefix。`npm:` 后面跟 registry 包名时是 npm registry,跟别名时是 rename alias。
 
-### `@<destination>` 怎么用
+`git:` / `npm:` / `workspace:` / `file:` / `link:` 前缀**只对 `ADD plugin` 有意义**;`ADD data` 不支持前缀形态。
 
-plugin / skill 一般**不用写**——`DEF plugin` / `DEF skill` 已经给好默认路径。`ADD data` 必须写目标路径,例如:
+### npm 聚合包 (umbrella bundle)
 
-```dsh
-ADD data ./seed-prompts/        @profile/prompts
-ADD data ./models/weights.bin   @profile/models/weights.bin
-```
-
-### §3a — 怎么选 prefix(永远先读上游 README)
-
-**永远先看插件上游仓库或 npm 包的 README**——它会写明它推荐哪种安装方式。常见情况:
-
-| 上游 README 推荐 | boxfile 推荐写法 | 理由 |
-|---|---|---|
-| `npm install xxx` / `pnpm add xxx` | `ADD plugin npm:@scope/name@<version>` | 走 npm registry;transitive deps 自动解析 |
-| `pnpm add github:owner/repo` | `ADD plugin github:owner/repo#v1.0` 或 `git:github.com/owner/repo:v1.2.3` | 仓库就是 source-of-truth |
-| `pnpm add file:./my-plugin` | `ADD plugin file:./plugins/my-plugin` 或 `ADD plugin ./plugins/my-plugin` | 本地源码 |
-| `pnpm add link:../sibling` | `ADD plugin link:../sibling-plugin` | pnpm link 语义(symlink) |
-| `pnpm add my-pkg@workspace:*` | `ADD plugin my-pkg@workspace:*` | monorepo workspace 成员 |
-| 仓库 README 给 `yarn@npm:yarn@1.22.22` 这种别名 | `ADD plugin yarn@npm:yarn@1.22.22` | 跟上游一字不差 |
-| 仓库和 npm 都发布,npm 落后 | 优先 `git:github.com/...`,锁到 commit/tag | npm 版本可能不是最新 |
-| 只在 npm 发,仓库是 mirror | 用 `npm:...` | 没办法走 git |
-
-### §3b — npm 聚合包(npm bundle)运行时的展开
-
-**有些 npm 包内部是聚合 / umbrella,本身只是空壳,实质是"一个 npm 名字 = N 个 dsh.bundle"。** 第三方维护者(典型如 `@linxin666/dsh-web-ui-all`)用 `scripts/aggregate.mjs` 把同 monorepo 多个独立 plugin 收成一个 npm release,`cordis.patch.yml` 里每条 `insert` 都引用一个兄弟包。**装一条 ADD 实际在 DSH 容器里展开为 N 个独立 plugin 启动。**
+**有些 npm 包内部是聚合 / umbrella,本身只是空壳,实质是"一个 npm 名字 = N 个 dsh.bundle"。** 第三方维护者(典型如 `@linxin666/dsh-web-ui-all`)把同 monorepo 多个独立 plugin 收成一个 npm release,`cordis.patch.yml` 里每条 `insert` 都引用一个兄弟包。**装一条 ADD 实际在 DSH 容器里展开为 N 个独立 plugin 启动。**
 
 | 形态 | 例子 | 运行时展开 |
 |---|---|---|
 | 独立 plugin | `npm:@linxin666/dsh-pet` | 1 个 plugin 实例 |
 | **聚合包**(典型) | `npm:@linxin666/dsh-web-ui-all` | 14 个实例(汇总包 + 13 个 `@linxin666/dsh-*`) |
 
-这是一个**非官方模式**——DSH 官方没有聚合包,`@deepseek-ai/*` 全是独立 plugin。DSH Box 在 `dsh plugin add` 之后会自动:① 把 `link:` 引用改成 `workspace:*` ② 把 plugin 源加进 `pnpm-workspace.yaml` 的 `packages:` ③ 在 `pnpm-workspace.yaml` 注入 `dangerouslyAllowAllBuilds: true` ④ 重跑 `pnpm install`,**让 transitive deps 全部 hoist 到 profile 根**。你不需要做额外配置,只要在 boxfile 写一行 `npm:...`,剩下的交给 DSH Box。
+DSH Box 在 build 阶段会自动:
+1. 把 `link:` 引用改成 `workspace:*`(直接注册到 profile 的 `pnpm-workspace.yaml`)
+2. 把 plugin 源加进 `pnpm-workspace.yaml` 的 `packages:`
+3. 在 workspace yaml 注入 `dangerouslyAllowAllBuilds: true`(让 native build script 不被 pnpm 11 拦)
+4. 重跑 `pnpm install`,让 transitive deps 全部 hoist 到 profile 根
+
+你不需要做额外配置,只要在 boxfile 写一行 `npm:...`,剩下的交给 DSH Box。
 
 > **避坑:** `dsh.profile.bundles` 里只会记载 1 个(那个聚合包名字),但 DSH harness 启动后实际挂载 14 个 plugin——`dsh ps` 之类将来显示插件数时,可能"账面"和"实际"不一致。如果你要"装一个开一个",直接 `npm:@linxin666/dsh-pet` 单独拉,绕开聚合包。
 
-### 避免的坑
+## §3 — DSHBox 的运行时架构(出问题先看这里)
 
-- **不要假设某个插件支持两种来源**。`@linxin666/dsh-web-ui-all` 在 npm 上是 **已 build** 的发行包(带 `lib/`、没有 devDependencies),必须走 `npm:@linxin666/dsh-web-ui-all`;DSH Box 会跳过 `pnpm run build`(你不需要装 `tsdown`)。如果同样的名字需要从源编辑,则走 `git:github.com/zhu1090093659/dsh-web-ui:latest`(源仓库里有 `src/`、`tsdown` 配齐)。
-- **不要省略 version**。`npm:@scope/name` 不带版本每次 build 都拿 latest;production build 必须 `@<exact-version>`。
-- **`git:` 后面必须是 short-form**。`git:https://github.com/owner/repo` 不被接受——`host/owner/repo` 就行,scheme 由 builder 补。
-- **`github:` 用 `#ref` 而非 `:tag`**——pnpm 风格。我们 GitHub 短形也接受 `@` (`v1.0`) 和 `:` (`v1.0.0`),但 `github:` prefix 后只识别 `#`。
-- **冒号 `:` vs at `@` 钉版本**:`git:github.com/owner/repo:v1.2.3`(tag)和 `git:github.com/owner/repo@main`(branch/commit)都合法,含义不一样。
-- **`<dest>` 不要乱写**。用 prefix 的 `npm:` / `git:` 加自己的 `@<dest>` 会覆盖 `DEF plugin` 默认路径,可能让 harness 找不到插件——除非你知道自己在干嘛。
-- **`workspace:*` 需要 profile 有 `pnpm-workspace.yaml`**。DSH Box 创建容器时**会自动**生成这个文件(`packages: ['.']`);DSH Box 在 build 阶段也会给外来 plugin 源加 `packages:` 条目,供 `workspace:*` 取用。
-- **native module build script 已被 DSH Box 自动放行**。`ssh2` / `cpu-features` / `cloudflared` 这类依赖需要 `node-gyp` 编译。DSH Box 会在 `pnpm-workspace.yaml` 里注入 `dangerouslyAllowAllBuilds: true`(pnpm 11 的官方开关),所以你不需要手动 `pnpm approve-builds`。如果想自己控制 build 脚本,手动编辑 `pnpm-workspace.yaml` 把 `dangerouslyAllowAllBuilds` 改成 `onlyBuiltDependencies: [...]` 显式列举即可。
-- **npm/registry 包的 transitive deps 已经被自动 hoist**。安装完成后 `profile/profiles/web/node_modules/@scope/...` 下能看到所有依赖;DSH Box 在 `dsh plugin add` 之后会切换为 `workspace:*` 引用 + 重跑 `pnpm install`,把 transitive deps 全部 hoist 到 profile 根——这是处理"npm 聚合包 → 多个 dsh.bundle"场景的必要步骤,DSH Box 已经为你做了。
-- **不要混搭 npm 名字和 git 仓库名**。`npm:@linxin666/dsh-web-ui-all` 拉的是 npm 发行版(带 build 后的 `lib/`,无 devDependencies);`git:github.com/zhu1090093659/dsh-web-ui:latest` 拉的是源仓(有 `src/`、`tsdown`,需要本地 build)。两条 ADD 装的是**不同 entity**——前者是"全家桶已发布版",后者是"源仓本身"。要看清楚你写的是 npm 名字还是 GitHub short-form。
+### 单 daemon + 多 thin client
 
-## §4 — 什么时候用 boxfile vs 一次性命令
+DSH Box 只有一个长进程:**`dshboxd`**。它拥有 task queue、所有运行中的容器 host 进程、plugin 安装、template store。`dshbox` CLI 和桌面 Tauri 都是 thin RPC client,跟 daemon 通过 `127.0.0.1:<port>` 上的 `POST /rpc` 通讯(token 在 JSON body 里)。
 
-| 需求 | 用什么 |
+```
+        ┌────────────────────────┐
+        │ dshboxd (single owner) │
+        │  - tasks / plugins     │
+        │  - container hosts     │
+        │  - template store      │
+        │  - ~/.dsh-box/server/  │
+        └───────────▲────────────┘
+                    │ JSON-RPC (token in body)
+        ┌───────────┴────────────┐
+        │  thin clients         │
+        │  - `dsh` CLI          │
+        │  - Tauri desktop UI   │
+        │  - WebView container  │
+        └────────────────────────┘
+```
+
+### 单实例保护
+
+`dshboxd` 启动时读 `~/.dsh-box/server/discovery.json` 里的旧 daemon 的 PID/端口,做 `TCP connect_timeout(250ms)`。连得上 → 旧 daemon 还活着,新 daemon 退出。连不上 → 僵尸 discovery,清掉继续 bind。所以两个 `dshboxd` 不会并发跑。
+
+### 容器 host 进程的生命周期
+
+每个容器启动时:
+
+1. `start_dsh_container_inner` 用 `setsid` 让 host 成为 process group leader,spawn `pnpm dsh --profile ...`
+2. 写入 `instances/<id>/state/host.json`(字段: `hostPid`, `hostPgid`, `hostPort`, `hostUrl`, `state`, `generation`, ...)
+3. 等 readiness probe(URL 200 OK)
+4. 启动 `spawn_health_watcher` 后台线程,**每 2 秒 HTTP probe + PID 探活(zombie-aware)**
+5. **连续 2 次 unhealthy → 写 `state=crashed`,watcher 退出**(不 auto-restart)
+6. 容器 destroy 时调 `terminate_process_group_grouped`:`SIGTERM` 等 5 秒,未退出则 `SIGKILL`(避免僵尸)
+
+容器 host 崩溃后,用户必须跑 `dshbox container restart <id>` 才能恢复。
+
+### Daemon 重启时 reconcile
+
+`dshboxd` 启动时扫所有 `state/host.json`:
+- PID `kill -0` 探测返回 ESRCH(包括 zombie 状态)→ 记录丢弃,清掉 host.pid
+- EPERM(权限拒绝) → 标记 `state=orphaned`,提示 PID 已被另一个进程复用
+- alive → 保留记录,信任 watcher 后续判定
+
+## §4 — 容器里 `dsh` agent 能看到的 skills
+
+启动时,DSH Box 把 `<container>/profile/skills/<name>/SKILL.md` 全部铺进 `$DSH_HOME/skills/`(DSH 子进程启动时 Cordis loader 扫描这个目录)。所以容器里 agent 一进上下文就能看到这些 skill。
+
+**DSH Box 自带的 skill(每个 web/headless/cli 容器都有):**
+
+| name | 说明 |
 |---|---|
-| 同一个组合每次重建都要一致(团队 / CI / 多容器) | **boxfile + `dshbox build` + `dshbox run <NAME>`** |
-| 想给当前这个容器临时多装一个插件 | `dshbox plugin install <container-id> <source> --profile <profile>` |
-| 把外部插件首次拉进仓库给后续 ADD 用 | `dshbox plugin import <source>` |
-| 只想跑一个不被持久化的容器 | `dshbox run <template>` 直接跑脚本型 template,build 步骤可省 |
+| `boxfile-guide` | 这份文档的前身——专门讲 boxfile DSL |
 
-**`build` ≠ image**:DSH Box 没有 image registry。`dshbox build` 产出一个**轻量 built template**(插件按名引用 repository、其它资源 snapshot 进 data store),跟 `dshbox pull template` 拉回来的脚本 template 进同一个 store,`run` 都能用。
+**用户用 `ADD skill` 加的 skill:** `boxfile` 写 `ADD skill my-tool from ./my-tool/` 后,build 把 `SKILL.md` 拷进 template;run 时再独立 copy 到 container instance。容器 agent 即时看到。
+
+> 想看当前容器加载了哪些 skill,在 DSH agent 里直接调 `dsh skill ls`(或类似命令,具体看 DSH agent 的 help)。要新增一个,改 boxfile 重 build → run 即可。
 
 ## §5 — 常见坑
 
+### Boxfile 错
+
 1. **`FROM` 拼错 host**——必须是 `github.com/<owner>/<repo>[:tag|@ref]`,少一段就当成本地 template 名查不到。可以跑 `dshbox pull template <同一行 FROM 的内容>` 验证 base 拉得到。
 2. **`:tag` 还是 `@ref`**——`github.com/owner/repo:v1.0.0`(tag)和 `github.com/owner/repo@main`(branch/commit)都合法;**粘 GitHub 浏览器地址栏通常是 `tree/main/...` 那种,记得只截到 `repo`**。
-3. **`NAME` 跟 `--name` 同时写了**——以 boxfile `NAME` 那行为准,CLI 的 `--name` 会覆盖模板名(用于"一个 boxfile 出多个不同名 template")。
-4. **不写 `NAME` 也不传 `--name`**——默认用 boxfile 文件名(如 `boxfile.dsh` → `boxfile`),但容易撞名,**始终显式 `NAME`**。
+3. **`NAME` 跟 `--name` 同时写了**——以 boxfile `NAME` 那行为准,CLI 的 `--name` 会覆盖模板名。
+4. **不写 `NAME` 也不传 `--name`**——默认用 boxfile 文件名(如 `boxfile.dsh` → `boxfile`),**始终显式 `NAME`**。
 5. **`ADD data` 漏 `@<dest>`**——直接报错;data 没有默认路径。
 6. **`pull template` 跳过了**——`build` 时 `FROM github.com/...` 去本地 store 找 base,找不到就报 "template not found"。
-7. **同一插件写两次**——同名第二次会被 dedup(仓库里只有一个 entry),不会重复安装。
-8. **聚合包 vs 源仓混写**——`npm:@linxin666/dsh-web-ui-all` 和 `git:github.com/zhu1090093659/dsh-web-ui` 是不同的安装目标,不能互相替换。要"全家桶"走 npm,要"自己改源"走 git。要么分别 `dsh plugin import` 装在仓库里(用仓库名显式 ADD),要么单挑其中一个来源。
+7. **同一插件写两次**——同名第二次 dedup,不会重复安装。
+8. **聚合包 vs 源仓混写**——`npm:@linxin666/dsh-web-ui-all`(已 build 的发行包,无 devDependencies)和 `git:github.com/zhu1090093659/dsh-web-ui`(源仓,带 `src/` + `tsdown`)是**不同 entity**,不能互相替换。
 
-## §6 — CLI quick reference
+### Plugin 装不进容器
 
-`dshbox` 在容器里就在 PATH 上;它跟本地 daemon 通信,命令行和桌面 GUI 共享同一份状态。
+1. **`<dest>` 不要乱写**。`npm:` / `git:` 加自己的 `@<dest>` 会覆盖 `DEF plugin` 默认路径,可能让 harness 找不到插件。
+2. **`workspace:*` 需要 profile 有 `pnpm-workspace.yaml`**。DSH Box 创建容器时自动生成(`packages: ['.']`);build 阶段也会给外来 plugin 源加 `packages:` 条目。
+3. **native module build script 已被 DSH Box 自动放行**。`ssh2` / `cpu-features` / `cloudflared` 等需要 `node-gyp` 编译的依赖,DSH Box 会在 workspace yaml 注入 `dangerouslyAllowAllBuilds: true`,你不需要手动 `pnpm approve-builds`。
+4. **不要混搭 npm 名字和 git 仓库名**。`npm:foo` 拉 npm 发行版(可能不是最新),`git:github.com/...` 拉源仓(可能需要本地 build)。
 
-```bash
-# ── Workflow ────────────────────────────────────────────────────
-dshbox init                              # 生成 boxfile.dsh 模板(存在则拒绝覆盖,加 --force)
-dshbox pull template <owner/repo>[:tag]  # 拉 base 进本地 template store(一次性)
-dshbox build [boxfile.dsh] [--name tpl]  # 构筑 built template(无 --name 时用 NAME 行)
-dshbox run <template>                    # 从 template 创建并启动容器
+### 容器状态异常
 
-# ── 模板管理 ─────────────────────────────────────────────────────
-dshbox template ls                       # 列出 script + built 两种 template
-dshbox template show <name>              # 看脚本正文或资源清单
-dshbox template rm <name>                # 删 template
-dshbox template prune                    # GC 无人引用的 snapshot
+| 状态 | 含义 | 怎么办 |
+|---|---|---|
+| `starting` | host 进程已 spawn 但 URL 还没就绪 | 等(通常 < 30s) |
+| `ready` | 首次 probe 成功 | 等下一次 probe 升级到 running |
+| `running` | 持续被 watcher 探测成功 | 一切正常 |
+| `crashed` | host 进程死了 或 连续 2 次 unhealthy | `dsh container restart <id>` 拉起 |
+| `stopped` | 用户显式 stop | `dsh container start <id>` 重新启动 |
+| `orphaned` | daemon 重启时发现 PID 还活着但 EPERM | 说明 PID 已被其他进程复用;`dsh container rm <id>` 重建容器 |
 
-# ── 扩展 / bundle ────────────────────────────────────────────────
-dshbox plugin ls                         # 仓库里的 plugin / skill 列表
-dshbox plugin import <source>            # 从 dir / tarball / github/npm 拉进仓库
-dshbox bundle ls                         # 已有的扩展整合包
+### 平台差异
 
-# ── 容器操作 ─────────────────────────────────────────────────────
-dshbox ps                                # 列出容器与状态
-dshbox container url <id>                # 取运行中容器的 webview URL
-dshbox container open <id>               # 在 DSH Box 窗口里打开
-dshbox container logs <id>               # tail 容器 host 日志
-dshbox container start <id>              # 启动已停止容器
-dshbox container stop <id>               # 停止运行中容器
-```
+- **Windows 安装后 `dsh` 不在 PATH**: 跑 `dshbox setup-path` 后**新开 terminal**。
+- **Windows 双击 dshbox.exe**: 现在直接弹 UI(不再只是打 help)。
+- **macOS / Linux daemon 后台进程**: `systemctl --user start|stop|restart dshboxd.service`(Linux),macOS 用 `dsh` 菜单或 `dshboxd` 直接启停。
 
-完整命令清单:`dshbox help` 或 `dshbox <command> help`(例如 `dshbox run help`)。
+## §6 — 调试技巧
+
+- `dsh rpc <method> [json]` 直发 JSON-RPC。例如 `dsh rpc get_info` 看 daemon 信息,`dsh rpc list_containers '{}'` 列容器。
+- `dsh container logs <id>` 实时 tail 容器 host 进程日志。host 启动失败(比如 `pnpm dsh` 报错)都打这里。
+- `instances/<id>/state/host.json` —— 容器的"心跳"。`state`、`probeCount`、`unhealthyCount`、`lastSeen` 字段直接告诉你 daemon 看到的真实情况。
+- `~/.dsh-box/server/discovery.json` —— daemon 的端口/token/PID。CLI 连接不上时先看这个文件存在不存在。
+- `~/.dsh-box/config.json` —— `runtimeDirectory`、`mirror.github`、`mirror.npm`、`npmRegistry` 等。
+- `dsh --version` 确认 CLI 和 daemon 来自同一 build batch。Daemon 启动时做 build-stamp 校验,如果不一致会自动重启。
+- `tail -f ~/.dsh-box/logs/daemon.log`(或 `dsh logs daemon`)—— daemon 自身的 stdout/stderr,看 start-up / reconcile / RPC error。
+
+完整命令清单:`dsh help` 或 `dsh <command> help`(例如 `dsh run help`)。
 "#;
 
-const BOXFILE_GUIDE_SKILL_NAME: &str = "boxfile-guide";
+const BOXFILE_GUIDE_SKILL_NAME: &str = "dshbox-guide";
 
 pub(crate) fn is_safe_version_name(version: &str) -> bool {
     is_safe_identifier(version)
