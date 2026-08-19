@@ -13,7 +13,7 @@ use box_dsh_versions::{
     installed_versions, parse_template_ref, pull_template, read_template_index,
     version_directory, write_template_index, DshVersion, HARNESS_STANDARD_REF,
 };
-use box_foundation::{is_safe_identifier, mirror_url, now_seconds, read_config, write_config};
+use box_foundation::{mirror_url, now_seconds, read_config, write_config};
 use serde::Deserialize;
 use std::{fs, time::Duration};
 
@@ -285,6 +285,8 @@ pub(crate) fn migrate_runtime_runtimes_to_templates() -> Result<Vec<String>, Str
         // Drop the body into the hash-addressed store, mirroring what
         // `pull_template` does. `write_template_with_entry` also updates
         // the manifest and index, so no extra bookkeeping is needed.
+        // The kind is always `Root` here — this migration only handles
+        // legacy harness clones, never user-authored templates.
         box_dsh_versions::write_template_with_entry(
             &root,
             &ref_value,
@@ -293,6 +295,7 @@ pub(crate) fn migrate_runtime_runtimes_to_templates() -> Result<Vec<String>, Str
             "web",
             Some(ref_value.clone()),
             now_seconds(),
+            box_dsh_versions::TemplateKind::Root,
         )
         .map_err(|error| format!("cannot register migrated template for `{tag}`: {error}"))?;
         registered.push(tag);

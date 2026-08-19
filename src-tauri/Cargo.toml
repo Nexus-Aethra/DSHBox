@@ -21,10 +21,25 @@ members = [
   "crates/box-server-core",
   "crates/box-client",
   "crates/box-dsh-context",
+  "crates/box-data-scheduler",
+  "crates/box-logger",
+  "crates/box-template-core",
   "crates/dshboxd",
   "tools/runtime-packager",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+# Unified tracing facade across all crates. Each crate re-uses these via
+# `tracing.workspace = true` so version drift is impossible.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
+tracing-appender = "0.2"
+# Crates published under this workspace; `path = ...` keeps Cargo from
+# treating the dep declaration as a registry lookup.
+box-foundation = { path = "crates/box-foundation" }
+box-data-scheduler = { path = "crates/box-data-scheduler" }
+box-dsh-versions = { path = "crates/box-dsh-versions" }
 
 [build-dependencies]
 tauri-build = { version = "2.4.1", features = [] }
@@ -62,6 +77,9 @@ box-state = { path = "crates/box-state" }
 box-server-core = { path = "crates/box-server-core" }
 box-client = { path = "crates/box-client" }
 box-dsh-context = { path = "crates/box-dsh-context" }
+box-data-scheduler = { path = "crates/box-data-scheduler" }
+box-logger = { path = "crates/box-logger" }
+box-template-core = { path = "crates/box-template-core" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.45", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }

@@ -5,16 +5,13 @@ use box_dsh_context::{
 use box_containers::{
     container_directory, scan_containers, CreateDshContainerRequest, DshContainer,
 };
-use box_dsh_versions::{
-    version_directory as dsh_version_directory, DshVersion,
-};
+use box_dsh_versions::{DshVersion};
 use box_extensions::{scan_workspace_extensions, ExtensionBundle};
 use box_foundation::{
-    is_safe_identifier, mirror_url, normalize_optional_url, normalize_runtime_directory,
-    now_seconds, read_config, strip_verbatim_prefix, suppress_console_window, write_config,
+    is_safe_identifier, normalize_optional_url, normalize_runtime_directory,
+    now_seconds, read_config, strip_verbatim_prefix, write_config,
     BoxConfig, BoxPaths,
 };
-use box_runtime::{remove_checkout, shallow_clone_with_cancel};
 use box_scheduler::{run_queued, TaskContext, TaskManager, TaskNotifier, TaskRecord};
 use box_server_core::{
     install_tray_autostart, install_user_service, restart_user_service, service_status,
@@ -25,7 +22,6 @@ use box_toolchains::{is_known_toolchain, ToolchainStatus};
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
-    ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
     sync::OnceLock,
@@ -69,6 +65,7 @@ pub(crate) struct ResolvedToolchain {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub(crate) struct BundledRuntimeManifest {
     node_version: String,
     pnpm_version: String,
@@ -201,6 +198,7 @@ fn repair_resources_on_startup(root: &str) {
                 "web",
                 Some(ref_value.clone()),
                 now_seconds(),
+                box_dsh_versions::TemplateKind::Root,
             ) {
                 Ok(entry) => write_startup_log(&format!(
                     "registered harness `{tag}` in template index ({})",

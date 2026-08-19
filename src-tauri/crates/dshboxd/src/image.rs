@@ -14,23 +14,24 @@ use box_dsh_versions::{
     collect_unreferenced_template_hash, harness_template_path, read_built_template,
     read_template_index, referenced_snapshot_digests, template_index_path,
     template_storage_root, templates_directory, write_built_template, write_template_index,
-    TemplateEntry,
+    TemplateEntry, TemplateKind,
 };
 use box_extensions::transfer::{
     append_plugin_archive, copy_extension_source, extract_extension_tarball, locate_extension_root,
 };
 use box_extensions::{
     extension_digest, repository_root, scan_repository, write_repository_index, ExtensionKind,
-    ReferenceKind, RepositoryExtension,
+    RepositoryExtension,
 };
 use box_foundation::{now_seconds, read_config};
 use box_image::{
-    compile_manifest, parse_script, parse_source_token, write_dshimage, AddKind,
+    compile_manifest, parse_script, write_dshimage, AddKind,
     ImageManifest, ImageOp, ParsedSource,
 };
+use crate::toolchains::{pnpm_policy, resolve_toolchain};
 use box_api::{TemplateResource, TemplateResourceList, TEMPLATE_LIST_SCHEMA_VERSION};
+use box_runtime::process::{ExecutionKind, NativeProcessRunner, ProcessSpec};
 use box_scheduler::TaskContext;
-use crate::toolchains::command_for_toolchain;
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -518,7 +519,7 @@ fn materialize_ops(
     container: &box_containers::DshContainer,
     script: &box_image::ImageScript,
 ) -> Result<Vec<(String, PathBuf)>, String> {
-    let mut inline_blobs: Vec<(String, PathBuf)> = Vec::new();
+    let inline_blobs: Vec<(String, PathBuf)> = Vec::new();
     let total_ops = script.ops.len().max(1);
     for (index, op) in script.ops.iter().enumerate() {
         let ImageOp::Add { kind, source, .. } = op;
@@ -657,6 +658,7 @@ fn migrate_legacy_template_files(root: &str) -> Result<(), String> {
             imported_at: now_seconds(),
             from_ref: None,
             built: false,
+            kind: TemplateKind::Common,
         };
         index.insert(entry.name.clone(), entry);
         std::fs::remove_file(&path).map_err(|error| error.to_string())?;
@@ -899,8 +901,9 @@ fn import_template_rich(
             &text,
             harness_ref,
             &profile,
-            from_ref,
+            from_ref.clone(),
             now_seconds(),
+            box_dsh_versions::classify_kind(from_ref.as_deref().unwrap_or("")),
         )?;
     }
 
@@ -1105,6 +1108,12 @@ fn import_template_legacy(
         Ok(script) => (script.harness_ref, script.profile),
         Err(_) => (None, String::new()),
     };
+    // `harness_ref` is the harness-side tag (e.g. `latest`, `dsh-v0.1.0-rc.7`),
+    // not the repo URL — so we cannot run `classify_kind` on it directly.
+    // Templates imported from a legacy archive default to `Common` since the
+    // import path has no upstream repo URL to inspect; build paths that do
+    // classify (e.g. `import_into_repository`) re-derive from the resolved
+    // ref.
     let entry = box_dsh_versions::write_template_with_entry(
         root,
         &target_name,
@@ -1113,6 +1122,7 @@ fn import_template_legacy(
         &profile,
         Some(format!("imported:legacy-archive")),
         now_seconds(),
+        box_dsh_versions::TemplateKind::Common,
     )?;
     clean();
     Ok(entry.name)
@@ -1396,6 +1406,7 @@ pub(crate) fn remove_template(name: &str) -> Result<(), String> {
                     imported_at: 0,
                     from_ref: None,
                     built: false,
+                    kind: TemplateKind::Common,
                 })
             } else {
                 None
@@ -1436,6 +1447,26 @@ pub(crate) fn remove_template(name: &str) -> Result<(), String> {
                             "warning: cannot release template reference to `{rname}` ({entry_id}): {error}"
                         );
                     }
+                }
+            }
+        }
+    }
+    // If this entry represents a pulled harness, drop the runtime clone
+    // too so a subsequent `pull_template` of the same ref can run cleanly.
+    // Without this the next install collides on the existing
+    // `runtimes/<tag>/source/` directory and reports
+    // `template version already exists`. The Template tab's "Delete" button
+    // and the Harness tab's "Uninstall" button now share the same atomic
+    // "drop both stores" semantics — both delete the index entry AND the
+    // runtime clone, leaving no orphan state behind.
+    if let Some(tag) = entry.harness_ref.as_deref() {
+        if box_foundation::is_safe_identifier(tag) {
+            let runtime_dir = box_dsh_versions::version_directory(&root, tag)
+                .parent()
+                .map(Path::to_path_buf);
+            if let Some(runtime_dir) = runtime_dir {
+                if runtime_dir.is_dir() {
+                    let _ = std::fs::remove_dir_all(&runtime_dir);
                 }
             }
         }
@@ -1568,7 +1599,7 @@ fn fetch_extension_via_npm_pack(
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
 
-    let npm = crate::toolchains::resolve_toolchain("npm")
+    let npm = resolve_toolchain("npm")
         .map_err(|e| format!("cannot resolve npm: {e}"))?;
     task.log(&format!("packing extension source via npm: {spec}"));
 
@@ -1577,15 +1608,17 @@ fn fetch_extension_via_npm_pack(
     // spec shape natively. It skips lifecycle scripts (postpack/prepare),
     // so we always get source-only tarballs. Lifecycle deps are installed
     // later by import_into_repository via pnpm install.
-    let mut cmd = command_for_toolchain(&npm);
-    cmd.args([
-        "pack",
-        spec,
-        "--pack-destination",
-        staging.to_str().ok_or_else(|| "staging path is not valid UTF-8".to_string())?,
-    ]);
-    let output = cmd
-        .output()
+    let pack_spec = ProcessSpec::new(npm.path.clone())
+        .args([
+            "pack",
+            spec,
+            "--pack-destination",
+            staging.to_str().ok_or_else(|| "staging path is not valid UTF-8".to_string())?,
+        ])
+        .policy(pnpm_policy(&npm))
+        .kind(ExecutionKind::Captured);
+    let output = NativeProcessRunner
+        .run(&pack_spec)
         .map_err(|e| format!("npm pack failed: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
