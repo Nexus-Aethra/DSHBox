@@ -1609,6 +1609,7 @@ fn fetch_extension_via_npm_pack(
     // so we always get source-only tarballs. Lifecycle deps are installed
     // later by import_into_repository via pnpm install.
     let pack_spec = ProcessSpec::new(npm.path.clone())
+        .args(&npm.arguments)
         .args([
             "pack",
             spec,

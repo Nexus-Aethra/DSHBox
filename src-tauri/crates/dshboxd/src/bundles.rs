@@ -287,6 +287,7 @@ fn register_plugin_directly(
     task.log(&format!("installing plugin dependencies for {plugin_name}"));
     let task_record = task.manager.task(&task.task_id)?;
     let install_spec = ProcessSpec::new(pnpm.path.clone())
+        .args(&pnpm.arguments)
         .args([
             "--dir",
             profile_dir.to_string_lossy().as_ref(),

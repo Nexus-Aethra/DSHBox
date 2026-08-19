@@ -156,6 +156,7 @@ pub(crate) fn start_dsh_container_inner(
                     task.log("installing DSH dependencies");
                 }
                 let install_spec = ProcessSpec::new(pnpm.path.clone())
+                    .args(&pnpm.arguments)
                     .args(["--dir", source_arg.as_ref(), "install"])
                     .policy(pnpm_policy(&pnpm))
                     .kind(ExecutionKind::Logged)
@@ -179,6 +180,7 @@ pub(crate) fn start_dsh_container_inner(
                 task.log("building DSH frontend");
             }
             let build_spec = ProcessSpec::new(pnpm.path.clone())
+                .args(&pnpm.arguments)
                 .args(["--dir", source_arg.as_ref(), "run", "build"])
                 .policy(pnpm_policy(&pnpm))
                 .kind(ExecutionKind::Logged)
@@ -453,6 +455,7 @@ pub(crate) fn rebuild_dsh_container_with_task(
             task.check_cancelled()?;
         }
         let spec = ProcessSpec::new(pnpm.path.clone())
+            .args(&pnpm.arguments)
             .args(args)
             .policy(pnpm_policy(&pnpm))
             .kind(ExecutionKind::Logged)

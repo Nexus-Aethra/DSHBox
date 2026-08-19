@@ -713,6 +713,7 @@ pub(crate) fn prepare_plugin_source(
         "--no-frozen-lockfile"
     };
     let install_spec = ProcessSpec::new(pnpm.path.clone())
+        .args(&pnpm.arguments)
         .args([
             "--dir",
             directory.to_string_lossy().as_ref(),

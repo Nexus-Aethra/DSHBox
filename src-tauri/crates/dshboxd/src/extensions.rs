@@ -358,6 +358,7 @@ fn install_plugin_dependencies(
         version.map(|v| format!("@{v}")).unwrap_or_default(),
     ));
     let install_spec = ProcessSpec::new(pnpm.path.clone())
+        .args(&pnpm.arguments)
         .args([
             "--dir",
             directory.to_string_lossy().as_ref(),
@@ -542,6 +543,7 @@ pub(crate) fn container_plugin_add(
     let task_record = task.manager.task(&task.task_id)?;
     let dsh_home = PathBuf::from(&container.directory).join("profile");
     let install_spec = ProcessSpec::new(pnpm.path.clone())
+        .args(&pnpm.arguments)
         .args([
             "--dir",
             source.to_string_lossy().as_ref(),
