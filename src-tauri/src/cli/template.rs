@@ -2,11 +2,9 @@
 //! templates (pulled/imported) and built templates (the metadata-only
 //! product of `dshbox build`).
 //!
-//! The `install` / `uninstall` / `list` subcommands call
-//! `box_template_core` directly so the CLI works without a running
-//! daemon (provided a `runtimeDirectory` is configured). Every other
-//! action (`show`, `info`, `import`, `export`, `rm`, `prune`) is a thin
-//! RPC against the daemon because those touch storage the daemon owns.
+//! Every subcommand is a thin RPC against the daemon; the CLI is
+//! deliberately aligned with the UI so any change in storage semantics
+//! lands in exactly one place (`dshboxd`).
 
 use box_api::{TemplateResource, TemplateResourceList};
 use serde_json::json;
@@ -60,9 +58,10 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     }
 }
 
-/// Read the runtime directory directly from the user config. The CLI runs
-/// without a daemon for `install` / `uninstall` / `list`, so it cannot
-/// rely on the daemon for storage paths.
+/// Read the runtime directory directly from the user config. Kept as a
+/// diagnostic helper — production paths should always go through the
+/// daemon so storage layout stays in one place.
+#[allow(dead_code)]
 fn local_runtime() -> Result<String, String> {
     let config = box_foundation::read_config()
         .map_err(|error| format!("cannot read dsh-box config: {error}"))?;
@@ -72,27 +71,23 @@ fn local_runtime() -> Result<String, String> {
 }
 
 /// `dshbox template install <ref>` — pull a template by reference and
-/// register it in the local runtime. Goes through `box_template_core` so
-/// the same code path the daemon uses is exercised here; the difference
-/// is the daemon would also enqueue the work via `box-scheduler` and
-/// broadcast progress on `/events`, while the CLI prints a single
-/// terminal line on completion.
+/// register it in the local runtime. Routes through `pull_template`,
+/// which the daemon runs inside a task worker so the same code path the
+/// UI exercises is hit here too; `run_task` blocks until completion and
+/// streams progress on stderr.
 fn install(ref_value: &str) -> Result<(), String> {
-    let runtime = local_runtime()?;
     let ref_value = ref_value.trim();
     if ref_value.is_empty() {
         return Err("template reference cannot be empty".to_owned());
     }
     println!("installing template {ref_value} (this may take a while)...");
-    let outcome = box_template_core::install_template(&runtime, ref_value, || false)?;
-    let kind = match outcome.entry.kind {
-        box_dsh_versions::TemplateKind::Root => "root",
-        box_dsh_versions::TemplateKind::Common => "common",
-    };
-    println!(
-        "installed {} ({}, version {}, kind={})",
-        outcome.entry.name, outcome.entry.id, outcome.version, kind
-    );
+    let client = rpc::connect()?;
+    rpc::run_task(
+        &client,
+        "pull_template",
+        json!({ "ref": ref_value }),
+    )?;
+    println!("installed {ref_value}");
     Ok(())
 }
 
@@ -101,37 +96,43 @@ fn install(ref_value: &str) -> Result<(), String> {
 /// background deletion queue, so this returns within a few hundred
 /// milliseconds even for multi-GB clones.
 fn uninstall(name: &str) -> Result<(), String> {
-    let runtime = local_runtime()?;
-    let (id, path) = box_template_core::uninstall_template(&runtime, name)?;
-    if path.is_empty() {
-        println!("soft-deleted {name} ({id})");
-    } else {
-        println!("soft-deleted {name} ({id}); background cleanup scheduled at {path}");
-    }
+    let client = rpc::connect()?;
+    // `remove_template` is the daemon-owned soft-delete; running it via
+    // `run_task` ensures progress and final status are surfaced the same
+    // way as every other long-running template RPC.
+    rpc::run_task(&client, "remove_template", json!({ "name": name }))?;
+    println!("uninstalled {name}");
     Ok(())
 }
 
-/// `dshbox template list` — local view (no daemon needed). Mirrors the
-/// columns the UI shows so `dsh-box` and `dshbox` render the same data.
+/// `dshbox template list` — mirror the UI columns; data comes from the
+/// daemon's `list_templates` so the CLI cannot drift from the store.
+/// Rendered from raw JSON so we don't have to mirror a Rust type here.
 fn list() -> Result<(), String> {
-    let runtime = local_runtime()?;
-    let index = box_dsh_versions::read_template_index(&runtime);
-    if index.is_empty() {
+    let client = rpc::connect()?;
+    let value = rpc::call(&client, "list_templates", json!({}))?;
+    let entries = value.as_array().ok_or_else(|| {
+        "invalid list_templates response from daemon: expected an array".to_owned()
+    })?;
+    if entries.is_empty() {
         println!("(no templates installed)");
         return Ok(());
     }
     println!("NAME\tVERSION\tPROFILE\tKIND\tFORM");
-    for entry in index.values() {
-        let version = entry.harness_ref.as_deref().unwrap_or("-");
-        let kind = match entry.kind {
-            box_dsh_versions::TemplateKind::Root => "root",
-            box_dsh_versions::TemplateKind::Common => "common",
+    for entry in entries {
+        let name = entry["name"].as_str().unwrap_or("?");
+        let version = entry["harnessRef"].as_str().unwrap_or("-");
+        let profile = entry["profile"].as_str().unwrap_or("-");
+        let kind = match entry["kind"].as_str().unwrap_or("common") {
+            "root" => "root",
+            _ => "common",
         };
-        let form = if entry.built { "built" } else { "script" };
-        println!(
-            "{}\t{version}\t{}\t{kind}\t{form}",
-            entry.name, entry.profile
-        );
+        let form = if entry["built"].as_bool().unwrap_or(false) {
+            "built"
+        } else {
+            "script"
+        };
+        println!("{name}\t{version}\t{profile}\t{kind}\t{form}");
     }
     Ok(())
 }
