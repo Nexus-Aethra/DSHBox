@@ -361,8 +361,102 @@ DSH Box 在 build 阶段会自动:
 - `dsh --version` 确认 CLI 和 daemon 来自同一 build batch。Daemon 启动时做 build-stamp 校验,如果不一致会自动重启。
 - `tail -f ~/.dsh-box/logs/daemon.log`(或 `dsh logs daemon`)—— daemon 自身的 stdout/stderr,看 start-up / reconcile / RPC error。
 
-完整命令清单:`dsh help` 或 `dsh <command> help`(例如 `dsh run help`)。
-"#;
+	完整命令清单:`dsh help` 或 `dsh <command> help`(例如 `dsh run help`)。
+
+	## §7 — RPC API 参考
+
+	所有客户端（CLI、桌面 UI、curl）都走 `POST /rpc` 单一入口。daemon 自动决定 sync/async：
+
+	```
+	# 同步——直接返回结果
+	POST /rpc   {"method":"ping","token":"..."}
+	→ {"ok":true, "result": {"pid":123,"status":"running"}}
+
+	# 异步——排队任务，返回 TaskRecord
+	POST /rpc   {"method":"pull_template","ref":"github.com/...","token":"..."}
+	→ {"ok":true, "task": {"id":"...","kind":"template-pull","status":"queued"}, "eventsUrl":"/events"}
+
+	# 错误
+	→ {"ok":false, "error":"template not found"}
+	```
+
+	### 同步方法一览
+
+	| method | 参数 | 返回 |
+	|--------|------|------|
+	| `ping` | — | daemon 运行状态 |
+	| `get_info` | — | 版本、runtime、容器数、插件数 |
+	| `list_containers` | — | `[DshContainer]` |
+	| `list_templates` | — | `[TemplateInfo]` |
+	| `list_bundles` | — | 扩展包列表 |
+	| `list_repository_extensions` | — | 仓库插件/技能列表 |
+	| `list_installed_dsh_versions` | — | 已安装 DSH 版本 |
+	| `list_dsh_catalog` | — | 可安装的 DSH 版本（含 installed 标记） |
+	| `list_tasks` | — | `[TaskRecord]` |
+	| `list_data_entries` | — | 数据条目 |
+	| `list_repository_reference_counts` | — | 引用计数 |
+	| `task_status` | `id` | 单个 TaskRecord |
+	| `cancel_task` | `id` | `{"cancelled":true}` |
+	| `delete_task` | `id` | — |
+	| `container_url` | `id` | 容器 webview URL |
+	| `template_info` | `name` | 模板详情 |
+	| `read_template` | `name` | 模板脚本正文 |
+	| `read_template_list` | `name` | built template 资源清单 |
+	| `save_mirror_settings` | `githubMirror`, `npmRegistry` | — |
+	| `save_runtime_directory` | `directory` | — |
+	| `container_list_plugins` | `containerId`, `profile` | 插件列表 |
+	| `remove_template` | `name` | — |
+	| `remove_repository_plugin` | `id`, `profile`, `name` | — |
+	| `delete_extension_bundle` | `id` | — |
+	| `shutdown` | — | 停止 daemon |
+
+	### 异步方法一览
+
+	异步方法返回 `TaskRecord` 后，通过 `GET /events?token=...` 订阅进度：
+
+	| method | 参数 | kind |
+	|--------|------|------|
+	| `pull_template` | `ref` | `template-pull` |
+	| `create_container_from_template` | `name`, `template`, `profile` | `template-container` |
+	| `enqueue_container_start` | `id` | `container-start` |
+	| `enqueue_container_stop` | `id` | `container-stop` |
+	| `enqueue_container_rebuild` | `id` | `container-rebuild` |
+	| `enqueue_container_restart` | `id` | `container-restart` |
+	| `enqueue_container_extension_add` | `id`, `profile`, `source` | `container-extension-add` |
+	| `enqueue_container_extension_copy` | `id`, `profile`, `repositoryId` | `container-extension-copy` |
+	| `enqueue_container_bundle_install` | `id`, `profile`, `bundleId`, `conflict` | `container-bundle-install` |
+	| `enqueue_build` | `scriptPath`, `outputPath`, `containerName` | `image-build` |
+	| `enqueue_repository_extension_import` | `source` | `repository-extension-import` |
+	| `enqueue_repository_extension_export` | `repositoryId`, `destination` | `repository-extension-export` |
+	| `enqueue_workspace_extension_import` | `id`, `relativePath` | `workspace-extension-import` |
+	| `enqueue_plugin_export` | `sourceContainerId`, `sourcePath`, `destination` | `plugin-export` |
+	| `enqueue_bundle_import` | `archive`, `conflict` | `bundle-import` |
+	| `enqueue_bundle_export` | `bundleId`, `destination`, `mode` | `bundle-export` |
+	| `refresh_dsh_catalog` | — | `dsh-catalog-refresh` |
+
+	### 调试示例
+
+	```bash
+	# 1. 取 token + port
+	cat ~/.dsh-box/server/discovery.json
+
+	# 2. 同步：ping
+	curl -s -X POST http://127.0.0.1:<port>/rpc \
+	  -H "Content-Type: application/json" \
+	  -d '{"method":"ping","token":"<token>"}'
+
+	# 3. 异步：拉模板
+	curl -s -X POST http://127.0.0.1:<port>/rpc \
+	  -H "Content-Type: application/json" \
+	  -d '{"method":"pull_template","ref":"github.com/deepseek-ai/deepseek-harness:latest","token":"<token>"}'
+	# → {"ok":true,"task":{...},"eventsUrl":"/events"}
+
+	# 4. 订阅事件（新开 terminal）
+	curl -N "http://127.0.0.1:<port>/events?token=<token>"
+	# → event: snapshot
+	# → event: TaskStage    data: {"id":"...","stage":"Cloning","progress":10}
+	# → event: TaskFinished data: {"id":"...","status":"succeeded"}
+	```"#;
 
 const BOXFILE_GUIDE_SKILL_NAME: &str = "dshbox-guide";
 
