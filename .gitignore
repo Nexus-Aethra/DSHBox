@@ -24,3 +24,5 @@
 # Vite build output (dist is bundled into the desktop binary by Tauri's
 # beforeBuildCommand; never edit files under this directory).
 /src-tauri/dist/
+# Prepare-script content-hash cache: regenerated on demand, never tracked.
+/.cache/

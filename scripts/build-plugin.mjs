@@ -1,8 +1,8 @@
-import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, statSync, readFileSync, createWriteStream } from 'node:fs'
+import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, statSync, readFileSync, writeFileSync, createWriteStream } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { delimiter, dirname, join, relative } from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { isFresh } from './mtime.mjs'
+import { hashInputs, isFresh } from './mtime.mjs'
 
 // Resolve the target triple, mirroring scripts/prepare-runtime.mjs.
 const target = process.argv.includes('--target')
@@ -28,6 +28,25 @@ const sources = [join(root, 'src-tauri/crates/box-dsh-context/dsh-box-context')]
 if (isFresh(output, sources, force)) {
   console.log(`plugins already prepared at ${output}; pass --force to rebuild`)
   process.exit(0)
+}
+
+// Stronger hash-cache: hash the plugin's package.json + the lockfile so
+// `pnpm build` only runs when the plugin's declared dependencies or
+// version actually changed. Without this, every workspace mtime drift
+// (Cargo.lock, sibling crates, etc.) wastes a full pnpm install + build.
+const cacheRoot = join(root, '.cache', 'dsh-box', 'plugin')
+mkdirSync(cacheRoot, { recursive: true })
+const cacheFile = join(cacheRoot, `${target}.sha256`)
+const hashInputs_ = [
+  join(pluginSource, 'package.json'),
+  join(pluginSource, 'pnpm-lock.yaml'),
+  join(pluginSource, 'tsconfig.json'),
+]
+if (hashInputs(cacheFile, hashInputs_, force)) {
+  if (existsSync(join(output, 'plugins-manifest.json'))) {
+    console.log(`plugin inputs unchanged (hash cache hit at ${cacheFile}); skipping pnpm build`)
+    process.exit(0)
+  }
 }
 
 // 1. Build the TypeScript plugin into dist/.
