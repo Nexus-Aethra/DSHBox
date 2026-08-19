@@ -953,6 +953,7 @@ dependencies = [
  "box-scheduler",
  "box-server-core",
  "box-state",
+ "box-template-core",
  "box-toolchains",
  "flate2",
  "reqwest 0.12.28",

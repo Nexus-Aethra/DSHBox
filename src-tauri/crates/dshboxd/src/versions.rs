@@ -10,12 +10,12 @@
 //! persisted.
 
 use box_dsh_versions::{
-    installed_versions, parse_template_ref, pull_template, read_template_index,
-    version_directory, write_template_index, DshVersion, HARNESS_STANDARD_REF,
+    installed_versions, parse_template_ref, read_template_index,
+    version_directory, DshVersion, HARNESS_STANDARD_REF,
 };
 use box_foundation::{mirror_url, now_seconds, read_config, write_config};
 use serde::Deserialize;
-use std::{fs, time::Duration};
+use std::time::Duration;
 
 pub(crate) fn is_safe_version_name(version: &str) -> bool {
     box_foundation::is_safe_identifier(version)
@@ -103,19 +103,18 @@ pub(crate) fn refresh_dsh_catalog() -> Result<(), String> {
 
 /// Pull a template by reference (e.g. `github.com/deepseek-ai/deepseek-harness:latest`)
 /// and select it as the active version. The `cancelled` probe lets task
-/// workers abort a long clone.
+/// workers abort a long clone. Delegates to `box_template_core::install_template`
+/// so the daemon and the CLI share the same install logic (root vs common
+/// classification, `.dsh-prepared` marker, resource-map bookkeeping).
 pub(crate) fn pull_template_with_cancel(
     ref_value: String,
     cancelled: impl Fn() -> bool + Send + 'static,
 ) -> Result<(), String> {
-    parse_template_ref(&ref_value).map_err(|error| format!("invalid template reference: {error}"))?;
     let root = read_config()?
         .runtime_directory
         .clone()
         .ok_or("DSH Box storage is not configured")?;
-    let version = pull_template(&root, &ref_value, cancelled).map_err(|error| {
-        // libgit2 SSL errors are terse; point the user at the one knob
-        // that actually fixes blocked github.com connections.
+    let outcome = box_template_core::install_template(&root, &ref_value, cancelled).map_err(|error| {
         if error.contains("SSL") {
             format!(
                 "pull template failed: {error}\nhint: github.com may be blocked on this network; configure a mirror with `dshbox config set mirror <prefix>` (e.g. https://gh-proxy.com)"
@@ -125,66 +124,47 @@ pub(crate) fn pull_template_with_cancel(
         }
     })?;
     let mut updated = read_config()?;
-    updated.selected_dsh_version = Some(version.clone());
+    updated.selected_dsh_version = Some(outcome.version.clone());
     write_config(&updated)?;
     eprintln!(
         "pulled template {} (resolved version {})",
-        ref_value, version
+        ref_value, outcome.version
     );
     Ok(())
 }
 
-/// Uninstall a DSH harness: drop the runtime clone, the template index
-/// entry that points at it (so the Harness tab and the Container dropdown
-/// both stop surfacing the version), and prune orphan data payloads.
+/// Uninstall a DSH harness: soft-delete the runtime clone, drop the
+/// template index entry, and enqueue the background hard-delete via the
+/// data-scheduler's deletion queue.
 ///
-/// The runtime directory and the template index are now treated as a
-/// single resource — neither half stays behind when the other is gone.
+/// Delegates to `box_template_core::uninstall_template` so the daemon and
+/// the CLI share the same soft-delete logic (rename + resource-map cleanup
+/// + deletion-queue enqueue). The actual `remove_dir_all` happens in the
+/// background deletion worker, not in this call — the function returns
+/// within a few hundred milliseconds.
 pub(crate) fn uninstall_dsh_version(version: &str) -> Result<(), String> {
     if !is_safe_version_name(version) {
         return Err("invalid DSH version".to_owned());
     }
-    let mut config = read_config()?;
-    let root = config
+    let root = read_config()?
         .runtime_directory
-        .as_deref()
         .ok_or("DSH Box storage is not configured")?;
-    // 1. Drop the runtime clone.
-    let directory = version_directory(root, version)
-        .parent()
-        .ok_or("invalid DSH destination")?
-        .to_path_buf();
-    if directory.is_dir() {
-        fs::remove_dir_all(&directory)
-            .map_err(|error| format!("cannot remove {}: {error}", directory.display()))?;
-    }
-    // 2. Drop the matching template index entry. Every pulled harness
-    // produces a template entry whose `harness_ref` matches the version
-    // slug, so this is the single lookup that unifies the two stores.
-    let mut index = read_template_index(root);
-    let names_to_remove: Vec<String> = index
-        .iter()
-        .filter_map(|(name, entry)| {
-            if entry.harness_ref.as_deref() == Some(version) {
-                Some(name.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-    for name in &names_to_remove {
-        index.remove(name);
-    }
-    if !names_to_remove.is_empty() {
-        write_template_index(root, &index)?;
-    }
+    // The `version` parameter is the harness ref tag (e.g. `dsh-v0.1.0-rc.7`).
+    // Translate it to the template index name by looking up the entry whose
+    // `harness_ref` matches.
+    let index = read_template_index(&root);
+    let template_name = index
+        .values()
+        .find(|entry| entry.harness_ref.as_deref() == Some(version))
+        .map(|entry| entry.name.clone())
+        .ok_or_else(|| format!("template with harness `{version}` is not installed"))?;
+    let _ = box_template_core::uninstall_template(&root, &template_name)?;
+    // Also clear the selected version if it pointed at this tag.
+    let mut config = read_config()?;
     if config.selected_dsh_version.as_deref() == Some(version) {
         config.selected_dsh_version = None;
+        let _ = write_config(&config);
     }
-    write_config(&config)?;
-    // Data payloads follow template lifecycles: drop store orphans now that
-    // this template (and usually its containers) is gone.
-    let _ = crate::data::prune_orphaned_data();
     Ok(())
 }
 
