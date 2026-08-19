@@ -262,6 +262,7 @@ pub fn is_safe_identifier(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn drive_root_normalizes_to_absolute() {

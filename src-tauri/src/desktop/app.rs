@@ -6,8 +6,7 @@ use box_containers::{
     container_directory, scan_containers, CreateDshContainerRequest, DshContainer,
 };
 use box_dsh_versions::{
-    version_directory as dsh_version_directory,
-    upgrade_legacy_harness, DshVersion, DSH_REPOSITORY,
+    version_directory as dsh_version_directory, DshVersion,
 };
 use box_extensions::{scan_workspace_extensions, ExtensionBundle};
 use box_foundation::{
@@ -170,26 +169,48 @@ pub(super) fn run() {
 }
 
 /// Startup repair pass for the template system:
-/// 1. `upgrade_legacy_harness` corrects legacy harness metadata and
-///    generates a base template per installed version.
+/// 1. Mirror every `runtimes/<tag>/source/` runtime into the template
+///    index. Older installs used a separate writer that left the runtime
+///    clone without an index entry; the Harness tab and the Container
+///    dropdown both rely on the index, so this is required for them to
+///    see the user's existing harnesses.
 /// 2. Containers created before the template system are bound to the base
 ///    template of their harness version when one exists locally; containers
 ///    that cannot be bound fall back to the startup validation error.
 ///
 /// Every step is best-effort and logged; failures never block startup.
 fn repair_resources_on_startup(root: &str) {
-    match upgrade_legacy_harness(root) {
-        Ok(reports) => {
-            for report in reports {
-                if report.template_created {
-                    write_startup_log(&format!(
-                        "generated base template {}",
-                        report.template_path
-                    ));
-                }
+    if let Ok(installed) = box_dsh_versions::installed_versions(root) {
+        let index = box_dsh_versions::read_template_index(root);
+        let already_indexed: std::collections::BTreeSet<String> = index
+            .values()
+            .filter_map(|entry| entry.harness_ref.clone())
+            .collect();
+        for tag in installed {
+            if already_indexed.contains(&tag) {
+                continue;
+            }
+            let ref_value = format!("github.com/deepseek-ai/deepseek-harness:{tag}");
+            let body =
+                format!("FROM {ref_value}\nPROFILE web\nNAME {ref_value}\nVERSION latest\n");
+            match box_dsh_versions::write_template_with_entry(
+                root,
+                &ref_value,
+                &body,
+                Some(tag.clone()),
+                "web",
+                Some(ref_value.clone()),
+                now_seconds(),
+            ) {
+                Ok(entry) => write_startup_log(&format!(
+                    "registered harness `{tag}` in template index ({})",
+                    entry.id
+                )),
+                Err(error) => write_startup_log(&format!(
+                    "cannot register harness `{tag}` in template index: {error}"
+                )),
             }
         }
-        Err(error) => write_startup_log(&format!("legacy harness upgrade failed: {error}")),
     }
     let instances = PathBuf::from(root).join("instances");
     let mut bound = 0usize;

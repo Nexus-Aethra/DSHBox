@@ -25,8 +25,9 @@ use crate::lifecycle::{
 };
 use crate::state::{bundled_runtime, ContainerManager, DaemonNotifier, DaemonState};
 use crate::versions::{
-    catalog_names, pull_template_with_cancel, refresh_dsh_catalog, uninstall_dsh_version,
-    upgrade_legacy_resources,
+    fetch_remote_dsh_tags, list_dsh_versions_derived, list_installed_dsh_versions,
+    migrate_runtime_runtimes_to_templates, pull_template_with_cancel, refresh_dsh_catalog,
+    uninstall_dsh_version,
 };
 use box_api::ContainerDescription;
 use box_dsh_versions::{
@@ -78,11 +79,18 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("list_bundles") => list_bundles(),
         Some("list_repository_extensions") => list_repository_extensions(),
         Some("list_repository_reference_counts") => list_repository_reference_counts_rpc(),
-        Some("list_installed_dsh_versions") => list_installed_dsh_versions(),
+        Some("list_installed_dsh_versions") => list_installed_dsh_versions().map(|names| json!(names)),
         Some("detect_toolchains") => detect_toolchains(),
         Some("enqueue_build") => enqueue_build(state, request),
         Some("enqueue_task") => enqueue_task(state, request),
-        Some("list_dsh_catalog") => catalog_names().map(|names| json!(names)),
+        Some("list_dsh_catalog") => {
+            // The Harness tab is derived entirely from the template index;
+            // `latest` and every installed harness show up here, and any
+            // remote tags fetched by `refresh_dsh_catalog` (if the user
+            // pressed "Load versions" first) are merged in.
+            let remote = fetch_remote_dsh_tags().ok();
+            list_dsh_versions_derived(remote).map(|items| json!(items))
+        }
         Some("uninstall_dsh_version") => uninstall_dsh_version_rpc(request),
         Some("remove_repository_extension") => remove_repository_extension_rpc(request),
         Some("prune_repository_extensions") => prune_unused_repository_extensions()
@@ -130,7 +138,9 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("enqueue_container_restart") => enqueue_container_restart(state, request),
         Some("delete_container") => delete_container_rpc(state, request),
         Some("describe_container") => describe_container_rpc(state, request),
-        Some("upgrade_legacy_resources") => upgrade_legacy_resources().map(|reports| json!(reports)),
+        Some("upgrade_legacy_resources") => {
+            migrate_runtime_runtimes_to_templates().map(|registered| json!({ "registered": registered }))
+        }
         Some("enqueue_container_extension_add") => enqueue_container_extension_add(state, request),
         Some("enqueue_workspace_extension_import") => enqueue_workspace_extension_import(state, request),
         Some("enqueue_container_extension_copy") => enqueue_container_extension_copy(state, request),
@@ -310,13 +320,6 @@ fn list_repository_reference_counts_rpc() -> Result<Value, String> {
         })
         .collect();
     Ok(json!(rows))
-}
-
-fn list_installed_dsh_versions() -> Result<Value, String> {
-    let root = read_config()?
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    Ok(json!(installed_versions(&root)?))
 }
 
 fn detect_toolchains() -> Result<Value, String> {

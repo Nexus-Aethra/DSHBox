@@ -23,9 +23,17 @@ export function useContainers(
   // daemon is never queried for pages the user has not opened.
 
   // Default the create form to the latest base template once known, and
-  // pre-fill the profile from the template's own PROFILE directive.
+  // pre-fill the profile from the template's own PROFILE directive. The
+  // selection is re-validated every time `templates` changes — if the
+  // current value no longer resolves to a live entry (the user deleted
+  // it in the Resources tab, the harness was uninstalled, …) fall back
+  // to `:latest` or the first available template so the dropdown never
+  // submits a stale name to the daemon.
   useEffect(() => {
-    setSelectedTemplate((current) => current || templates.find((template) => template.name.endsWith(':latest'))?.name || templates[0]?.name || '')
+    setSelectedTemplate((current) => {
+      if (current !== '' && templates.some((template) => template.name === current)) return current
+      return templates.find((template) => template.name.endsWith(':latest'))?.name || templates[0]?.name || ''
+    })
   }, [templates])
   useEffect(() => {
     const template = templates.find((item) => item.name === selectedTemplate)
