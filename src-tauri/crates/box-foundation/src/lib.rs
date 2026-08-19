@@ -97,6 +97,13 @@ impl BoxPaths {
 }
 
 pub fn config_path() -> BoxResult<PathBuf> {
+    // `DSHBOX_CONFIG_DIR` lets tests and CLI invocations point at a
+    // sandboxed config without mutating HOME/USERPROFILE. This is the
+    // same env var name the dispatch-test harness sets, so the production
+    // path stays one lookup.
+    if let Some(override_dir) = std::env::var_os("DSHBOX_CONFIG_DIR") {
+        return Ok(PathBuf::from(override_dir).join("config.json"));
+    }
     Ok(dirs::home_dir()
         .ok_or("cannot determine home directory")?
         .join(".dsh-box/config.json"))
