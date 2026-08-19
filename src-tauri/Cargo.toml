@@ -80,6 +80,7 @@ box-dsh-context = { path = "crates/box-dsh-context" }
 box-data-scheduler = { path = "crates/box-data-scheduler" }
 box-logger = { path = "crates/box-logger" }
 box-template-core = { path = "crates/box-template-core" }
+tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.45", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }

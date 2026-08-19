@@ -10,6 +10,7 @@ use std::{
     fs,
     path::PathBuf,
 };
+use tracing::info;
 
 pub const DSH_REPOSITORY: &str = "https://github.com/deepseek-ai/deepseek-harness.git";
 pub const DSH_TAGS_API: &str =
@@ -479,6 +480,7 @@ pub fn pull_template(
 ) -> BoxResult<String> {
     let parsed = parse_template_ref(ref_value)?;
     let destination = version_directory(root, &parsed.version);
+    info!(ref = %ref_value, version = %parsed.version, dest = %destination.display(), "pulling template");
     if destination.exists() {
         let index = read_template_index(root);
         let indexed = index.values().any(|entry| {
@@ -560,6 +562,7 @@ pub fn pull_template(
     // the harness tag (e.g. `latest` or `v0.1.0`) is part of the filename
     // and two distinct refs do not overwrite each other.
     write_pulled_base_template(root, &parsed, &ref_value, &commit, destination.to_str())?;
+    info!(version = %parsed.version, commit = %commit, "template pull complete");
     Ok(parsed.version)
 }
 

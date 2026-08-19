@@ -20,6 +20,7 @@ mod test_support;
 mod toolchains;
 mod versions;
 
+use box_runtime::process;
 use box_server_core::{read_discovery, remove_discovery, write_discovery, ServerDiscovery};
 use state::{initialize_bundled_plugins, initialize_bundled_runtime, DaemonState};
 use std::{
@@ -28,13 +29,32 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tracing::{error, info, warn};
 
 pub fn run() {
+    // Install SIGTERM/SIGINT/SIGHUP handlers so an externally signalled
+    // shutdown still walks the graceful path. The shared atomic lets the
+    // listener loop notice the request and call `graceful_shutdown`.
+    process::install_signal_handlers();
+
+    // Initialise the unified logger before any output. The log directory
+    // is `<runtime>/logs/daemon/`; the file appender is daily-rolling.
+    {
+        let log_dir = box_logger::log_dir(
+            box_logger::LogComponent::Daemon,
+            box_foundation::read_config()
+                .ok()
+                .and_then(|c| c.runtime_directory)
+                .as_deref(),
+        );
+        let _ = box_logger::init(box_logger::LogComponent::Daemon, &log_dir);
+    }
+
     if let Err(error) = initialize_bundled_runtime() {
-        eprintln!("warning: bundled runtime unavailable: {error}");
+        warn!("bundled runtime unavailable: {error}");
     }
     if let Err(error) = initialize_bundled_plugins() {
-        eprintln!("warning: bundled plugins unavailable: {error}");
+        warn!("bundled plugins unavailable: {error}");
     }
 
     // Prevent multiple daemon instances: read the existing discovery file,
@@ -50,7 +70,7 @@ pub fn run() {
     let state = match DaemonState::load() {
         Ok(state) => Arc::new(state),
         Err(error) => {
-            eprintln!("dshboxd: cannot load state: {error}");
+            error!("cannot load state: {error}");
             std::process::exit(1);
         }
     };
@@ -69,11 +89,22 @@ pub fn run() {
     let port = listener.local_addr().expect("get local port").port();
     let discovery = write_discovery(port).expect("write server discovery");
 
-    eprintln!(
-        "dshboxd listening on 127.0.0.1:{} (pid {})",
-        port,
-        std::process::id()
-    );
+    info!("listening on 127.0.0.1:{port} (pid {})", std::process::id());
+
+    // Graceful shutdown: every managed host gets a TERM-by-pgroup, a
+    // bounded wait, then a forced kill. Without this loop the OS would
+    // hand every running container over to init as an orphan whenever the
+    // daemon exits.
+    let listener_state = state.clone();
+    let listener_discovery = discovery.clone();
+    std::thread::spawn(move || {
+        while !process::shutdown_requested() {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        graceful_shutdown(&listener_state);
+        remove_discovery_with(&listener_discovery);
+        std::process::exit(0);
+    });
 
     for stream in listener.incoming() {
         let token = discovery.token.clone();
@@ -83,8 +114,46 @@ pub fn run() {
                 handle_http(stream, state, &token);
             }
         });
+        if process::shutdown_requested() {
+            break;
+        }
     }
+    graceful_shutdown(&state);
     remove_discovery();
+}
+
+fn remove_discovery_with(_discovery: &ServerDiscovery) {
+    let _ = remove_discovery();
+}
+
+/// Stop every managed host gracefully. Each host gets a TERM-by-pgroup,
+/// then a 5 s grace window, then a forced kill. Stale state records are
+/// cleared so the next daemon start doesn't try to resume dead hosts.
+fn graceful_shutdown(state: &DaemonState) {
+    let hosts = match state.containers.running.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let drained: Vec<(String, u32)> = hosts
+        .iter()
+        .filter_map(|(id, host)| host.child.id().map(|pid| (id.clone(), pid)))
+        .collect();
+    for (id, pid) in &drained {
+        let _ = id;
+        let _ = process::kill_tree_pid(*pid, None, false);
+    }
+    drop(hosts);
+    std::thread::sleep(Duration::from_secs(5));
+    let mut hosts = match state.containers.running.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for host in hosts.values_mut() {
+        if let Some(pid) = host.child.id() {
+            let _ = process::kill_tree_pid(pid, None, true);
+        }
+    }
+    hosts.clear();
 }
 
 /// Parse an HTTP/1.1 request and dispatch it to `dispatch::dispatch`.
@@ -248,7 +317,7 @@ fn ensure_single_instance() -> Option<ServerDiscovery> {
         }
         Err(_) => {
             // Port unreachable — stale discovery from a crashed daemon.
-            eprintln!("dshboxd: removing stale discovery at {} (pid {}) — proceeding", addr, existing.pid);
+            info!("removing stale discovery at {} (pid {}) — proceeding", addr, existing.pid);
             remove_discovery();
             None
         }

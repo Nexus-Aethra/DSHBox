@@ -27,6 +27,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use tracing::info;
 
 /// Result of a successful install: the new `TemplateEntry`, the resolved
 /// `kind` (`Root`/`Common`), the absolute runtime path the clone lives at
@@ -70,6 +71,7 @@ pub fn install_template<F: Fn() -> bool + Send + 'static>(
     let parsed = parse_template_ref(ref_value)
         .map_err(|error| format!("invalid template reference: {error}"))?;
     let kind = classify_kind(ref_value);
+    info!(ref = %ref_value, version = %parsed.version, kind = %kind.as_str(), "installing template");
 
     // 1. Clone + write base template + index entry.
     let version = box_dsh_versions::pull_template(runtime, ref_value, cancelled)?;
@@ -141,6 +143,7 @@ pub fn install_template<F: Fn() -> bool + Send + 'static>(
         let _ = write_resource_map(Path::new(runtime), &map);
     }
 
+    info!(name = %entry.name, version = %version, kind = %entry.kind.as_str(), "template installed");
     Ok(InstallOutcome {
         entry,
         runtime_path,
@@ -162,6 +165,7 @@ pub fn install_template<F: Fn() -> bool + Send + 'static>(
 /// Returns the deleted `(id, path)` pair so the caller can surface a
 /// diagnostic ("scheduled for deletion at <path>") if useful.
 pub fn uninstall_template(runtime: &str, name: &str) -> Result<(String, String), String> {
+    info!(name, "uninstalling template");
     let index = read_template_index(runtime);
     let entry = index
         .get(name)
@@ -226,6 +230,7 @@ pub fn uninstall_template(runtime: &str, name: &str) -> Result<(String, String),
         let _ = box_foundation::write_config(&config);
     }
 
+    info!(name, "template uninstalled");
     Ok((format!("template:{name}"), String::new()))
 }
 

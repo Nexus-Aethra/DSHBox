@@ -16,6 +16,7 @@ use box_dsh_versions::{
 use box_foundation::{mirror_url, now_seconds, read_config, write_config};
 use serde::Deserialize;
 use std::time::Duration;
+use tracing::info;
 
 pub(crate) fn is_safe_version_name(version: &str) -> bool {
     box_foundation::is_safe_identifier(version)
@@ -126,10 +127,7 @@ pub(crate) fn pull_template_with_cancel(
     let mut updated = read_config()?;
     updated.selected_dsh_version = Some(outcome.version.clone());
     write_config(&updated)?;
-    eprintln!(
-        "pulled template {} (resolved version {})",
-        ref_value, outcome.version
-    );
+    info!("pulled template {} (resolved version {})", ref_value, outcome.version);
     Ok(())
 }
 

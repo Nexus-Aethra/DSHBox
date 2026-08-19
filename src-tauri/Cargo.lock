@@ -208,6 +208,7 @@ dependencies = [
  "box-toolchains",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -312,6 +313,7 @@ dependencies = [
  "box-foundation",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -932,6 +934,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "tracing",
  "uuid",
  "webbrowser",
  "windows-sys 0.45.0",
@@ -949,6 +952,7 @@ dependencies = [
  "box-extensions",
  "box-foundation",
  "box-image",
+ "box-logger",
  "box-runtime",
  "box-scheduler",
  "box-server-core",
@@ -962,6 +966,7 @@ dependencies = [
  "serde_yaml",
  "tar",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
