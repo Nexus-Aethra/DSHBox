@@ -3,21 +3,20 @@
 //! snapshot. CLI and desktop clients talk to this state via RPC; they never
 //! construct their own copies.
 
-use box_foundation::{read_config, strip_verbatim_prefix, BoxConfig, BoxPaths, BoxResult};
+use box_foundation::{read_config, BoxConfig, BoxPaths, BoxResult};
+use box_runtime::{bundled::ResolvedBundledRuntime, process::{self, TrackedChild}};
 use box_scheduler::{TaskManager, TaskNotifier};
 use box_state::ResourceStateManager;
-use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    process::{Child, Command},
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
 /// A managed host process (container server) owned by the daemon.
 /// Mirrors the desktop's `ManagedHost`; clients never hold these.
 pub(crate) struct ManagedHost {
-    pub(crate) child: Child,
+    pub(crate) child: TrackedChild,
     pub(crate) url: String,
 }
 
@@ -37,16 +36,6 @@ pub(crate) struct BundledRuntime {
     pub(crate) node: PathBuf,
     pub(crate) npm: PathBuf,
     pub(crate) pnpm: PathBuf,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BundledRuntimeManifest {
-    node_version: String,
-    pnpm_version: String,
-    node_entry: String,
-    npm_entry: String,
-    pnpm_entry: String,
 }
 
 static BUNDLED_RUNTIME: OnceLock<BundledRuntime> = OnceLock::new();
@@ -109,30 +98,32 @@ pub(crate) fn dshbox_install_directory() -> Result<PathBuf, String> {
 /// startup so every task worker can resolve node/npm/pnpm.
 pub(crate) fn initialize_bundled_runtime() -> Result<(), String> {
     let root = resource_directory()?.join("runtime").join(bundled_target());
-    let manifest: BundledRuntimeManifest = serde_json::from_str(
-        &std::fs::read_to_string(root.join("runtime-manifest.json")).map_err(|_| {
-            format!(
-                "bundled runtime is missing for {}; reinstall DSH Box",
-                bundled_target()
-            )
-        })?,
-    )
-    .map_err(|error| format!("cannot parse bundled runtime manifest: {error}"))?;
-    let plain = |entry: &str| {
-        PathBuf::from(strip_verbatim_prefix(&root.join(entry).to_string_lossy()))
-    };
-    let node = plain(&manifest.node_entry);
-    let npm = plain(&manifest.npm_entry);
-    let pnpm = plain(&manifest.pnpm_entry);
+    let runtime = ResolvedBundledRuntime::from_path(&root).map_err(|error| {
+        format!(
+            "bundled runtime is missing for {}: {error}",
+            bundled_target()
+        )
+    })?;
+    let node = runtime.node_executable();
+    let npm = runtime.npm_script();
+    let pnpm = runtime.pnpm_script();
     if !node.is_file() || !npm.is_file() || !pnpm.is_file() {
         return Err("bundled runtime is incomplete; reinstall DSH Box".to_owned());
     }
-    let mut version_probe = Command::new(&node);
-    box_foundation::suppress_console_window(&mut version_probe);
-    let npm_version = version_probe
+    let policy = process::bundled_toolchain_policy(
+        dshbox_install_directory().ok().as_deref(),
+        &runtime.node_dir(),
+        &runtime.pnpm_dir(),
+        None,
+        None,
+        false,
+    );
+    let spec = process::ProcessSpec::new(&node)
         .arg(&npm)
         .arg("--version")
-        .output()
+        .policy(policy);
+    let npm_version = process::NativeProcessRunner
+        .run(&spec)
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
@@ -140,9 +131,9 @@ pub(crate) fn initialize_bundled_runtime() -> Result<(), String> {
         .unwrap_or_else(|| "unknown".to_owned());
     BUNDLED_RUNTIME
         .set(BundledRuntime {
-            node_version: manifest.node_version,
+            node_version: runtime.manifest.node_version,
             npm_version,
-            pnpm_version: manifest.pnpm_version,
+            pnpm_version: runtime.manifest.pnpm_version,
             node,
             npm,
             pnpm,
@@ -254,17 +245,16 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> 
 /// Everything the daemon owns, shared with every connection thread.
 pub(crate) struct DaemonState {
     pub(crate) manager: TaskManager,
-    /// Box paths derived from the persisted config. Held behind a lock so
-    /// `save_runtime_directory` can move the storage root while the daemon
-    /// stays up (a daemon started before onboarding must adopt the newly
-    /// chosen runtime directory without a restart).
+    /// Box paths derived from the persisted config.
     pub(crate) paths: RwLock<BoxPaths>,
-    /// Container registry shared with task workers: long-running container
-    /// starts run on worker threads, so the registry is behind an `Arc`.
+    /// Container registry shared with task workers.
     pub(crate) containers: Arc<ContainerManager>,
-    /// Reserved for upcoming resource RPCs (toolchain download state).
+    /// Reserved for upcoming resource RPCs.
     #[allow(dead_code)]
     pub(crate) resources: ResourceStateManager,
+    /// Event bus for SSE streaming. Every task progress update, log line,
+    /// and resource change is broadcast to all `/events` subscribers.
+    pub(crate) events: std::sync::Arc<crate::events::DaemonEvents>,
 }
 
 impl DaemonState {
@@ -279,6 +269,7 @@ impl DaemonState {
             paths: RwLock::new(paths),
             containers: Arc::new(ContainerManager::default()),
             resources: ResourceStateManager::default(),
+            events: std::sync::Arc::new(crate::events::DaemonEvents::new()),
         })
     }
 
@@ -294,31 +285,41 @@ impl DaemonState {
     }
 }
 
-/// Task notifier for daemon-run tasks: persists progress to the task log
-/// file and refreshes the resource snapshot. There is no event bus to emit
-/// to; clients poll `task_status`/`list_tasks` instead.
+/// Task notifier for daemon-run tasks: persists progress, refreshes the
+/// resource snapshot, and broadcasts events to all `/events` subscribers.
 pub(crate) struct DaemonNotifier {
     manager: TaskManager,
     resources: ResourceStateManager,
     paths: BoxPaths,
+    events: std::sync::Arc<crate::events::DaemonEvents>,
 }
 
 impl DaemonNotifier {
-    pub(crate) fn from_paths(manager: TaskManager, paths: BoxPaths) -> Self {
+    pub(crate) fn from_paths(
+        manager: TaskManager,
+        paths: BoxPaths,
+        events: std::sync::Arc<crate::events::DaemonEvents>,
+    ) -> Self {
         Self {
             manager,
             resources: ResourceStateManager::default(),
             paths,
+            events,
         }
     }
 }
 
 impl TaskNotifier for DaemonNotifier {
-    fn stage(&self, task_id: &str, _stage: &str, _progress: u8) {
+    fn stage(&self, task_id: &str, stage: &str, progress: u8) {
         if let Ok(task) = self.manager.task(task_id) {
             self.resources.apply_task_update(task);
         }
         let _ = self.manager.persist(&self.paths);
+        self.events.broadcast(crate::events::DaemonEvent::TaskStage {
+            task_id: task_id.to_owned(),
+            stage: stage.to_owned(),
+            progress,
+        });
     }
 
     fn log(&self, task_id: &str, line: &str) {
@@ -329,5 +330,26 @@ impl TaskNotifier for DaemonNotifier {
                 .open(&task.log_path)
                 .and_then(|mut file| std::io::Write::write_all(&mut file, entry.as_bytes()));
         }
+        self.events.broadcast(crate::events::DaemonEvent::TaskLog {
+            task_id: task_id.to_owned(),
+            line: line.to_owned(),
+        });
+    }
+
+    fn finished(
+        &self,
+        task_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) {
+        if let Ok(task) = self.manager.task(task_id) {
+            self.resources.apply_task_update(task);
+        }
+        let _ = self.manager.persist(&self.paths);
+        self.events.broadcast(crate::events::DaemonEvent::TaskFinished {
+            task_id: task_id.to_owned(),
+            status: status.to_owned(),
+            error: error.map(str::to_owned),
+        });
     }
 }

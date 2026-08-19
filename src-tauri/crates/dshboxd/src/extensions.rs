@@ -3,7 +3,7 @@
 //! Mirrors the desktop's `extensions.rs` paths without Tauri deps.
 
 use crate::bundles::{install_container_plugin, install_container_skill};
-use crate::toolchains::{command_for_toolchain, resolve_toolchain, wait_for_process};
+use crate::toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel};
 use box_dsh_versions::version_directory as dsh_version_directory;
 use box_extensions::transfer::{
     append_plugin_archive, archive_content_root, copy_extension_source, extract_extension_tarball,
@@ -14,13 +14,14 @@ use box_extensions::{
     RepositoryExtension,
 };
 use box_foundation::{is_safe_identifier, mirror_url, now_seconds, read_config};
+use box_runtime::process::{ExecutionKind, ProcessSpec};
 use box_runtime::shallow_clone_with_cancel;
 use box_scheduler::TaskContext;
 use flate2::{write::GzEncoder, Compression};
+use std::time::Duration;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
 };
 
 /// True when the plugin's package.json declares any runtime or build
@@ -350,18 +351,13 @@ fn install_plugin_dependencies(
         .map_err(|error| format!("cannot write workspace manifest: {error}"))?;
     }
     let task_record = task.manager.task(&task.task_id)?;
-    let log = fs::OpenOptions::new()
-        .append(true)
-        .open(&task_record.log_path)
-        .map_err(|error| error.to_string())?;
     let frozen = directory.join("pnpm-lock.yaml").is_file();
     task.log(&format!(
         "installing dependencies for {}{}",
         name,
         version.map(|v| format!("@{v}")).unwrap_or_default(),
     ));
-    let mut install = command_for_toolchain(&pnpm);
-    install
+    let install_spec = ProcessSpec::new(pnpm.path.clone())
         .args([
             "--dir",
             directory.to_string_lossy().as_ref(),
@@ -373,16 +369,19 @@ fn install_plugin_dependencies(
                 "--no-frozen-lockfile"
             },
         ])
-        .stdout(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .stderr(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ));
-    let mut child = install
-        .spawn()
-        .map_err(|error| format!("cannot start plugin dependency install: {error}"))?;
-    let status = wait_for_process(&mut child, Some(task), "installing plugin dependencies")?;
+        .policy(pnpm_policy(&pnpm))
+        .kind(ExecutionKind::Logged)
+        .log_path(&task_record.log_path);
+    let mut install_logged = run_logged(&install_spec, "pnpm install").map_err(|error| {
+        format!("cannot start plugin dependency install: {error}")
+    })?;
+    let status = install_logged
+        .wait_or_kill(
+            &TaskCancel(Some(task)),
+            Duration::from_secs(900),
+            "installing plugin dependencies",
+        )
+        .map_err(|error| format!("pnpm install: {error}"))?;
     if status.success() {
         Ok(())
     } else {
@@ -541,11 +540,8 @@ pub(crate) fn container_plugin_add(
     }
 
     let task_record = task.manager.task(&task.task_id)?;
-    let log = fs::OpenOptions::new()
-        .append(true)
-        .open(&task_record.log_path)
-        .map_err(|error| error.to_string())?;
-    let mut child = command_for_toolchain(&pnpm)
+    let dsh_home = PathBuf::from(&container.directory).join("profile");
+    let install_spec = ProcessSpec::new(pnpm.path.clone())
         .args([
             "--dir",
             source.to_string_lossy().as_ref(),
@@ -556,17 +552,21 @@ pub(crate) fn container_plugin_add(
             "add",
             spec,
         ])
-        .env(
-            "DSH_HOME",
-            PathBuf::from(&container.directory).join("profile"),
+        .policy(
+            pnpm_policy(&pnpm)
+                .task_override("DSH_HOME", dsh_home.to_string_lossy().into_owned()),
         )
-        .stdout(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .stderr(Stdio::from(log))
-        .spawn()
+        .kind(ExecutionKind::Logged)
+        .log_path(&task_record.log_path);
+    let mut install_logged = run_logged(&install_spec, "dsh plugin add")
         .map_err(|error| format!("cannot start plugin install: {error}"))?;
-    let status = wait_for_process(&mut child, Some(task), "installing plugin")?;
+    let status = install_logged
+        .wait_or_kill(
+            &TaskCancel(Some(task)),
+            Duration::from_secs(900),
+            "installing plugin",
+        )
+        .map_err(|error| format!("dsh plugin add: {error}"))?;
     if !status.success() {
         return Err(format!("dsh plugin add exited with {status}"));
     }

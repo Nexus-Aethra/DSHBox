@@ -3,7 +3,7 @@
 //! profile scaffolding it needs) plus the startup helpers the daemon
 //! lifecycle uses (workspace, context snapshot, profile preflight).
 
-use crate::toolchains::{command_for_toolchain, resolve_toolchain, wait_for_process};
+use crate::toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel};
 use box_containers::DshContainer;
 use box_dsh_context::{
     render_patch_yml, render_snapshot, DshContextFiles, DEFAULT_ORDER, PATCH_FILENAME,
@@ -11,11 +11,12 @@ use box_dsh_context::{
 };
 use box_dsh_versions::version_directory as dsh_version_directory;
 use box_foundation::{is_safe_identifier, read_config};
+use box_runtime::process::{ExecutionKind, ProcessSpec};
 use box_scheduler::TaskContext;
+use std::time::Duration;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -706,16 +707,12 @@ pub(crate) fn prepare_plugin_source(
 ) -> Result<(), String> {
     let pnpm = resolve_toolchain("pnpm")?;
     let task_record = task.manager.task(&task.task_id)?;
-    let log = fs::OpenOptions::new()
-        .append(true)
-        .open(&task_record.log_path)
-        .map_err(|error| error.to_string())?;
     let frozen = if directory.join("pnpm-lock.yaml").is_file() {
         "--frozen-lockfile"
     } else {
         "--no-frozen-lockfile"
     };
-    let mut install = command_for_toolchain(&pnpm)
+    let install_spec = ProcessSpec::new(pnpm.path.clone())
         .args([
             "--dir",
             directory.to_string_lossy().as_ref(),
@@ -723,15 +720,19 @@ pub(crate) fn prepare_plugin_source(
             "--force",
             frozen,
         ])
-        .stdout(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .stderr(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .spawn()
-        .map_err(|error| format!("cannot install dependencies for plugin {name}: {error}"))?;
-    let status = wait_for_process(&mut install, Some(task), "installing plugin dependencies")?;
+        .policy(pnpm_policy(&pnpm))
+        .kind(ExecutionKind::Logged)
+        .log_path(&task_record.log_path);
+    let mut install_logged = run_logged(&install_spec, "pnpm install").map_err(|error| {
+        format!("cannot install dependencies for plugin {name}: {error}")
+    })?;
+    let status = install_logged
+        .wait_or_kill(
+            &TaskCancel(Some(task)),
+            Duration::from_secs(900),
+            "installing plugin dependencies",
+        )
+        .map_err(|error| format!("pnpm install: {error}"))?;
     if !status.success() {
         return Err(format!(
             "plugin {name} dependency installation exited with {status}"
@@ -742,15 +743,20 @@ pub(crate) fn prepare_plugin_source(
     }
     if let Some(script) = plugin_build_script(directory, entry)? {
         task.update(format!("Building plugin {name}"), 38);
-        let mut build = command_for_toolchain(&pnpm)
+        let build_spec = ProcessSpec::new(pnpm.path.clone())
             .args(["--dir", directory.to_string_lossy().as_ref(), "run", script])
-            .stdout(Stdio::from(
-                log.try_clone().map_err(|error| error.to_string())?,
-            ))
-            .stderr(Stdio::from(log))
-            .spawn()
+            .policy(pnpm_policy(&pnpm))
+            .kind(ExecutionKind::Logged)
+            .log_path(&task_record.log_path);
+        let mut build_logged = run_logged(&build_spec, "pnpm build")
             .map_err(|error| format!("cannot build plugin {name}: {error}"))?;
-        let status = wait_for_process(&mut build, Some(task), "building plugin")?;
+        let status = build_logged
+            .wait_or_kill(
+                &TaskCancel(Some(task)),
+                Duration::from_secs(900),
+                "building plugin",
+            )
+            .map_err(|error| format!("pnpm build: {error}"))?;
         if !status.success() {
             return Err(format!("plugin {name} build exited with {status}"));
         }

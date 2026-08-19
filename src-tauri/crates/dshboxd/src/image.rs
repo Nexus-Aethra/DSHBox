@@ -1708,6 +1708,7 @@ mod tests {
                 imported_at: now_seconds(),
                 from_ref: None,
                 built: true,
+                kind: TemplateKind::Common,
             },
         );
         write_template_index(root.to_string_lossy().as_ref(), &index).unwrap();
@@ -1742,6 +1743,7 @@ mod tests {
                 imported_at: now_seconds(),
                 from_ref: Some("github.com/deepseek-ai/deepseek-harness:latest".to_owned()),
                 built: false,
+                kind: TemplateKind::Root,
             },
         );
         write_template_index(root.to_string_lossy().as_ref(), &index).unwrap();

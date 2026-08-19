@@ -83,6 +83,17 @@ impl BoxPaths {
             .join("logs/tasks")
             .join(format!("{id}.log")))
     }
+
+    /// `<runtime>/logs/` — the unified tracing destination for every
+    /// subsystem (`daemon.log`, `desktop.log`, `cli.log`, `bundled.log`).
+    /// Created on demand by the logger crate.
+    pub fn log_dir(&self) -> BoxResult<PathBuf> {
+        Ok(self
+            .runtime
+            .as_ref()
+            .ok_or("DSH Box storage is not configured")?
+            .join("logs"))
+    }
 }
 
 pub fn config_path() -> BoxResult<PathBuf> {

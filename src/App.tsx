@@ -245,7 +245,7 @@ export function MainApp() {
       <section className="workspace">
         <div className="workspace-heading">
           <div><p className="eyebrow">CONTAINER</p><h1>{text.containerTitle}</h1></div>
-          <Button variant="primary" shape="icon" size="lg" aria-label={text.createContainer} title={text.createContainer} onClick={() => { containers.setCreatingContainerView(true) }}>+</Button>
+          <Button variant="primary" shape="icon" size="lg" aria-label={text.createContainer} title={text.createContainer} onClick={() => { void containers.openCreateContainerView() }}>+</Button>
         </div>
         <div className="version-list container-list">
           {containers.containers.map((container) => {
@@ -296,13 +296,20 @@ export function MainApp() {
             <Field label={text.containerName} required>
               {(id) => <Input id={id} value={containers.containerName} placeholder={text.namePlaceholder} onChange={(event) => { containers.setContainerName(event.target.value) }} autoFocus />}
             </Field>
-            <Field label={text.template} required help={containers.templates.length === 0 ? text.noTemplate : undefined}>
-              {(id) => containers.templates.length > 0 ? (
+            <Field
+              label={text.template}
+              required
+              help={containers.templatesLoading ? text.loadingTemplates : containers.templatesError !== null ? text.templateLoadFailed : containers.templates.length === 0 ? text.noTemplate : undefined}
+            >
+              {(id) => !containers.templatesLoading && containers.templatesError === null && containers.templates.length > 0 ? (
                 <Select
                   id={id}
                   value={containers.selectedTemplate}
                   onChange={(event) => { containers.setSelectedTemplate(event.target.value) }}
-                  options={containers.templates.map((template) => ({ value: template.name, label: `${template.name}${template.harnessRef ? ` (${template.harnessRef})` : ''}` }))}
+                  options={[
+                    { value: '', label: text.templateRequired },
+                    ...containers.templates.map((template) => ({ value: template.name, label: `${template.name}${template.harnessRef ? ` (${template.harnessRef})` : ''}` })),
+                  ]}
                 />
               ) : null}
             </Field>
@@ -310,7 +317,21 @@ export function MainApp() {
               {(id) => <Input id={id} value={containers.newContainerProfile} placeholder={text.profilePlaceholder} onChange={(event) => { containers.setNewContainerProfile(event.target.value) }} />}
             </Field>
             <div>
-              <Button variant="primary" size="lg" loading={containers.creatingContainer} disabled={!containers.containerName.trim() || !containers.newContainerProfile.trim() || !containers.selectedTemplate} onClick={() => { void containers.createContainer() }}>{containers.creatingContainer ? text.creating : text.createContainer}</Button>
+              <Button
+                variant="primary"
+                size="lg"
+                loading={containers.creatingContainer}
+                disabled={
+                  containers.templatesLoading
+                  || containers.templatesError !== null
+                  || !containers.containerName.trim()
+                  || !containers.newContainerProfile.trim()
+                  || !containers.templates.some((template) => template.name === containers.selectedTemplate)
+                }
+                onClick={() => { void containers.createContainer() }}
+              >
+                {containers.creatingContainer ? text.creating : text.createContainer}
+              </Button>
             </div>
           </Stack>
         </Card>

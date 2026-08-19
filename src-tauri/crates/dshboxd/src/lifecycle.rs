@@ -9,26 +9,24 @@ use crate::containers::{
 };
 use crate::image::lookup_template_path;
 use crate::state::{ContainerManager, ManagedHost};
-use crate::toolchains::{
-    command_for_toolchain, resolve_toolchain, spawn_forwarding_log, wait_for_process,
-};
+use crate::toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel};
 use box_containers::container_directory;
 use box_dsh_context::PLUGIN_ID;
 use box_dsh_versions::version_directory as dsh_version_directory;
-use box_foundation::{is_safe_identifier, read_config, suppress_console_window};
+use box_foundation::{is_safe_identifier, read_config};
+use box_runtime::process::{self, ExecutionKind, ProcessSpec, TrackedChild};
 use box_scheduler::TaskContext;
 use std::{
     collections::BTreeMap,
     fs,
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
 
-use crate::host::{self, ContainerHostRecord, HostState};
+use crate::host::{self, HostState};
 
 /// Start the DSH host for `id` and wait until its frontend answers.
 /// The running map is the daemon-owned registry; containers already
@@ -76,7 +74,7 @@ pub(crate) fn start_dsh_container_inner(
     let name = value["name"].as_str().unwrap_or(id).to_owned();
     let template = value["template"].as_str().map(str::to_owned);
     repair_known_profile_template(&directory, profile)?;
-    let workspace = ensure_container_workspace(&directory)?;
+    let _workspace = ensure_container_workspace(&directory)?;
     let dshbox_home = crate::state::dshbox_install_directory()
         .unwrap_or_else(|_| PathBuf::from("."));
     let context_files = write_dshbox_context_snapshot(&directory, &value, profile, &dshbox_home)?;
@@ -157,11 +155,15 @@ pub(crate) fn start_dsh_container_inner(
                     task.update("Installing DSH dependencies", 40);
                     task.log("installing DSH dependencies");
                 }
-                let mut install = command_for_toolchain(&pnpm);
-                install.args(["--dir", source_arg.as_ref(), "install"]);
-                let mut install = spawn_forwarding_log(&mut install, &log_path, task)
-                    .map_err(|error| format!("cannot install DSH dependencies: {error}"))?;
-                let status = wait_for_process(&mut install, task, "installing DSH dependencies")?;
+                let install_spec = ProcessSpec::new(pnpm.path.clone())
+                    .args(["--dir", source_arg.as_ref(), "install"])
+                    .policy(pnpm_policy(&pnpm))
+                    .kind(ExecutionKind::Logged)
+                    .log_path(&log_path);
+                let mut install_logged = run_logged(&install_spec, "DSH dependency install").map_err(|error| format!("cannot install DSH dependencies: {error}"))?;
+                let status = install_logged
+                    .wait_or_kill(&TaskCancel(task), Duration::from_secs(900), "installing DSH dependencies")
+                    .map_err(|error| format!("DSH dependency install: {error}"))?;
                 if !status.success() {
                     return Err(format!(
                         "DSH dependency install failed; inspect {}",
@@ -176,11 +178,15 @@ pub(crate) fn start_dsh_container_inner(
                 task.update("Building DSH frontend", 55);
                 task.log("building DSH frontend");
             }
-            let mut build = command_for_toolchain(&pnpm);
-            build.args(["--dir", source_arg.as_ref(), "run", "build"]);
-            let mut build = spawn_forwarding_log(&mut build, &log_path, task)
-                .map_err(|error| format!("cannot build DSH before launch: {error}"))?;
-            let status = wait_for_process(&mut build, task, "building DSH frontend")?;
+            let build_spec = ProcessSpec::new(pnpm.path.clone())
+                .args(["--dir", source_arg.as_ref(), "run", "build"])
+                .policy(pnpm_policy(&pnpm))
+                .kind(ExecutionKind::Logged)
+                .log_path(&log_path);
+            let mut build_logged = run_logged(&build_spec, "DSH frontend build").map_err(|error| format!("cannot build DSH before launch: {error}"))?;
+            let status = build_logged
+                .wait_or_kill(&TaskCancel(task), Duration::from_secs(900), "building DSH frontend")
+                .map_err(|error| format!("DSH build: {error}"))?;
             if !status.success() {
                 return Err(format!("DSH build failed; inspect {}", log_path.display()));
             }
@@ -216,8 +222,13 @@ pub(crate) fn start_dsh_container_inner(
         // script directly lets the node process's stderr propagate to the
         // host.log unmodified.
         let node = resolve_toolchain("node")?;
-        let mut command = command_for_toolchain(&node);
-        command
+        let policy = process::dsh_host_policy(
+            std::path::Path::new(&node.path).parent().map(Path::to_path_buf).as_deref().unwrap_or(Path::new(".")),
+            std::path::Path::new(&node.path).parent().and_then(|p| p.parent()).map(|p| p.join("pnpm")).as_deref().unwrap_or(Path::new(".")),
+            &plugins_node_modules,
+        );
+        let policy = policy.task_override("DSH_HOME", directory.join("profile").to_string_lossy().into_owned());
+        let spec = ProcessSpec::new(node.path.clone())
             .args([
                 "--import",
                 "tsx/esm",
@@ -229,28 +240,17 @@ pub(crate) fn start_dsh_container_inner(
                 "--patch",
                 patch.to_string_lossy().as_ref(),
             ])
-            .current_dir(&source)
-            .env("DSH_HOME", directory.join("profile"))
-            .env("NODE_PATH", plugins_node_modules.as_os_str())
-            // Force chokidar into polling mode so the container host is
-            // insulated from the host machine's inotify watcher budget.
-            // Linux users with many editors / dev tools (ZCode's own
-            // `zcode-host-local`, IDEs, etc.) routinely exhaust the
-            // default 65536 max_user_watches, which makes recursive
-            // `chokidar.watch` inside DSH fail with ENOSPC and crash
-            // the host — seen as "DSH host did not become ready" in
-            // the UI while the CLI path (which bypasses this watcher)
-            // still works. Polling sidesteps inotify entirely.
-            .env("CHOKIDAR_USEPOLLING", "true");
-        // Detach the host into its own process group so cleanup can reach
-        // every descendant with a single `kill(-pgid, ...)`. Linux/macOS
-        // use `setsid`; Windows relies on `CREATE_NEW_PROCESS_GROUP` so
-        // `taskkill /T` walks the tree the same way.
-        make_process_group_leader(&mut command);
-        let mut child = spawn_forwarding_log(&mut command, &log_path, task)
-            .map_err(|error| format!("cannot start DSH host: {error}"))?;
-        let host_pid = child.id();
-        let host_pgid = process_group_id(&child);
+            .cwd(&source)
+            .policy(policy)
+            .kind(ExecutionKind::Logged)
+            .log_path(&log_path)
+            .new_process_group(true);
+        let mut tracked: TrackedChild = run_logged(&spec, "DSH host")
+            .map_err(|error| format!("cannot start DSH host: {error}"))?
+            .into_tracked();
+        // Detach into a TrackedChild for stop / graceful_shutdown handling.
+        let host_pid = tracked.id().unwrap_or(0);
+        let host_pgid = tracked.pgid().unwrap_or(0);
         // Persist a starting record before the readiness probe begins so
         // a daemon crash mid-start still leaves something for the next
         // run to reconcile against.
@@ -276,16 +276,10 @@ pub(crate) fn start_dsh_container_inner(
         }
         let ready = (0..80).any(|attempt| {
             if task.map(TaskContext::cancelled).unwrap_or(false) {
-                terminate_process_group(host_pgid);
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = tracked.kill_tree(false, Duration::from_secs(2));
                 return false;
             }
-            if let Some(status) = child.try_wait().ok().flatten() {
-                // DSH host exited before the 20s readiness window — log the
-                // exit code and signal so we can diagnose startup failures.
-                // The host.log captures stdout/stderr via the forwarding
-                // threads, but the exit code itself is not written there.
+            if let Ok(Some(status)) = tracked.try_wait() {
                 let (code, signal) = host::exit_status_to_parts(status);
                 if let Some(task) = task {
                     if let Some(sig) = signal {
@@ -312,9 +306,6 @@ pub(crate) fn start_dsh_container_inner(
             available
         });
         if ready {
-            // Bump the record to `Ready` and spawn the long-running
-            // watcher that keeps `lastSeen` fresh and flips to
-            // `Crashed` when the host disappears.
             let snapshot = host::read_host_record(id)
                 .ok()
                 .flatten()
@@ -332,7 +323,7 @@ pub(crate) fn start_dsh_container_inner(
                 .insert(
                     id.to_owned(),
                     ManagedHost {
-                        child,
+                        child: tracked,
                         url: url.clone(),
                     },
                 );
@@ -349,10 +340,11 @@ pub(crate) fn start_dsh_container_inner(
             });
             return Err("task cancelled while waiting for DSH host".to_owned());
         }
-        terminate_process_group(host_pgid);
-        let _ = child.kill();
-        let exit_status = child.wait().ok();
-        let (code, signal) = exit_status
+        let _ = tracked.kill_tree(false, Duration::from_secs(2));
+        let (code, signal) = tracked
+            .try_wait()
+            .ok()
+            .flatten()
             .map(host::exit_status_to_parts)
             .unwrap_or((-1, None));
         let _ = host::compare_and_swap_host_record(id, &initial, |on_disk| {
@@ -391,10 +383,10 @@ pub(crate) fn stop_dsh_container(
         .map_err(|_| "container manager lock failed")?
         .remove(id);
     if let Some(mut host) = host {
-        terminate_process_group_grouped(&host.child);
-        let _ = host.child.wait();
-        // After wait() the OS has reaped the host; no zombie can remain
-        // because the whole process group was killed.
+        let _ = host.child.kill_tree(false, Duration::from_secs(5));
+        // TrackedChild's Drop impl performs the final force-kill + reap
+        // if the process hasn't exited yet, so we don't need an extra
+        // wait() here.
     }
     let root = read_config()?
         .runtime_directory
@@ -460,11 +452,14 @@ pub(crate) fn rebuild_dsh_container_with_task(
             );
             task.check_cancelled()?;
         }
-        let mut command = command_for_toolchain(&pnpm);
-        command.args(args);
-        let mut command = spawn_forwarding_log(&mut command, &log_path, task)
-            .map_err(|error| format!("cannot run pnpm: {error}"))?;
-        let status = wait_for_process(&mut command, task, "running pnpm")?;
+        let spec = ProcessSpec::new(pnpm.path.clone())
+            .args(args)
+            .policy(pnpm_policy(&pnpm))
+            .kind(ExecutionKind::Logged)
+            .log_path(&log_path);
+        let mut logged = run_logged(&spec, "pnpm rebuild step")?;
+        let status = logged
+            .wait_or_kill(&TaskCancel(task), Duration::from_secs(900), "running pnpm")?;
         if !status.success() {
             return Err(format!(
                 "DSH rebuild failed; inspect {}",
@@ -728,159 +723,6 @@ fn wait_for_pnpm_links(source: &Path, deadline: Duration) -> Result<(), String> 
     ))
 }
 
-/// Detach the child into its own process group so the daemon can later
-/// kill the whole subtree with a single `kill(-pgid, SIGTERM)`.
-fn make_process_group_leader(command: &mut Command) {
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            // setsid() makes this process the leader of a new session
-            // and process group; pgid == pid afterwards.
-            libc_setsid();
-            Ok(())
-        });
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NEW_PROCESS_GROUP allows taskkill /T to walk the tree.
-        // CREATE_NO_WINDOW suppresses the flash console window every time
-        // a container starts; without it the user sees a black cmd window
-        // pop up for ~50ms on every Start action.
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    }
-}
-
-#[cfg(unix)]
-fn libc_setsid() {
-    // libc::setsid — pulled in via the platform libc shim. We use the
-    // raw syscall via the `libc` crate if available, otherwise fall
-    // back to an unsafe extern declaration. dshboxd already depends
-    // on libc transitively (reqwest, ring); declare locally to keep
-    // the dependency surface explicit.
-    extern "C" {
-        fn setsid() -> i32;
-    }
-    unsafe {
-        let _ = setsid();
-    }
-}
-
-/// Returns the pgid of `child`. On unix we use `getpgid(pid)` rather
-/// than assuming `pid == pgid` — Node/Electron-style runtimes can call
-/// `setpgid` after `setsid`, which leaves the host detached from the
-/// group we set up. If the lookup fails we fall back to the pid so
-/// cleanup still has something to target.
-fn process_group_id(child: &Child) -> i32 {
-    #[cfg(unix)]
-    {
-        let pid = child.id() as i32;
-        extern "C" {
-            fn getpgid(pid: i32) -> i32;
-        }
-        let pgid = unsafe { getpgid(pid) };
-        if pgid > 0 {
-            pgid
-        } else {
-            pid
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        0
-    }
-}
-
-/// Best-effort termination of a process group. Falls through to direct
-/// kill of `child` on Windows (no process group concept) and on any
-/// platform where the pgid == 0 sentinel is passed.
-fn terminate_process_group_grouped(child: &Child) {
-    let pgid = process_group_id(child);
-    if pgid > 0 {
-        terminate_process_group(pgid);
-    }
-    // Also kill the host PID directly in case `setsid` didn't take
-    // effect (e.g. the child re-execed into something else).
-    terminate_host_pid(child.id());
-    // Brief grace window; if still alive, escalate.
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
-        if !pid_alive(child.id()) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    // Still alive after 5s? Force-kill.
-    terminate_host_pid_force(child.id());
-}
-
-/// Send a graceful stop signal to a single PID. On unix this is
-/// `kill -TERM`; on Windows `kill` doesn't exist, so we use `taskkill`
-/// without `/F` first to give the process a chance to clean up.
-fn terminate_host_pid(pid: u32) {
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // `taskkill /T /PID <pid>` walks the process tree without
-        // requiring `/F`, so descendants get a chance to shut down
-        // cleanly. CREATE_NO_WINDOW keeps the console hidden.
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/PID", &pid.to_string()])
-            .creation_flags(0x08000000)
-            .status();
-    }
-}
-
-/// Force-kill a single PID. Used after the grace window expires.
-fn terminate_host_pid_force(pid: u32) {
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .status();
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .creation_flags(0x08000000)
-            .status();
-    }
-}
-
-/// Terminate a process group by pgid. Used during shutdown when we
-/// no longer have the `Child` handle (only the recorded pgid).
-fn terminate_process_group(pgid: i32) {
-    if pgid <= 0 {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &format!("-{pgid}")])
-            .status();
-    }
-    // Windows: there is no portable process-group signal. The pgid we
-    // record is set via `CREATE_NEW_PROCESS_GROUP`, which `taskkill /T`
-    // walks. We deliberately don't issue a kill here — the per-PID
-    // helpers above handle the actual termination; the pgid is only
-    // metadata on Windows.
-    #[cfg(windows)]
-    {
-        let _ = pgid; // suppress unused-variable warning
-    }
-}
-
 /// Scan every persisted `host.json` and reconcile it against the live
 /// process table. Called once at daemon startup so that a previous
 /// daemon's death doesn't leave stale "running" records behind.
@@ -1018,7 +860,6 @@ fn probe_pid(pid: u32) -> PidProbe {
         }
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
         const ERROR_ACCESS_DENIED: u32 = 5;
-        const ERROR_INVALID_PARAMETER: u32 = 87;
         let handle = unsafe {
             OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
         };

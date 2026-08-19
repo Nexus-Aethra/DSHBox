@@ -239,31 +239,35 @@ pub(crate) fn link_daemon_into_path(server: &Path) {
 
 
 pub(crate) fn initialize_bundled_runtime(resource_directory: PathBuf) -> Result<(), String> {
-    let root = resource_directory.join("runtime").join(bundled_target());
-    let manifest: BundledRuntimeManifest = serde_json::from_str(
-        &fs::read_to_string(root.join("runtime-manifest.json")).map_err(|_| {
-            format!(
-                "bundled runtime is missing for {}; reinstall DSH Box",
-                bundled_target()
-            )
-        })?,
+    let runtime = box_runtime::bundled::ResolvedBundledRuntime::from_path(
+        &resource_directory.join("runtime").join(bundled_target()),
     )
-    .map_err(|error| format!("cannot parse bundled runtime manifest: {error}"))?;
-    // Tauri's resource_dir returns verbatim `\\?\` paths on Windows, and
-    // bundled Node crashes with `EISDIR lstat 'D:'` when a verbatim entry
-    // script reaches `Module._findPath`. Store plain absolute paths instead.
-    let node = PathBuf::from(strip_verbatim_prefix(&root.join(&manifest.node_entry).to_string_lossy()));
-    let npm = PathBuf::from(strip_verbatim_prefix(&root.join(&manifest.npm_entry).to_string_lossy()));
-    let pnpm = PathBuf::from(strip_verbatim_prefix(&root.join(&manifest.pnpm_entry).to_string_lossy()));
+    .map_err(|error| {
+        format!(
+            "bundled runtime is missing for {}: {error}",
+            bundled_target()
+        )
+    })?;
+    let node = runtime.node_executable();
+    let npm = runtime.npm_script();
+    let pnpm = runtime.pnpm_script();
     if !node.is_file() || !npm.is_file() || !pnpm.is_file() {
         return Err("bundled runtime is incomplete; reinstall DSH Box".to_owned());
     }
-    let mut version_probe = Command::new(&node);
-    suppress_console_window(&mut version_probe);
-    let npm_version = version_probe
+    let policy = box_runtime::process::bundled_toolchain_policy(
+        None,
+        &runtime.node_dir(),
+        &runtime.pnpm_dir(),
+        None,
+        None,
+        false,
+    );
+    let spec = box_runtime::process::ProcessSpec::new(&node)
         .arg(&npm)
         .arg("--version")
-        .output()
+        .policy(policy);
+    let npm_version = box_runtime::process::NativeProcessRunner
+        .run(&spec)
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
@@ -271,9 +275,9 @@ pub(crate) fn initialize_bundled_runtime(resource_directory: PathBuf) -> Result<
         .unwrap_or_else(|| "unknown".to_owned());
     BUNDLED_RUNTIME
         .set(BundledRuntime {
-            node_version: manifest.node_version,
+            node_version: runtime.manifest.node_version,
             npm_version,
-            pnpm_version: manifest.pnpm_version,
+            pnpm_version: runtime.manifest.pnpm_version,
             node,
             npm,
             pnpm,

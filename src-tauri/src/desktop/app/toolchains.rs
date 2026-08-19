@@ -57,38 +57,33 @@ pub(crate) fn resolve_toolchain(id: &str) -> Result<ResolvedToolchain, String> {
 }
 
 pub(crate) fn command_for_toolchain(toolchain: &ResolvedToolchain) -> Command {
+    let runtime = bundled_runtime().ok();
+    let node_dir = runtime.as_ref().map(|r| r.node.parent().map(Path::to_path_buf).unwrap_or_default());
+    let pnpm_dir = runtime.as_ref().map(|r| {
+        r.node
+            .parent()
+            .and_then(|root| root.parent())
+            .map(|root| root.join("pnpm"))
+            .unwrap_or_default()
+    });
+    let config = read_config().ok();
+    let policy = box_runtime::process::bundled_toolchain_policy(
+        None,
+        node_dir.as_deref().unwrap_or(Path::new(".")),
+        pnpm_dir.as_deref().unwrap_or(Path::new(".")),
+        config
+            .as_ref()
+            .and_then(|c| c.runtime_directory.as_deref())
+            .map(Path::new),
+        config
+            .as_ref()
+            .and_then(|c| c.npm_registry.as_deref()),
+        false,
+    );
     let mut command = Command::new(&toolchain.path);
-    suppress_console_window(&mut command);
+    box_runtime::process::platform::configure_non_interactive(&mut command, false);
     command.args(&toolchain.arguments);
-    // Prepend the bundled runtime bin directories so child processes can
-    // resolve bare `pnpm`/`npm` commands: pnpm's dependency-status check and
-    // DSH build scripts spawn them without the bundled runtime on PATH.
-    if let Ok(runtime) = bundled_runtime() {
-        // node and pnpm live as siblings under runtime/<target>/, e.g.
-        // node/node.exe and pnpm/pnpm.cmd. The recorded tool entries are
-        // deep paths (node/node.exe, pnpm/node_modules/pnpm/bin/pnpm.mjs),
-        // so derive the bin directories from the node executable's parent.
-        if let Some(node_dir) = runtime.node.parent() {
-            let pnpm_dir = node_dir.parent().map(|root| root.join("pnpm"));
-            if let Some(existing) = env::var_os("PATH") {
-                let mut parts: Vec<OsString> = vec![node_dir.as_os_str().to_owned()];
-                if let Some(pnpm_dir) = pnpm_dir {
-                    parts.push(pnpm_dir.as_os_str().to_owned());
-                }
-                parts.push(existing);
-                if let Ok(joined) = env::join_paths(parts) {
-                    command.env("PATH", joined);
-                }
-            }
-        }
-    }
-    // Apply the user-configured npm registry to every npm/pnpm child so
-    // installs and DSH build scripts resolve packages through the mirror.
-    if let Ok(config) = read_config() {
-        if let Some(registry) = config.npm_registry.as_deref() {
-            command.env("npm_config_registry", registry);
-        }
-    }
+    policy.apply(&mut command);
     command
 }
 

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::ExitStatus,
 };
 
@@ -143,6 +143,7 @@ pub fn write_host_record(record: &ContainerHostRecord) -> BoxResult<()> {
 
 /// Outcome of [`compare_and_swap_host_record`].
 #[derive(Debug)]
+#[allow(dead_code)] // fields are read by integration tests, not by daemon internals.
 pub enum CasOutcome {
     /// Caller's update was persisted; `record` now reflects the new state.
     Applied(ContainerHostRecord),
@@ -303,6 +304,7 @@ pub fn list_all_host_records_in(runtime_root: &str) -> BoxResult<Vec<ContainerHo
 }
 
 /// Helper: produce a process description from an exit pair for logging.
+#[allow(dead_code)] // exercised by integration tests; daemon core uses describe_exit_inline.
 pub fn describe_exit(status: Option<i32>, signal: Option<i32>) -> String {
     match (status, signal) {
         (_, Some(sig)) => format!("signal {sig}"),

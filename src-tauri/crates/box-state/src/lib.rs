@@ -435,6 +435,7 @@ mod tests {
             error: Some("broken".to_owned()),
             params: serde_json::json!({}),
             cancel_requested: false,
+            rollback_error: None,
         }
     }
     fn toolchain() -> ToolchainStatus {

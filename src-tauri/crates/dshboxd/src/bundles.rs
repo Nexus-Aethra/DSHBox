@@ -3,9 +3,8 @@
 //! `install_container_skill`, bundle create/delete/export/import).
 
 use crate::extensions::repository_metadata;
-use crate::toolchains::{command_for_toolchain, resolve_toolchain, wait_for_process};
+use crate::toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel};
 use box_containers::DshContainer;
-use box_dsh_versions::version_directory as dsh_version_directory;
 use box_extensions::transfer::{
     append_plugin_archive, copy_extension_source, extract_extension_tarball,
 };
@@ -15,13 +14,14 @@ use box_extensions::{
     ExtensionBundle, ExtensionKind, ExtensionRecord, RepositoryExtension,
 };
 use box_foundation::{is_safe_identifier, mirror_url, now_seconds, read_config};
+use box_runtime::process::{ExecutionKind, ProcessSpec};
 use box_runtime::shallow_clone_with_cancel;
 use box_scheduler::TaskContext;
 use flate2::{write::GzEncoder, Compression};
+use std::time::Duration;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
 };
 
 pub(crate) fn skill_name(path: &Path) -> Result<String, String> {
@@ -286,24 +286,27 @@ fn register_plugin_directly(
     let pnpm = resolve_toolchain("pnpm")?;
     task.log(&format!("installing plugin dependencies for {plugin_name}"));
     let task_record = task.manager.task(&task.task_id)?;
-    let log = fs::OpenOptions::new()
-        .append(true)
-        .open(&task_record.log_path)
-        .map_err(|error| error.to_string())?;
-    let mut child = command_for_toolchain(&pnpm)
+    let install_spec = ProcessSpec::new(pnpm.path.clone())
         .args([
             "--dir",
             profile_dir.to_string_lossy().as_ref(),
             "install",
             "--no-frozen-lockfile",
         ])
-        .stdout(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .stderr(Stdio::from(log))
-        .spawn()
-        .map_err(|error| format!("cannot start pnpm install: {error}"))?;
-    let status = wait_for_process(&mut child, Some(task), "installing plugin dependencies")?;
+        .policy(pnpm_policy(&pnpm))
+        .kind(ExecutionKind::Logged)
+        .log_path(&task_record.log_path);
+    let mut install_logged =
+        run_logged(&install_spec, "pnpm install").map_err(|error| {
+            format!("cannot start pnpm install: {error}")
+        })?;
+    let status = install_logged
+        .wait_or_kill(
+            &TaskCancel(Some(task)),
+            Duration::from_secs(900),
+            "installing plugin dependencies",
+        )
+        .map_err(|error| format!("pnpm install: {error}"))?;
     if !status.success() {
         return Err(format!("pnpm install for plugin {plugin_name} exited with {status}"));
     }
