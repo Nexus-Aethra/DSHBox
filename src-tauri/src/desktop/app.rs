@@ -35,6 +35,7 @@ mod bundles;
 mod commands;
 mod containers;
 mod rpc;
+mod events;
 mod extensions;
 pub(crate) mod image;
 pub(crate) mod lifecycle;
@@ -47,6 +48,7 @@ pub(crate) use bundles::*;
 pub(crate) use containers::*;
 pub(crate) use extensions::*;
 pub(crate) use rpc::*;
+pub(crate) use events::*;
 pub(crate) use lifecycle::*;
 pub(crate) use services::*;
 pub(crate) use tasks::*;
@@ -328,6 +330,10 @@ fn run_inner() -> Result<(), String> {
             }
             let handle = app.handle().clone();
             thread::spawn(move || refresh_global_state(&handle));
+            // Bridge daemon `/events` SSE stream to the Tauri event bus so
+            // every state transition the daemon emits surfaces as a
+            // `daemon://event` payload the frontend can subscribe to.
+            spawn_event_subscriber(app.handle().clone());
             if let Some(id) = initial_container.clone() {
                 let client = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
