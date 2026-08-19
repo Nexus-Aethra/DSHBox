@@ -2,6 +2,16 @@ import { useEffect, useRef, useState } from 'react'
 import { boxApi } from '../shared/api/box-api'
 import type { TaskRecord } from '../shared/types/domain'
 
+/** Payload the desktop event subscriber forwards from the daemon's SSE
+ *  stream. Every daemon state transition arrives here so the UI can react
+ *  without polling task status.
+ */
+type DaemonEvent =
+  | { event: 'snapshot'; payload: { tasks?: TaskRecord[] } }
+  | { event: 'TaskStage' | 'TaskLog' | 'TaskFinished' | 'RollbackStarted' | 'RollbackFinished' | 'RollbackFailed'; payload: TaskRecord }
+  | { event: 'ResourceAdded' | 'ResourceRemoved' | 'ResourceUpdated'; payload: { key: string; kind?: string } }
+  | { event: 'TagsFetched'; payload: { tags: string[] } }
+
 export type TaskRefreshers = {
   onVersionsChanged: () => void
   onTemplatesChanged: () => void
@@ -48,8 +58,42 @@ export function useTasks(refreshers: TaskRefreshers, onError: (message: string |
       }
     }
     const taskEvents = ['task://created', 'task://updated', 'task://finished'].map((event) => boxApi.listenTask<TaskRecord>(event, (payload) => { update(payload); refreshForTask(payload) }))
-    const logEvent = boxApi.listenTask<{ taskId: string; line: string }>('task://log', (payload) => setTaskLogs((current) => payload.taskId in current ? { ...current, [payload.taskId]: `${current[payload.taskId]}${current[payload.taskId] ? '\n' : ''}${payload.line}` } : current))
-    const unlisteners = Promise.all([...taskEvents, logEvent])
+    const logEvent = boxApi.listenTask<{ taskId: string; line: string }>('task://log', (payload) => setTaskLogs((current) => payload.taskId in current ? { ...current, [payload.taskId]: `${current[payload.taskId] ? '\n' : ''}${payload.line}` } : current))
+    // Daemon-owned tasks stream through `/events`; the desktop event
+    // subscriber forwards every frame as `daemon://event`. Subscribe once
+    // and route by `event` so a single listener handles stage, log and
+    // finished transitions without duplicate code.
+    const daemonEvents = boxApi.listenTask<DaemonEvent>('daemon://event', (payload) => {
+      switch (payload.event) {
+        case 'snapshot':
+          if (Array.isArray(payload.payload.tasks)) setTasks(payload.payload.tasks)
+          break
+        case 'TaskStage':
+        case 'TaskFinished':
+        case 'RollbackStarted':
+        case 'RollbackFinished':
+        case 'RollbackFailed':
+          update(payload.payload); refreshForTask(payload.payload); break
+        case 'TaskLog': {
+          const line = payload.payload.stage ?? ''
+          const taskId = payload.payload.id
+          if (taskId && line) {
+            setTaskLogs((current) => taskId in current
+              ? { ...current, [taskId]: `${current[taskId]}${current[taskId] ? '\n' : ''}${line}` }
+              : current)
+          }
+          break
+        }
+        case 'ResourceAdded':
+        case 'ResourceRemoved':
+        case 'ResourceUpdated':
+        case 'TagsFetched':
+          // The list-level refreshers below pick these up on the next poll
+          // tick; nothing to do here yet.
+          break
+      }
+    })
+    const unlisteners = Promise.all([...taskEvents, logEvent, daemonEvents])
     // Poll for tasks enqueued by the CLI process (which cannot emit Tauri
     // events into this process). The backend merges the shared state file on
     // every call, so the next poll picks up progress and completion too.
