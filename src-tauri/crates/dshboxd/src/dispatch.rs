@@ -37,50 +37,98 @@ use box_extensions::{read_bundles, scan_container_extensions, scan_repository};
 use box_foundation::{now_seconds, read_config, write_config};
 use box_scheduler::{run_queued, TaskContext, TaskRecord};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{debug, info, warn};
 
 /// Set when a client asks the daemon to stop (build-batch mismatch during
 /// an upgrade); `main.rs` exits after the response is written back.
 pub(crate) static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-/// Dispatch one request against the daemon state. Every handler returns a
-/// `{"ok": bool, ...}` frame; errors never panic the connection thread.
-pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
-    let result = match request["method"].as_str() {
-        Some("ping") => Ok(json!({
+/// What an RPC handler returns. The dispatch table wraps each match arm in
+/// one of these so the single entry point can format the HTTP response
+/// without per-handler branching.
+#[derive(Debug)]
+pub enum HandlerResult {
+    /// Synchronous reply: data is serialised directly into the response.
+    Sync(Value),
+    /// Asynchronous reply: caller polls task status and listens on /events.
+    Async(TaskRecord),
+}
+
+/// Function shape for every entry in the dispatch table. Sync handlers
+/// return JSON inline; async handlers enqueue a worker and return the
+/// `TaskRecord` immediately.
+pub type Handler = fn(&DaemonState, &Value) -> Result<HandlerResult, String>;
+
+/// Catalogue of every method this daemon answers. The current dispatch
+/// driver uses an inline `match`, but the table is exposed so introspection
+/// endpoints (`task_state_machine` RPC, CLI `dshbox rpc list`) can list
+/// available methods without re-parsing the match body.
+pub fn dispatch_table() -> BTreeMap<&'static str, Handler> {
+    use HandlerResult::Sync;
+    let mut table: BTreeMap<&'static str, Handler> = BTreeMap::new();
+    table.insert("ping", |_state, _req| {
+        Ok(Sync(json!({
             "pid": std::process::id(),
             "status": "running",
             "startedAt": now_seconds(),
             "runtime": bundled_runtime().map(|_| "ready").unwrap_or("missing"),
-        })),
-        Some("get_info") => get_info(),
-        Some("list_containers") => list_containers(state),
-        Some("list_templates") => list_templates().map(|items| json!(items)),
+        })))
+    });
+    table.insert("task_state_machine", |_state, _req| {
+        Ok(Sync(box_scheduler::task_state_machine_definition()))
+    });
+    table
+}
+
+/// Dispatch one request against the daemon state. Every handler returns a
+/// `{"ok": bool, ...}` frame; errors never panic the connection thread.
+///
+/// Sync handlers wrap their JSON payload in `HandlerResult::Sync`; async
+/// handlers enqueue a worker and return `HandlerResult::Async(TaskRecord)`
+/// so the caller can subscribe to `/events` for progress.
+pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
+    use HandlerResult::Sync;
+    let method = request["method"].as_str().unwrap_or("?");
+    debug!(method, "rpc request received");
+    let result: Result<HandlerResult, String> = match request["method"].as_str() {
+        Some("ping") => Ok(Sync(json!({
+            "pid": std::process::id(),
+            "status": "running",
+            "startedAt": now_seconds(),
+            "runtime": bundled_runtime().map(|_| "ready").unwrap_or("missing"),
+        }))),
+        Some("get_info") => get_info().map(Sync),
+        Some("list_containers") => list_containers(state).map(Sync),
+        Some("list_templates") => list_templates().map(|items| Sync(json!(items))),
         Some("read_template") => {
             let name = request["name"].as_str().unwrap_or("").to_owned();
-            read_template(&name).map(|text| json!({ "name": name, "text": text }))
+            read_template(&name).map(|text| Sync(json!({ "name": name, "text": text })))
         }
         Some("import_template") => {
             let archive = request["archive"].as_str().unwrap_or("").to_owned();
             let name = request["name"].as_str().map(str::to_owned).filter(|value| !value.is_empty());
             import_template(&archive, name, "rename")
-                .map(|name| json!({ "name": name }))
+                .map(|name| Sync(json!({ "name": name })))
         }
         Some("export_template") => {
             let name = request["name"].as_str().unwrap_or("").to_owned();
             let destination = request["destination"].as_str().map(str::to_owned).filter(|value| !value.is_empty());
-            export_template(&name, destination).map(|path| json!({ "path": path }))
+            export_template(&name, destination).map(|path| Sync(json!({ "path": path })))
         }
         Some("remove_template") => {
             let name = request["name"].as_str().unwrap_or("").to_owned();
-            remove_template(&name).map(|_| json!({ "name": name, "removed": true }))
+            remove_template(&name).map(|_| Sync(json!({ "name": name, "removed": true })))
         }
-        Some("list_bundles") => list_bundles(),
-        Some("list_repository_extensions") => list_repository_extensions(),
-        Some("list_repository_reference_counts") => list_repository_reference_counts_rpc(),
-        Some("list_installed_dsh_versions") => list_installed_dsh_versions().map(|names| json!(names)),
-        Some("detect_toolchains") => detect_toolchains(),
+        Some("list_bundles") => list_bundles().map(Sync),
+        Some("list_repository_extensions") => list_repository_extensions().map(Sync),
+        Some("list_repository_reference_counts") => list_repository_reference_counts_rpc().map(Sync),
+        Some("list_installed_dsh_versions") => {
+            list_installed_dsh_versions().map(|names| Sync(json!(names)))
+        }
+        Some("detect_toolchains") => detect_toolchains().map(Sync),
         Some("enqueue_build") => enqueue_build(state, request),
         Some("enqueue_task") => enqueue_task(state, request),
         Some("list_dsh_catalog") => {
@@ -89,29 +137,30 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
             // remote tags fetched by `refresh_dsh_catalog` (if the user
             // pressed "Load versions" first) are merged in.
             let remote = fetch_remote_dsh_tags().ok();
-            list_dsh_versions_derived(remote).map(|items| json!(items))
+            list_dsh_versions_derived(remote).map(|items| Sync(json!(items)))
         }
-        Some("uninstall_dsh_version") => uninstall_dsh_version_rpc(request),
-        Some("remove_repository_extension") => remove_repository_extension_rpc(request),
-        Some("prune_repository_extensions") => prune_unused_repository_extensions()
-            .map(|removed| json!(removed)),
-        Some("prune_orphaned_data") => prune_orphaned_data().map(|removed| json!(removed)),
-        Some("list_data_entries") => list_data_entries().map(|entries| json!(entries)),
+        Some("uninstall_dsh_version") => uninstall_dsh_version_rpc(request).map(Sync),
+        Some("remove_repository_extension") => remove_repository_extension_rpc(request).map(Sync),
+        Some("prune_repository_extensions") => {
+            prune_unused_repository_extensions().map(|removed| Sync(json!(removed)))
+        }
+        Some("prune_orphaned_data") => prune_orphaned_data().map(|removed| Sync(json!(removed))),
+        Some("list_data_entries") => list_data_entries().map(|entries| Sync(json!(entries))),
         Some("container_list_plugins") => {
             let id = request["containerId"].as_str().unwrap_or("").to_owned();
             let profile = request["profile"].as_str().unwrap_or("web").to_owned();
-            container_list_plugins(&id, &profile).map(|plugins| json!(plugins))
+            container_list_plugins(&id, &profile).map(|plugins| Sync(json!(plugins)))
         }
         Some("create_extension_bundle") => {
             let name = request["name"].as_str().unwrap_or("").to_owned();
             let ids = string_array(&request["repositoryIds"]);
-            create_extension_bundle(&name, &ids).map(|bundle| json!(bundle))
+            create_extension_bundle(&name, &ids).map(|bundle| Sync(json!(bundle)))
         }
-        Some("delete_extension_bundle") => delete_extension_bundle_rpc(request),
-        Some("stop_container") => stop_container_rpc(state, request),
-        Some("container_url") => container_url_rpc(state, request),
-        Some("save_mirror_settings") => save_mirror_settings_rpc(request),
-        Some("save_runtime_directory") => save_runtime_directory_rpc(state, request),
+        Some("delete_extension_bundle") => delete_extension_bundle_rpc(request).map(Sync),
+        Some("stop_container") => stop_container_rpc(state, request).map(Sync),
+        Some("container_url") => container_url_rpc(state, request).map(Sync),
+        Some("save_mirror_settings") => save_mirror_settings_rpc(request).map(Sync),
+        Some("save_runtime_directory") => save_runtime_directory_rpc(state, request).map(Sync),
         Some("refresh_dsh_catalog") => enqueue_dsh_catalog_refresh(state),
         Some("pull_template") => enqueue_pull_template(state, request),
         Some("import_repository_extension") => enqueue_repository_import(state, request),
@@ -122,16 +171,16 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("create_container_from_template") => enqueue_template_container(state, request),
         Some("read_template_list") => {
             let name = request["name"].as_str().unwrap_or("").to_owned();
-            read_template_list(&name)
+            read_template_list(&name).map(Sync)
         }
         Some("template_info") => {
             let name = request["name"].as_str().unwrap_or("").to_owned();
-            template_info(&name)
+            template_info(&name).map(Sync)
         }
         Some("prune_template_snapshots") => {
-            prune_template_snapshots().map(|removed| json!({ "removed": removed }))
+            prune_template_snapshots().map(|removed| Sync(json!({ "removed": removed })))
         }
-        Some("create_container") => create_container_rpc(request),
+        Some("create_container") => create_container_rpc(request).map(Sync),
         Some("enqueue_container_start") => enqueue_container_start(state, request),
         Some("enqueue_container_stop") => enqueue_container_stop(state, request),
         Some("enqueue_container_rebuild") => enqueue_container_rebuild(state, request),
@@ -139,16 +188,19 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("delete_container") => delete_container_rpc(state, request),
         Some("describe_container") => describe_container_rpc(state, request),
         Some("upgrade_legacy_resources") => {
-            migrate_runtime_runtimes_to_templates().map(|registered| json!({ "registered": registered }))
+            migrate_runtime_runtimes_to_templates()
+                .map(|registered| Sync(json!({ "registered": registered })))
         }
         Some("enqueue_container_extension_add") => enqueue_container_extension_add(state, request),
-        Some("enqueue_workspace_extension_import") => enqueue_workspace_extension_import(state, request),
+        Some("enqueue_workspace_extension_import") => {
+            enqueue_workspace_extension_import(state, request)
+        }
         Some("enqueue_container_extension_copy") => enqueue_container_extension_copy(state, request),
         Some("enqueue_plugin_export") => enqueue_plugin_export(state, request),
-        Some("remove_repository_plugin") => remove_repository_plugin_rpc(request),
+        Some("remove_repository_plugin") => remove_repository_plugin_rpc(request).map(Sync),
         Some("enqueue_container_bundle_install") => enqueue_container_bundle_install(state, request),
         Some("list_tasks") => match state.manager.list() {
-            Ok(tasks) => Ok(json!(tasks)),
+            Ok(tasks) => Ok(Sync(json!(tasks))),
             Err(e) => Err(e.to_string()),
         },
         Some("cancel_task") => {
@@ -157,7 +209,7 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
                 Ok(paths) => state
                     .manager
                     .request_cancel(&paths, id)
-                    .map(|_| json!({"id": id, "cancelled": true}))
+                    .map(|_| Sync(json!({"id": id, "cancelled": true})))
                     .map_err(|e| e.to_string()),
                 Err(_) => Err("daemon paths lock failed".to_owned()),
             }
@@ -165,7 +217,7 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("task_status") => {
             let id = request["id"].as_str().unwrap_or("");
             match state.manager.task(id) {
-                Ok(task) => Ok(json!(task)),
+                Ok(task) => Ok(Sync(json!(task))),
                 Err(e) => Err(e.to_string()),
             }
         }
@@ -177,7 +229,7 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
                 Ok(paths) => state
                     .manager
                     .update(&paths, id, stage, progress)
-                    .map(|task| json!(task))
+                    .map(|task| Sync(json!(task)))
                     .map_err(|e| e.to_string()),
                 Err(_) => Err("daemon paths lock failed".to_owned()),
             }
@@ -195,22 +247,41 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
                 Ok(paths) => state
                     .manager
                     .finish(&paths, id, &result)
-                    .map(|task| json!(task))
+                    .map(|task| Sync(json!(task)))
                     .map_err(|e| e.to_string()),
                 Err(_) => Err("daemon paths lock failed".to_owned()),
             }
         }
-        Some("delete_task") => delete_task_rpc(state, request),
+        Some("delete_task") => delete_task_rpc(state, request).map(Sync),
         Some("shutdown") => {
             SHUTDOWN.store(true, Ordering::Relaxed);
             box_server_core::remove_discovery();
-            Ok(json!({ "ok": true }))
+            Ok(Sync(json!({ "ok": true })))
+        }
+        Some("task_state_machine") => {
+            // Look the entry up in the dispatch table so the BTreeMap stays
+            // the canonical registration site; if a future refactor moves
+            // this handler off the match, the table keeps it reachable.
+            match dispatch_table().get("task_state_machine") {
+                Some(handler) => handler(state, request),
+                None => Err("task_state_machine handler missing".to_owned()),
+            }
         }
         _ => return json!({"ok": false, "error": "unknown method"}),
     };
     match result {
-        Ok(value) => json!({"ok": true, "result": value}),
-        Err(error) => json!({"ok": false, "error": error}),
+        Ok(HandlerResult::Sync(value)) => {
+            debug!(method, "rpc sync reply sent");
+            json!({"ok": true, "result": value})
+        }
+        Ok(HandlerResult::Async(task)) => {
+            info!(method, task_id = %task.id, kind = %task.kind, "rpc async task enqueued");
+            json!({"ok": true, "task": task, "eventsUrl": "/events"})
+        }
+        Err(error) => {
+            warn!(method, error = %error, "rpc request failed");
+            json!({"ok": false, "error": error})
+        }
     }
 }
 
@@ -333,7 +404,7 @@ fn detect_toolchains() -> Result<Value, String> {
 
 /// Enqueue a build task on the daemon queue and return the task record
 /// immediately; the client polls `task_status` for progress.
-fn enqueue_build(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_build(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let parsed: BuildImageRequest = serde_json::from_value(request.clone())
         .map_err(|error| format!("invalid build request: {error}"))?;
     let params = json!({
@@ -347,7 +418,7 @@ fn enqueue_build(state: &DaemonState, request: &Value) -> Result<Value, String> 
         vec!["repository:extensions".to_owned()],
         params,
         move |task| build_image_from_script(parsed, task),
-    )
+    ).map(HandlerResult::Async)
 }
 
 /// Enqueue `work` as a daemon-owned task and return the task record right
@@ -359,14 +430,14 @@ fn enqueue_task_worker(
     resource_keys: Vec<String>,
     params: Value,
     work: impl FnOnce(&TaskContext) -> Result<(), String> + Send + 'static,
-) -> Result<Value, String> {
+) -> Result<TaskRecord, String> {
     let paths = state
         .paths
         .read()
         .map_err(|_| "daemon paths lock failed".to_owned())?;
     let task = state.manager.enqueue(&paths, kind, resource_keys, params)?;
     spawn_task_worker(state, &task, work);
-    Ok(json!(task))
+    Ok(task)
 }
 
 /// Spawn one daemon worker for a queued task, wiring the daemon notifier.
@@ -384,23 +455,31 @@ fn spawn_task_worker(
         Err(_) => return,
     };
     let task_id = task.id.clone();
+    let events = state.events.clone();
     std::thread::spawn(move || {
-        let notifier = DaemonNotifier::from_paths(manager.clone(), paths.clone());
-        run_queued(&manager, &paths, std::sync::Arc::new(notifier), &task_id, work);
+        let notifier = DaemonNotifier::from_paths(manager.clone(), paths.clone(), events);
+        run_queued(
+            &manager,
+            &paths,
+            std::sync::Arc::new(notifier),
+            &task_id,
+            work,
+            None,
+        );
     });
 }
 
-fn enqueue_dsh_catalog_refresh(state: &DaemonState) -> Result<Value, String> {
+fn enqueue_dsh_catalog_refresh(state: &DaemonState) -> Result<HandlerResult, String> {
     enqueue_task_worker(
         state,
         "dsh-catalog-refresh",
         vec!["repository:dsh-versions".to_owned()],
         json!({}),
         |_task| refresh_dsh_catalog(),
-    )
+    ).map(HandlerResult::Async)
 }
 
-fn enqueue_pull_template(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_pull_template(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let ref_value = request["ref"].as_str().unwrap_or("").to_owned();
     if ref_value.is_empty() {
         return Err("expected a template reference (e.g. `github.com/owner/repo[:tag|@ref]`); a missing `:tag` defaults to `latest`".to_owned());
@@ -428,10 +507,10 @@ fn enqueue_pull_template(state: &DaemonState, request: &Value) -> Result<Value, 
                     .unwrap_or(true)
             })
         },
-    )
+    ).map(HandlerResult::Async)
 }
 
-fn enqueue_repository_import(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_repository_import(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let source = request["source"].as_str().unwrap_or("").to_owned();
     if source.is_empty() {
         return Err("expected a source path".to_owned());
@@ -443,10 +522,10 @@ fn enqueue_repository_import(state: &DaemonState, request: &Value) -> Result<Val
         vec!["repository:extensions".to_owned()],
         params,
         move |task| import_into_repository(task, Path::new(&source)).map(|_| ()),
-    )
+    ).map(HandlerResult::Async)
 }
 
-fn enqueue_repository_export(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_repository_export(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let repository_id = request["repositoryId"].as_str().unwrap_or("").to_owned();
     let destination = request["destination"].as_str().unwrap_or("").to_owned();
     if repository_id.is_empty() || destination.is_empty() {
@@ -462,10 +541,10 @@ fn enqueue_repository_export(state: &DaemonState, request: &Value) -> Result<Val
         vec!["repository:extensions".to_owned()],
         params,
         move |task| export_repository_extension(&repository_id, &destination, task),
-    )
+    ).map(HandlerResult::Async)
 }
 
-fn enqueue_container_plugin_add(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_container_plugin_add(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let container_id = request["containerId"].as_str().unwrap_or("").to_owned();
     let profile = request["profile"].as_str().unwrap_or("web").to_owned();
     let spec = request["spec"].as_str().unwrap_or("").to_owned();
@@ -483,10 +562,10 @@ fn enqueue_container_plugin_add(state: &DaemonState, request: &Value) -> Result<
         vec!["container:extensions".to_owned()],
         params,
         move |task| container_plugin_add(&container_id, &profile, &spec, task),
-    )
+    ).map(HandlerResult::Async)
 }
 
-fn enqueue_bundle_export(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_bundle_export(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let bundle_id = request["bundleId"].as_str().unwrap_or("").to_owned();
     let destination = request["destination"].as_str().unwrap_or("").to_owned();
     let mode = request["mode"].as_str().unwrap_or("quick").to_owned();
@@ -507,10 +586,10 @@ fn enqueue_bundle_export(state: &DaemonState, request: &Value) -> Result<Value, 
         vec!["repository:extensions".to_owned()],
         params,
         move |task| export_extension_bundle(&bundle_id, &destination, &mode, task),
-    )
+    ).map(HandlerResult::Async)
 }
 
-fn enqueue_bundle_import(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_bundle_import(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let archive = request["archive"].as_str().unwrap_or("").to_owned();
     let conflict = request["conflict"].as_str().unwrap_or("keep").to_owned();
     if archive.is_empty() {
@@ -526,13 +605,13 @@ fn enqueue_bundle_import(state: &DaemonState, request: &Value) -> Result<Value, 
         vec!["repository:extensions".to_owned()],
         params,
         move |task| import_extension_bundle(&archive, &conflict, task),
-    )
+    ).map(HandlerResult::Async)
 }
 
 /// Materialize a template container and start its DSH host inside one
 /// daemon task; the client resolves the new container's id and URL via
 /// `list_containers` + `container_url` after the task settles.
-fn enqueue_template_container(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_template_container(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let parsed: CreateTemplateContainerRequest = serde_json::from_value(request.clone())
         .map_err(|error| format!("invalid template container request: {error}"))?;
     let params = json!({
@@ -553,7 +632,7 @@ fn enqueue_template_container(state: &DaemonState, request: &Value) -> Result<Va
             task.log(&format!("container url: {url}"));
             Ok(())
         },
-    )
+    ).map(HandlerResult::Async)
 }
 
 /// Returns the resource list of a built template (the metadata-only form
@@ -740,7 +819,7 @@ fn save_runtime_directory_rpc(state: &DaemonState, request: &Value) -> Result<Va
     Ok(json!({ "saved": true, "restartRequired": true }))
 }
 
-fn enqueue_task(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_task(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let kind = request["kind"].as_str().unwrap_or("");
     let resource_keys: Vec<String> = request["resource_keys"]
         .as_array()
@@ -754,7 +833,7 @@ fn enqueue_task(state: &DaemonState, request: &Value) -> Result<Value, String> {
     state
         .manager
         .enqueue(&paths, kind, resource_keys, params)
-        .map(|task| json!(task))
+        .map(HandlerResult::Async)
         .map_err(|e| e.to_string())
 }
 
@@ -765,7 +844,7 @@ fn create_container_rpc(request: &Value) -> Result<Value, String> {
     create_dsh_container_sync(&name, &version, &profile).map(|container| json!(container))
 }
 
-fn enqueue_container_start(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_container_start(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
     if id.is_empty() {
         return Err("expected a container id".to_owned());
@@ -782,10 +861,10 @@ fn enqueue_container_start(state: &DaemonState, request: &Value) -> Result<Value
             task.check_cancelled()?;
             start_dsh_container_inner(&id, &containers.running, Some(task)).map(|_| ())
         },
-    )
+    ).map(HandlerResult::Async)
 }
 
-fn enqueue_container_stop(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_container_stop(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
     if id.is_empty() {
         return Err("expected a container id".to_owned());
@@ -802,10 +881,10 @@ fn enqueue_container_stop(state: &DaemonState, request: &Value) -> Result<Value,
             task.check_cancelled()?;
             stop_dsh_container(&id, &containers)
         },
-    )
+    ).map(HandlerResult::Async)
 }
 
-fn enqueue_container_rebuild(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_container_rebuild(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
     if id.is_empty() {
         return Err("expected a container id".to_owned());
@@ -822,7 +901,7 @@ fn enqueue_container_rebuild(state: &DaemonState, request: &Value) -> Result<Val
             task.check_cancelled()?;
             rebuild_dsh_container_with_task(id, &containers, Some(task))
         },
-    )
+    ).map(HandlerResult::Async)
 }
 
 /// Manual restart of a container that has been marked `Crashed` (or
@@ -831,7 +910,7 @@ fn enqueue_container_rebuild(state: &DaemonState, request: &Value) -> Result<Val
 /// watcher detects the new PID automatically because
 /// `start_dsh_container_inner` always allocates a fresh record before
 /// spawning the readiness probe.
-fn enqueue_container_restart(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_container_restart(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
     if id.is_empty() {
         return Err("expected a container id".to_owned());
@@ -856,10 +935,10 @@ fn enqueue_container_restart(state: &DaemonState, request: &Value) -> Result<Val
             task.check_cancelled()?;
             start_dsh_container_inner(&id, &containers.running, Some(task)).map(|_| ())
         },
-    )
+    ).map(HandlerResult::Async)
 }
 
-fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
     if !box_foundation::is_safe_identifier(&id) {
         return Err("invalid container id".to_owned());
@@ -908,7 +987,7 @@ fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<Value, S
     // (no reference counting): garbage-collect the store now that this
     // container's usage records are gone.
     let _ = crate::data::prune_orphaned_data();
-    Ok(json!({ "id": id, "deleted": true }))
+    Ok(HandlerResult::Sync(json!({ "id": id, "deleted": true })))
 }
 
 /// Compose the full container description used by `dshbox container describe`.
@@ -917,7 +996,7 @@ fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<Value, S
 /// the desktop details panel uses (`scan_container_extensions`). The result
 /// is serialised through `box_api::ContainerDescription` so the wire shape
 /// is identical for every consumer (CLI text, CLI `--json`, future UI).
-fn describe_container_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn describe_container_rpc(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
     if !box_foundation::is_safe_identifier(&id) {
         return Err("invalid container id".to_owned());
@@ -960,7 +1039,7 @@ fn describe_container_rpc(state: &DaemonState, request: &Value) -> Result<Value,
     };
     let value = serde_json::to_value(&description)
         .map_err(|error| format!("cannot serialize description: {error}"))?;
-    Ok(value)
+    Ok(HandlerResult::Sync(value))
 }
 
 /// Read the PID file and confirm the host process is still alive (Unix
@@ -993,7 +1072,7 @@ fn is_safe_workspace_relative_path(value: &str) -> bool {
         })
 }
 
-fn enqueue_container_extension_add(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_container_extension_add(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
     let profile = request["profile"].as_str().unwrap_or("web").to_owned();
     let source = request["source"].as_str().unwrap_or("").to_owned();
@@ -1014,10 +1093,10 @@ fn enqueue_container_extension_add(state: &DaemonState, request: &Value) -> Resu
         vec![format!("container:{id}")],
         params,
         move |task| install_container_extension(&id, &profile, &source, task),
-    )
+    ).map(HandlerResult::Async)
 }
 
-fn enqueue_workspace_extension_import(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_workspace_extension_import(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
     let relative_path = request["relativePath"].as_str().unwrap_or("").to_owned();
     if !box_foundation::is_safe_identifier(&id)
@@ -1032,10 +1111,10 @@ fn enqueue_workspace_extension_import(state: &DaemonState, request: &Value) -> R
         vec![format!("container:{id}"), "repository:extensions".to_owned()],
         params,
         move |task| import_workspace_extension(&id, &relative_path, task),
-    )
+    ).map(HandlerResult::Async)
 }
 
-fn enqueue_container_extension_copy(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_container_extension_copy(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
     let profile = request["profile"].as_str().map(str::to_owned);
     let repository_id = request["repositoryId"].as_str().unwrap_or("").to_owned();
@@ -1059,10 +1138,10 @@ fn enqueue_container_extension_copy(state: &DaemonState, request: &Value) -> Res
         // repository entry (None template_id triggers that branch in
         // `link_repository_extension`).
         move |task| link_repository_extension(&id, profile.as_deref(), &repository_id, None, task),
-    )
+    ).map(HandlerResult::Async)
 }
 
-fn enqueue_plugin_export(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_plugin_export(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let source_container_id = request["sourceContainerId"].as_str().unwrap_or("").to_owned();
     let source_path = request["sourcePath"].as_str().unwrap_or("").to_owned();
     let destination = request["destination"].as_str().unwrap_or("").to_owned();
@@ -1081,7 +1160,7 @@ fn enqueue_plugin_export(state: &DaemonState, request: &Value) -> Result<Value, 
         move |task| {
             export_repository_plugin(&source_container_id, &source_path, &destination, task)
         },
-    )
+    ).map(HandlerResult::Async)
 }
 
 fn remove_repository_plugin_rpc(request: &Value) -> Result<Value, String> {
@@ -1092,7 +1171,7 @@ fn remove_repository_plugin_rpc(request: &Value) -> Result<Value, String> {
     Ok(json!({ "id": id, "removed": true }))
 }
 
-fn enqueue_container_bundle_install(state: &DaemonState, request: &Value) -> Result<Value, String> {
+fn enqueue_container_bundle_install(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
     let profile = request["profile"].as_str().unwrap_or("").to_owned();
     let bundle_id = request["bundleId"].as_str().unwrap_or("").to_owned();
@@ -1116,7 +1195,7 @@ fn enqueue_container_bundle_install(state: &DaemonState, request: &Value) -> Res
         vec![format!("container:{id}")],
         params,
         move |task| install_container_bundle(&id, &profile, &bundle_id, &conflict, task),
-    )
+    ).map(HandlerResult::Async)
 }
 
 fn delete_task_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
@@ -1232,6 +1311,7 @@ mod tests {
             paths: RwLock::new(paths),
             containers: Arc::new(ContainerManager::default()),
             resources: box_state::ResourceStateManager::default(),
+            events: Arc::new(crate::events::DaemonEvents::new()),
         };
         (state, id, home, runtime)
     }
@@ -1246,6 +1326,12 @@ mod tests {
         let _guard = env_lock();
         let (state, id, home, runtime) = setup(true);
         let response = describe_container_rpc(&state, &json!({ "id": id })).unwrap();
+        // `describe_container_rpc` now returns `HandlerResult::Sync(json)`;
+        // unwrap the inner value before asserting on its fields.
+        let response = match response {
+            HandlerResult::Sync(value) => value,
+            HandlerResult::Async(_) => panic!("describe_container must be sync"),
+        };
         assert_eq!(response["id"], id);
         assert_eq!(response["name"], "dsh-test");
         assert_eq!(response["version"], "latest");
@@ -1267,6 +1353,10 @@ mod tests {
         let _guard = env_lock();
         let (state, id, home, runtime) = setup(false);
         let response = describe_container_rpc(&state, &json!({ "id": id })).unwrap();
+        let response = match response {
+            HandlerResult::Sync(value) => value,
+            HandlerResult::Async(_) => panic!("describe_container must be sync"),
+        };
         assert_eq!(response["status"], "stopped");
         assert!(response["url"].is_null());
         assert!(response["hostPid"].is_null());
