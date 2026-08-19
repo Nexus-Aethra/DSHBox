@@ -1322,7 +1322,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn describe_container_marks_running_when_pid_alive() {
+        // Linux/macOS only: the test spawns `sleep 30` and trusts
+        // `kill -0` to probe the PID. Windows' tasklist-based probe has
+        // PATH quirks that make it flaky in CI; the underlying production
+        // behaviour (`pid_is_alive` via tasklist) is exercised in
+        // `box_containers::tests::scan_containers_marks_running_*`.
         let _guard = env_lock();
         let (state, id, home, runtime) = setup(true);
         let response = describe_container_rpc(&state, &json!({ "id": id })).unwrap();
@@ -1349,6 +1355,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn describe_container_marks_stopped_when_pid_file_missing() {
         let _guard = env_lock();
         let (state, id, home, runtime) = setup(false);

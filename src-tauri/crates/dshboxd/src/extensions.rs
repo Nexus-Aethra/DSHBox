@@ -902,9 +902,17 @@ mod tests {
     }
 
     fn make_plugin_source(name: &str, version: &str) -> PathBuf {
+        // Mix nanosecond timestamp with PID so back-to-back invocations
+        // never collide on the same directory name. Seconds-resolution
+        // timestamps were prone to races when cargo test ran two cases
+        // within the same wall-clock second.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
         let dir = env::temp_dir().join(format!(
-            "dshboxd-ext-src-{name}-{version}-{}",
-            now_seconds()
+            "dshboxd-ext-src-{name}-{version}-{pid}-{nanos}"
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -938,7 +946,12 @@ mod tests {
         let home = sandbox("dedup-home");
         let runtime = sandbox("dedup-runtime");
         write_config(&home, &runtime);
+        // `box_foundation::config_path` honours `DSHBOX_CONFIG_DIR`; this
+        // is what production-like reads see on Windows where `HOME` is
+        // ignored by `dirs::home_dir()`. The HOME line is kept for
+        // compatibility with Linux/macOS where `dirs` falls back to it.
         let _guard = EnvGuard::set("HOME", &home);
+        let _dshbox_dir = EnvGuard::set("DSHBOX_CONFIG_DIR", &home.join(".dsh-box"));
 
         let source_a = make_plugin_source("dsh-better-sidebar", "0.12.3");
         let task = test_task(&runtime);
