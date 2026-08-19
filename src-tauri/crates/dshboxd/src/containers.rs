@@ -33,7 +33,7 @@ description: Use when working with DSH Box — authoring a boxfile (`.dsh`), cho
 
 `dshbox` 是 DSH 容器**外部**的管理 CLI——它装模板、拉插件、起停容器、跑 boxfile build/run 全链路。`dsh` 是 DSH 容器**内部**的 agent CLI——你在容器里跟 agent 对话时调的是 `dsh`,不是 `dshbox`。
 
-> 记住这条边界: **容器管理走 `dshbox`;容器内跟 agent 对话走 `dsh`。** 容器里 `dshbox` 也在 PATH 上(它是 thin RPC client,跟本地 daemon 通讯),但你日常基本不会直接调它。
+36	> 记住这条边界: **容器管理走 `dshbox`;容器内跟 agent 对话走 `dsh`。** 容器里 `dshbox` 也在 PATH 上(它是 thin RPC client,跟本地 daemon 通过 HTTP 通讯),但你日常基本不会直接调它。
 
 `dshbox` 命令分四组:**Workflow**(init / pull / build / run 起一个完整容器)、**Template 管理**(template ls / show / rm)、**Plugin & Skill**(plugin ls / import / install / skill install)、**Container 操作**(ps / container start / stop / restart / rm / logs / url)。完整列表 `dshbox help`。
 
@@ -234,32 +234,55 @@ DSH Box 在 build 阶段会自动:
 
 ### 单 daemon + 多 thin client
 
-DSH Box 只有一个长进程:**`dshboxd`**。它拥有 task queue、所有运行中的容器 host 进程、plugin 安装、template store。`dshbox` CLI 和桌面 Tauri 都是 thin RPC client,跟 daemon 通过 `127.0.0.1:<port>` 上的 `POST /rpc` 通讯(token 在 JSON body 里)。
+	DSH Box 只有一个长进程:**`dshboxd`**。它拥有 task queue、所有运行中的容器 host 进程、plugin 安装、template store。`dshbox` CLI 和桌面 Tauri 都是 thin RPC client,跟 daemon 通过 `127.0.0.1:<port>` 上的 `POST /rpc` 通讯(token 在 JSON body 里)。
 
-```
-        ┌────────────────────────┐
-        │ dshboxd (single owner) │
-        │  - tasks / plugins     │
-        │  - container hosts     │
-        │  - template store      │
-        │  - ~/.dsh-box/server/  │
-        └───────────▲────────────┘
-                    │ JSON-RPC (token in body)
-        ┌───────────┴────────────┐
-        │  thin clients         │
-        │  - `dsh` CLI          │
-        │  - Tauri desktop UI   │
-        │  - WebView container  │
-        └────────────────────────┘
-```
+	```
+	        ┌────────────────────────┐
+	        │ dshboxd (single owner) │
+	        │  - tasks / plugins     │
+	        │  - container hosts     │
+	        │  - template store      │
+	        │  - ~/.dsh-box/server/  │
+	        └───────────▲────────────┘
+	                    │ POST /rpc + GET /events (SSE)
+	        ┌───────────┴────────────┐
+	        │  thin clients         │
+	        │  - `dshbox` CLI       │
+	        │  - Tauri desktop UI   │
+	        │  - curl (debug)       │
+	        └────────────────────────┘
+	```
 
-### 单实例保护
+	### 双模 RPC: sync / async
 
-`dshboxd` 启动时读 `~/.dsh-box/server/discovery.json` 里的旧 daemon 的 PID/端口,做 `TCP connect_timeout(250ms)`。连得上 → 旧 daemon 还活着,新 daemon 退出。连不上 → 僵尸 discovery,清掉继续 bind。所以两个 `dshboxd` 不会并发跑。
+	`POST /rpc` 是所有客户端的唯一入口。daemon 自己决定 sync 还是 async：
 
-### 容器 host 进程的生命周期
+	- **同步方法**（`list_templates`, `ping`, `cancel_task`, `save_*`）直接返回 JSON：`{"ok":true,"result":...}`
+	- **异步方法**（`pull_template`, `create_container_from_template`, `enqueue_container_start`）排队任务后立即返回 `{"ok":true,"task":{...},"eventsUrl":"/events"}`
+	- 客户端不需要指定 sync/async——daemon 通过 `HandlerResult::Sync/Async` 枚举自动区分
 
-每个容器启动时:
+	### SSE 事件流 (GET /events)
+
+	异步任务的进度通过 SSE (Server-Sent Events) 实时推送：
+
+	```
+	curl -N "http://127.0.0.1:<port>/events?token=..."
+
+	→ event: snapshot    data: {"tasks":[...]}
+	→ event: TaskStage   data: {"id":"...","stage":"Installing","progress":45}
+	→ event: TaskLog     data: {"id":"...","log":"downloading..."}
+	→ event: TaskFinished data: {"id":"...","status":"succeeded"}
+	```
+
+	桌面 Tauri 的 `events.rs` 订阅 SSE 并桥接为 `daemon://event` 事件，`useTasks.ts` 前端按 `event` 字段路由。跑 `curl -N` 就能一行行看到所有任务进度。
+
+	### 单实例保护
+
+	`dshboxd` 启动时读 `~/.dsh-box/server/discovery.json` 里的旧 daemon 的 PID/端口,做 `TCP connect_timeout(250ms)`。连得上 → 旧 daemon 还活着,新 daemon 退出。连不上 → 僵尸 discovery,清掉继续 bind。所以两个 `dshboxd` 不会并发跑。
+
+	### 容器 host 进程的生命周期
+
+	每个容器启动时:
 
 1. `start_dsh_container_inner` 用 `setsid` 让 host 成为 process group leader,spawn `pnpm dsh --profile ...`
 2. 写入 `instances/<id>/state/host.json`(字段: `hostPid`, `hostPgid`, `hostPort`, `hostUrl`, `state`, `generation`, ...)
