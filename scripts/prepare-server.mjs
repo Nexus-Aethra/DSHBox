@@ -5,6 +5,20 @@ import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
 import { hashInputs, isFresh } from './mtime.mjs'
 
+function walkRustFiles(dir) {
+  const { readdirSync, statSync } = require('node:fs')
+  const files = []
+  try {
+    for (const entry of readdirSync(dir)) {
+      const p = join(dir, entry)
+      const st = statSync(p)
+      if (st.isDirectory()) files.push(...walkRustFiles(p))
+      else if (entry.endsWith('.rs')) files.push(p)
+    }
+  } catch { /* skip missing dirs */ }
+  return files
+}
+
 const target = process.env.DSH_BOX_RUNTIME_TARGET ?? ({ linux: { x64: 'linux-x64', arm64: 'linux-arm64' }, win32: { x64: 'win-x64', arm64: 'win-arm64' }, darwin: { x64: 'macos-x64', arm64: 'macos-arm64' } }[platform]?.[arch])
 if (!target) throw new Error(`unsupported server target: ${platform}-${arch}`)
 const destination = join('src-tauri', 'resources', 'server', target, `dshboxd${target.startsWith('win-') ? '.exe' : ''}`)
@@ -26,18 +40,17 @@ if (isFresh(destination, sources, force)) {
 // dshboxd crate sources + Cargo.lock are byte-identical to the last
 // successful build. The Cargo.lock mtime flips on every workspace build
 // (unrelated crates), so mtime alone would force a needless rebuild.
+//
+// We hash all .rs files under dshboxd/src/ plus the Cargo.lock, not just
+// main.rs, because changes to lifecycle.rs, containers.rs, toolchains.rs,
+// etc. all affect the daemon's behavior.
 const cacheRoot = join('.cache', 'dsh-box', 'server')
 await mkdir(cacheRoot, { recursive: true })
 const cacheFile = join(cacheRoot, `${target}.sha256`)
 const inputs = [
   join('src-tauri', 'Cargo.lock'),
-  // dshboxd + every box-* crate it depends on transitively (foundation,
-  // runtime, scheduler, state, ...). Hashing the whole crate tree would
-  // be expensive — dshboxd's own sources + Cargo.lock is enough for the
-  // common case where dependencies are pinned.
   join('src-tauri', 'crates', 'dshboxd', 'Cargo.toml'),
-  join('src-tauri', 'crates', 'dshboxd', 'Cargo.lock'),
-  join('src-tauri', 'crates', 'dshboxd', 'src', 'main.rs'),
+  ...walkRustFiles(join('src-tauri', 'crates', 'dshboxd', 'src')),
 ]
 if (hashInputs(cacheFile, inputs, force)) {
   if (existsSync(destination)) {
