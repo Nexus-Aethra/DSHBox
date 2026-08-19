@@ -195,6 +195,20 @@ pub(crate) fn start_dsh_container_inner(
         }
         let plugins_node_modules =
             PathBuf::from(&root).join("plugins").join("node_modules");
+        // Wait for the harness runtime's pnpm store to finish initialising.
+        // `pull_template` only clones the repo — it does NOT run `pnpm
+        // install` — so the first container create on a freshly-installed
+        // harness races the on-demand `pnpm install` in the container-build
+        // path above. If we spawn node before pnpm has linked `tsx` (and
+        // the rest of the ESM deps) into `source/node_modules/`, Node v24's
+        // ESM resolver reports `ERR_MODULE_NOT_FOUND` for the `--import`
+        // specifier. Bound the wait to a few seconds — pnpm install for the
+        // dsh monorepo typically lands within a second once started, so a
+        // short poll is enough; if it takes longer the actual `pnpm install`
+        // failure will surface through the build step above and abort
+        // before we get here.
+        wait_for_pnpm_links(&source, std::time::Duration::from_secs(15))
+            .map_err(|error| format!("DSH runtime not ready ({error})"))?;
         // Launch the DSH host directly via `node --import tsx/esm` instead of
         // going through `pnpm dsh`.  pnpm's lifecycle runner wraps the exit
         // code in `[ELIFECYCLE]` and swallows the actual error message,
@@ -681,6 +695,37 @@ fn spawn_health_watcher(id: &str, url: String) {
 /// fully-reaped entries.
 fn pid_alive(pid: u32) -> bool {
     matches!(probe_pid(pid), PidProbe::Alive)
+}
+
+/// Poll for the `tsx` symlink under `<source>/node_modules/` to resolve
+/// successfully. pnpm install lays down `.pnpm/tsx@<ver>/node_modules/tsx`
+/// before linking the top-level `node_modules/tsx` symlink, so once
+/// `std::fs::metadata` succeeds on that symlink target the rest of the
+/// store is also ready for the ESM resolver. Times out with the supplied
+/// deadline so the caller can report a clean error rather than letting
+/// node spew `ERR_MODULE_NOT_FOUND`.
+fn wait_for_pnpm_links(source: &Path, deadline: Duration) -> Result<(), String> {
+    let marker = source.join("node_modules").join("tsx");
+    let probe = || {
+        // `metadata` follows symlinks; a dangling link returns Err — that's
+        // exactly what we want to wait out.
+        std::fs::metadata(&marker).map(|_| ()).map_err(|error| error.to_string())
+    };
+    if probe().is_ok() {
+        return Ok(());
+    }
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        if probe().is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!(
+        "pnpm store link is missing at {} after {:?}",
+        marker.display(),
+        deadline
+    ))
 }
 
 /// Detach the child into its own process group so the daemon can later
