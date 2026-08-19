@@ -276,6 +276,7 @@ dependencies = [
  "box-foundation",
  "serde",
  "serde_json",
+ "tracing",
  "uuid",
 ]
 
