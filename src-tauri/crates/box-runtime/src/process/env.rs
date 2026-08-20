@@ -193,7 +193,6 @@ pub fn dsh_host_policy(
         .remove("COLORTERM")
         .prepend_path(node_dir)
         .prepend_path(pnpm_dir)
-        .protect("DSH_HOME")
         .protect("DSHBOX_HOME")
         .replace("NODE_PATH", plugins_node_modules.as_os_str().to_owned())
         .replace("CHOKIDAR_USEPOLLING", "true")
