@@ -1,12 +1,11 @@
 import { copyFile, mkdir, writeFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync, statSync } from 'node:fs'
 import { arch, env, platform } from 'node:process'
 import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
 import { hashInputs, isFresh } from './mtime.mjs'
 
 function walkRustFiles(dir) {
-  const { readdirSync, statSync } = require('node:fs')
   const files = []
   try {
     for (const entry of readdirSync(dir)) {
