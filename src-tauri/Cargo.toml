@@ -1,6 +1,6 @@
 [package]
 name = "dshbox"
-version = "0.1.4"
+version = "0.1.5"
 description = "Managed DeepSeek Harness desktop runtime"
 authors = ["Nexus-Aethra"]
 edition = "2021"

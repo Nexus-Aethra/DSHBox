@@ -38,17 +38,19 @@ build. Do not use it as the primary recovery path.
 Prepared-base installation invokes:
 
 ```text
-pnpm --force --config.optional=true install
+pnpm --config.optional=true install
 ```
 
-`--force` is pnpm's documented way to install optional dependencies even when
-their platform conditions would otherwise prevent them from being selected.
-This is intentionally scoped to the private prepared-base staging directory:
-we trade a one-time, larger cache for a complete and reproducible runtime.
+The daemon also replaces inherited `npm_config_optional` and
+`pnpm_config_optional` values with `true`. This preserves pnpm's normal,
+platform-aware optional dependency selection: a Windows x64 host receives the
+Windows x64 esbuild and koffi prebuilds, but not Android, macOS, or Linux
+artifacts. A separate isolated install confirmed that shape (935 packages and
+the required Windows x64 native packages).
 
-The generic process environment also continues to set optional dependencies to
-enabled, but that setting alone was demonstrated to be insufficient for this
-lockfile/install path.
+`pnpm --force` was used only as a diagnostic recovery experiment. It proved
+the root cause but downloads every platform's optional artifacts, so it is not
+used by the release path.
 
 ## Diagnostics retention
 

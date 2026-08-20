@@ -224,15 +224,11 @@ pub(crate) fn pull_template_with_cancel(
         run_pnpm_task(
             &pnpm,
             &harness,
-            // `optional=true` alone does not make pnpm materialize optional
-            // platform packages that it has already filtered from a lockfile.
-            // DSH relies on those packages for esbuild and koffi on Windows.
-            // `--force` is pnpm's documented switch for installing every
-            // optional dependency regardless of platform filtering. This is
-            // intentionally limited to the private prepared-base staging
-            // install, where a reliable, self-contained runtime matters more
-            // than the extra one-time disk use.
-            ["--force", "--config.optional=true", "install"],
+            // Keep optional dependencies explicitly enabled. pnpm then selects
+            // only the platform packages for the current host (for example
+            // Windows x64 esbuild and koffi prebuilds), rather than downloading
+            // every platform's optional binaries via `--force`.
+            ["--config.optional=true", "install"],
             &log_path,
             task,
             "prepared-base dependency install",
