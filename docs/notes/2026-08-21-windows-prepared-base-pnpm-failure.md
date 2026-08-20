@@ -43,8 +43,10 @@ pnpm --config.optional=true install
 
 The daemon also replaces inherited `npm_config_optional` and
 `pnpm_config_optional` values with `true`. This preserves pnpm's normal,
-platform-aware optional dependency selection: a Windows x64 host receives the
-Windows x64 esbuild and koffi prebuilds, but not Android, macOS, or Linux
+platform-aware optional dependency selection. Before installation it appends a
+`supportedArchitectures` entry for the current host to the private staging
+clone's `pnpm-workspace.yaml`. This makes pnpm materialise Windows x64 esbuild,
+koffi, and lefthook prebuilds without selecting Android, macOS, or Linux
 artifacts. A separate isolated install confirmed that shape (935 packages and
 the required Windows x64 native packages).
 

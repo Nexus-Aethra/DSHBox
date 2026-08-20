@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -217,6 +218,7 @@ pub(crate) fn pull_template_with_cancel(
             })?;
         task.check_cancelled()?;
 
+        configure_staged_pnpm_platform(&harness)?;
         let pnpm = resolve_toolchain("pnpm")?;
         let log_path = staged.join("prepare.log");
         task.update("Installing DSH dependencies", 35);
@@ -330,6 +332,42 @@ pub(crate) fn pull_template_with_cancel(
         ref_value, record.version
     );
     Ok(())
+}
+
+/// pnpm's lockfile resolver needs an explicit supported-architectures entry
+/// when materialising DSH's native optional dependency graph from an empty
+/// store. Without it, pnpm recognises the current platform but can leave the
+/// matching esbuild, koffi, and lefthook prebuilds unlinked. This only updates
+/// the private staging clone, never the user's source repository.
+fn configure_staged_pnpm_platform(harness: &Path) -> Result<(), String> {
+    let workspace = harness.join("pnpm-workspace.yaml");
+    let contents = fs::read_to_string(&workspace)
+        .map_err(|error| format!("cannot read {}: {error}", workspace.display()))?;
+    if contents.lines().any(|line| line.trim() == "supportedArchitectures:") {
+        return Ok(());
+    }
+    let os = if cfg!(target_os = "windows") {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    };
+    let cpu = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "ia32",
+        architecture => architecture,
+    };
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&workspace)
+        .map_err(|error| format!("cannot update {}: {error}", workspace.display()))?;
+    writeln!(
+        file,
+        "\nsupportedArchitectures:\n  os:\n    - {os}\n  cpu:\n    - {cpu}"
+    )
+    .map_err(|error| format!("cannot write {}: {error}", workspace.display()))
 }
 
 fn run_pnpm_task<const N: usize>(
