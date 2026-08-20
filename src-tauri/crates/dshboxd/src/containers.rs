@@ -639,6 +639,17 @@ pub(crate) fn write_dshbox_context_snapshot(
     let snapshot_path = state_dir.join(SNAPSHOT_FILENAME);
     let patch_path = state_dir.join(PATCH_FILENAME);
 
+    // Compute the dshbox CLI binary path. On Windows the binary has `.exe`
+    // extension; on Unix it's bare. The agent uses this path when `dshbox`
+    // is not in PATH (e.g. DSH subprocesses that inherit a sanitised env).
+    let dshbox_cli = {
+        let mut binary = dshbox_home.to_path_buf();
+        binary.push("dshbox");
+        // EXE_SUFFIX includes the leading dot (".exe"); set_extension
+        // adds its own dot, so strip the prefix.
+        binary.set_extension(std::env::consts::EXE_SUFFIX.strip_prefix('.').unwrap_or("exe"));
+        binary
+    };
     let snapshot_body = render_snapshot(
         container_id,
         container_name,
@@ -650,6 +661,7 @@ pub(crate) fn write_dshbox_context_snapshot(
         &skills_root,
         &logs_root,
         dshbox_home,
+        &dshbox_cli,
         &api_key_envs,
     );
     // Atomic write: stage to .tmp then rename so a racing read never sees a

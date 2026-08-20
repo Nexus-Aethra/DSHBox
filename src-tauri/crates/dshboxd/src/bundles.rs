@@ -254,7 +254,8 @@ fn register_plugin_directly(
     }
 
     // --- Step 2: Update pnpm-workspace.yaml ---
-    let plugin_source_string = plugin_source.to_string_lossy().into_owned();
+    let plugin_source_string = plugin_source.to_string_lossy().into_owned()
+        .replace('\\', "/");
     if workspace_manifest.is_file() {
         let ws_text = fs::read_to_string(&workspace_manifest)
             .map_err(|error| format!("cannot read workspace yaml: {error}"))?;

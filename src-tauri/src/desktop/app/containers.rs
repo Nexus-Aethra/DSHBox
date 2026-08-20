@@ -110,6 +110,12 @@ pub(crate) fn write_dshbox_context_snapshot(
     let snapshot_path = state_dir.join(SNAPSHOT_FILENAME);
     let patch_path = state_dir.join(PATCH_FILENAME);
 
+    let dshbox_cli = {
+        let mut binary = _dshbox_home.to_path_buf();
+        binary.push("dshbox");
+        binary.set_extension(std::env::consts::EXE_SUFFIX.strip_prefix('.').unwrap_or("exe"));
+        binary
+    };
     let snapshot_body = render_snapshot(
         container_id,
         container_name,
@@ -121,6 +127,7 @@ pub(crate) fn write_dshbox_context_snapshot(
         &skills_root,
         &logs_root,
         _dshbox_home,
+        &dshbox_cli,
         &api_key_envs,
     );
     // Atomic write: stage to .tmp then rename so a racing read never sees a
@@ -356,6 +363,7 @@ mod context_snapshot_tests {
         assert_eq!(snapshot["container"]["profile"], "web");
         assert!(snapshot["paths"]["workspace"].as_str().unwrap().ends_with("workspace"));
         assert_eq!(snapshot["paths"]["dshboxHome"], root.to_string_lossy().as_ref());
+        assert!(snapshot["paths"]["dshboxCli"].as_str().unwrap_or("").ends_with("dshbox.exe") || snapshot["paths"]["dshboxCli"].as_str().unwrap_or("").ends_with("dshbox"));
         assert_eq!(snapshot["credentials"]["providers"].as_array().unwrap().len(), 0);
 
         let patch_body = fs::read_to_string(&files.patch_path).unwrap();

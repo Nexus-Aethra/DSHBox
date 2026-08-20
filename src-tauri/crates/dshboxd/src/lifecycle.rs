@@ -179,10 +179,25 @@ pub(crate) fn start_dsh_container_inner(
                 task.update("Building DSH frontend", 55);
                 task.log("building DSH frontend");
             }
-            let build_spec = ProcessSpec::new(pnpm.path.clone())
-                .args(&pnpm.arguments)
-                .args(["--dir", source_arg.as_ref(), "run", "build"])
-                .policy(pnpm_policy(&pnpm))
+            // Run the build via `node --import tsx/esm scripts/build.ts`
+            // instead of `pnpm run build`. The `tsx` CLI resolves `esbuild`
+            // through ESM from the symlinked `node_modules/tsx/dist/cli.mjs`
+            // path, which cannot reach the pnpm virtual-store sibling directory
+            // `.pnpm/tsx@*/node_modules/esbuild`. The `tsx/esm` loader handles
+            // the virtual-store layout correctly. The build script requires
+            // `npm_execpath` to find the package manager, so we set it to the
+            // bundled pnpm path.
+            let node = resolve_toolchain("node")?;
+            let pnpm_mjs = PathBuf::from(&pnpm.path)
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("pnpm").join("node_modules").join("pnpm").join("bin").join("pnpm.mjs"))
+                .unwrap_or_else(|| PathBuf::from("pnpm.mjs"));
+            let build_spec = ProcessSpec::new(node.path.clone())
+                .args(&node.arguments)
+                .args(["--import", "tsx/esm", "scripts/build.ts"])
+                .cwd(&source)
+                .policy(pnpm_policy(&pnpm).replace("npm_execpath", pnpm_mjs.to_string_lossy().as_ref()))
                 .kind(ExecutionKind::Logged)
                 .log_path(&log_path);
             let mut build_logged = run_logged(&build_spec, "DSH frontend build").map_err(|error| format!("cannot build DSH before launch: {error}"))?;
