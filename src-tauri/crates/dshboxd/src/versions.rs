@@ -224,10 +224,15 @@ pub(crate) fn pull_template_with_cancel(
         run_pnpm_task(
             &pnpm,
             &harness,
-            // Keep this on the command line as well as in the environment:
-            // pnpm 11 can otherwise inherit a service-level `--no-optional`
-            // setting and omit the Windows native packages DSH needs.
-            ["--config.optional=true", "install"],
+            // `optional=true` alone does not make pnpm materialize optional
+            // platform packages that it has already filtered from a lockfile.
+            // DSH relies on those packages for esbuild and koffi on Windows.
+            // `--force` is pnpm's documented switch for installing every
+            // optional dependency regardless of platform filtering. This is
+            // intentionally limited to the private prepared-base staging
+            // install, where a reliable, self-contained runtime matters more
+            // than the extra one-time disk use.
+            ["--force", "--config.optional=true", "install"],
             &log_path,
             task,
             "prepared-base dependency install",
@@ -257,8 +262,23 @@ pub(crate) fn pull_template_with_cancel(
     let mut record = match prepare {
         Ok(record) => record,
         Err(error) => {
+            // Staging is deliberately ephemeral, but the user-facing error
+            // points at the pnpm transcript. Retain that transcript before
+            // cleanup so a failed template pull is diagnosable after the task
+            // completes.
+            let diagnostic_dir = layout.root().join("logs").join("templates");
+            let diagnostic_log = diagnostic_dir.join(format!("{}-pull.log", task.task_id));
+            let _ = fs::create_dir_all(&diagnostic_dir);
+            let retained = fs::copy(staged.join("prepare.log"), &diagnostic_log).is_ok();
             let _ = fs::remove_dir_all(&staged);
-            return Err(error);
+            return if retained {
+                Err(format!(
+                    "{error}; retained diagnostics at {}",
+                    diagnostic_log.display()
+                ))
+            } else {
+                Err(error)
+            };
         }
     };
     // The prepared base is copied later as source only. Its staging-local pnpm
