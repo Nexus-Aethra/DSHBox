@@ -164,6 +164,42 @@ fn bundled_policy_overrides_registry_and_store() {
 }
 
 #[test]
+fn bundled_npm_script_targets_lib_path_not_broken_symlink_shim() {
+    // Regression guard: the deb installer dereferences `node/bin/npm` (a
+    // symlink in the source tree) into a 54-byte shell wrapper that calls
+    // `require('../lib/cli.js')`, which can't resolve because the real
+    // entry is `node/lib/node_modules/npm/bin/npm-cli.js`. Every code path
+    // must use `runtime.npm_script()` (or its consumers like
+    // `toolchains::resolve_toolchain("npm")`) so it lands on the absolute
+    // manifest path, never on the broken `bin/npm` shim.
+    let runtime = ensure_test_layout();
+    if skip_if_runtime_missing(&runtime) { return; }
+    let npm_entry = runtime.npm_script();
+    let npm_str = npm_entry.to_string_lossy();
+    assert!(
+        !npm_str.ends_with("bin/npm") && !npm_str.ends_with("bin\\npm"),
+        "npm entry resolved to the symlink shim path `{npm_str}`; \
+         install layout likely fell back to bin/npm instead of the manifest entry",
+    );
+    assert!(
+        npm_str.contains("node_modules") && npm_str.contains("npm-cli.js"),
+        "npm entry `{npm_str}` is not the upstream npm-cli.js script",
+    );
+    assert!(npm_entry.is_file(), "npm entry `{npm_str}` must exist on disk");
+
+    // Same guard for pnpm — win commit 937c94f used to derive pnpm from
+    // `pnpm.path` (which is the node binary) and produced a `<root>/node/pnpm/...`
+    // path that doesn't exist. Today we read it from the manifest.
+    let pnpm_entry = runtime.pnpm_script();
+    let pnpm_str = pnpm_entry.to_string_lossy();
+    assert!(
+        pnpm_str.contains("node_modules") && pnpm_str.contains("pnpm"),
+        "pnpm entry `{pnpm_str}` is not the upstream pnpm.mjs script",
+    );
+    assert!(pnpm_entry.is_file(), "pnpm entry `{pnpm_str}` must exist on disk");
+}
+
+#[test]
 fn bundled_pnpm_runs_logged_and_writes_log_file() {
     let runtime = ensure_test_layout();
     if skip_if_runtime_missing(&runtime) { return; }

@@ -12,7 +12,7 @@ import { join } from 'node:path'
 // Directories that never influence build output freshness.
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'target', '.git', '.pnpm', '.vite'])
 
-function latestMtime(path) {
+export function latestMtime(path) {
   const stat = statSync(path)
   if (!stat.isDirectory()) return stat.mtimeMs
   let latest = stat.mtimeMs

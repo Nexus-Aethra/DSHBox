@@ -8,7 +8,7 @@ use crate::containers::{
     write_dshbox_context_snapshot,
 };
 use crate::image::lookup_template_path;
-use crate::state::{ContainerManager, ManagedHost};
+use crate::state::{bundled_runtime, ContainerManager, ManagedHost};
 use crate::toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel};
 use box_containers::container_directory;
 use box_dsh_context::PLUGIN_ID;
@@ -21,6 +21,7 @@ use std::{
     fs,
     net::TcpListener,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::Mutex,
     thread,
     time::{Duration, Instant},
@@ -188,11 +189,16 @@ pub(crate) fn start_dsh_container_inner(
             // `npm_execpath` to find the package manager, so we set it to the
             // bundled pnpm path.
             let node = resolve_toolchain("node")?;
-            let pnpm_mjs = PathBuf::from(&pnpm.path)
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|p| p.join("pnpm").join("node_modules").join("pnpm").join("bin").join("pnpm.mjs"))
-                .unwrap_or_else(|| PathBuf::from("pnpm.mjs"));
+            // Use the manifest-resolved pnpm entry directly instead of
+            // deriving it from `pnpm.path` (which is actually the node
+            // executable). The previous heuristic assumed the bundled
+            // layout `<root>/{node,pnpm}/` had pnpm one directory up
+            // from node's parent, but real installer layouts vary (e.g.
+            // Linux deb drops the `resources/` layer), so deriving a
+            // sibling produced a nonexistent `<root>/node/pnpm/.../pnpm.mjs`
+            // path that pnpm then forwarded to child processes via
+            // `npm_execpath` and crashed them at module-load time.
+            let pnpm_mjs = bundled_runtime()?.pnpm.clone();
             let build_spec = ProcessSpec::new(node.path.clone())
                 .args(&node.arguments)
                 .args(["--import", "tsx/esm", "scripts/build.ts"])
