@@ -165,7 +165,10 @@ pub fn template_content_path(root: &str, id: &str) -> PathBuf {
 }
 
 pub fn template_manifest_path(root: &str, id: &str) -> PathBuf {
-    template_storage_root(root).join(id).join("manifest.json")
+    // `manifest.json` is the v8 built-template resource list. Keep the
+    // index-facing metadata separate so writing one cannot overwrite the
+    // other (source templates use this file too).
+    template_storage_root(root).join(id).join("entry.json")
 }
 
 /// FNV-1a 64-bit hash of a single template script. The content is the
@@ -329,7 +332,23 @@ pub fn collect_unreferenced_template_hash(root: &str, id: &str, index: &Template
 }
 
 pub fn built_template_list_path(root: &str, id: &str) -> PathBuf {
-    template_storage_root(root).join(id).join("list.json")
+    template_storage_root(root).join(id).join("manifest.json")
+}
+
+/// The on-disk directory for one built template — every resource row in
+/// `manifest.json` references files under this path (relative), so the
+/// materialiser can copy them into the container profile without going
+/// through the runtime plugin repository.
+pub fn built_template_artifact_dir(root: &str, id: &str) -> PathBuf {
+    template_storage_root(root).join(id)
+}
+
+pub fn built_template_repository_dir(root: &str, id: &str) -> PathBuf {
+    template_storage_root(root).join(id).join("repository")
+}
+
+pub fn built_template_data_dir(root: &str, id: &str) -> PathBuf {
+    template_storage_root(root).join(id).join("data")
 }
 
 /// Persist a built template (the metadata-only product of `dshbox build`)
@@ -337,6 +356,14 @@ pub fn built_template_list_path(root: &str, id: &str) -> PathBuf {
 /// there is no separate image registry, only built templates. The id is
 /// the fnv1a64 hash of the serialised resource list; re-building under
 /// the same name retires the previous hash.
+///
+/// Every resource referenced by the list is expected to already live
+/// under `<root>/templates/<id>/repository/...` or
+/// `<root>/templates/<id>/data/<digest>/` — this function only writes
+/// `manifest.json` (the resource list) and the per-hash `manifest.json`
+/// index entry. The resource materialisation itself happens in the
+/// caller so we can fail loudly for one row without abandoning an
+/// otherwise-good build.
 pub fn write_built_template(
     root: &str,
     list: &box_api::TemplateResourceList,
@@ -345,7 +372,7 @@ pub fn write_built_template(
     let id = template_content_hash(&body);
     let dir = template_storage_root(root).join(&id);
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-    fs::write(dir.join("list.json"), &body).map_err(|error| error.to_string())?;
+    fs::write(dir.join("manifest.json"), &body).map_err(|error| error.to_string())?;
     // Built templates inherit their kind from the base ref. The `base` field
     // is the user-facing reference (`github.com/.../deepseek-harness:latest`
     // for harness builds, anything else for user-authored builds), so the
@@ -400,11 +427,12 @@ pub fn read_built_template(
     if !entry.built {
         return Ok(None);
     }
-    let path = built_template_list_path(root, &entry.id);
+    let dir = template_storage_root(root).join(&entry.id);
+    let path = dir.join("manifest.json");
     if !path.is_file() {
         return Err(format!(
-            "built template `{name}` is corrupt: {} missing",
-            path.display()
+            "built template `{name}` is corrupt: manifest.json missing in {}",
+            dir.display()
         ));
     }
     let text = fs::read_to_string(&path)
@@ -430,8 +458,10 @@ pub fn referenced_snapshot_digests(root: &str) -> Result<Vec<String>, String> {
             continue;
         };
         for resource in &list.resources {
-            if let box_api::TemplateResource::Snapshot { digest, .. } = resource {
-                digests.push(digest.clone());
+            if resource.source_kind != "plugin" {
+                if let Some(digest) = resource.source.strip_prefix("data/") {
+                    digests.push(digest.to_owned());
+                }
             }
         }
     }

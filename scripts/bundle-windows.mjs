@@ -28,7 +28,7 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
 import { platform } from 'node:process'
-import { delimiter, join, resolve } from 'node:path'
+import { delimiter, dirname, join, resolve } from 'node:path'
 
 const HOST = platform
 const IS_WINDOWS = HOST === 'win32'
@@ -444,7 +444,7 @@ const tauriEnv = {
 // pnpm install we have to inject the corepack shims directory and the
 // Node bin directory into the child's PATH ourselves.
 {
-  const nodeBin = tools.node ? join(tools.node, '..') : null
+  const nodeBin = tools.node ? dirname(tools.node) : null
   const corepackShims = nodeBin ? join(nodeBin, 'node_modules', 'corepack', 'shims') : null
   const extras = [corepackShims, nodeBin].filter(Boolean)
   let basePath = process.env.PATH ?? ''

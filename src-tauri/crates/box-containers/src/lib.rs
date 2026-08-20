@@ -75,7 +75,17 @@ fn pid_is_alive(pid: u32) -> bool {
     match output {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            stdout.contains(&format!(",{pid},"))
+            // `/FO CSV` quotes every field, including the PID: the first
+            // data row is e.g. `"node.exe","1234",...`.  Looking for an
+            // unquoted `,1234,` therefore reports every healthy Windows
+            // host as stopped.
+            let expected = pid.to_string();
+            stdout.lines().any(|line| {
+                line.split(',')
+                    .nth(1)
+                    .map(|field| field.trim().trim_matches('"') == expected)
+                    .unwrap_or(false)
+            })
         }
         Err(_) => false,
     }
@@ -93,6 +103,13 @@ pub fn is_host_alive(container: &DshContainer) -> bool {
     let Ok(pid) = pid_text.trim().parse::<u32>() else {
         return false;
     };
+    pid_is_alive(pid)
+}
+
+/// Check a persisted host PID when only the lifecycle record is available.
+/// This is used after a daemon restart, when there is no in-memory child
+/// handle but the host may still be serving its loopback URL.
+pub fn is_host_pid_alive(pid: u32) -> bool {
     pid_is_alive(pid)
 }
 

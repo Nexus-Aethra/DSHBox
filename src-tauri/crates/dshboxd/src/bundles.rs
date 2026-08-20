@@ -3,7 +3,6 @@
 //! `install_container_skill`, bundle create/delete/export/import).
 
 use crate::extensions::repository_metadata;
-use crate::toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel};
 use box_containers::DshContainer;
 use box_extensions::transfer::{
     append_plugin_archive, copy_extension_source, extract_extension_tarball,
@@ -14,11 +13,9 @@ use box_extensions::{
     ExtensionBundle, ExtensionKind, ExtensionRecord, RepositoryExtension,
 };
 use box_foundation::{is_safe_identifier, mirror_url, now_seconds, read_config};
-use box_runtime::process::{ExecutionKind, ProcessSpec};
 use box_runtime::shallow_clone_with_cancel;
 use box_scheduler::TaskContext;
 use flate2::{write::GzEncoder, Compression};
-use std::time::Duration;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -212,31 +209,18 @@ fn register_plugin_directly(
     // (the copy below). Using `workspace:*` here would force pnpm to treat
     // this profile as a workspace member — that would re-introduce the
     // absolute-path coupling this PR is removing.
-    let needs_install = {
-        let mut deps = match manifest
-            .get("dependencies")
-            .and_then(serde_json::Value::as_object)
-        {
-            Some(obj) => obj.clone(),
-            None => serde_json::Map::new(),
-        };
-        let mut changed = false;
-        match deps.get(plugin_name) {
-            None | Some(serde_json::Value::Null) => {
-                deps.insert(plugin_name.to_string(), serde_json::Value::String("*".to_owned()));
-                changed = true;
-            }
-            Some(existing) if existing.as_str() == Some("*") => {}
-            _ => {
-                deps.insert(plugin_name.to_string(), serde_json::Value::String("*".to_owned()));
-                changed = true;
-            }
-        }
-        if changed {
-            manifest["dependencies"] = serde_json::Value::Object(deps);
-        }
-        changed
-    };
+    // The plugin is a physical payload, not a root dependency. Adding `*`
+    // lets pnpm resolve it (and its peers) from the registry, potentially
+    // mixing a different DSH release into this profile.
+    let removed_registry_dependency = manifest
+        .get_mut("dependencies")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|deps| {
+            (deps.get(plugin_name).and_then(serde_json::Value::as_str) == Some("*"))
+                .then(|| deps.remove(plugin_name))
+                .flatten()
+        })
+        .is_some();
 
     // Add to dsh.profile.bundles if not already listed
     let needs_bundle = {
@@ -259,7 +243,7 @@ fn register_plugin_directly(
         }
     }
 
-    if needs_install || needs_bundle {
+    if removed_registry_dependency || needs_bundle {
         let serialized = serde_json::to_string_pretty(&manifest)
             .unwrap_or_else(|_| manifest_text.to_owned());
         fs::write(&manifest_path, serialized)
@@ -277,23 +261,7 @@ fn register_plugin_directly(
         .join("node_modules")
         .join(scope)
         .join(package);
-    if let Err(error) = fs::create_dir_all(plugin_target.parent().unwrap_or(profile_dir)) {
-        return Err(format!("cannot create {}: {error}", plugin_target.parent().unwrap_or(profile_dir).display()));
-    }
-    // Replace any prior copy so an upgrade does not leave stale files.
-    if fs::symlink_metadata(&plugin_target).is_ok() {
-        if fs::symlink_metadata(&plugin_target)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            fs::remove_file(&plugin_target)
-                .map_err(|error| format!("cannot replace stale plugin link: {error}"))?;
-        } else {
-            fs::remove_dir_all(&plugin_target)
-                .map_err(|error| format!("cannot replace stale plugin copy: {error}"))?;
-        }
-    }
-    crate::lifecycle::copy_tree_following(plugin_source, &plugin_target)
+    crate::lifecycle::replace_tree_following(plugin_source, &plugin_target)
         .map_err(|error| format!("cannot copy plugin `{plugin_name}` into profile: {error}"))?;
 
     // --- Step 3: pnpm-workspace.yaml: only local `packages: ['.']` + build-script approval ---
@@ -301,40 +269,50 @@ fn register_plugin_directly(
         .map_err(|error| format!("cannot update pnpm-workspace.yaml: {error}"))?;
 
     // --- Step 4: Run pnpm install in profile dir ---
-    let pnpm = resolve_toolchain("pnpm")?;
-    task.log(&format!("installing plugin dependencies for {plugin_name}"));
-    let task_record = task.manager.task(&task.task_id)?;
-    let install_spec = ProcessSpec::new(pnpm.path.clone())
-        .args(&pnpm.arguments)
-        .args([
-            "--dir",
-            profile_dir.to_string_lossy().as_ref(),
-            "install",
-            "--no-frozen-lockfile",
-        ])
-        .policy(pnpm_policy(&pnpm))
-        .kind(ExecutionKind::Logged)
-        .log_path(&task_record.log_path);
-    let mut install_logged =
-        run_logged(&install_spec, "pnpm install").map_err(|error| {
-            format!("cannot start pnpm install: {error}")
-        })?;
-    let status = install_logged
-        .wait_or_kill(
-            &TaskCancel(Some(task)),
-            Duration::from_secs(900),
-            "installing plugin dependencies",
-        )
-        .map_err(|error| format!("pnpm install: {error}"))?;
-    if !status.success() {
-        return Err(format!("pnpm install for plugin {plugin_name} exited with {status}"));
+    task.log(&format!("registered physical plugin payload for {plugin_name}"));
+    Ok(())
+}
+
+/// Register plugins that have already been copied from a built template into
+/// a profile. This deliberately performs no repository lookup or file copy:
+/// PR3 materialisation owns a detached profile tree before this function runs.
+pub(crate) fn prepare_materialized_profile(
+    profile_dir: &Path,
+    plugin_names: &[String],
+    task: &TaskContext,
+) -> Result<(), String> {
+    let manifest_path = profile_dir.join("package.json");
+    let text = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("cannot read profile package.json: {error}"))?;
+    let mut manifest: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("cannot parse profile package.json: {error}"))?;
+    if let Some(deps) = manifest["dependencies"].as_object_mut() {
+        for name in plugin_names {
+            if deps.get(name).and_then(serde_json::Value::as_str) == Some("*") {
+                deps.remove(name);
+            }
+        }
     }
+    {
+        let bundles = manifest.pointer_mut("/dsh/profile/bundles")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or("profile has no dsh.profile.bundles")?;
+        for name in plugin_names {
+            if !bundles.iter().any(|item| item.as_str() == Some(name)) {
+                bundles.push(serde_json::Value::String(name.clone()));
+            }
+        }
+    }
+    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?)
+        .map_err(|error| format!("cannot write profile package.json: {error}"))?;
+    ensure_local_pnpm_workspace(&profile_dir.join("pnpm-workspace.yaml"))?;
+    task.log("registered built-template plugin payloads without registry resolution");
     Ok(())
 }
 
 /// Split a package name (`@scope/foo` or `foo`) into `(scope, name)`.
 /// Returns `None` when the name is malformed.
-fn split_package_name(name: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_package_name(name: &str) -> Option<(&str, &str)> {
     if let Some(rest) = name.strip_prefix('@') {
         let (scope, package) = rest.split_once('/')?;
         if scope.is_empty() || package.is_empty() {
@@ -838,7 +816,7 @@ pub(crate) fn install_container_bundle(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_local_pnpm_workspace, register_plugin_directly, split_package_name};
+    use super::{ensure_local_pnpm_workspace, split_package_name};
 
     #[test]
     fn split_package_name_handles_scoped_and_unscoped() {

@@ -13,7 +13,9 @@ DSH Box is a lightweight desktop shell built with [Tauri 2](https://tauri.app) t
 - **Embedded WebView, no browser needed** — the DSH frontend opens in a native WebView window managed by DSH Box. No port-forwarding, no copy-pasting URLs, no tab clutter.
 - **Zero-dependency install** — a private Node, npm, and pnpm runtime is bundled with every release. No system Node, no manual toolchain setup, no PATH hacking.
 - **Version manager built in** — browse DSH releases from `deepseek-ai/deepseek-harness`, install or uninstall any tag with one click, and pin a version per Container.
-- **Boxfile / built-template pipeline** — describe a Container with a small declarative `.dsh` script (`FROM` + `PROFILE` + `ADD plugin|skill|data`) and `dshbox build` produces a reusable built template; `dshbox run <template>` instantiates and starts a Container. See [Architecture → Boxfile](#boxfile-and-the-built-template-pipeline).
+- **Boxfile / sealed-template pipeline** — describe a Container with a small declarative `.dsh` script (`FROM` + `PROFILE` + `ADD plugin|skill|data`); `dshbox build` produces a reusable source recipe and `dshbox run <template>` prepares it once in the final Container directory. See [Architecture → Boxfile](#boxfile-and-the-built-template-pipeline).
+- **Portable built templates** — building a Boxfile materialises its plugin, skill, and data payloads into the template. Containers receive their own copied payloads, so they do not depend on workspace paths, pnpm links, or a mutable extension repository.
+- **Windows-first runtime recovery** — on Windows, DSH Box recovers from a first-run pnpm junction-validation failure after dependencies were materialised, and allocates a fresh loopback port immediately before Host launch. Transient loopback bind failures are retried without rebuilding the frontend.
 - **In-container agent awareness** — DSH Box injects a `dsh-box-context` plugin into every Container so the in-session agent sees `paths.dshboxHome` and `paths.dshboxCli` and can manage DSH Boxes (containers, templates, plugins) even when it does not inherit a sane `PATH`.
 - **Extension & Skill repository** — import plugins and skills from a GitHub URL, a local directory, or a tarball, then install them into any Container's profile with a single click. Skills are auto-sorted into the Container's skill root.
 - **Bundle (整合包) workflow** — group any mix of plugins and skills into a named bundle, then export it two ways:
@@ -35,7 +37,7 @@ Download the installer for your platform from the **Releases** page of this repo
 
 | Platform | Artifact | Notes |
 |---|---|---|
-| Windows (x64) | `dshbox-<version>-x64-setup.exe` | NSIS installer, per-user and per-machine modes |
+| Windows (x64) | `dshbox_<version>_x64_<locale>.msi` | MSI installer with bundled runtime and sidecar |
 | Linux (x64) | `dshbox-<version>-amd64.deb` | Debian/Ubuntu package |
 | macOS (arm64) | `dshbox-<version>-arm64.dmg` | Apple Silicon |
 
@@ -48,10 +50,11 @@ No runtime prerequisites — the bundled Node/npm/pnpm runtime travels inside th
 ## Quick start
 
 1. **Launch DSH Box** and pick a writable *runtime directory* when prompted (all DSH data lives there).
-2. Open **DSH Version** → **Load versions** → install the DSH tag you want.
-3. Open **DSH Container** → create a Container (name, profile, DSH version).
-4. Press **Start** — DSH Box builds the frontend if needed (or launches the cached build directly), then opens the DSH UI in the embedded WebView.
-5. Head to **Plugin Repository** to import plugins/skills or assemble bundles, then add them to any Container.
+2. Open **Resources** → **DSH Versions** → **Load versions**, then install the DSH tag you want.
+3. Open **Resources** → **Templates**, then pull an official DSH template or build a reusable template from a Boxfile.
+4. Open **Container** → create a Container from that template (name and profile).
+5. The first create prepares the Container in its final directory (offline dependency install, local plugins, frontend build). Press **Start** — DSH Box launches that prepared copy and opens the DSH UI in the embedded WebView.
+6. Use **Resources** to import plugins/skills, assemble bundles, or create Boxfiles for reusable plugin-enabled templates.
 
 ### Tray
 
@@ -82,7 +85,7 @@ This means the same HTTP surface serves every consumer — the desktop app's Tau
 
 ### Boxfile and the built-template pipeline
 
-A **boxfile** (`.dsh`) is the declarative script that describes a Container you want to instantiate. It is parsed by `box-image::parse_script` and resolved by `dshbox build` into a **built template** — metadata-only entries registered in the same content-addressable template store as script templates. `dshbox run <template>` then creates and starts a Container from the template.
+A **boxfile** (`.dsh`) is the declarative script that describes a Container you want to instantiate. `dshbox build` resolves it into a **sealed template recipe**: physical Harness source without `node_modules`, plus the profile, local plugin artifacts, skills, and data needed by its `ADD` directives. `dshbox run <template>` copies it to the final Container directory, performs offline install, adds local artifacts, and builds once; later starts do none of those steps.
 
 The full grammar is in [`docs/template-system.md`](docs/template-system.md); the canonical reference example (every source shape) is in [`examples/boxfile-plugin-chains.dsh`](examples/boxfile-plugin-chains.dsh). Here is the minimal form:
 
@@ -118,18 +121,19 @@ ADD skill team-conventions
 The `:latest` tag and the explicit `latest` keyword are interchangeable; both pin the harness repository's main branch.
 
 How each `ADD` is stored matters:
-- `ADD plugin` — content stays in the shared **Repository** (one row in `~/.dsh-box/repository/plugins/`); the built template only records a reference id, and reference counts gate deletion.
-- `ADD skill` and `ADD data` — snapshotted into the data store (`<runtime>/data/<digest>/`) and copied into the Container profile.
-- The bundled `dsh-box-context` plugin (`@deepseek-ai/dsh-box-context`) is linked automatically — you do not need to `ADD` it.
+- `ADD plugin` — the source is imported into the shared **Repository** as an immutable local `artifact.tgz`, recorded by the sealed recipe, then added only while preparing a Container at its final path. No running Container has an absolute repository path or runs a plugin dependency install.
+- `ADD skill` and `ADD data` — snapshotted into the data store (`<runtime>/data/<digest>/`), materialised in the built template, and copied into the Container profile.
+- The bundled `dsh-box-context` plugin (`@deepseek-ai/dsh-box-context`) is copied automatically — you do not need to `ADD` it.
 
-`dshbox build` writes a built template entry keyed by `<name>` (id = fnv1a64 digest). `dshbox run <name>` then:
+`dshbox build` writes a digest-addressed sealed template. `dshbox run <name>` then:
 1. Resolves the template's `FROM` chain (max depth 4),
 2. Creates `<runtime>/instances/<id>/{profile,workspace,state,logs}`,
-3. Copies plugins/skills/data into the profile,
-4. Runs `pnpm install` (with build-scripts approved per-profile),
-5. Runs `node --import tsx/esm scripts/build.ts` to build the frontend,
-6. Launches the DSH host process and waits on a 20s health probe,
-7. Writes `paths.dshboxHome` + `paths.dshboxCli` into the snapshot so the in-container agent can find the CLI.
+3. Copies the template's materialised plugins/skills/data into the profile,
+4. Allocates a loopback port immediately before host spawn,
+5. Launches bundled `pnpm dsh web` from the Container's Harness copy and waits for readiness,
+6. Writes `paths.dshboxHome` + `paths.dshboxCli` into the snapshot so the in-container agent can find the CLI.
+
+The full storage, transaction, and migration contract is in [`docs/specs/prepared-template-runtime.md`](docs/specs/prepared-template-runtime.md). This is a schema break: legacy shared `runtimes/<version>/source` layouts are not used by new builds.
 
 ### Data scheduler and reference counts
 
@@ -167,7 +171,7 @@ pnpm tauri dev          # run in development
 Release bundles (per platform):
 
 ```bash
-pnpm bundle:windows     # Windows NSIS installer
+pnpm bundle:windows     # Windows MSI installer
 pnpm bundle:linux       # Linux .deb
 pnpm bundle:macos       # macOS .dmg
 ```

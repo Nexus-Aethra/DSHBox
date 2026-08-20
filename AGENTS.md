@@ -119,10 +119,13 @@ they don't run them inline.
   pnpm supply-chain checks (lifecycle-script approval, minimum-release-age).
 - **Runtime archive integrity.** Verify SHA-256 (Node) and SHA-512 (pnpm)
   before use; a failed verification aborts startup, no silent fallback.
-- **Built template vs image.** `dshbox build` produces a metadata-only built
-  template in the same content-addressable store as pulled script templates.
-  `dshbox image` is a deprecated alias forwarding to `build`/`template`. There
-  is no separate image registry — full design in `docs/specs/image-build.md`.
+- **Prepared/sealed templates.** Pulling a root Harness template prepares a
+  complete source tree (`pnpm install` + `pnpm run build`). `dshbox build`
+  copies that base and publishes a sealed physical template with locally packed
+  plugin artifacts installed. Container creation copies that sealed tree;
+  Container startup must never install or build DSH. `dshbox image` remains a
+  deprecated alias forwarding to `build`/`template`. The authoritative design
+  is `docs/specs/prepared-template-runtime.md`.
 - **Plugin cache dedup.** A second `build` of the same `name+version` should
   hit the existing hash entry (`<root>/repository/plugins/img-<id>/source/`)
   and not produce a duplicate `img-…` row (see

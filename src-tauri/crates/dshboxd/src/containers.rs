@@ -24,7 +24,8 @@ use std::{
 /// can open the workspace and immediately read how a boxfile is written.
 /// The body covers every supported directive and source shape so users do
 /// not have to leave the container to consult documentation.
-const BOXFILE_GUIDE_SKILL: &str = r#"---
+#[cfg(any())]
+const LEGACY_BOXFILE_GUIDE_SKILL: &str = r#"---
 name: dshbox-guide
 description: Use when working with DSH Box — authoring a boxfile (`.dsh`), choosing ADD sources for 插件/技能/数据, running `dshbox` commands to manage templates and containers, or troubleshooting anything that touches container lifecycle, plugins, skills, or the dshbox daemon.
 ---
@@ -457,6 +458,70 @@ DSH Box 在 build 阶段会自动:
 	# → event: TaskStage    data: {"id":"...","stage":"Cloning","progress":10}
 	# → event: TaskFinished data: {"id":"...","status":"succeeded"}
 	```"#;
+
+const BOXFILE_GUIDE_SKILL: &str = r#"---
+name: dshbox-guide
+description: Use when creating or troubleshooting DSH Box templates and containers.
+---
+
+# DSH Box Guide
+
+`dshbox` manages templates and containers. `dsh` is the Harness command that
+runs inside a container profile.
+
+## Standard workflow
+
+```bash
+dshbox pull template github.com/deepseek-ai/deepseek-harness:<tag>
+dshbox build ./boxfile.dsh
+dshbox run <template-name>
+```
+
+`build` creates a reusable template recipe. `run` creates a new container,
+installs its dependencies in the final container path, builds Harness, and
+starts the host. Use `dshbox ps`, `dshbox container logs <id>`, and
+`dshbox container stop <id>` for lifecycle operations.
+
+## Current Boxfile syntax
+
+```dsh
+FROM github.com/deepseek-ai/deepseek-harness:dsh-v0.1.0-rc.8
+PROFILE web
+NAME my-template
+VERSION 1.0.0
+ADD plugin github.com/owner/plugin-repository
+```
+
+Supported directives are `FROM`, `PROFILE`, `NAME`, `VERSION`, `LABEL`, and
+`ADD plugin <pnpm-source>`. A source may be a registry package, a GitHub short
+form (`github.com/owner/repo`), or a pnpm Git spec (`git+https://...`). Pull
+the exact `FROM` template before building.
+
+`ADD skill` and `ADD data` are not supported by the current sealed-template
+builder. Keep skills and data outside a Boxfile until that feature is added.
+
+## Git plugins with build scripts
+
+pnpm requires an explicit approval for lifecycle scripts. If build fails with
+an `allowBuilds` hint, add the exact line printed by DSH Box, for example:
+
+```dsh
+ADD plugin github.com/omdsh-dev/DSH-better-sidebar
+LABEL dshbox.allow-build=git+https://github.com/omdsh-dev/DSH-better-sidebar,node-pty@1.1.0
+```
+
+The first value authorizes that declared Git source. Additional values are
+exact `package@version` keys for explicitly approved transitive build scripts.
+Do not use a global allow-all setting. Rebuild the template after changing the
+Boxfile.
+
+## Troubleshooting
+
+- `template not found`: run `dshbox pull template` with the same `FROM` ref.
+- `plugin add failed`: read the task error; it includes a copyable
+  `dshbox.allow-build` label when pnpm needs approval.
+- Host fails after build: use `dshbox container logs <id>`.
+"#;
 
 const BOXFILE_GUIDE_SKILL_NAME: &str = "dshbox-guide";
 

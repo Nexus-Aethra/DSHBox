@@ -7,7 +7,8 @@
 use crate::state::{bundled_runtime, dshbox_install_directory};
 use box_foundation::read_config;
 use box_runtime::process::{
-    self, ExecutionResult, LoggedProcess, NativeProcessRunner, ProcessSpec, runner::CancellationToken,
+    self, runner::CancellationToken, ExecutionResult, LoggedProcess, NativeProcessRunner,
+    ProcessSpec,
 };
 use box_scheduler::TaskContext;
 use box_toolchains::is_known_toolchain;
@@ -91,10 +92,7 @@ impl CancellationToken for TaskCancel<'_> {
 /// logged variant, returning the inner `LoggedProcess`. The DSH host and
 /// all pnpm/npm invocations funnel through this so error reporting is
 /// uniform.
-pub(crate) fn run_logged(
-    spec: &ProcessSpec,
-    description: &str,
-) -> Result<LoggedProcess, String> {
+pub(crate) fn run_logged(spec: &ProcessSpec, description: &str) -> Result<LoggedProcess, String> {
     match NativeProcessRunner
         .execute(spec)
         .map_err(|error| format!("cannot start {description}: {error}"))?
@@ -105,4 +103,3 @@ pub(crate) fn run_logged(
         )),
     }
 }
-

@@ -9,7 +9,7 @@ use box_extensions::transfer::{
     append_plugin_archive, archive_content_root, copy_extension_source, extract_extension_tarball,
 };
 use box_extensions::{
-    detect_extension_kind, read_bundles, read_extension_records, remove_plugin_record,
+    detect_extension_kind, read_bundles, remove_plugin_record,
     repository_root, scan_repository, write_bundles, write_repository_index, ExtensionKind,
     RepositoryExtension,
 };
@@ -43,6 +43,74 @@ fn plugin_declares_deps(directory: &Path) -> bool {
             .is_some_and(|object| !object.is_empty())
     };
     non_empty("dependencies") || non_empty("devDependencies")
+}
+
+/// Immutable local package input for a repository plugin. The source tree is
+/// retained only for inspection/export; template construction must consume
+/// this archive instead of a workspace or absolute source path.
+pub(crate) fn repository_plugin_artifact(entry: &RepositoryExtension) -> Result<PathBuf, String> {
+    if entry.kind != ExtensionKind::Plugin {
+        return Err("only plugins have installable artifacts".to_owned());
+    }
+    PathBuf::from(&entry.source_path)
+        .parent()
+        .map(|directory| directory.join("artifact.tgz"))
+        .ok_or("repository plugin source has no parent".to_owned())
+}
+
+fn package_repository_plugin(
+    task: &TaskContext,
+    source: &Path,
+    artifact: &Path,
+    name: &str,
+) -> Result<(), String> {
+    if artifact.is_file() {
+        return Ok(());
+    }
+    let artifact_parent = artifact.parent().ok_or("plugin artifact has no parent")?;
+    let staging = artifact_parent.join(format!(".pack-{}", task.task_id));
+    if staging.exists() {
+        fs::remove_dir_all(&staging).map_err(|error| error.to_string())?;
+    }
+    fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
+    let npm = resolve_toolchain("npm")?;
+    let log_path = task.manager.task(&task.task_id)?.log_path;
+    task.update("Packing plugin artifact", 82);
+    task.log(&format!("packing immutable local artifact for {name}"));
+    let staging_arg = staging.to_string_lossy().into_owned();
+    let spec = ProcessSpec::new(npm.path.clone())
+        .args(&npm.arguments)
+        .args(["pack", "--pack-destination", staging_arg.as_str()])
+        .cwd(source)
+        .policy(pnpm_policy(&npm))
+        .kind(ExecutionKind::Logged)
+        .log_path(&log_path);
+    let mut process = run_logged(&spec, "plugin artifact pack")?;
+    let status = process
+        .wait_or_kill(
+            &TaskCancel(Some(task)),
+            Duration::from_secs(300),
+            "packing plugin artifact",
+        )
+        .map_err(|error| format!("plugin artifact pack: {error}"))?;
+    if !status.success() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!("plugin artifact pack failed; inspect {log_path}"));
+    }
+    let packed = fs::read_dir(&staging)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_file() && matches!(path.extension().and_then(|ext| ext.to_str()), Some("tgz") | Some("gz")))
+        .ok_or("npm pack produced no tarball")?;
+    fs::rename(&packed, artifact).map_err(|error| {
+        format!(
+            "cannot publish plugin artifact {}: {error}",
+            artifact.display()
+        )
+    })?;
+    let _ = fs::remove_dir_all(&staging);
+    Ok(())
 }
 
 pub(crate) fn repository_metadata(
@@ -174,15 +242,6 @@ pub(crate) fn link_repository_extension(
                     box_extensions::ReferenceKind::Template,
                     template_id,
                 )?;
-            } else {
-                // Direct (non-template) link from CLI: record the
-                // container as the owner so `plugin prune` keeps it.
-                box_extensions::add_reference_owner(
-                    Path::new(&root),
-                    &entry.id,
-                    box_extensions::ReferenceKind::Container,
-                    container_id,
-                )?;
             }
         }
         ExtensionKind::Skill => {
@@ -232,6 +291,10 @@ pub(crate) fn import_into_repository(
             && !existing_source.join("node_modules").is_dir()
         {
             install_plugin_dependencies(task, existing_source, &name, version.as_deref())?;
+        }
+        if matches!(kind, ExtensionKind::Plugin) {
+            let artifact = repository_plugin_artifact(&existing)?;
+            package_repository_plugin(task, existing_source, &artifact, &existing.name)?;
         }
         let kind_label = match existing.kind {
             ExtensionKind::Plugin => "plugin",
@@ -308,10 +371,21 @@ pub(crate) fn import_into_repository(
         source: Some(source.to_string_lossy().into_owned()),
     });
     write_repository_index(Path::new(&root), &entries)?;
-    Ok(entries
+    let created = entries
         .into_iter()
         .find(|entry| entry.id == entry_id)
-        .expect("entry we just pushed"))
+        .expect("entry we just pushed");
+    if matches!(&created.kind, ExtensionKind::Plugin) {
+        let artifact = repository_plugin_artifact(&created)?;
+        if let Err(error) = package_repository_plugin(task, Path::new(&created.source_path), &artifact, &created.name) {
+            let mut rollback = scan_repository(Path::new(&root));
+            rollback.retain(|entry| entry.id != created.id);
+            let _ = write_repository_index(Path::new(&root), &rollback);
+            let _ = fs::remove_dir_all(Path::new(&created.source_path).parent().unwrap_or(Path::new(".")));
+            return Err(error);
+        }
+    }
+    Ok(created)
 }
 
 fn install_plugin_dependencies(
@@ -441,13 +515,6 @@ pub(crate) fn remove_repository_extension(id: &str) -> Result<(), String> {
         .unwrap_or_default();
     if !owners.is_empty() {
         let mut parts = Vec::new();
-        if !owners.containers.is_empty() {
-            parts.push(format!(
-                "{} container(s) [{}]",
-                owners.containers.len(),
-                owners.containers.iter().cloned().collect::<Vec<_>>().join(", ")
-            ));
-        }
         if !owners.templates.is_empty() {
             parts.push(format!(
                 "{} template(s) [{}]",
@@ -663,17 +730,6 @@ pub(crate) fn install_container_extension(
     // shared repository entry. Local / tarball installs have no
     // `repository_id`, so the owner set never grows for them — they
     // also never show up as `unused_repository_ids`.
-    if source_kind == "repository" {
-        let root = read_config()?
-            .runtime_directory
-            .ok_or("DSH Box storage is not configured")?;
-        box_extensions::add_reference_owner(
-            Path::new(&root),
-            source,
-            box_extensions::ReferenceKind::Container,
-            container_id,
-        )?;
-    }
     let _ = fs::remove_dir_all(staging);
     task.update("Refreshing container extensions", 95);
     Ok(())
@@ -809,23 +865,7 @@ pub(crate) fn remove_repository_plugin(id: &str, profile: &str, name: &str) -> R
     // record so the `repository_id` is still available. Local /
     // tarball installs have no `repository_id`, and the remove is a
     // no-op for them.
-    let repository_id = read_extension_records(&container)
-        .into_iter()
-        .find(|record| {
-            record.kind == ExtensionKind::Plugin
-                && record.profile.as_deref() == Some(profile)
-                && record.name == name
-        })
-        .and_then(|record| record.repository_id);
     remove_plugin_record(&container, profile, name)?;
-    if let Some(repository_id) = repository_id.as_deref() {
-        box_extensions::remove_reference_owner(
-            Path::new(&root),
-            repository_id,
-            box_extensions::ReferenceKind::Container,
-            &container.id,
-        )?;
-    }
     Ok(())
 }
 
@@ -891,14 +931,19 @@ mod tests {
     }
 
     fn test_task(runtime: &Path) -> TaskContext {
+        let paths = BoxPaths {
+            config: runtime.join("config.json"),
+            runtime: Some(runtime.to_path_buf()),
+        };
+        let manager = TaskManager::default();
+        let record = manager
+            .enqueue(&paths, "test", Vec::new(), serde_json::json!({}))
+            .unwrap();
         TaskContext {
-            manager: TaskManager::default(),
-            paths: BoxPaths {
-                config: runtime.join("config.json"),
-                runtime: Some(runtime.to_path_buf()),
-            },
+            manager,
+            paths,
             notifier: std::sync::Arc::new(NoopNotifier),
-            task_id: "test-task".to_owned(),
+            task_id: record.id,
             profile_dir: None,
         }
     }
@@ -954,6 +999,11 @@ mod tests {
         // compatibility with Linux/macOS where `dirs` falls back to it.
         let _guard = EnvGuard::set("HOME", &home);
         let _dshbox_dir = EnvGuard::set("DSHBOX_CONFIG_DIR", &home.join(".dsh-box"));
+        // Repository imports now produce an immutable `npm pack` artifact.
+        // Production initializes this once during daemon startup; unit tests
+        // exercise the same path explicitly (another concurrent test may
+        // have initialized it already, which is equally valid).
+        let _ = crate::state::initialize_bundled_runtime();
 
         let source_a = make_plugin_source("dsh-better-sidebar", "0.12.3");
         let task = test_task(&runtime);
@@ -979,10 +1029,7 @@ mod tests {
 
         // Different version skews the cache key.
         let source_c = make_plugin_source("dsh-better-sidebar", "0.12.4");
-        let task_v2 = TaskContext {
-            task_id: "test-task-v2".to_owned(),
-            ..task
-        };
+        let task_v2 = test_task(&runtime);
         let third = import_into_repository(&task_v2, &source_c).unwrap();
         assert_ne!(
             first.id, third.id,
@@ -1021,5 +1068,25 @@ mod tests {
                 None => unsafe { env::remove_var(self.key) },
             }
         }
+    }
+
+    #[test]
+    fn plugin_artifact_lives_next_to_the_repository_source() {
+        let entry = RepositoryExtension {
+            id: "img-1".to_owned(),
+            kind: ExtensionKind::Plugin,
+            name: "@example/plugin".to_owned(),
+            version: Some("1.0.0".to_owned()),
+            description: None,
+            content_digest: "digest".to_owned(),
+            source_path: "D:/runtime/repository/plugins/img-1/source".to_owned(),
+            imported_at: 0,
+            diagnostic: None,
+            source: None,
+        };
+        assert_eq!(
+            repository_plugin_artifact(&entry).unwrap(),
+            PathBuf::from("D:/runtime/repository/plugins/img-1/artifact.tgz")
+        );
     }
 }

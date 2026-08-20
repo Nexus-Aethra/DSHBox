@@ -13,8 +13,8 @@ mod dispatch;
 mod events;
 mod extensions;
 mod host;
-mod image;
 mod lifecycle;
+mod sealed;
 mod state;
 #[cfg(test)]
 mod test_support;

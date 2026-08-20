@@ -6,7 +6,6 @@
 //! deliberately aligned with the UI so any change in storage semantics
 //! lands in exactly one place (`dshboxd`).
 
-use box_api::{TemplateResource, TemplateResourceList};
 use serde_json::json;
 
 use super::rpc;
@@ -118,66 +117,18 @@ fn list() -> Result<(), String> {
         println!("(no templates installed)");
         return Ok(());
     }
-    println!("NAME\tVERSION\tPROFILE\tKIND\tFORM");
+    println!("NAME\tHARNESS\tPROFILE\tKIND");
     for entry in entries {
         let name = entry["name"].as_str().unwrap_or("?");
         let version = entry["harnessRef"].as_str().unwrap_or("-");
         let profile = entry["profile"].as_str().unwrap_or("-");
-        let kind = match entry["kind"].as_str().unwrap_or("common") {
-            "root" => "root",
-            _ => "common",
-        };
-        let form = if entry["built"].as_bool().unwrap_or(false) {
-            "built"
-        } else {
-            "script"
-        };
-        println!("{name}\t{version}\t{profile}\t{kind}\t{form}");
+        println!("{name}\t{version}\t{profile}\tsealed");
     }
     Ok(())
 }
 
 fn show(name: &str) -> Result<(), String> {
     let client = rpc::connect()?;
-    // Built templates render their resource list; source scripts their body.
-    if let Ok(value) = rpc::call(&client, "read_template_list", json!({ "name": name })) {
-        let list: TemplateResourceList = serde_json::from_value(value)
-            .map_err(|error| format!("invalid built template from daemon: {error}"))?;
-        println!("name:     {}", list.name);
-        println!("base:     {}", list.base);
-        println!("profile:  {}", list.profile);
-        println!("harness:  {}", list.harness_ref.as_deref().unwrap_or("-"));
-        println!("created:  {}", list.created_at);
-        println!("resources: ({} total)", list.resources.len());
-        for (index, resource) in list.resources.iter().enumerate() {
-            match resource {
-                TemplateResource::Reference {
-                    kind,
-                    name,
-                    version,
-                    entry_id,
-                } => {
-                    println!(
-                        "  {}. {kind} {name} {} (reference -> repository entry {entry_id})",
-                        index + 1,
-                        version.as_deref().unwrap_or("-")
-                    );
-                }
-                TemplateResource::Snapshot {
-                    kind,
-                    name,
-                    digest,
-                    destination,
-                } => {
-                    println!(
-                        "  {}. {kind} {name} (snapshot data/{digest} -> {destination})",
-                        index + 1
-                    );
-                }
-            }
-        }
-        return Ok(());
-    }
     let value = rpc::call(&client, "read_template", json!({ "name": name }))?;
     let text = value["text"]
         .as_str()
@@ -245,44 +196,14 @@ fn info(name: &str) -> Result<(), String> {
     println!("id:          {}", value["id"].as_str().unwrap_or("-"));
     println!("built:       {}", value["built"].as_bool().unwrap_or(false));
 
-    if value["built"].as_bool() == Some(true) {
-        println!("base:        {}", value["base"].as_str().unwrap_or("-"));
-        println!("profile:     {}", value["profile"].as_str().unwrap_or("-"));
-        println!(
-            "harness:     {}",
-            value["harnessRef"].as_str().unwrap_or("-")
-        );
-        println!(
-            "schemaVer:   {}",
-            value["schemaVersion"].as_u64().unwrap_or(0)
-        );
-        println!(
-            "createdAt:   {} ({})",
-            value["createdAt"].as_u64().unwrap_or(0),
-            value["createdAtIso"].as_str().unwrap_or("-")
-        );
-        println!(
-            "resources:   {}",
-            value["resources"].as_u64().unwrap_or(0)
-        );
-        if let Some(labels) = value["labels"].as_object() {
-            if !labels.is_empty() {
-                println!("labels:");
-                for (k, v) in labels {
-                    println!("  {}: {}", k, v.as_str().unwrap_or("-"));
-                }
-            }
-        }
-    } else {
-        println!("profile:     {}", value["profile"].as_str().unwrap_or("-"));
-        println!(
-            "harness:     {}",
-            value["harnessRef"].as_str().unwrap_or("-")
-        );
-        println!(
-            "importedAt:  {}",
-            value["importedAt"].as_u64().unwrap_or(0)
-        );
+    println!("base:        {}", value["base"].as_str().unwrap_or("-"));
+    println!("base id:     {}", value["baseId"].as_str().unwrap_or("-"));
+    println!("profile:     {}", value["profile"].as_str().unwrap_or("-"));
+    println!("schema:      {}", value["schemaVersion"].as_u64().unwrap_or(0));
+    println!("created:     {}", value["createdAt"].as_u64().unwrap_or(0));
+    println!("size bytes:  {}", value["sizeBytes"].as_u64().unwrap_or(0));
+    if let Some(artifacts) = value["pluginArtifacts"].as_array() {
+        println!("plugins:     {}", artifacts.len());
     }
     Ok(())
 }

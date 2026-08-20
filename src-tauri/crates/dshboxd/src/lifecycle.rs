@@ -4,30 +4,63 @@
 //! the child processes and the running registry.
 
 use crate::containers::{
-    ensure_container_workspace, preflight_profile_plugins, repair_known_profile_template,
+    ensure_container_workspace, repair_known_profile_template,
     write_dshbox_context_snapshot,
 };
-use crate::image::lookup_template_path;
-use crate::state::{bundled_runtime, ContainerManager, ManagedHost};
-use crate::toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel};
+use crate::state::{ContainerManager, ManagedHost};
+use crate::toolchains::{resolve_toolchain, run_logged};
 use box_containers::container_directory;
 use box_dsh_context::PLUGIN_ID;
-use box_dsh_versions::version_directory as dsh_version_directory;
 use box_foundation::{is_safe_identifier, read_config};
 use box_runtime::process::{self, ExecutionKind, ProcessSpec, TrackedChild};
 use box_scheduler::TaskContext;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     net::TcpListener,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
 
 use crate::host::{self, HostState};
+
+fn dsh_dependencies_ready(source: &Path) -> bool {
+    // `pnpm install` can leave the root node_modules directory behind when
+    // Windows fails during junction creation/final validation. The frontend
+    // build imports tsx directly, so this package manifest is the smallest
+    // reliable marker that the workspace is actually ready to build.
+    source
+        .join("node_modules")
+        .join("tsx")
+        .join("package.json")
+        .is_file()
+}
+
+const HOST_BIND_ATTEMPTS: u32 = 3;
+const HOST_READY_PROBES: usize = 240;
+
+fn allocate_loopback_port() -> Result<u16, String> {
+    // This reservation only identifies a currently usable port; DSH owns the
+    // eventual listener, so the socket must be released before host spawn.
+    // Keep the allocation immediately adjacent to that spawn to minimise the
+    // unavoidable hand-off window.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|error| format!("cannot allocate loopback port: {error}"))?;
+    listener
+        .local_addr()
+        .map(|address| address.port())
+        .map_err(|error| error.to_string())
+}
+
+fn is_transient_loopback_bind_failure(output: &[u8]) -> bool {
+    let output = String::from_utf8_lossy(output);
+    output.contains("listen EACCES")
+        || output.contains("listen EADDRINUSE")
+        || output.contains("permission denied 127.0.0.1")
+        || output.contains("address already in use 127.0.0.1")
+}
 
 /// Start the DSH host for `id` and wait until its frontend answers.
 /// The running map is the daemon-owned registry; containers already
@@ -56,19 +89,13 @@ pub(crate) fn start_dsh_container_inner(
     // miss them and report `template not found` even though the container
     // was materialised correctly moments before). `lookup_template_path`
     // falls back to the legacy alias for older installs.
-    match value["template"].as_str() {
-        Some(name) => {
-            lookup_template_path(&root, name).map_err(|error| {
-                format!("template not found: {name} ({error})")
-            })?;
-        }
-        None => {
-            if value["image"].as_str().is_none() {
-                return Err("container is not based on a template or image".to_owned());
-            }
-        }
+    // Sealed recipes retain `sealedTemplate`; direct official-template runs
+    // are materialised from a prepared base and rely on the local manifest.
+    // Both forms are self-contained once preparation has completed.
+    if !directory.join("manifest.json").is_file() {
+        return Err("container is missing its template manifest".to_owned());
     }
-    let version = value["version"]
+    let _version = value["version"]
         .as_str()
         .ok_or("container has no version")?;
     let profile = value["profile"].as_str().unwrap_or("web");
@@ -83,7 +110,7 @@ pub(crate) fn start_dsh_container_inner(
     // machinery, which never consults NODE_PATH; expose the vendored
     // plugin as a real node_modules entry next to the profile.
     ensure_bundled_context_plugin(&directory, profile)?;
-    let source = dsh_version_directory(&root, version);
+    let source = directory.join("harness");
     if !source.join("package.json").is_file() {
         return Err("DSH source is incomplete".to_owned());
     }
@@ -119,105 +146,20 @@ pub(crate) fn start_dsh_container_inner(
         profile,
         "container created; preflight not yet complete",
     );
-    preflight_profile_plugins(&directory, profile, task)?;
     if let Some(task) = task {
         task.check_cancelled()?;
     }
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|error| format!("cannot allocate port: {error}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|error| error.to_string())?
-        .port();
-    drop(listener);
     let patch = directory.join("box-web.patch.yml");
-    fs::write(
-        &patch,
-        format!("- id: webserver\n  config:\n    host: 127.0.0.1\n    port: {port}\n"),
-    )
-    .map_err(|error| format!("cannot write web patch: {error}"))?;
-    let pnpm = resolve_toolchain("pnpm")?;
-    let source_arg = source.to_string_lossy().into_owned();
-    let url = format!("http://127.0.0.1:{port}");
     let log_path = directory.join("logs").join("host.log");
     let _ = fs::File::create(&log_path);
-    let mut built = source
-        .join("apps")
-        .join("web")
-        .join("dist")
-        .join("index.html")
-        .is_file();
+    if !dsh_dependencies_ready(&source)
+        || !source.join("apps/web/dist/index.html").is_file()
+    {
+        return Err("sealed container is missing prepared DSH dependencies or frontend build".to_owned());
+    }
     let mut attempt = 0;
     loop {
         attempt += 1;
-        if !built {
-            if !source.join("node_modules").is_dir() {
-                if let Some(task) = task {
-                    task.update("Installing DSH dependencies", 40);
-                    task.log("installing DSH dependencies");
-                }
-                let install_spec = ProcessSpec::new(pnpm.path.clone())
-                    .args(&pnpm.arguments)
-                    .args(["--dir", source_arg.as_ref(), "install"])
-                    .policy(pnpm_policy(&pnpm))
-                    .kind(ExecutionKind::Logged)
-                    .log_path(&log_path);
-                let mut install_logged = run_logged(&install_spec, "DSH dependency install").map_err(|error| format!("cannot install DSH dependencies: {error}"))?;
-                let status = install_logged
-                    .wait_or_kill(&TaskCancel(task), Duration::from_secs(900), "installing DSH dependencies")
-                    .map_err(|error| format!("DSH dependency install: {error}"))?;
-                if !status.success() {
-                    return Err(format!(
-                        "DSH dependency install failed; inspect {}",
-                        log_path.display()
-                    ));
-                }
-                if let Some(task) = task {
-                    task.check_cancelled()?;
-                }
-            }
-            if let Some(task) = task {
-                task.update("Building DSH frontend", 55);
-                task.log("building DSH frontend");
-            }
-            // Run the build via `node --import tsx/esm scripts/build.ts`
-            // instead of `pnpm run build`. The `tsx` CLI resolves `esbuild`
-            // through ESM from the symlinked `node_modules/tsx/dist/cli.mjs`
-            // path, which cannot reach the pnpm virtual-store sibling directory
-            // `.pnpm/tsx@*/node_modules/esbuild`. The `tsx/esm` loader handles
-            // the virtual-store layout correctly. The build script requires
-            // `npm_execpath` to find the package manager, so we set it to the
-            // bundled pnpm path.
-            let node = resolve_toolchain("node")?;
-            // Use the manifest-resolved pnpm entry directly instead of
-            // deriving it from `pnpm.path` (which is actually the node
-            // executable). The previous heuristic assumed the bundled
-            // layout `<root>/{node,pnpm}/` had pnpm one directory up
-            // from node's parent, but real installer layouts vary (e.g.
-            // Linux deb drops the `resources/` layer), so deriving a
-            // sibling produced a nonexistent `<root>/node/pnpm/.../pnpm.mjs`
-            // path that pnpm then forwarded to child processes via
-            // `npm_execpath` and crashed them at module-load time.
-            let pnpm_mjs = bundled_runtime()?.pnpm.clone();
-            let build_spec = ProcessSpec::new(node.path.clone())
-                .args(&node.arguments)
-                .args(["--import", "tsx/esm", "scripts/build.ts"])
-                .cwd(&source)
-                .policy(pnpm_policy(&pnpm).replace("npm_execpath", pnpm_mjs.to_string_lossy().as_ref()))
-                .kind(ExecutionKind::Logged)
-                .log_path(&log_path);
-            let mut build_logged = run_logged(&build_spec, "DSH frontend build").map_err(|error| format!("cannot build DSH before launch: {error}"))?;
-            let status = build_logged
-                .wait_or_kill(&TaskCancel(task), Duration::from_secs(900), "building DSH frontend")
-                .map_err(|error| format!("DSH build: {error}"))?;
-            if !status.success() {
-                return Err(format!("DSH build failed; inspect {}", log_path.display()));
-            }
-            if let Some(task) = task {
-                task.check_cancelled()?;
-            }
-            built = true;
-        }
         if let Some(task) = task {
             task.update("Launching DSH host", 75);
             task.log("launching DSH host");
@@ -251,6 +193,17 @@ pub(crate) fn start_dsh_container_inner(
             &plugins_node_modules,
         );
         let policy = policy.task_override("DSH_HOME", directory.join("profile").to_string_lossy().into_owned());
+        let port = allocate_loopback_port()?;
+        let url = format!("http://127.0.0.1:{port}");
+        fs::write(
+            &patch,
+            format!("- id: webserver\n  config:\n    host: 127.0.0.1\n    port: {port}\n"),
+        )
+        .map_err(|error| format!("cannot write web patch: {error}"))?;
+        let log_offset = fs::metadata(&log_path).map(|metadata| metadata.len()).unwrap_or(0);
+        if let Some(task) = task {
+            task.log(&format!("starting DSH host on {url}"));
+        }
         let spec = ProcessSpec::new(node.path.clone())
             .args([
                 "--import",
@@ -297,7 +250,7 @@ pub(crate) fn start_dsh_container_inner(
                 task.log(&format!("warning: cannot write host pid file: {error}"));
             }
         }
-        let ready = (0..80).any(|attempt| {
+        let ready = (0..HOST_READY_PROBES).any(|attempt| {
             if task.map(TaskContext::cancelled).unwrap_or(false) {
                 let _ = tracked.kill_tree(false, Duration::from_secs(2));
                 return false;
@@ -316,8 +269,11 @@ pub(crate) fn start_dsh_container_inner(
                 return false;
             }
             if let Some(task) = task {
-                if attempt % 10 == 0 {
-                    task.log(&format!("waiting for DSH host ({}/20s)", attempt / 4));
+                if attempt % 20 == 0 {
+                    task.log(&format!(
+                        "waiting for DSH host ({}/60s)",
+                        attempt / 4
+                    ));
                 }
             }
             let available = reqwest::blocking::get(&url)
@@ -377,12 +333,17 @@ pub(crate) fn start_dsh_container_inner(
             next.exit_signal = signal;
             next
         });
-        if attempt == 1 && built {
+        let host_output = fs::read(&log_path)
+            .ok()
+            .and_then(|output| output.get(log_offset as usize..).map(|tail| tail.to_vec()))
+            .unwrap_or_default();
+        if is_transient_loopback_bind_failure(&host_output) && attempt < HOST_BIND_ATTEMPTS {
             if let Some(task) = task {
-                task.update("Rebuilding DSH frontend", 60);
-                task.log("DSH launch failed; rebuilding frontend");
+                task.log(&format!(
+                    "DSH host could not bind {url}; selecting a new loopback port (attempt {}/{HOST_BIND_ATTEMPTS})",
+                    attempt + 1
+                ));
             }
-            built = false;
             continue;
         }
         let _ = fs::remove_file(&pid_path);
@@ -426,9 +387,10 @@ pub(crate) fn stop_dsh_container(
     Ok(())
 }
 
-/// Rebuild a container's DSH frontend: stop the host, reinstall and build
-/// the harness source, then start the host again. Mirrors the desktop's
-/// `rebuild_dsh_container_with_task` without Tauri dependencies.
+/// A sealed container already contains a prepared frontend. Rebuild is kept
+/// as a UI-compatible recovery action, but now means a clean host restart;
+/// mutating the container with `pnpm install` or `pnpm build` would break the
+/// sealed-template contract.
 pub(crate) fn rebuild_dsh_container_with_task(
     id: String,
     manager: &ContainerManager,
@@ -438,58 +400,9 @@ pub(crate) fn rebuild_dsh_container_with_task(
         task.update("Stopping DSH host", 20);
     }
     stop_dsh_container(&id, manager)?;
-    let config = read_config()?;
-    let root = config
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    let directory = container_directory(&root, &id);
-    let metadata = fs::read_to_string(directory.join("container.json"))
-        .map_err(|error| format!("cannot read container: {error}"))?;
-    let value: serde_json::Value = serde_json::from_str(&metadata)
-        .map_err(|error| format!("cannot parse container: {error}"))?;
-    let source = dsh_version_directory(
-        &root,
-        value["version"]
-            .as_str()
-            .ok_or("container has no version")?,
-    );
-    let pnpm = resolve_toolchain("pnpm")?;
-    let log_path = directory.join("logs").join("rebuild.log");
-    fs::File::create(&log_path).map_err(|error| format!("cannot create rebuild log: {error}"))?;
-    let source_arg = source.to_string_lossy().into_owned();
-    for (index, args) in [
-        ["--dir", source_arg.as_ref(), "install"],
-        ["--dir", source_arg.as_ref(), "build"],
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        if let Some(task) = task {
-            task.update(
-                if index == 0 {
-                    "Installing DSH dependencies"
-                } else {
-                    "Building DSH frontend"
-                },
-                if index == 0 { 45 } else { 70 },
-            );
-            task.check_cancelled()?;
-        }
-        let spec = ProcessSpec::new(pnpm.path.clone())
-            .args(&pnpm.arguments)
-            .args(args)
-            .policy(pnpm_policy(&pnpm))
-            .kind(ExecutionKind::Logged)
-            .log_path(&log_path);
-        let mut logged = run_logged(&spec, "pnpm rebuild step")?;
-        let status = logged
-            .wait_or_kill(&TaskCancel(task), Duration::from_secs(900), "running pnpm")?;
-        if !status.success() {
-            return Err(format!(
-                "DSH rebuild failed; inspect {}",
-                log_path.display()
-            ));
-        }
+    if let Some(task) = task {
+        task.update("Validating sealed container", 55);
+        task.check_cancelled()?;
     }
     start_dsh_container_inner(&id, &manager.running, task).map(|_| ())
 }
@@ -591,35 +504,103 @@ pub(crate) fn copy_tree_following(
     source: &Path,
     destination: &Path,
 ) -> std::io::Result<()> {
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
+    let mut ancestors = HashSet::new();
+    copy_tree_following_inner(source, destination, &mut ancestors)
+}
+
+fn copy_tree_following_inner(
+    source: &Path,
+    destination: &Path,
+    ancestors: &mut HashSet<PathBuf>,
+) -> std::io::Result<()> {
+    // Package-manager trees are graphs, not necessarily trees: pnpm can
+    // create a package-local junction that ultimately points back to an
+    // ancestor package. `cp -rL` semantics must reject that impossible-to-
+    // materialize cycle instead of recursing until dshboxd stack-overflows.
+    let identity = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    if !ancestors.insert(identity.clone()) {
+        // The source is a package-manager graph. A reparse point back to an
+        // ancestor cannot be represented by a finite physical tree; omitting
+        // this back-edge is safe because Node resolves that dependency from
+        // the already materialized ancestor `node_modules` directory.
+        return Ok(());
+    }
+    let result = (|| {
+    fs::create_dir_all(destination)
+        .map_err(|error| copy_tree_error(error, "create directory", source, destination))?;
+    for entry in fs::read_dir(source)
+        .map_err(|error| copy_tree_error(error, "read directory", source, destination))?
+    {
+        let entry = entry.map_err(|error| copy_tree_error(error, "read directory entry", source, destination))?;
         let from = entry.path();
         let to = destination.join(entry.file_name());
         // `symlink_metadata` does not follow symlinks, so a symlink to a
         // directory here still reports `is_symlink()` plus `is_dir()`. We
         // recurse only on plain directories and treat everything else as
         // a leaf whose target we materialise.
-        let metadata = fs::symlink_metadata(&from)?;
+        let metadata = fs::symlink_metadata(&from)
+            .map_err(|error| copy_tree_error(error, "read metadata", &from, &to))?;
         if metadata.file_type().is_symlink() {
             // Resolve the link, then copy whatever it points at. If the
             // target is a directory we recurse; otherwise we hit the file
             // branch below.
             let resolved = fs::canonicalize(&from).unwrap_or_else(|_| from.clone());
-            let resolved_meta = fs::symlink_metadata(&resolved)
-                .or_else(|_| fs::metadata(&resolved))?;
+            // `canonicalize` resolves a Windows pnpm junction, but
+            // `symlink_metadata` on the resolved path can still report a
+            // reparse-point file type. Use `metadata` here deliberately: we
+            // need the target's real directory/file kind before deciding
+            // between recursive copy and `fs::copy`.
+            let resolved_meta = fs::metadata(&resolved)
+                .map_err(|error| copy_tree_error(error, "read dereferenced metadata", &resolved, &to))?;
             if resolved_meta.is_dir() {
-                copy_tree_following(&resolved, &to)?;
+                copy_tree_following_inner(&resolved, &to, ancestors)
+                    .map_err(|error| copy_tree_error(error, "copy dereferenced directory", &resolved, &to))?;
             } else {
-                fs::copy(&resolved, &to)?;
+                fs::copy(&resolved, &to)
+                    .map_err(|error| copy_tree_error(error, "copy dereferenced file", &resolved, &to))?;
             }
         } else if metadata.is_dir() {
-            copy_tree_following(&from, &to)?;
+            copy_tree_following_inner(&from, &to, ancestors)
+                .map_err(|error| copy_tree_error(error, "copy directory", &from, &to))?;
         } else if metadata.is_file() {
-            fs::copy(&from, &to)?;
+            fs::copy(&from, &to)
+                .map_err(|error| copy_tree_error(error, "copy file", &from, &to))?;
         }
     }
     Ok(())
+    })();
+    ancestors.remove(&identity);
+    result
+}
+
+fn copy_tree_error(
+    error: std::io::Error,
+    action: &str,
+    source: &Path,
+    destination: &Path,
+) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!("{action} {} -> {}: {error}", source.display(), destination.display()),
+    )
+}
+
+/// Replace a destination tree with a dereferenced physical copy.  Package
+/// managers can replace a copied package with links during install, so callers
+/// that promise a container-owned plugin payload must use this after install
+/// as well as before it.
+pub(crate) fn replace_tree_following(
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(destination) {
+        if metadata.file_type().is_symlink() || metadata.is_file() {
+            fs::remove_file(destination)?;
+        } else if metadata.is_dir() {
+            fs::remove_dir_all(destination)?;
+        }
+    }
+    copy_tree_following(source, destination)
 }
 
 /// Watches the host URL and writes back to `host.json`.
@@ -908,6 +889,43 @@ fn probe_pid(pid: u32) -> PidProbe {
 }
 
 #[cfg(test)]
+mod dependency_ready_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn requires_the_tsx_manifest_not_just_node_modules() {
+        let root = std::env::temp_dir().join(format!(
+            "dshbox-dependency-ready-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        assert!(!dsh_dependencies_ready(&root));
+
+        fs::create_dir_all(root.join("node_modules/tsx")).unwrap();
+        fs::write(root.join("node_modules/tsx/package.json"), "{}").unwrap();
+        assert!(dsh_dependencies_ready(&root));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recognises_retryable_loopback_bind_errors() {
+        assert!(is_transient_loopback_bind_failure(
+            b"Error: listen EACCES: permission denied 127.0.0.1:54329"
+        ));
+        assert!(is_transient_loopback_bind_failure(
+            b"Error: listen EADDRINUSE: address already in use 127.0.0.1:54329"
+        ));
+        assert!(!is_transient_loopback_bind_failure(
+            b"plugin tree failed to load"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod copy_tree_following_tests {
     use super::*;
     use std::fs;
@@ -953,6 +971,21 @@ mod copy_tree_following_tests {
         let metadata = fs::symlink_metadata(dst.join("link")).unwrap();
         assert!(!metadata.file_type().is_symlink(), "expected plain file");
         assert_eq!(fs::read_to_string(dst.join("link")).unwrap(), "content");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminates_when_a_link_points_to_an_ancestor() {
+        use std::os::unix::fs::symlink;
+        let src = sandbox("cycle");
+        let dst = sandbox("cycle-dst");
+        fs::write(src.join("real.txt"), "content").unwrap();
+        symlink(".", src.join("cycle")).unwrap();
+
+        copy_tree_following(&src, &dst).unwrap();
+
+        assert_eq!(fs::read_to_string(dst.join("real.txt")).unwrap(), "content");
+        assert!(!dst.join("cycle").exists());
     }
 
     #[test]

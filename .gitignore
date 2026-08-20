@@ -21,6 +21,11 @@
 /.zcode/
 # Throwaway packaging artefacts.
 /dshbox-*.tgz
+# Isolated Windows/Linux lifecycle experiments. These roots can contain cloned
+# Harness trees and pnpm stores; they are deliberately never source inputs.
+/.e2e-config-*/
+/.e2e-runtime-*/
+/.e2e-*.dsh
 # Vite build output (dist is bundled into the desktop binary by Tauri's
 # beforeBuildCommand; never edit files under this directory).
 /src-tauri/dist/

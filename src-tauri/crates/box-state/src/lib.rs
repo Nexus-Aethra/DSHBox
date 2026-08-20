@@ -252,7 +252,7 @@ impl ResourceStateManager {
                             (
                                 id,
                                 RepositoryReferenceCount {
-                                    containers: count.containers.len() as u32,
+                                    containers: 0,
                                     templates: count.templates.len() as u32,
                                 },
                             )

@@ -14,22 +14,23 @@ use crate::extensions::{
     import_workspace_extension, install_container_extension, prune_unused_repository_extensions,
     remove_repository_extension, remove_repository_plugin,
 };
-use crate::image::{
-    build_image_from_script, export_template, import_template, list_templates,
-    materialize_template_container, prune_template_snapshots, read_template, remove_template,
-    BuildImageRequest, CreateTemplateContainerRequest,
-};
 use crate::host::{self, HostState};
 use crate::lifecycle::{
     rebuild_dsh_container_with_task, start_dsh_container_inner, stop_dsh_container,
 };
+use crate::sealed::{
+    build_sealed_template_from_script, create_container_from_sealed,
+    export_sealed_template, import_sealed_template,
+    list_sealed_templates, read_sealed_template, remove_sealed_template,
+    prune_sealed_template_snapshots, sealed_template_info,
+};
 use crate::state::{bundled_runtime, ContainerManager, DaemonNotifier, DaemonState};
 use crate::versions::{
     fetch_remote_dsh_tags, list_dsh_versions_derived, list_installed_dsh_versions,
-    migrate_runtime_runtimes_to_templates, pull_template_with_cancel, refresh_dsh_catalog,
+    pull_template_with_cancel, refresh_dsh_catalog,
     uninstall_dsh_version,
 };
-use box_api::ContainerDescription;
+use box_api::{BuildImageRequest, ContainerDescription, CreateTemplateContainerRequest};
 use box_dsh_versions::{
     installed_versions, parse_template_ref, read_built_template, read_template_index,
 };
@@ -102,25 +103,25 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         }))),
         Some("get_info") => get_info().map(Sync),
         Some("list_containers") => list_containers(state).map(Sync),
-        Some("list_templates") => list_templates().map(|items| Sync(json!(items))),
+        Some("list_templates") => list_sealed_templates().map(|items| Sync(json!(items))),
         Some("read_template") => {
             let name = request["name"].as_str().unwrap_or("").to_owned();
-            read_template(&name).map(|text| Sync(json!({ "name": name, "text": text })))
+            read_sealed_template(&name).map(|text| Sync(json!({ "name": name, "text": text })))
         }
         Some("import_template") => {
             let archive = request["archive"].as_str().unwrap_or("").to_owned();
             let name = request["name"].as_str().map(str::to_owned).filter(|value| !value.is_empty());
-            import_template(&archive, name, "rename")
+            import_sealed_template(&archive, name)
                 .map(|name| Sync(json!({ "name": name })))
         }
         Some("export_template") => {
             let name = request["name"].as_str().unwrap_or("").to_owned();
             let destination = request["destination"].as_str().map(str::to_owned).filter(|value| !value.is_empty());
-            export_template(&name, destination).map(|path| Sync(json!({ "path": path })))
+            export_sealed_template(&name, destination).map(|path| Sync(json!({ "path": path })))
         }
         Some("remove_template") => {
             let name = request["name"].as_str().unwrap_or("").to_owned();
-            remove_template(&name).map(|_| Sync(json!({ "name": name, "removed": true })))
+            remove_sealed_template(&name).map(|_| Sync(json!({ "name": name, "removed": true })))
         }
         Some("list_bundles") => list_bundles().map(Sync),
         Some("list_repository_extensions") => list_repository_extensions().map(Sync),
@@ -175,10 +176,10 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         }
         Some("template_info") => {
             let name = request["name"].as_str().unwrap_or("").to_owned();
-            template_info(&name).map(Sync)
+            sealed_template_info(&name).map(Sync)
         }
         Some("prune_template_snapshots") => {
-            prune_template_snapshots().map(|removed| Sync(json!({ "removed": removed })))
+            prune_sealed_template_snapshots().map(|removed| Sync(json!({ "removed": removed })))
         }
         Some("create_container") => create_container_rpc(request).map(Sync),
         Some("enqueue_container_start") => enqueue_container_start(state, request),
@@ -187,10 +188,6 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("enqueue_container_restart") => enqueue_container_restart(state, request),
         Some("delete_container") => delete_container_rpc(state, request),
         Some("describe_container") => describe_container_rpc(state, request),
-        Some("upgrade_legacy_resources") => {
-            migrate_runtime_runtimes_to_templates()
-                .map(|registered| Sync(json!({ "registered": registered })))
-        }
         Some("enqueue_container_extension_add") => enqueue_container_extension_add(state, request),
         Some("enqueue_workspace_extension_import") => {
             enqueue_workspace_extension_import(state, request)
@@ -321,7 +318,14 @@ fn list_containers(state: &DaemonState) -> Result<Value, String> {
         .collect::<Vec<_>>();
     let running = state_running_containers(&state.containers);
     for container in &mut containers {
-        container.status = if running.contains(&container.id) {
+        // The daemon registry contains only children started by this daemon
+        // process.  A daemon restart deliberately loses those Child handles,
+        // but a persisted host PID can still be healthy (especially on
+        // Windows, where the desktop daemon is commonly restarted during an
+        // update).  Keep the CLI and UI aligned with that durable signal.
+        container.status = if running.contains(&container.id)
+            || box_containers::is_host_alive(container)
+        {
             "running".to_owned()
         } else if matches!(
             host::read_host_record(&container.id)
@@ -375,7 +379,7 @@ fn list_repository_reference_counts_rpc() -> Result<Value, String> {
         .map(|entry| {
             let owners = references.get(&entry.id);
             let containers: Vec<String> = owners
-                .map(|set| set.containers.iter().cloned().collect())
+                .map(|_| Vec::new())
                 .unwrap_or_default();
             let templates: Vec<String> = owners
                 .map(|set| set.templates.iter().cloned().collect())
@@ -417,7 +421,7 @@ fn enqueue_build(state: &DaemonState, request: &Value) -> Result<HandlerResult, 
         "image-build",
         vec!["repository:extensions".to_owned()],
         params,
-        move |task| build_image_from_script(parsed, task),
+        move |task| build_sealed_template_from_script(parsed, task),
     ).map(HandlerResult::Async)
 }
 
@@ -505,7 +509,7 @@ fn enqueue_pull_template(state: &DaemonState, request: &Value) -> Result<Handler
                     .task(&cancel_id)
                     .map(|record| record.cancel_requested)
                     .unwrap_or(true)
-            })
+            }, task)
         },
     ).map(HandlerResult::Async)
 }
@@ -626,7 +630,7 @@ fn enqueue_template_container(state: &DaemonState, request: &Value) -> Result<Ha
         vec!["repository:extensions".to_owned()],
         params,
         move |task| {
-            let container = materialize_template_container(parsed, task)?;
+            let container = create_container_from_sealed(&parsed, task)?;
             let url = start_dsh_container_inner(&container.id, &containers.running, Some(task))?;
             task.update(format!("Container {} is ready", container.id), 100);
             task.log(&format!("container url: {url}"));
@@ -638,12 +642,7 @@ fn enqueue_template_container(state: &DaemonState, request: &Value) -> Result<Ha
 /// Returns the resource list of a built template (the metadata-only form
 /// produced by `dshbox build`), for `dshbox template show`.
 fn read_template_list(name: &str) -> Result<Value, String> {
-    let root = read_config()?
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    let list = box_dsh_versions::read_built_template(&root, name)?
-        .ok_or_else(|| format!("template `{name}` is not a built template"))?;
-    Ok(json!(list))
+    sealed_template_info(name)
 }
 
 /// Rich metadata for one built template: build timestamp, template version,
@@ -785,8 +784,17 @@ fn container_url_rpc(state: &DaemonState, request: &Value) -> Result<Value, Stri
         .running
         .lock()
         .map_err(|_| "container manager lock failed".to_owned())?;
-    match running.get(&id) {
-        Some(host) => Ok(json!({ "id": id, "url": host.url })),
+    if let Some(host) = running.get(&id) {
+        return Ok(json!({ "id": id, "url": host.url }));
+    }
+    drop(running);
+    let record = host::read_host_record(&id)
+        .map_err(|error| format!("cannot read host record: {error}"))?;
+    match record.filter(|record| {
+        matches!(record.state, HostState::Starting | HostState::Ready | HostState::Running)
+            && box_containers::is_host_pid_alive(record.host_pid)
+    }) {
+        Some(record) => Ok(json!({ "id": id, "url": record.host_url })),
         None => Err(format!("container is not running: {id}")),
     }
 }
@@ -954,32 +962,6 @@ fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<HandlerR
     let directory = Path::new(&root).join("instances").join(&id);
     if !directory.is_dir() {
         return Err(format!("container not found: {id}"));
-    }
-    // Release the container from each repository plugin it currently
-    // references. Skills are skipped (they have no owner bookkeeping);
-    // local / tarball installs have no `repository_id` (the remove
-    // call is a no-op for them).
-    let container = box_containers::DshContainer {
-        id: id.clone(),
-        name: String::new(),
-        version: String::new(),
-        profile: "web".to_owned(),
-        template: None,
-        directory: directory.to_string_lossy().into_owned(),
-        status: String::new(),
-    };
-    for record in box_extensions::read_extension_records(&container) {
-        if record.kind != box_extensions::ExtensionKind::Plugin {
-            continue;
-        }
-        if let Some(repository_id) = record.repository_id {
-            box_extensions::remove_reference_owner(
-                Path::new(&root),
-                &repository_id,
-                box_extensions::ReferenceKind::Container,
-                &id,
-            )?;
-        }
     }
     std::fs::remove_dir_all(&directory)
         .map_err(|error| format!("cannot remove container: {error}"))?;

@@ -384,9 +384,7 @@ mod tests {
 
     #[test]
     fn exit_status_to_parts_handles_success() {
-        let status = std::process::Command::new("true")
-            .status()
-            .expect("spawn true");
+        let status = exit_status_command(0).status().expect("spawn successful command");
         let (code, signal) = exit_status_to_parts(status);
         assert_eq!(code, 0);
         #[cfg(unix)]
@@ -395,9 +393,7 @@ mod tests {
 
     #[test]
     fn exit_status_to_parts_handles_failure() {
-        let status = std::process::Command::new("false")
-            .status()
-            .expect("spawn false");
+        let status = exit_status_command(1).status().expect("spawn failing command");
         let (code, _signal) = exit_status_to_parts(status);
         assert_eq!(code, 1);
     }
@@ -408,6 +404,21 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(describe_exit(None, Some(11)), "signal 11");
         assert_eq!(describe_exit(None, None), "unknown exit");
+    }
+
+    fn exit_status_command(code: i32) -> std::process::Command {
+        #[cfg(windows)]
+        {
+            let mut command = std::process::Command::new("cmd.exe");
+            command.args(["/C", "exit", &code.to_string()]);
+            command
+        }
+        #[cfg(not(windows))]
+        {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", &format!("exit {code}")]);
+            command
+        }
     }
 
     // CAS tests need a writable runtime dir; they call the `_in`

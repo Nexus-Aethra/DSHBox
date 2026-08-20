@@ -81,36 +81,50 @@ pub struct RemoveTemplateRequest {
 
 // ── Built-template resource list ──────────────────────────────────────
 // DSH Box has a single unit of construction — the template. A *built*
-// template is the metadata-only product of `dshbox build` (spec:
-// docs/specs/image-build.md): plugins are recorded as references into the
-// shared repository, every other kind as a content-addressed snapshot of
-// the data store. There is no separate "image" concept; the word survives
-// only as a deprecated CLI alias.
+// template is the fully physical product of `dshbox build` (spec:
+// docs/specs/image-build.md). Every resource row points at a file or
+// directory inside the template's own storage tree (the hash-addressed
+// directory under `<root>/templates/<id>/`). Container materialisation
+// `cp -rL`s each row into the destination path verbatim — there is no
+// shared-plugin-repository indirection at this layer. There is no
+// separate "image" concept; the word survives only as a deprecated CLI
+// alias.
 
 /// Bump together with any structural change to [`TemplateResourceList`].
-pub const TEMPLATE_LIST_SCHEMA_VERSION: u32 = 7;
+pub const TEMPLATE_LIST_SCHEMA_VERSION: u32 = 8;
 
 /// One resource row inside a built template.
+///
+/// `source_kind` distinguishes how the row's `source` (a path string)
+/// should be interpreted:
+///   - `"plugin"` — a `<scope>/<name>` subdirectory of the template's
+///     `repository/` tree (legacy rows may carry the historical
+///     repository entry id; readers accept both).
+///   - `"skill"` / `"data"` — a content-addressed snapshot under the
+///     template's `data/<digest>/` tree.
+///
+/// `sha256` is the content hash of the resource at build time, used by
+/// consumers to detect drift when the same template is re-applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "mode")]
-pub enum TemplateResource {
-    /// A plugin recorded as a reference into the shared repository.
-    #[serde(rename_all = "camelCase")]
-    Reference {
-        kind: String,
-        name: String,
-        version: Option<String>,
-        entry_id: String,
-    },
-    /// Any non-plugin kind recorded as a content-addressed snapshot of the
-    /// global data store.
-    #[serde(rename_all = "camelCase")]
-    Snapshot {
-        kind: String,
-        name: String,
-        digest: String,
-        destination: String,
-    },
+#[serde(rename_all = "camelCase")]
+pub struct TemplateResource {
+    /// `"plugin" | "skill" | "data"`.
+    pub kind: String,
+    /// Plugin/skill/data name (the canonical npm name or skill folder).
+    pub name: String,
+    /// Origin discriminator; see the schema doc above.
+    pub source_kind: String,
+    /// Path the materialiser should copy out of the template directory.
+    /// Plugin: `repository/<scope>/<name>` (relative). Skill/data:
+    /// `data/<digest>` (relative). Older `reference` rows used an absolute
+    /// runtime path; the reader accepts those for backward compatibility,
+    /// but newer writes always emit the relative form.
+    pub source: String,
+    /// Where the resource lands inside the container profile
+    /// (`profile/skills/<name>` or `node_modules/<scope>/<name>`).
+    pub destination: String,
+    /// SHA-256 of the resource file/directory content. Hex, lowercase.
+    pub sha256: String,
 }
 
 /// The complete metadata of one built template — the only thing it owns.
@@ -271,17 +285,21 @@ mod tests {
             labels: BTreeMap::new(),
             created_at: 1_786_900_000,
             resources: vec![
-                TemplateResource::Reference {
+                TemplateResource {
                     kind: "plugin".to_owned(),
                     name: "dsh-better-sidebar".to_owned(),
-                    version: Some("0.12.2".to_owned()),
-                    entry_id: "a1b2c3d4".to_owned(),
+                    source_kind: "plugin".to_owned(),
+                    source: "repository/dsh-better-sidebar".to_owned(),
+                    destination: "node_modules/dsh-better-sidebar".to_owned(),
+                    sha256: "1c5b6d2c98d6e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718".to_owned(),
                 },
-                TemplateResource::Snapshot {
+                TemplateResource {
                     kind: "skill".to_owned(),
                     name: "boxfile-guide".to_owned(),
-                    digest: "feedface01234567".to_owned(),
+                    source_kind: "skill".to_owned(),
+                    source: "data/feedface01234567".to_owned(),
                     destination: "profile/skills/boxfile-guide".to_owned(),
+                    sha256: "feedface0123456701234567890abcdef01234567890abcdef01234567890abcde".to_owned(),
                 },
             ],
         }
@@ -292,14 +310,17 @@ mod tests {
         // The spec (docs/specs/image-build.md) pins this JSON layout; any
         // field change must update the spec deliberately.
         let json = serde_json::to_value(sample_resource_list()).unwrap();
-        assert_eq!(json["schemaVersion"], 7);
+        assert_eq!(json["schemaVersion"], 8);
         assert_eq!(json["harnessRef"], "latest");
         let plugin = &json["resources"][0];
-        assert_eq!(plugin["mode"], "reference");
-        assert_eq!(plugin["entryId"], "a1b2c3d4");
+        assert_eq!(plugin["kind"], "plugin");
+        assert_eq!(plugin["sourceKind"], "plugin");
+        assert_eq!(plugin["source"], "repository/dsh-better-sidebar");
+        assert_eq!(plugin["destination"], "node_modules/dsh-better-sidebar");
         let skill = &json["resources"][1];
-        assert_eq!(skill["mode"], "snapshot");
-        assert_eq!(skill["digest"], "feedface01234567");
+        assert_eq!(skill["kind"], "skill");
+        assert_eq!(skill["sourceKind"], "skill");
+        assert_eq!(skill["source"], "data/feedface01234567");
         // Round trip.
         let parsed: TemplateResourceList = serde_json::from_value(json).unwrap();
         assert_eq!(parsed, sample_resource_list());
