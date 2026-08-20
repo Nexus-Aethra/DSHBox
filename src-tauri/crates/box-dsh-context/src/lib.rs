@@ -52,6 +52,11 @@ pub struct DshContextFiles {
 /// directly from the install, bypassing the runtime data directory when
 /// needed — particularly useful on Windows where the runtime data directory
 /// may be incomplete or corrupted while the install is always intact.
+///
+/// `dshbox_cli` is the absolute path to the `dshbox` CLI binary (e.g.
+/// `D:\dshbox\dshbox.exe`). If the `DSHBOX_HOME` env var is not set or the
+/// `dshbox` command isn't in PATH, the agent can invoke this path directly
+/// to manage containers, templates, and plugins from inside the DSH session.
 #[allow(clippy::too_many_arguments)]
 pub fn render_snapshot(
     container_id: &str,
@@ -64,6 +69,7 @@ pub fn render_snapshot(
     skills_root: &std::path::Path,
     logs_root: &std::path::Path,
     dshbox_home: &std::path::Path,
+    dshbox_cli: &std::path::Path,
     api_key_envs: &[String],
 ) -> String {
     let snapshot = serde_json::json!({
@@ -80,6 +86,7 @@ pub fn render_snapshot(
             "skills": skills_root.display().to_string(),
             "logs": logs_root.display().to_string(),
             "dshboxHome": dshbox_home.display().to_string(),
+            "dshboxCli": dshbox_cli.display().to_string(),
         },
         "credentials": {
             "providers": api_key_envs.iter().map(|env| {
@@ -139,6 +146,7 @@ mod tests {
             &PathBuf::from("/run/skills"),
             &PathBuf::from("/run/logs"),
             &PathBuf::from("/opt/dshbox"),
+            &PathBuf::from("/opt/dshbox/dshbox"),
             &["MINIMAX_CN_API_KEY".to_owned()],
         );
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -146,6 +154,7 @@ mod tests {
         assert_eq!(v["container"]["name"], "my box");
         assert_eq!(v["paths"]["workspace"], "/run/ws");
         assert_eq!(v["paths"]["dshboxHome"], "/opt/dshbox");
+        assert_eq!(v["paths"]["dshboxCli"], "/opt/dshbox/dshbox");
         assert_eq!(v["credentials"]["providers"][0]["apiKeyEnv"], "MINIMAX_CN_API_KEY");
     }
 
