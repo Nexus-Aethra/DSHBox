@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "dshbox"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "box-api",
  "box-client",

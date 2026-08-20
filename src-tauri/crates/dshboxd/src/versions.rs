@@ -502,6 +502,10 @@ pub(crate) fn list_installed_dsh_versions() -> Result<Vec<String>, String> {
 /// Idempotent: a second call is a no-op once every runtime is mirrored.
 /// Returns the tags that were registered in this pass so the caller can
 /// surface a diagnostic message.
+#[allow(
+    dead_code,
+    reason = "legacy migration is intentionally not run during rapid schema iteration"
+)]
 pub(crate) fn migrate_runtime_runtimes_to_templates() -> Result<Vec<String>, String> {
     let root = read_config()?
         .runtime_directory

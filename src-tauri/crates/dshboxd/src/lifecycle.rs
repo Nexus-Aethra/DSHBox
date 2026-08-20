@@ -4,8 +4,7 @@
 //! the child processes and the running registry.
 
 use crate::containers::{
-    ensure_container_workspace, repair_known_profile_template,
-    write_dshbox_context_snapshot,
+    ensure_container_workspace, repair_known_profile_template, write_dshbox_context_snapshot,
 };
 use crate::state::{ContainerManager, ManagedHost};
 use crate::toolchains::{resolve_toolchain, run_logged};
@@ -19,9 +18,9 @@ use std::{
     fs,
     net::TcpListener,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{mpsc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::host::{self, HostState};
@@ -40,6 +39,8 @@ fn dsh_dependencies_ready(source: &Path) -> bool {
 
 const HOST_BIND_ATTEMPTS: u32 = 3;
 const HOST_READY_PROBES: usize = 240;
+const CONTEXT_PLUGIN_COPY_TIMEOUT: Duration = Duration::from_secs(45);
+const CONTEXT_PLUGIN_MARKER: &str = ".dshbox-materialized";
 
 fn allocate_loopback_port() -> Result<u16, String> {
     // This reservation only identifies a currently usable port; DSH owns the
@@ -103,13 +104,16 @@ pub(crate) fn start_dsh_container_inner(
     let template = value["template"].as_str().map(str::to_owned);
     repair_known_profile_template(&directory, profile)?;
     let _workspace = ensure_container_workspace(&directory)?;
-    let dshbox_home = crate::state::dshbox_install_directory()
-        .unwrap_or_else(|_| PathBuf::from("."));
+    let dshbox_home =
+        crate::state::dshbox_install_directory().unwrap_or_else(|_| PathBuf::from("."));
     let context_files = write_dshbox_context_snapshot(&directory, &value, profile, &dshbox_home)?;
     // DSH's Cordis loader imports loader entries through Node's ESM
     // machinery, which never consults NODE_PATH; expose the vendored
     // plugin as a real node_modules entry next to the profile.
-    ensure_bundled_context_plugin(&directory, profile)?;
+    if let Some(task) = task {
+        task.update("Verifying DSH Box context plugin", 20);
+    }
+    materialize_bundled_context_plugin(&directory, profile, task)?;
     let source = directory.join("harness");
     if !source.join("package.json").is_file() {
         return Err("DSH source is incomplete".to_owned());
@@ -152,10 +156,10 @@ pub(crate) fn start_dsh_container_inner(
     let patch = directory.join("box-web.patch.yml");
     let log_path = directory.join("logs").join("host.log");
     let _ = fs::File::create(&log_path);
-    if !dsh_dependencies_ready(&source)
-        || !source.join("apps/web/dist/index.html").is_file()
-    {
-        return Err("sealed container is missing prepared DSH dependencies or frontend build".to_owned());
+    if !dsh_dependencies_ready(&source) || !source.join("apps/web/dist/index.html").is_file() {
+        return Err(
+            "sealed container is missing prepared DSH dependencies or frontend build".to_owned(),
+        );
     }
     let mut attempt = 0;
     loop {
@@ -164,8 +168,7 @@ pub(crate) fn start_dsh_container_inner(
             task.update("Launching DSH host", 75);
             task.log("launching DSH host");
         }
-        let plugins_node_modules =
-            PathBuf::from(&root).join("plugins").join("node_modules");
+        let plugins_node_modules = PathBuf::from(&root).join("plugins").join("node_modules");
         // Wait for the harness runtime's pnpm store to finish initialising.
         // `pull_template` only clones the repo — it does NOT run `pnpm
         // install` — so the first container create on a freshly-installed
@@ -188,11 +191,23 @@ pub(crate) fn start_dsh_container_inner(
         // host.log unmodified.
         let node = resolve_toolchain("node")?;
         let policy = process::dsh_host_policy(
-            std::path::Path::new(&node.path).parent().map(Path::to_path_buf).as_deref().unwrap_or(Path::new(".")),
-            std::path::Path::new(&node.path).parent().and_then(|p| p.parent()).map(|p| p.join("pnpm")).as_deref().unwrap_or(Path::new(".")),
+            std::path::Path::new(&node.path)
+                .parent()
+                .map(Path::to_path_buf)
+                .as_deref()
+                .unwrap_or(Path::new(".")),
+            std::path::Path::new(&node.path)
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("pnpm"))
+                .as_deref()
+                .unwrap_or(Path::new(".")),
             &plugins_node_modules,
         );
-        let policy = policy.task_override("DSH_HOME", directory.join("profile").to_string_lossy().into_owned());
+        let policy = policy.task_override(
+            "DSH_HOME",
+            directory.join("profile").to_string_lossy().into_owned(),
+        );
         let port = allocate_loopback_port()?;
         let url = format!("http://127.0.0.1:{port}");
         fs::write(
@@ -200,7 +215,9 @@ pub(crate) fn start_dsh_container_inner(
             format!("- id: webserver\n  config:\n    host: 127.0.0.1\n    port: {port}\n"),
         )
         .map_err(|error| format!("cannot write web patch: {error}"))?;
-        let log_offset = fs::metadata(&log_path).map(|metadata| metadata.len()).unwrap_or(0);
+        let log_offset = fs::metadata(&log_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         if let Some(task) = task {
             task.log(&format!("starting DSH host on {url}"));
         }
@@ -208,7 +225,10 @@ pub(crate) fn start_dsh_container_inner(
             .args([
                 "--import",
                 "tsx/esm",
-                source.join("apps/cli/src/bin.ts").to_string_lossy().as_ref(),
+                source
+                    .join("apps/cli/src/bin.ts")
+                    .to_string_lossy()
+                    .as_ref(),
                 "--profile",
                 profile,
                 "--patch",
@@ -270,10 +290,7 @@ pub(crate) fn start_dsh_container_inner(
             }
             if let Some(task) = task {
                 if attempt % 20 == 0 {
-                    task.log(&format!(
-                        "waiting for DSH host ({}/60s)",
-                        attempt / 4
-                    ));
+                    task.log(&format!("waiting for DSH host ({}/60s)", attempt / 4));
                 }
             }
             let available = reqwest::blocking::get(&url)
@@ -357,10 +374,7 @@ pub(crate) fn start_dsh_container_inner(
 /// Stop a running container host: send SIGTERM to the process group,
 /// wait up to 5s for graceful exit, escalate to SIGKILL, and update the
 /// `host.json` state to `Stopped`.
-pub(crate) fn stop_dsh_container(
-    id: &str,
-    manager: &ContainerManager,
-) -> Result<(), String> {
+pub(crate) fn stop_dsh_container(id: &str, manager: &ContainerManager) -> Result<(), String> {
     let host = manager
         .running
         .lock()
@@ -375,7 +389,9 @@ pub(crate) fn stop_dsh_container(
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
-    let pid_path = container_directory(&root, id).join("state").join("host.pid");
+    let pid_path = container_directory(&root, id)
+        .join("state")
+        .join("host.pid");
     let _ = fs::remove_file(&pid_path);
     if let Ok(Some(snapshot)) = host::read_host_record(id) {
         let _ = host::compare_and_swap_host_record(id, &snapshot, |on_disk| {
@@ -409,7 +425,11 @@ pub(crate) fn rebuild_dsh_container_with_task(
 
 /// Expose the vendored `@deepseek-ai/dsh-box-context` bundle to the DSH
 /// loader as a real `node_modules` entry under the container's profile.
-fn ensure_bundled_context_plugin(directory: &Path, profile: &str) -> Result<(), String> {
+pub(crate) fn materialize_bundled_context_plugin(
+    directory: &Path,
+    profile: &str,
+    task: Option<&TaskContext>,
+) -> Result<(), String> {
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
@@ -436,7 +456,18 @@ fn ensure_bundled_context_plugin(directory: &Path, profile: &str) -> Result<(), 
         .join("profiles")
         .join(profile)
         .join("node_modules");
-    ensure_vendored_plugin_copied(&vendored, &profile_node_modules)
+    if let Some(task) = task {
+        task.log("verifying DSH Box context plugin");
+    }
+    let copied = ensure_vendored_plugin_copied(&vendored, &profile_node_modules)?;
+    if let Some(task) = task {
+        task.log(if copied {
+            "materialized DSH Box context plugin"
+        } else {
+            "DSH Box context plugin is already materialized"
+        });
+    }
+    Ok(())
 }
 
 /// Idempotent exposure of the vendored bundle under a profile's
@@ -449,7 +480,7 @@ fn ensure_bundled_context_plugin(directory: &Path, profile: &str) -> Result<(), 
 fn ensure_vendored_plugin_copied(
     vendored: &Path,
     profile_node_modules: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let scoped = profile_node_modules.join("@deepseek-ai");
     fs::create_dir_all(&scoped)
         .map_err(|error| format!("cannot create {}: {error}", scoped.display()))?;
@@ -459,9 +490,9 @@ fn ensure_vendored_plugin_copied(
         && !fs::symlink_metadata(&target)
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false)
-        && packages_match(vendored, &target)?
+        && materialized_package_matches(vendored, &target)?
     {
-        return Ok(());
+        return Ok(false);
     }
     // Otherwise it is a stale symlink, an unexpected file, or a divergent
     // copy — clear it before re-copying. `symlink_metadata` is used so we
@@ -478,8 +509,8 @@ fn ensure_vendored_plugin_copied(
                 .map_err(|error| format!("cannot replace stale plugin file: {error}"))?;
         }
     }
-    copy_tree_following(vendored, &target)
-        .map_err(|error| format!("cannot copy vendored plugin into profile: {error}"))
+    copy_vendored_plugin_with_timeout(vendored, &target)?;
+    Ok(true)
 }
 
 /// True when the two plugin trees share the same `package.json` bytes.
@@ -487,12 +518,57 @@ fn ensure_vendored_plugin_copied(
 /// equality check on `package.json` is enough — that file is rewritten
 /// whenever the plugin is re-extracted, which is the only thing the user
 /// can meaningfully change in the vendored tree.)
-fn packages_match(first: &Path, second: &Path) -> Result<bool, String> {
+fn materialized_package_matches(first: &Path, second: &Path) -> Result<bool, String> {
     let a = fs::read(first.join("package.json"))
         .map_err(|error| format!("cannot read {}/package.json: {error}", first.display()))?;
     let b = fs::read(second.join("package.json"))
         .map_err(|error| format!("cannot read {}/package.json: {error}", second.display()))?;
-    Ok(a == b)
+    let marker = fs::read(second.join(CONTEXT_PLUGIN_MARKER)).unwrap_or_default();
+    Ok(a == b && a == marker)
+}
+
+/// Materialize in a separate worker so a stalled filesystem operation cannot
+/// hold the scheduler task forever. The staging tree is never visible to the
+/// DSH loader; only a completed copy is published at the target path.
+fn copy_vendored_plugin_with_timeout(source: &Path, target: &Path) -> Result<(), String> {
+    let source = source.to_path_buf();
+    let target = target.to_path_buf();
+    let copy_target = target.clone();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("dshbox-context-copy".to_owned())
+        .spawn(move || {
+            let result = copy_vendored_plugin_atomically(&source, &copy_target);
+            let _ = sender.send(result);
+        })
+        .map_err(|error| format!("cannot start context plugin copy: {error}"))?;
+    receiver.recv_timeout(CONTEXT_PLUGIN_COPY_TIMEOUT).map_err(|error| match error {
+        mpsc::RecvTimeoutError::Timeout => format!(
+            "DSH Box context plugin copy exceeded {} seconds; retry the container start (a filesystem or antivirus lock may be blocking {})",
+            CONTEXT_PLUGIN_COPY_TIMEOUT.as_secs(),
+            target.display()
+        ),
+        mpsc::RecvTimeoutError::Disconnected => "DSH Box context plugin copy worker stopped unexpectedly".to_owned(),
+    })?
+}
+
+fn copy_vendored_plugin_atomically(source: &Path, target: &Path) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or("context plugin target has no parent")?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let staging = parent.join(format!(".{PLUGIN_ID}.copy-{}-{nonce}", std::process::id()));
+    copy_tree_following(source, &staging)
+        .map_err(|error| format!("cannot copy vendored plugin into staging: {error}"))?;
+    let package = fs::read(source.join("package.json"))
+        .map_err(|error| format!("cannot read {}/package.json: {error}", source.display()))?;
+    fs::write(staging.join(CONTEXT_PLUGIN_MARKER), package)
+        .map_err(|error| format!("cannot mark materialized context plugin: {error}"))?;
+    fs::rename(&staging, target)
+        .map_err(|error| format!("cannot publish materialized context plugin: {error}"))
 }
 
 /// Recursive directory copy with `cp -rL` semantics: any symlinks
@@ -500,10 +576,7 @@ fn packages_match(first: &Path, second: &Path) -> Result<bool, String> {
 /// contents materialised, never re-exported as a link. This keeps each
 /// container profile self-contained and prevents the Windows pnpm +
 /// AV + symlink interactions we have hit in the past.
-pub(crate) fn copy_tree_following(
-    source: &Path,
-    destination: &Path,
-) -> std::io::Result<()> {
+pub(crate) fn copy_tree_following(source: &Path, destination: &Path) -> std::io::Result<()> {
     let mut ancestors = HashSet::new();
     copy_tree_following_inner(source, destination, &mut ancestors)
 }
@@ -526,48 +599,53 @@ fn copy_tree_following_inner(
         return Ok(());
     }
     let result = (|| {
-    fs::create_dir_all(destination)
-        .map_err(|error| copy_tree_error(error, "create directory", source, destination))?;
-    for entry in fs::read_dir(source)
-        .map_err(|error| copy_tree_error(error, "read directory", source, destination))?
-    {
-        let entry = entry.map_err(|error| copy_tree_error(error, "read directory entry", source, destination))?;
-        let from = entry.path();
-        let to = destination.join(entry.file_name());
-        // `symlink_metadata` does not follow symlinks, so a symlink to a
-        // directory here still reports `is_symlink()` plus `is_dir()`. We
-        // recurse only on plain directories and treat everything else as
-        // a leaf whose target we materialise.
-        let metadata = fs::symlink_metadata(&from)
-            .map_err(|error| copy_tree_error(error, "read metadata", &from, &to))?;
-        if metadata.file_type().is_symlink() {
-            // Resolve the link, then copy whatever it points at. If the
-            // target is a directory we recurse; otherwise we hit the file
-            // branch below.
-            let resolved = fs::canonicalize(&from).unwrap_or_else(|_| from.clone());
-            // `canonicalize` resolves a Windows pnpm junction, but
-            // `symlink_metadata` on the resolved path can still report a
-            // reparse-point file type. Use `metadata` here deliberately: we
-            // need the target's real directory/file kind before deciding
-            // between recursive copy and `fs::copy`.
-            let resolved_meta = fs::metadata(&resolved)
-                .map_err(|error| copy_tree_error(error, "read dereferenced metadata", &resolved, &to))?;
-            if resolved_meta.is_dir() {
-                copy_tree_following_inner(&resolved, &to, ancestors)
-                    .map_err(|error| copy_tree_error(error, "copy dereferenced directory", &resolved, &to))?;
-            } else {
-                fs::copy(&resolved, &to)
-                    .map_err(|error| copy_tree_error(error, "copy dereferenced file", &resolved, &to))?;
+        fs::create_dir_all(destination)
+            .map_err(|error| copy_tree_error(error, "create directory", source, destination))?;
+        for entry in fs::read_dir(source)
+            .map_err(|error| copy_tree_error(error, "read directory", source, destination))?
+        {
+            let entry = entry.map_err(|error| {
+                copy_tree_error(error, "read directory entry", source, destination)
+            })?;
+            let from = entry.path();
+            let to = destination.join(entry.file_name());
+            // `symlink_metadata` does not follow symlinks, so a symlink to a
+            // directory here still reports `is_symlink()` plus `is_dir()`. We
+            // recurse only on plain directories and treat everything else as
+            // a leaf whose target we materialise.
+            let metadata = fs::symlink_metadata(&from)
+                .map_err(|error| copy_tree_error(error, "read metadata", &from, &to))?;
+            if metadata.file_type().is_symlink() {
+                // Resolve the link, then copy whatever it points at. If the
+                // target is a directory we recurse; otherwise we hit the file
+                // branch below.
+                let resolved = fs::canonicalize(&from).unwrap_or_else(|_| from.clone());
+                // `canonicalize` resolves a Windows pnpm junction, but
+                // `symlink_metadata` on the resolved path can still report a
+                // reparse-point file type. Use `metadata` here deliberately: we
+                // need the target's real directory/file kind before deciding
+                // between recursive copy and `fs::copy`.
+                let resolved_meta = fs::metadata(&resolved).map_err(|error| {
+                    copy_tree_error(error, "read dereferenced metadata", &resolved, &to)
+                })?;
+                if resolved_meta.is_dir() {
+                    copy_tree_following_inner(&resolved, &to, ancestors).map_err(|error| {
+                        copy_tree_error(error, "copy dereferenced directory", &resolved, &to)
+                    })?;
+                } else {
+                    fs::copy(&resolved, &to).map_err(|error| {
+                        copy_tree_error(error, "copy dereferenced file", &resolved, &to)
+                    })?;
+                }
+            } else if metadata.is_dir() {
+                copy_tree_following_inner(&from, &to, ancestors)
+                    .map_err(|error| copy_tree_error(error, "copy directory", &from, &to))?;
+            } else if metadata.is_file() {
+                fs::copy(&from, &to)
+                    .map_err(|error| copy_tree_error(error, "copy file", &from, &to))?;
             }
-        } else if metadata.is_dir() {
-            copy_tree_following_inner(&from, &to, ancestors)
-                .map_err(|error| copy_tree_error(error, "copy directory", &from, &to))?;
-        } else if metadata.is_file() {
-            fs::copy(&from, &to)
-                .map_err(|error| copy_tree_error(error, "copy file", &from, &to))?;
         }
-    }
-    Ok(())
+        Ok(())
     })();
     ancestors.remove(&identity);
     result
@@ -581,7 +659,11 @@ fn copy_tree_error(
 ) -> std::io::Error {
     std::io::Error::new(
         error.kind(),
-        format!("{action} {} -> {}: {error}", source.display(), destination.display()),
+        format!(
+            "{action} {} -> {}: {error}",
+            source.display(),
+            destination.display()
+        ),
     )
 }
 
@@ -589,10 +671,7 @@ fn copy_tree_error(
 /// managers can replace a copied package with links during install, so callers
 /// that promise a container-owned plugin payload must use this after install
 /// as well as before it.
-pub(crate) fn replace_tree_following(
-    source: &Path,
-    destination: &Path,
-) -> std::io::Result<()> {
+pub(crate) fn replace_tree_following(source: &Path, destination: &Path) -> std::io::Result<()> {
     if let Ok(metadata) = fs::symlink_metadata(destination) {
         if metadata.file_type().is_symlink() || metadata.is_file() {
             fs::remove_file(destination)?;
@@ -670,7 +749,10 @@ fn spawn_health_watcher(id: &str, url: String) {
                 } else {
                     next.unhealthy_count = on_disk.unhealthy_count.saturating_add(1);
                     if next.unhealthy_count >= UNHEALTHY_THRESHOLD
-                        && matches!(next.state, HostState::Starting | HostState::Ready | HostState::Running)
+                        && matches!(
+                            next.state,
+                            HostState::Starting | HostState::Ready | HostState::Running
+                        )
                     {
                         next.state = HostState::Crashed;
                     }
@@ -713,7 +795,9 @@ fn wait_for_pnpm_links(source: &Path, deadline: Duration) -> Result<(), String> 
     let probe = || {
         // `metadata` follows symlinks; a dangling link returns Err — that's
         // exactly what we want to wait out.
-        std::fs::metadata(&marker).map(|_| ()).map_err(|error| error.to_string())
+        std::fs::metadata(&marker)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     };
     if probe().is_ok() {
         return Ok(());
@@ -774,28 +858,24 @@ pub(crate) fn reconcile_orphan_containers() {
                 // still consult it don't trip over a phantom running
                 // container.
                 if let Ok(config) = read_config() {
-                if let Some(root) = config.runtime_directory {
-                    let pid_path = container_directory(&root, &record.id)
-                        .join("state")
-                        .join("host.pid");
-                    let _ = fs::remove_file(pid_path);
+                    if let Some(root) = config.runtime_directory {
+                        let pid_path = container_directory(&root, &record.id)
+                            .join("state")
+                            .join("host.pid");
+                        let _ = fs::remove_file(pid_path);
+                    }
                 }
-            }
             }
             PidProbe::Eperm => {
                 eprintln!(
                     "reconcile: {} host PID {} exists but is not ours; flagging orphaned",
                     record.id, record.host_pid
                 );
-                let _ = host::compare_and_swap_host_record(
-                    &record.id,
-                    &record,
-                    |on_disk| {
-                        let mut next = on_disk.clone();
-                        next.state = HostState::Orphaned;
-                        next
-                    },
-                );
+                let _ = host::compare_and_swap_host_record(&record.id, &record, |on_disk| {
+                    let mut next = on_disk.clone();
+                    next.state = HostState::Orphaned;
+                    next
+                });
             }
         }
     }
@@ -859,19 +939,13 @@ fn probe_pid(pid: u32) -> PidProbe {
     #[cfg(windows)]
     {
         extern "system" {
-            fn OpenProcess(
-                access: u32,
-                inherit: i32,
-                pid: u32,
-            ) -> *mut core::ffi::c_void;
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
             fn GetLastError() -> u32;
             fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
         }
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
         const ERROR_ACCESS_DENIED: u32 = 5;
-        let handle = unsafe {
-            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
-        };
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if !handle.is_null() {
             unsafe {
                 CloseHandle(handle);
@@ -953,7 +1027,10 @@ mod copy_tree_following_tests {
         copy_tree_following(&src, &dst).unwrap();
         assert_eq!(fs::read_to_string(dst.join("hello.txt")).unwrap(), "hi");
         assert!(dst.join("nested/inner.txt").is_file());
-        assert_eq!(fs::read_to_string(dst.join("nested/inner.txt")).unwrap(), "deep");
+        assert_eq!(
+            fs::read_to_string(dst.join("nested/inner.txt")).unwrap(),
+            "deep"
+        );
     }
 
     #[test]
@@ -998,5 +1075,32 @@ mod copy_tree_following_tests {
         fs::create_dir_all(&dst).unwrap();
         copy_tree_following(&src, &dst).unwrap();
         assert!(dst.join("x.txt").is_file());
+    }
+
+    #[test]
+    fn context_plugin_requires_a_completion_marker() {
+        let source = sandbox("context-source");
+        let target = sandbox("context-target");
+        fs::write(source.join("package.json"), "{\"version\":1}").unwrap();
+        fs::write(target.join("package.json"), "{\"version\":1}").unwrap();
+
+        assert!(!materialized_package_matches(&source, &target).unwrap());
+        fs::write(target.join(CONTEXT_PLUGIN_MARKER), "{\"version\":1}").unwrap();
+        assert!(materialized_package_matches(&source, &target).unwrap());
+    }
+
+    #[test]
+    fn context_plugin_copy_is_complete_before_it_is_reused() {
+        let source = sandbox("context-copy-source");
+        let profile_modules = sandbox("context-copy-profile");
+        fs::write(source.join("package.json"), "{\"version\":1}").unwrap();
+        fs::create_dir_all(source.join("node_modules/example")).unwrap();
+        fs::write(source.join("node_modules/example/index.js"), "export {};").unwrap();
+
+        assert!(ensure_vendored_plugin_copied(&source, &profile_modules).unwrap());
+        let target = profile_modules.join("@deepseek-ai").join(PLUGIN_ID);
+        assert!(target.join(CONTEXT_PLUGIN_MARKER).is_file());
+        assert!(target.join("node_modules/example/index.js").is_file());
+        assert!(!ensure_vendored_plugin_copied(&source, &profile_modules).unwrap());
     }
 }

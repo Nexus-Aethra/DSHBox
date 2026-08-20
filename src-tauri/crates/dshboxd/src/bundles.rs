@@ -51,8 +51,12 @@ pub(crate) fn install_container_skill(
         return Err(format!("skill already exists: {name}"));
     }
     task.update("Installing container skill", 65);
-    fs::create_dir_all(destination.parent().ok_or("skill destination has no parent")?)
-        .map_err(|error| error.to_string())?;
+    fs::create_dir_all(
+        destination
+            .parent()
+            .ok_or("skill destination has no parent")?,
+    )
+    .map_err(|error| error.to_string())?;
     fs::rename(&extracted, &destination)
         .map_err(|error| format!("cannot install skill: {error}"))?;
     write_extension_record(
@@ -195,12 +199,15 @@ fn register_plugin_directly(
     let manifest_path = profile_dir.join("package.json");
     let workspace_manifest = profile_dir.join("pnpm-workspace.yaml");
     if !manifest_path.is_file() {
-        return Err(format!("profile at {} is missing package.json", profile_dir.display()));
+        return Err(format!(
+            "profile at {} is missing package.json",
+            profile_dir.display()
+        ));
     }
 
     // --- Step 1: Update package.json ---
-    let manifest_text =
-        fs::read_to_string(&manifest_path).map_err(|error| format!("cannot read package.json: {error}"))?;
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("cannot read package.json: {error}"))?;
     let mut manifest: serde_json::Value = serde_json::from_str(&manifest_text)
         .map_err(|error| format!("cannot parse package.json: {error}"))?;
 
@@ -244,8 +251,8 @@ fn register_plugin_directly(
     }
 
     if removed_registry_dependency || needs_bundle {
-        let serialized = serde_json::to_string_pretty(&manifest)
-            .unwrap_or_else(|_| manifest_text.to_owned());
+        let serialized =
+            serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| manifest_text.to_owned());
         fs::write(&manifest_path, serialized)
             .map_err(|error| format!("cannot write package.json: {error}"))?;
     }
@@ -257,10 +264,7 @@ fn register_plugin_directly(
     // split is well-defined.
     let (scope, package) = split_package_name(plugin_name)
         .ok_or_else(|| format!("plugin name `{plugin_name}` is not a valid package name"))?;
-    let plugin_target = profile_dir
-        .join("node_modules")
-        .join(scope)
-        .join(package);
+    let plugin_target = profile_dir.join("node_modules").join(scope).join(package);
     crate::lifecycle::replace_tree_following(plugin_source, &plugin_target)
         .map_err(|error| format!("cannot copy plugin `{plugin_name}` into profile: {error}"))?;
 
@@ -269,13 +273,16 @@ fn register_plugin_directly(
         .map_err(|error| format!("cannot update pnpm-workspace.yaml: {error}"))?;
 
     // --- Step 4: Run pnpm install in profile dir ---
-    task.log(&format!("registered physical plugin payload for {plugin_name}"));
+    task.log(&format!(
+        "registered physical plugin payload for {plugin_name}"
+    ));
     Ok(())
 }
 
 /// Register plugins that have already been copied from a built template into
 /// a profile. This deliberately performs no repository lookup or file copy:
 /// PR3 materialisation owns a detached profile tree before this function runs.
+#[allow(dead_code, reason = "superseded by sealed recipe materialization")]
 pub(crate) fn prepare_materialized_profile(
     profile_dir: &Path,
     plugin_names: &[String],
@@ -294,7 +301,8 @@ pub(crate) fn prepare_materialized_profile(
         }
     }
     {
-        let bundles = manifest.pointer_mut("/dsh/profile/bundles")
+        let bundles = manifest
+            .pointer_mut("/dsh/profile/bundles")
             .and_then(serde_json::Value::as_array_mut)
             .ok_or("profile has no dsh.profile.bundles")?;
         for name in plugin_names {
@@ -303,8 +311,11 @@ pub(crate) fn prepare_materialized_profile(
             }
         }
     }
-    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?)
-        .map_err(|error| format!("cannot write profile package.json: {error}"))?;
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("cannot write profile package.json: {error}"))?;
     ensure_local_pnpm_workspace(&profile_dir.join("pnpm-workspace.yaml"))?;
     task.log("registered built-template plugin payloads without registry resolution");
     Ok(())
@@ -339,8 +350,7 @@ fn ensure_local_pnpm_workspace(path: &Path) -> Result<(), String> {
     let content = "packages:\n  - .\nnodeLinker: hoisted\n\
                    ignore-workspace-root-check: true\n\
                    dangerouslyAllowAllBuilds: true\n";
-    fs::write(path, content)
-        .map_err(|error| format!("cannot write pnpm-workspace.yaml: {error}"))
+    fs::write(path, content).map_err(|error| format!("cannot write pnpm-workspace.yaml: {error}"))
 }
 
 /// Append an extra `packages:` entry to a `pnpm-workspace.yaml` whose
@@ -493,12 +503,18 @@ pub(crate) fn export_extension_bundle(
     for entry in &bundle.entries {
         task.check_cancelled()?;
         let Some(source_path) = source_path(&entry.repository_id) else {
-            task.log(&format!("skipping {}: repository source is gone", entry.name));
+            task.log(&format!(
+                "skipping {}: repository source is gone",
+                entry.name
+            ));
             continue;
         };
         let source = Path::new(&source_path);
         if !source.is_dir() {
-            task.log(&format!("skipping {}: source directory is missing", entry.name));
+            task.log(&format!(
+                "skipping {}: source directory is missing",
+                entry.name
+            ));
             continue;
         }
         let github = entry
@@ -557,7 +573,10 @@ pub(crate) fn import_extension_bundle(
     if manifest["format"].as_str() != Some("dsh-bundle") {
         return Err("not a DSH Box bundle archive".to_owned());
     }
-    let bundle_name = manifest["name"].as_str().unwrap_or("imported-bundle").to_owned();
+    let bundle_name = manifest["name"]
+        .as_str()
+        .unwrap_or("imported-bundle")
+        .to_owned();
     let manifest_entries = manifest["entries"]
         .as_array()
         .cloned()
@@ -672,11 +691,7 @@ pub(crate) fn import_extension_bundle(
             source,
         });
     }
-    repository.sort_by(|left, right| {
-        left.name
-            .cmp(&right.name)
-            .then(left.id.cmp(&right.id))
-    });
+    repository.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
     write_repository_index(Path::new(&root), &repository)?;
     // Register the imported set as a bundle so it shows in the bundle list.
     let prefix = format!("{}-", task.task_id);
@@ -762,10 +777,7 @@ pub(crate) fn install_container_bundle(
                         ));
                         continue;
                     }
-                    task.log(&format!(
-                        "overwrite: replacing plugin {}",
-                        repo_entry.name
-                    ));
+                    task.log(&format!("overwrite: replacing plugin {}", repo_entry.name));
                     let _ = fs::remove_dir_all(
                         installed.parent().ok_or("plugin install has no parent")?,
                     );
@@ -791,21 +803,13 @@ pub(crate) fn install_container_bundle(
                     .join(&name);
                 if destination.exists() {
                     if conflict == "keep" {
-                        task.log(&format!(
-                            "keep: skill {name} already installed, skipping"
-                        ));
+                        task.log(&format!("keep: skill {name} already installed, skipping"));
                         continue;
                     }
                     task.log(&format!("overwrite: replacing skill {name}"));
                     let _ = fs::remove_dir_all(&destination);
                 }
-                install_container_skill(
-                    &container,
-                    "repository",
-                    &repo_entry.name,
-                    staged,
-                    task,
-                )?;
+                install_container_skill(&container, "repository", &repo_entry.name, staged, task)?;
             }
         }
     }

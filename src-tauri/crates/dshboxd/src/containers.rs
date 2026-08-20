@@ -712,7 +712,11 @@ pub(crate) fn write_dshbox_context_snapshot(
         binary.push("dshbox");
         // EXE_SUFFIX includes the leading dot (".exe"); set_extension
         // adds its own dot, so strip the prefix.
-        binary.set_extension(std::env::consts::EXE_SUFFIX.strip_prefix('.').unwrap_or("exe"));
+        binary.set_extension(
+            std::env::consts::EXE_SUFFIX
+                .strip_prefix('.')
+                .unwrap_or("exe"),
+        );
         binary
     };
     let snapshot_body = render_snapshot(
@@ -809,6 +813,7 @@ pub(crate) fn repair_known_profile_template(
 /// Ensures every non-bundled DSH plugin selected by a profile has its
 /// declared runtime entry, preparing TypeScript sources before the DSH
 /// loader attempts to import them.
+#[allow(dead_code, reason = "superseded by DSH-managed plugin preparation")]
 pub(crate) fn preflight_profile_plugins(
     container_directory: &Path,
     profile: &str,
@@ -872,6 +877,7 @@ pub(crate) fn preflight_profile_plugins(
     Ok(())
 }
 
+#[allow(dead_code, reason = "only used by the retired profile preflight path")]
 fn plugin_source_directory(plugin_directory: &Path) -> PathBuf {
     fs::canonicalize(plugin_directory.join("node_modules"))
         .ok()
@@ -879,6 +885,7 @@ fn plugin_source_directory(plugin_directory: &Path) -> PathBuf {
         .unwrap_or_else(|| plugin_directory.to_path_buf())
 }
 
+#[allow(dead_code, reason = "only used by the retired profile preflight path")]
 pub(crate) fn plugin_runtime_entry(manifest: &serde_json::Value) -> Option<String> {
     manifest
         .get("main")
@@ -892,6 +899,7 @@ pub(crate) fn plugin_runtime_entry(manifest: &serde_json::Value) -> Option<Strin
         })
 }
 
+#[allow(dead_code, reason = "only used by the retired profile preflight path")]
 pub(crate) fn prepare_plugin_source(
     directory: &Path,
     name: &str,
@@ -918,9 +926,8 @@ pub(crate) fn prepare_plugin_source(
         .policy(pnpm_policy(&pnpm))
         .kind(ExecutionKind::Logged)
         .log_path(&task_record.log_path);
-    let mut install_logged = run_logged(&install_spec, "pnpm install").map_err(|error| {
-        format!("cannot install dependencies for plugin {name}: {error}")
-    })?;
+    let mut install_logged = run_logged(&install_spec, "pnpm install")
+        .map_err(|error| format!("cannot install dependencies for plugin {name}: {error}"))?;
     let status = install_logged
         .wait_or_kill(
             &TaskCancel(Some(task)),
@@ -970,6 +977,7 @@ pub(crate) fn prepare_plugin_source(
 /// Returns true when an already-built entry predates a source file.  Linked
 /// source directories are intentionally followed: repository-backed plugins
 /// expose `src/` and `lib/` through links inside each container profile.
+#[allow(dead_code, reason = "only used by the retired profile preflight path")]
 fn plugin_source_is_newer_than_entry(directory: &Path, entry: &Path) -> Result<bool, String> {
     let Ok(entry_modified) = fs::metadata(entry).and_then(|metadata| metadata.modified()) else {
         return Ok(false);
@@ -977,6 +985,7 @@ fn plugin_source_is_newer_than_entry(directory: &Path, entry: &Path) -> Result<b
     plugin_source_tree_is_newer(directory, entry_modified)
 }
 
+#[allow(dead_code, reason = "only used by the retired profile preflight path")]
 fn plugin_source_tree_is_newer(
     directory: &Path,
     entry_modified: SystemTime,
@@ -987,8 +996,16 @@ fn plugin_source_tree_is_newer(
         if matches!(
             name.to_str(),
             Some(
-                ".git" | "node_modules" | "lib" | "dist" | "build" | "out" | ".cache"
-                    | "pnpm-lock.yaml" | "pnpm-workspace.yaml" | "package.json"
+                ".git"
+                    | "node_modules"
+                    | "lib"
+                    | "dist"
+                    | "build"
+                    | "out"
+                    | ".cache"
+                    | "pnpm-lock.yaml"
+                    | "pnpm-workspace.yaml"
+                    | "package.json"
             )
         ) {
             continue;
@@ -1025,10 +1042,8 @@ fn plugin_source_tree_is_newer(
 ///
 /// If no buildable script is found, return `None` so the caller knows the
 /// entry cannot be produced and should report a clear error.
-fn plugin_build_script(
-    directory: &Path,
-    entry: &str,
-) -> Result<Option<&'static str>, String> {
+#[allow(dead_code, reason = "only used by the retired profile preflight path")]
+fn plugin_build_script(directory: &Path, entry: &str) -> Result<Option<&'static str>, String> {
     let manifest: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(directory.join("package.json"))
             .map_err(|error| format!("cannot read plugin manifest: {error}"))?,
@@ -1113,4 +1128,3 @@ fn plugin_build_script(
     }
     Ok(None)
 }
-

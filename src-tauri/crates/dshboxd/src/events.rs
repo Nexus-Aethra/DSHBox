@@ -6,14 +6,15 @@
 //! (CLI `--watch`, desktop event proxy, or `curl -N`) consume it as a
 //! standard SSE feed.
 
-use std::{
-    collections::BTreeMap,
-    sync::Mutex,
-};
+use std::{collections::BTreeMap, sync::Mutex};
 
 /// A single event the daemon broadcasts to all `/events` subscribers.
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "event", rename_all = "lowercase")]
+#[allow(
+    dead_code,
+    reason = "reserved event vocabulary not yet emitted by the daemon"
+)]
 pub enum DaemonEvent {
     /// A task changed stage or progress.
     TaskStage {
@@ -22,10 +23,7 @@ pub enum DaemonEvent {
         progress: u8,
     },
     /// A task produced a log line.
-    TaskLog {
-        task_id: String,
-        line: String,
-    },
+    TaskLog { task_id: String, line: String },
     /// A task finished (success or failure).
     TaskFinished {
         task_id: String,
@@ -34,18 +32,11 @@ pub enum DaemonEvent {
         error: Option<String>,
     },
     /// Rollback was initiated for a failed task.
-    RollbackStarted {
-        task_id: String,
-    },
+    RollbackStarted { task_id: String },
     /// Rollback completed successfully for a failed task.
-    RollbackFinished {
-        task_id: String,
-    },
+    RollbackFinished { task_id: String },
     /// Rollback itself failed (the task ends in Failed with rollback_error).
-    RollbackFailed {
-        task_id: String,
-        error: String,
-    },
+    RollbackFailed { task_id: String, error: String },
     /// A resource was added to the resource map.
     ResourceAdded {
         id: String,
@@ -53,18 +44,11 @@ pub enum DaemonEvent {
         name: String,
     },
     /// A resource was removed (soft-deleted) from the resource map.
-    ResourceRemoved {
-        id: String,
-    },
+    ResourceRemoved { id: String },
     /// A resource's status changed (e.g., active → deleted).
-    ResourceUpdated {
-        id: String,
-        status: String,
-    },
+    ResourceUpdated { id: String, status: String },
     /// Remote tags were fetched (result of `fetch_remote_tags`).
-    TagsFetched {
-        tags: Vec<String>,
-    },
+    TagsFetched { tags: Vec<String> },
 }
 
 impl DaemonEvent {

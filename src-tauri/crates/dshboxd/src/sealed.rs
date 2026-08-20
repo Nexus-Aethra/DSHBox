@@ -4,7 +4,7 @@
 
 use crate::{
     containers::create_profile_manifest,
-    lifecycle::copy_tree_following,
+    lifecycle::{copy_tree_following, materialize_bundled_context_plugin},
     toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel},
     versions::{list_prepared_bases, prepared_base_for_version, PreparedBaseRecord},
 };
@@ -930,6 +930,8 @@ fn prepare_container_at_final_path(
     {
         return Err("container preparation is missing DSH build outputs".to_owned());
     }
+    task.update("Materializing DSH Box context plugin", 82);
+    materialize_bundled_context_plugin(directory, profile, Some(task))?;
     Ok(())
 }
 
