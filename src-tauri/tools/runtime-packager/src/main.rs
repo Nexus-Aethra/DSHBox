@@ -158,6 +158,51 @@ fn install_command_shims(output: &Path, windows: bool) -> Result<(), String> {
             ),
         )
         .map_err(stringify)?;
+        // The Node upstream tarball ships `node/bin/{npm,npx,corepack}` as
+        // symlinks into `node/lib/node_modules/...`. Symlinks survive normal
+        // tarball extraction, yet the Tauri deb/rpm bundler dereferences them
+        // into the symlink target's content — and the upstream scripts
+        // hardcode a `require('../lib/cli.js')` that only resolves from the
+        // symlinked path. Replace each with a $(dirname)-relative shim so
+        // the installed binary is self-contained and works regardless of
+        // how the installer handles symlinks (the script stays valid when
+        // copied to a different absolute path during install).
+        let bin_dir = output.join("node").join("bin");
+        fs::create_dir_all(&bin_dir).map_err(stringify)?;
+        let shims: &[(&str, &str)] = &[
+            ("npm", "../lib/node_modules/npm/bin/npm-cli.js"),
+            ("npx", "../lib/node_modules/npm/bin/npx-cli.js"),
+            ("corepack", "../lib/node_modules/corepack/dist/corepack.js"),
+        ];
+        for (name, script) in shims {
+            let path = bin_dir.join(name);
+            // The Node upstream tarball ships these names as symlinks into
+            // lib/node_modules/...; without removing the symlink first,
+            // fs::write would clobber the target file. Use symlink_metadata
+            // so we don't follow the link ourselves when deciding what to
+            // delete.
+            if let Ok(metadata) = fs::symlink_metadata(&path) {
+                if metadata.file_type().is_symlink() || metadata.is_file() {
+                    fs::remove_file(&path).map_err(stringify)?;
+                }
+            }
+            // `$(dirname "$0")` is `node/bin/`; the shim lives there, so the
+            // node binary is just `$(dirname "$0")/node` (no `bin/` prefix)
+            // and the script path steps up one level to `node/lib/...`.
+            let body = format!(
+                "#!/bin/sh\nexec \"$(dirname \"$0\")/node\" \"$(dirname \"$0\")/{script}\" \"$@\"\n"
+            );
+            fs::write(&path, body).map_err(stringify)?;
+            // Preserve executable bit: the symlink didn't carry one, and
+            // fs::write resets perms to 0644 on Unix.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&path).map_err(stringify)?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&path, perms).map_err(stringify)?;
+            }
+        }
     }
     Ok(())
 }
