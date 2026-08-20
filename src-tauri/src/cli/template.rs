@@ -122,7 +122,12 @@ fn list() -> Result<(), String> {
         let name = entry["name"].as_str().unwrap_or("?");
         let version = entry["harnessRef"].as_str().unwrap_or("-");
         let profile = entry["profile"].as_str().unwrap_or("-");
-        println!("{name}\t{version}\t{profile}\tsealed");
+        let kind = if entry["built"].as_bool().unwrap_or(false) {
+            "sealed"
+        } else {
+            "prepared"
+        };
+        println!("{name}\t{version}\t{profile}\t{kind}");
     }
     Ok(())
 }

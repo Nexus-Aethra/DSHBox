@@ -89,6 +89,15 @@ pub(crate) fn prepared_base_for_version(
         .ok_or_else(|| format!("prepared Harness base `{version}` is not installed"))
 }
 
+/// Return every prepared Harness base that can be used as a direct container
+/// template. This is deliberately shared with the template listing so the
+/// CLI and desktop never disagree about which roots are runnable.
+pub(crate) fn list_prepared_bases(root: &str) -> Result<Vec<PreparedBaseRecord>, String> {
+    let layout = RuntimeLayout::new(root);
+    layout.initialize_schema_10()?;
+    Ok(read_prepared_base_index(&layout)?.into_values().collect())
+}
+
 /// Resolve the canonical FROM reference into its mirror-aware clone URL.
 /// Centralised here so the CLI and the desktop don't reach into
 /// `box_dsh_versions` themselves.
@@ -215,7 +224,10 @@ pub(crate) fn pull_template_with_cancel(
         run_pnpm_task(
             &pnpm,
             &harness,
-            ["install"],
+            // Keep this on the command line as well as in the environment:
+            // pnpm 11 can otherwise inherit a service-level `--no-optional`
+            // setting and omit the Windows native packages DSH needs.
+            ["--config.optional=true", "install"],
             &log_path,
             task,
             "prepared-base dependency install",

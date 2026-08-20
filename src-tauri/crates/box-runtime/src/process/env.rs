@@ -230,7 +230,15 @@ pub fn bundled_toolchain_policy(
                 runtime.join("pnpm").join("npm-cache").into_os_string(),
             );
     }
-    policy.replace("pnpm_config_verify_deps_before_run", "false")
+    // DSH's lockfile contains platform-specific optional packages (notably
+    // esbuild, lefthook, and koffi). A service-level `npm_config_optional`
+    // inherited from the host must not turn a normal template pull into
+    // `--no-optional`, which leaves Windows binaries absent and forces an
+    // unavailable native build toolchain.
+    policy
+        .replace("npm_config_optional", "true")
+        .replace("pnpm_config_optional", "true")
+        .replace("pnpm_config_verify_deps_before_run", "false")
 }
 
 /// Rules for a DSH Host child. The host does not touch pnpm store / npm
@@ -339,6 +347,8 @@ mod tests {
                 .join("store")
                 .into_os_string()
         );
+        assert_eq!(output.get("NPM_CONFIG_OPTIONAL").unwrap(), "true");
+        assert_eq!(output.get("PNPM_CONFIG_OPTIONAL").unwrap(), "true");
     }
 
     #[test]

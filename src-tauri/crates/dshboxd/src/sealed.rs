@@ -6,7 +6,7 @@ use crate::{
     containers::create_profile_manifest,
     lifecycle::copy_tree_following,
     toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel},
-    versions::{prepared_base_for_version, PreparedBaseRecord},
+    versions::{list_prepared_bases, prepared_base_for_version, PreparedBaseRecord},
 };
 use box_api::{BuildImageRequest, CreateTemplateContainerRequest, TemplateInfo};
 use box_extensions::transfer::extract_extension_tarball;
@@ -86,33 +86,57 @@ pub(crate) fn build_sealed_template_from_script(
     .map(|_| ())
 }
 
-/// The template list is now derived solely from the schema-10 sealed index.
-/// In particular, this deliberately does not inspect legacy `templates/*.dsh`
-/// files or the removed shared-runtime metadata index.
+/// List every runnable template. A prepared Harness base is directly runnable
+/// with no plugins; a sealed template is a prepared base plus a Boxfile plugin
+/// recipe. Both the CLI and desktop consume this one list before creating a
+/// container, so discovery and execution use the same semantics.
 pub(crate) fn list_sealed_templates() -> Result<Vec<TemplateInfo>, String> {
     let root = box_foundation::read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
     let layout = RuntimeLayout::new(&root);
     layout.initialize_schema_10()?;
-    read_index(&layout)?
-        .into_values()
-        .map(|record| {
-            let manifest: TemplateManifest = serde_json::from_str(
-                &fs::read_to_string(Path::new(&record.directory).join("manifest.json"))
-                    .map_err(|error| format!("cannot read sealed template manifest: {error}"))?,
-            )
-            .map_err(|error| format!("cannot parse sealed template manifest: {error}"))?;
-            manifest.validate()?;
-            Ok(TemplateInfo {
+    let mut templates = BTreeMap::new();
+    for base in list_prepared_bases(&root)? {
+        if let Some(template) = prepared_base_template_info(base) {
+            templates.insert(template.name.clone(), template);
+        }
+    }
+    for record in read_index(&layout)?.into_values() {
+        let manifest: TemplateManifest = serde_json::from_str(
+            &fs::read_to_string(Path::new(&record.directory).join("manifest.json"))
+                .map_err(|error| format!("cannot read sealed template manifest: {error}"))?,
+        )
+        .map_err(|error| format!("cannot parse sealed template manifest: {error}"))?;
+        manifest.validate()?;
+        templates.insert(
+            record.name.clone(),
+            TemplateInfo {
                 name: record.name,
                 id: record.id,
                 harness_ref: Some(manifest.source_ref),
                 profile: record.profile,
                 built: true,
-            })
-        })
-        .collect()
+            },
+        );
+    }
+    Ok(templates.into_values().collect())
+}
+
+fn prepared_base_template_info(base: PreparedBaseRecord) -> Option<TemplateInfo> {
+    let directory = Path::new(&base.directory);
+    if !directory.join("manifest.json").is_file()
+        || !directory.join("harness/package.json").is_file()
+    {
+        return None;
+    }
+    Some(TemplateInfo {
+        name: base.source_ref.clone(),
+        id: base.id,
+        harness_ref: Some(base.source_ref),
+        profile: "web".to_owned(),
+        built: false,
+    })
 }
 
 pub(crate) fn read_sealed_template(name: &str) -> Result<String, String> {
@@ -551,7 +575,9 @@ fn pnpm_ignored_build_keys(log_path: &Path) -> Vec<String> {
     let Ok(log) = fs::read_to_string(log_path) else {
         return Vec::new();
     };
-    let Some((_, after_header)) = log.rsplit_once("[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts:") else {
+    let Some((_, after_header)) =
+        log.rsplit_once("[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts:")
+    else {
         return Vec::new();
     };
     after_header
@@ -588,11 +614,8 @@ fn add_pnpm_build_approval(workspace_manifest: &Path, key: &str) -> Result<(), S
         let separator = if existing.ends_with('\n') { "" } else { "\n" };
         format!("{existing}{separator}allowBuilds:\n  \"{escaped_key}\": true\n")
     };
-    fs::write(
-        workspace_manifest,
-        updated,
-    )
-    .map_err(|error| format!("cannot write pnpm build approval: {error}"))
+    fs::write(workspace_manifest, updated)
+        .map_err(|error| format!("cannot write pnpm build approval: {error}"))
 }
 
 fn seed_profile_recipe(
@@ -611,7 +634,10 @@ fn seed_profile_recipe(
     ensure_prepared_base_tools(base_harness, &pnpm, &log_path, task)?;
     let profile_home = staged.join("profile").to_string_lossy().into_owned();
     let harness_arg = base_harness.to_string_lossy().into_owned();
-    let workspace_manifest = staged.join("profile/profiles").join(profile).join("pnpm-workspace.yaml");
+    let workspace_manifest = staged
+        .join("profile/profiles")
+        .join(profile)
+        .join("pnpm-workspace.yaml");
     // Entries not equal to an ADD spec are exact pnpm package keys, such as
     // `node-pty@1.1.0`. They cover a user-approved transitive build script.
     for key in allowed_build_sources
@@ -657,10 +683,7 @@ fn seed_profile_recipe(
                         log_path.display()
                     )
                 })?;
-                add_pnpm_build_approval(
-                    &workspace_manifest,
-                    &allow_key,
-                )?;
+                add_pnpm_build_approval(&workspace_manifest, &allow_key)?;
                 let mut retry = run_logged(&spec, "resolve approved plugin recipe")?;
                 let retry_status = retry
                     .wait_or_kill(
@@ -1011,4 +1034,49 @@ fn template_is_used_by_container(layout: &RuntimeLayout, name: &str) -> Result<b
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_base_is_exposed_as_a_direct_runnable_template() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base_directory = temporary.path().join("base");
+        fs::create_dir_all(base_directory.join("harness")).unwrap();
+        fs::write(base_directory.join("manifest.json"), "{}").unwrap();
+        fs::write(base_directory.join("harness/package.json"), "{}").unwrap();
+        let template = prepared_base_template_info(PreparedBaseRecord {
+            id: "base-test".to_owned(),
+            version: "dsh-v-test".to_owned(),
+            source_ref: "github.com/deepseek-ai/deepseek-harness:dsh-v-test".to_owned(),
+            source_commit: "test".to_owned(),
+            directory: base_directory.to_string_lossy().into_owned(),
+            created_at: 0,
+            size_bytes: 0,
+        })
+        .expect("complete prepared base should be listed");
+        assert_eq!(
+            template.name,
+            "github.com/deepseek-ai/deepseek-harness:dsh-v-test"
+        );
+        assert!(!template.built);
+        assert_eq!(template.profile, "web");
+    }
+
+    #[test]
+    fn incomplete_prepared_base_is_not_listed_as_runnable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let template = prepared_base_template_info(PreparedBaseRecord {
+            id: "base-test".to_owned(),
+            version: "dsh-v-test".to_owned(),
+            source_ref: "github.com/deepseek-ai/deepseek-harness:dsh-v-test".to_owned(),
+            source_commit: "test".to_owned(),
+            directory: temporary.path().to_string_lossy().into_owned(),
+            created_at: 0,
+            size_bytes: 0,
+        });
+        assert!(template.is_none());
+    }
 }
