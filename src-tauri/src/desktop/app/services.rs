@@ -490,19 +490,35 @@ pub(crate) fn initialize_bundled_plugins(resource_directory: &Path) -> Result<()
     Ok(())
 }
 
-/// Recursive directory copy used by `initialize_bundled_plugins` and the
-/// Windows fallback in `lifecycle::link_vendored_plugin` (directory
-/// symlinks need Developer Mode or an elevated shell there).
+/// Recursive directory copy with `cp -rL` semantics: any symlinks
+/// inside the source tree are dereferenced and their target contents
+/// materialised, never re-exported as a link. Identical in shape to
+/// `dshboxd::lifecycle::copy_tree_following`; the two copies are kept
+/// independent because they live in different binaries (the daemon and
+/// the desktop shell), and the surface is small enough that the
+/// duplication is cheaper than threading another crate boundary.
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> {
     fs::create_dir_all(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let from = entry.path();
         let to = destination.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
+        let metadata = fs::symlink_metadata(&from)?;
+        if metadata.file_type().is_symlink() {
+            // Resolve through the symlink. The resolved target may still
+            // be a directory (recursed below via the next branch) or a
+            // file (handled via fs::copy).
+            let resolved = fs::canonicalize(&from).unwrap_or_else(|_| from.clone());
+            let resolved_meta = fs::symlink_metadata(&resolved)
+                .or_else(|_| fs::metadata(&resolved))?;
+            if resolved_meta.is_dir() {
+                copy_dir_recursive(&resolved, &to)?;
+            } else {
+                fs::copy(&resolved, &to)?;
+            }
+        } else if metadata.is_dir() {
             copy_dir_recursive(&from, &to)?;
-        } else if file_type.is_file() {
+        } else if metadata.is_file() {
             fs::copy(&from, &to)?;
         }
     }

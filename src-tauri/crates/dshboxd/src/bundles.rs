@@ -172,13 +172,23 @@ fn is_github_source(source: &str) -> bool {
 
 /// Register a plugin as a pnpm workspace member directly, bypassing
 /// `dsh plugin add`. Steps:
-/// 1. Update profile package.json: add `workspace:*` dependency + DSH bundles entry
-/// 2. Update profile pnpm-workspace.yaml: add plugin source to `packages:`
-/// 3. Run `pnpm install` in the profile directory to hoist deps
+/// 1. Update profile package.json: add the plugin to `dependencies` (as
+///    `*` so pnpm reads it directly from `node_modules/<scope>/<name>`)
+///    and to `dsh.profile.bundles` so the DSH host loader finds it.
+/// 2. Physically copy the plugin source into
+///    `<profile>/node_modules/<scope>/<name>/` (`cp -rL` semantics via
+///    `copy_tree_following`). Plugins are no longer shared via
+///    `pnpm-workspace.yaml` package references — every container profile
+///    owns its own materialised copy.
+/// 3. Run `pnpm install` in the profile directory so the plugin's
+///    transitive dependencies (and any postinstall scripts) are wired up
+///    once. The local `pnpm-workspace.yaml` still exists but only carries
+///    `packages: ['.']` + `dangerouslyAllowAllBuilds: true` — never an
+///    external absolute path.
 ///
-/// This avoids ERR_PNPM_ADDING_TO_ROOT because `pnpm install` (not `pnpm add`)
-/// doesn't refuse to touch the workspace root — it only installs what's
-/// declared in the manifest.
+/// This path replaces the old `pnpm-workspace.yaml: packages: [...]`
+/// approach which depended on inodes/symlink behaviours the Windows +
+/// pnpm + AV combination has historically raced on.
 fn register_plugin_directly(
     profile_dir: &Path,
     plugin_source: &Path,
@@ -197,7 +207,11 @@ fn register_plugin_directly(
     let mut manifest: serde_json::Value = serde_json::from_str(&manifest_text)
         .map_err(|error| format!("cannot parse package.json: {error}"))?;
 
-    // Add to dependencies
+    // Add to dependencies. `*` is the cleanest version specifier pnpm
+    // accepts for a package that already lives in `node_modules/<scope>/<name>/`
+    // (the copy below). Using `workspace:*` here would force pnpm to treat
+    // this profile as a workspace member — that would re-introduce the
+    // absolute-path coupling this PR is removing.
     let needs_install = {
         let mut deps = match manifest
             .get("dependencies")
@@ -209,12 +223,12 @@ fn register_plugin_directly(
         let mut changed = false;
         match deps.get(plugin_name) {
             None | Some(serde_json::Value::Null) => {
-                deps.insert(plugin_name.to_string(), serde_json::Value::String("workspace:*".to_owned()));
+                deps.insert(plugin_name.to_string(), serde_json::Value::String("*".to_owned()));
                 changed = true;
             }
-            Some(existing) if existing.as_str() == Some("workspace:*") => {}
+            Some(existing) if existing.as_str() == Some("*") => {}
             _ => {
-                deps.insert(plugin_name.to_string(), serde_json::Value::String("workspace:*".to_owned()));
+                deps.insert(plugin_name.to_string(), serde_json::Value::String("*".to_owned()));
                 changed = true;
             }
         }
@@ -237,7 +251,6 @@ fn register_plugin_directly(
     };
 
     if needs_bundle {
-        // Add plugin to dsh.profile.bundles
         let bundles = manifest
             .pointer_mut("/dsh/profile/bundles")
             .and_then(serde_json::Value::as_array_mut);
@@ -253,37 +266,41 @@ fn register_plugin_directly(
             .map_err(|error| format!("cannot write package.json: {error}"))?;
     }
 
-    // --- Step 2: Update pnpm-workspace.yaml ---
-    let plugin_source_string = plugin_source.to_string_lossy().into_owned()
-        .replace('\\', "/");
-    if workspace_manifest.is_file() {
-        let ws_text = fs::read_to_string(&workspace_manifest)
-            .map_err(|error| format!("cannot read workspace yaml: {error}"))?;
-        let mut updated = ws_text.clone();
-        if !updated.contains(&plugin_source_string) {
-            updated = inject_workspace_package(&updated, &plugin_source_string);
-        }
-        // Ensure build scripts are allowed (node-pty etc.)
-        if !updated.contains("dangerouslyAllowAllBuilds") {
-            let trailing = if updated.ends_with('\n') { "" } else { "\n" };
-            updated.push_str(&format!("{trailing}dangerouslyAllowAllBuilds: true\n"));
-        }
-        if updated != ws_text {
-            fs::write(&workspace_manifest, &updated)
-                .map_err(|error| format!("cannot write workspace yaml: {error}"))?;
-        }
-    } else {
-        // Create minimal workspace yaml
-        let content = format!(
-            "packages:\n  - .\n  - {}\nnodeLinker: hoisted\n\
-             ignore-workspace-root-check: true\ndangerouslyAllowAllBuilds: true\n",
-            plugin_source_string
-        );
-        fs::write(&workspace_manifest, content)
-            .map_err(|error| format!("cannot create workspace yaml: {error}"))?;
+    // --- Step 2: Physically copy the plugin into the profile ---
+    // Scoped packages are installed under `<scope>/<name>/`, unscoped
+    // ones directly under `<name>/`. The plugin_name arg is always the
+    // canonical package name from the plugin's own package.json, so the
+    // split is well-defined.
+    let (scope, package) = split_package_name(plugin_name)
+        .ok_or_else(|| format!("plugin name `{plugin_name}` is not a valid package name"))?;
+    let plugin_target = profile_dir
+        .join("node_modules")
+        .join(scope)
+        .join(package);
+    if let Err(error) = fs::create_dir_all(plugin_target.parent().unwrap_or(profile_dir)) {
+        return Err(format!("cannot create {}: {error}", plugin_target.parent().unwrap_or(profile_dir).display()));
     }
+    // Replace any prior copy so an upgrade does not leave stale files.
+    if fs::symlink_metadata(&plugin_target).is_ok() {
+        if fs::symlink_metadata(&plugin_target)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            fs::remove_file(&plugin_target)
+                .map_err(|error| format!("cannot replace stale plugin link: {error}"))?;
+        } else {
+            fs::remove_dir_all(&plugin_target)
+                .map_err(|error| format!("cannot replace stale plugin copy: {error}"))?;
+        }
+    }
+    crate::lifecycle::copy_tree_following(plugin_source, &plugin_target)
+        .map_err(|error| format!("cannot copy plugin `{plugin_name}` into profile: {error}"))?;
 
-    // --- Step 3: Run pnpm install in profile dir ---
+    // --- Step 3: pnpm-workspace.yaml: only local `packages: ['.']` + build-script approval ---
+    ensure_local_pnpm_workspace(&workspace_manifest)
+        .map_err(|error| format!("cannot update pnpm-workspace.yaml: {error}"))?;
+
+    // --- Step 4: Run pnpm install in profile dir ---
     let pnpm = resolve_toolchain("pnpm")?;
     task.log(&format!("installing plugin dependencies for {plugin_name}"));
     let task_record = task.manager.task(&task.task_id)?;
@@ -315,137 +332,41 @@ fn register_plugin_directly(
     Ok(())
 }
 
+/// Split a package name (`@scope/foo` or `foo`) into `(scope, name)`.
+/// Returns `None` when the name is malformed.
+fn split_package_name(name: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = name.strip_prefix('@') {
+        let (scope, package) = rest.split_once('/')?;
+        if scope.is_empty() || package.is_empty() {
+            return None;
+        }
+        Some((scope, package))
+    } else {
+        if name.is_empty() || name.contains('/') {
+            return None;
+        }
+        Some(("", name))
+    }
+}
+
+/// Ensure the profile-local `pnpm-workspace.yaml` keeps only:
+///   - `packages: ['.']` (the profile itself as the root)
+///   - `dangerouslyAllowAllBuilds: true` so plugin postinstall scripts run
+///
+/// Any `packages:` entries pointing at absolute paths (left over from
+/// older installs that wrote `<runtime>/repository/...` references) are
+/// dropped. The new install path is fully physical, so this file no
+/// longer needs to bridge across paths.
+fn ensure_local_pnpm_workspace(path: &Path) -> Result<(), String> {
+    let content = "packages:\n  - .\nnodeLinker: hoisted\n\
+                   ignore-workspace-root-check: true\n\
+                   dangerouslyAllowAllBuilds: true\n";
+    fs::write(path, content)
+        .map_err(|error| format!("cannot write pnpm-workspace.yaml: {error}"))
+}
+
 /// Append an extra `packages:` entry to a `pnpm-workspace.yaml` whose
 /// `packages:` list is a YAML block sequence. If the file uses a different
-/// layout (no top-level `packages:` key, inline flow sequence, etc.) the
-/// original is returned untouched so the caller can surface a clearer
-/// error. The new entry is anchored right after the last existing `- `
-/// line of the block sequence — never at end-of-file — so YAML keeps
-/// treating every `- ` line as a member of the `packages:` list.
-fn inject_workspace_package(workspace_text: &str, new_path: &str) -> String {
-    let Some(packages_index) = workspace_text.find("packages:") else {
-        return workspace_text.to_owned();
-    };
-    let after_packages = &workspace_text[packages_index + "packages:".len()..];
-    let first_significant_offset = after_packages
-        .chars()
-        .position(|character| !character.is_whitespace())
-        .unwrap_or(after_packages.len());
-    let first_significant = after_packages[first_significant_offset..]
-        .chars()
-        .next()
-        .unwrap_or('\0');
-    let key_column = workspace_text[..packages_index]
-        .rfind('\n')
-        .map(|new_line| packages_index - new_line - 1)
-        .unwrap_or(packages_index);
-    let block_indent: String = " ".repeat(key_column + 2);
-    if first_significant == '[' {
-        let close = after_packages.find(']').unwrap_or(after_packages.len());
-        let inside = &after_packages[first_significant_offset + 1..close];
-        let entries: Vec<&str> = inside
-            .split(',')
-            .map(str::trim)
-            .filter(|entry| !entry.is_empty())
-            .collect();
-        let rebuilt_entries = entries
-            .iter()
-            .map(|entry| format!("{block_indent}- {entry}\n"))
-            .collect::<String>();
-        let tail = &after_packages[close + 1..];
-        let rebuilt = format!(
-            "packages:\n{rebuilt_entries}{block_indent}- {new_path}\n{tail}"
-        );
-        let prefix = &workspace_text[..packages_index];
-        return format!("{prefix}{rebuilt}");
-    }
-    if first_significant != '-' {
-        // Unknown shape — return unchanged so the caller can surface a
-        // clearer diagnostic than a half-rewrite would.
-        return workspace_text.to_owned();
-    }
-    // Block sequence: walk the lines after `packages:`, find the last
-    // `- ` line that has the same indent as the first, and insert the
-    // new entry immediately after it. Lines that don't start with the
-    // expected indent (or start with `-`) end the sequence.
-    let lines: Vec<&str> = workspace_text.lines().collect();
-    let packages_line_index = workspace_text[..packages_index].matches('\n').count();
-    let mut last_member_index: Option<usize> = None;
-    for (offset, line) in lines.iter().enumerate().skip(packages_line_index + 1) {
-        let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with('-') {
-            if indented_match(indent, &block_indent) {
-                last_member_index = Some(offset);
-                continue;
-            }
-            break;
-        }
-        if indent < block_indent.len() {
-            break;
-        }
-        // A non-`-` line at the same indent is a sibling key (e.g.
-        // `nodeLinker:`) — the block sequence is over.
-        break;
-    }
-    let Some(last_member_index) = last_member_index else {
-        // Empty list — emit the very first entry directly under the key.
-        let mut output = String::new();
-        for (offset, line) in lines.iter().enumerate() {
-            if offset == packages_line_index {
-                output.push_str(line);
-                output.push('\n');
-                output.push_str(&block_indent);
-                output.push_str("- ");
-                output.push_str(new_path);
-                output.push('\n');
-            } else {
-                output.push_str(line);
-                if offset + 1 < lines.len() {
-                    output.push('\n');
-                }
-            }
-        }
-        if !workspace_text.ends_with('\n') && !output.ends_with('\n') {
-            output.push('\n');
-        }
-        return output;
-    };
-    let mut output = String::new();
-    for (offset, line) in lines.iter().enumerate() {
-        if offset == last_member_index {
-            output.push_str(line);
-            output.push('\n');
-            output.push_str(&block_indent);
-            output.push_str("- ");
-            output.push_str(new_path);
-        } else {
-            output.push_str(line);
-        }
-        if offset + 1 < lines.len() {
-            output.push('\n');
-        }
-    }
-    if workspace_text.ends_with('\n') && !output.ends_with('\n') {
-        output.push('\n');
-    }
-    if !workspace_text.ends_with('\n') && !output.ends_with('\n') {
-        output.push('\n');
-    }
-    output
-}
-
-/// Whether `observed` is a leading-indent run that matches `expected`
-/// (which is itself a whitespace-only string). Both strings are non-empty
-/// here because the caller knows the first `-` line already has the
-/// expected indent.
-fn indented_match(observed: usize, expected: &str) -> bool {
-    observed == expected.len()
-}
-
 /// Create a bundle from repository entry ids (docker-style: name + picks).
 pub(crate) fn create_extension_bundle(
     name: &str,
@@ -917,36 +838,40 @@ pub(crate) fn install_container_bundle(
 
 #[cfg(test)]
 mod tests {
-    use super::inject_workspace_package;
+    use super::{ensure_local_pnpm_workspace, register_plugin_directly, split_package_name};
 
     #[test]
-    fn inject_workspace_package_appends_to_block_sequence() {
-        let input = "packages:\n  - .\n\nnodeLinker: hoisted\n";
-        let output = inject_workspace_package(input, "/path/to/plugin");
-        // Trailing newline is preserved exactly as in the input.
+    fn split_package_name_handles_scoped_and_unscoped() {
         assert_eq!(
-            output,
-            "packages:\n  - .\n  - /path/to/plugin\n\nnodeLinker: hoisted\n"
+            split_package_name("@deepseek-ai/dsh-box-context"),
+            Some(("deepseek-ai", "dsh-box-context"))
         );
+        assert_eq!(split_package_name("foo"), Some(("", "foo")));
+        assert_eq!(split_package_name(""), None);
+        assert_eq!(split_package_name("@/foo"), None);
+        assert_eq!(split_package_name("foo/bar"), None);
     }
 
     #[test]
-    fn inject_workspace_package_handles_inline_flow_sequence() {
-        // Entries are preserved verbatim from the source flow sequence so
-        // pnpm sees the same intent; the only change is the conversion to
-        // a block sequence with the new entry appended.
-        let input = "packages: ['.', '../shared']\n";
-        let output = inject_workspace_package(input, "/path/to/plugin");
-        assert_eq!(
-            output,
-            "packages:\n  - '.'\n  - '../shared'\n  - /path/to/plugin\n\n"
-        );
-    }
-
-    #[test]
-    fn inject_workspace_package_passes_through_unknown_layout() {
-        let input = "nodeLinker: hoisted\n";
-        let output = inject_workspace_package(input, "/path/to/plugin");
-        assert_eq!(output, input);
+    fn ensure_local_pnpm_workspace_contains_no_external_paths() {
+        // Regression: the legacy layout injected absolute paths into the
+        // `packages:` list so pnpm would hoist from a shared source. The
+        // new layout is fully physical; nothing external should remain.
+        let dir = std::env::temp_dir().join(format!(
+            "dshbox-bundles-yaml-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let yaml = dir.join("pnpm-workspace.yaml");
+        ensure_local_pnpm_workspace(&yaml).unwrap();
+        let content = std::fs::read_to_string(&yaml).unwrap();
+        assert!(content.contains("packages:\n  - .\n"));
+        assert!(content.contains("dangerouslyAllowAllBuilds: true"));
+        assert!(!content.contains("../"), "no external paths expected");
+        assert!(!content.contains('/'), "no absolute paths expected");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

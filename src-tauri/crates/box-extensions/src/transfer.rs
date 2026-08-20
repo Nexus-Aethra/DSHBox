@@ -214,19 +214,25 @@ mod tests {
         root
     }
 
-    /// Compare the inode of two paths when the platform exposes one;
-    /// on Windows fall back to asserting both paths resolve to the same
-    /// symlink target (a copied directory would have a different target).
+    /// Inverted: with the cp -rL install path the on-disk files must be
+    /// *distinct*. Asserting this is cheap on Unix (compare inodes) and
+    /// remains useful on Windows because two physical copies will at
+    /// minimum have different canonical paths — but a Windows test would
+    /// need a more careful file-id comparison, so we skip it there.
     #[cfg(unix)]
-    fn assert_same_shared_file(left: &Path, right: &Path) {
+    fn assert_distinct_copies(left: &Path, right: &Path) {
         use std::os::unix::fs::MetadataExt;
         let left_ino = fs::metadata(left).unwrap().ino();
         let right_ino = fs::metadata(right).unwrap().ino();
-        assert_eq!(left_ino, right_ino, "{left:?} and {right:?} must share an inode");
+        assert_ne!(left_ino, right_ino, "{left:?} and {right:?} must NOT share an inode");
     }
 
     #[cfg(not(unix))]
-    fn assert_same_shared_file(_left: &Path, _right: &Path) {}
+    fn assert_distinct_copies(left: &Path, right: &Path) {
+        let left_canon = fs::canonicalize(left).unwrap();
+        let right_canon = fs::canonicalize(right).unwrap();
+        assert_ne!(left_canon, right_canon, "{left:?} and {right:?} must NOT share a path");
+    }
 
     #[test]
     fn locate_root_returns_directory_itself_when_it_holds_manifest() {

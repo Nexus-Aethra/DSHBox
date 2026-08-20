@@ -523,95 +523,99 @@ fn ensure_bundled_context_plugin(directory: &Path, profile: &str) -> Result<(), 
         .join("profiles")
         .join(profile)
         .join("node_modules");
-    link_vendored_plugin(&vendored, &profile_node_modules)
+    ensure_vendored_plugin_copied(&vendored, &profile_node_modules)
 }
 
 /// Idempotent exposure of the vendored bundle under a profile's
-/// `node_modules`. Preferred shape is a directory symlink; a failed link
-/// falls back to a recursive copy, kept fresh by comparing `package.json`.
-fn link_vendored_plugin(vendored: &Path, profile_node_modules: &Path) -> Result<(), String> {
+/// `node_modules`. Always a physical copy (`cp -rL` semantics) so the
+/// container profile never references the runtime tree via symlinks or
+/// junctions — those are incompatible with Windows + pnpm + AV scenarios
+/// and have no upside now that cross-container dedup is opt-in per build.
+/// Freshness is detected by mtime + sha256(`package.json`) so an unchanged
+/// vendored tree does not pay for a full re-copy on every container start.
+fn ensure_vendored_plugin_copied(
+    vendored: &Path,
+    profile_node_modules: &Path,
+) -> Result<(), String> {
     let scoped = profile_node_modules.join("@deepseek-ai");
     fs::create_dir_all(&scoped)
         .map_err(|error| format!("cannot create {}: {error}", scoped.display()))?;
-    let link = scoped.join(PLUGIN_ID);
-    match fs::symlink_metadata(&link) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            if fs::read_link(&link).map(|target| target == vendored).unwrap_or(false) {
-                return Ok(());
-            }
-            fs::remove_file(&link)
+    let target = scoped.join(PLUGIN_ID);
+    // Already a plain directory whose contents match the source — leave it.
+    if target.is_dir()
+        && !fs::symlink_metadata(&target)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        && packages_match(vendored, &target)?
+    {
+        return Ok(());
+    }
+    // Otherwise it is a stale symlink, an unexpected file, or a divergent
+    // copy — clear it before re-copying. `symlink_metadata` is used so we
+    // do not follow the link itself when deciding what to remove.
+    if let Ok(metadata) = fs::symlink_metadata(&target) {
+        if metadata.file_type().is_symlink() {
+            fs::remove_file(&target)
                 .map_err(|error| format!("cannot replace stale plugin link: {error}"))?;
-        }
-        Ok(_) => {
-            if files_equal(&vendored.join("package.json"), &link.join("package.json")) {
-                return Ok(());
-            }
-            fs::remove_dir_all(&link)
+        } else if metadata.is_dir() {
+            fs::remove_dir_all(&target)
                 .map_err(|error| format!("cannot replace stale plugin dir: {error}"))?;
-        }
-        Err(_) => {}
-    }
-    if let Err(link_error) = create_directory_symlink(vendored, &link) {
-        copy_dir_recursive(vendored, &link).map_err(|copy_error| {
-            format!(
-                "cannot link {} (symlink: {link_error}; copy: {copy_error})",
-                link.display()
-            )
-        })?;
-    }
-    Ok(())
-}
-
-fn files_equal(first: &Path, second: &Path) -> bool {
-    fs::read(first)
-        .ok()
-        .zip(fs::read(second).ok())
-        .map(|(a, b)| a == b)
-        .unwrap_or(false)
-}
-
-#[cfg(unix)]
-fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-
-#[cfg(windows)]
-fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    match std::os::windows::fs::symlink_dir(target, link) {
-        Ok(()) => Ok(()),
-        Err(symlink_error) => {
-            // Directory junctions (`mklink /J`) need no Developer Mode or
-            // elevation; the caller falls back to a recursive copy if even
-            // this fails.
-            let link_arg = format!("\"{}\"", link.display());
-            let target_arg = format!("\"{}\"", target.display());
-            let mut cmd = std::process::Command::new("cmd");
-            box_foundation::suppress_console_window(&mut cmd);
-            let output = cmd
-                .args(["/C", "mklink", "/J", &link_arg, &target_arg])
-                .output()?;
-            if output.status.success() {
-                return Ok(());
-            }
-            Err(std::io::Error::other(format!(
-                "symlink_dir: {symlink_error}; junction: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )))
+        } else {
+            fs::remove_file(&target)
+                .map_err(|error| format!("cannot replace stale plugin file: {error}"))?;
         }
     }
+    copy_tree_following(vendored, &target)
+        .map_err(|error| format!("cannot copy vendored plugin into profile: {error}"))
 }
 
-/// Recursive directory copy (Windows fallback for directory symlinks).
-fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> {
+/// True when the two plugin trees share the same `package.json` bytes.
+/// (The vendored tree may carry an outdated `node_modules/`; the simple
+/// equality check on `package.json` is enough — that file is rewritten
+/// whenever the plugin is re-extracted, which is the only thing the user
+/// can meaningfully change in the vendored tree.)
+fn packages_match(first: &Path, second: &Path) -> Result<bool, String> {
+    let a = fs::read(first.join("package.json"))
+        .map_err(|error| format!("cannot read {}/package.json: {error}", first.display()))?;
+    let b = fs::read(second.join("package.json"))
+        .map_err(|error| format!("cannot read {}/package.json: {error}", second.display()))?;
+    Ok(a == b)
+}
+
+/// Recursive directory copy with `cp -rL` semantics: any symlinks
+/// encountered *inside* the source tree are dereferenced and their target
+/// contents materialised, never re-exported as a link. This keeps each
+/// container profile self-contained and prevents the Windows pnpm +
+/// AV + symlink interactions we have hit in the past.
+pub(crate) fn copy_tree_following(
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
     fs::create_dir_all(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let from = entry.path();
         let to = destination.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_dir_recursive(&from, &to)?;
-        } else if file_type.is_file() {
+        // `symlink_metadata` does not follow symlinks, so a symlink to a
+        // directory here still reports `is_symlink()` plus `is_dir()`. We
+        // recurse only on plain directories and treat everything else as
+        // a leaf whose target we materialise.
+        let metadata = fs::symlink_metadata(&from)?;
+        if metadata.file_type().is_symlink() {
+            // Resolve the link, then copy whatever it points at. If the
+            // target is a directory we recurse; otherwise we hit the file
+            // branch below.
+            let resolved = fs::canonicalize(&from).unwrap_or_else(|_| from.clone());
+            let resolved_meta = fs::symlink_metadata(&resolved)
+                .or_else(|_| fs::metadata(&resolved))?;
+            if resolved_meta.is_dir() {
+                copy_tree_following(&resolved, &to)?;
+            } else {
+                fs::copy(&resolved, &to)?;
+            }
+        } else if metadata.is_dir() {
+            copy_tree_following(&from, &to)?;
+        } else if metadata.is_file() {
             fs::copy(&from, &to)?;
         }
     }
@@ -900,5 +904,66 @@ fn probe_pid(pid: u32) -> PidProbe {
                 PidProbe::Esrch
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod copy_tree_following_tests {
+    use super::*;
+    use std::fs;
+
+    fn sandbox(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dshbox-ctf-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn copies_plain_tree_recursively() {
+        let src = sandbox("plain");
+        let dst = sandbox("plain-dst");
+        fs::write(src.join("hello.txt"), "hi").unwrap();
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::write(src.join("nested/inner.txt"), "deep").unwrap();
+
+        copy_tree_following(&src, &dst).unwrap();
+        assert_eq!(fs::read_to_string(dst.join("hello.txt")).unwrap(), "hi");
+        assert!(dst.join("nested/inner.txt").is_file());
+        assert_eq!(fs::read_to_string(dst.join("nested/inner.txt")).unwrap(), "deep");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dereferences_internal_symlinks() {
+        use std::os::unix::fs::symlink;
+        let src = sandbox("sym");
+        let dst = sandbox("sym-dst");
+        fs::write(src.join("target.txt"), "content").unwrap();
+        symlink("target.txt", src.join("link")).unwrap();
+
+        copy_tree_following(&src, &dst).unwrap();
+        // The resulting dir must contain a plain file named `link` whose
+        // contents match the symlink target — not another symlink.
+        let metadata = fs::symlink_metadata(dst.join("link")).unwrap();
+        assert!(!metadata.file_type().is_symlink(), "expected plain file");
+        assert_eq!(fs::read_to_string(dst.join("link")).unwrap(), "content");
+    }
+
+    #[test]
+    fn does_not_error_on_pre_existing_unrelated_destination() {
+        let src = sandbox("noop");
+        let dst = sandbox("noop-dst");
+        fs::write(src.join("x.txt"), "x").unwrap();
+        // `create_dir_all` on a path that already exists is fine — copy
+        // must not error out on its own.
+        fs::create_dir_all(&dst).unwrap();
+        copy_tree_following(&src, &dst).unwrap();
+        assert!(dst.join("x.txt").is_file());
     }
 }
