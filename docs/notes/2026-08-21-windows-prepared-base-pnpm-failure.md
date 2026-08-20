@@ -2,16 +2,16 @@
 
 ## Status
 
-Resolved in the installed Windows daemon on 2026-08-21. A real CLI task using
+Resolved in the installed Windows daemon on 2026-08-21. After a clean-store
+failure reproduced the missing Windows optional packages, a real CLI task using
 the desktop application's `D:\ddd` runtime directory completed the clone,
-dependency install, validation, and prepared-base publish steps. The completed
-task was `a5255b71-3adf-44b0-ac33-4b18e7579d93` and produced
-`templates/base-620592ceac885222`.
+dependency install, validation, and prepared-base publish steps with the
+platform-scoped fix. The completed task was
+`f196ceea-483c-4771-870b-1066d2985543`.
 
-Previous successful pulls remain insufficient evidence on their own because
-they may have reused an already-populated pnpm store or a previously prepared
-base. The above task was initiated after the failure and used the replacement
-installed sidecar.
+Earlier task `a5255b71-3adf-44b0-ac33-4b18e7579d93` proved the diagnostic
+`--force` path only. It is not acceptance evidence for the release path because
+it downloaded all platform artifacts.
 
 ## Observed failure
 
