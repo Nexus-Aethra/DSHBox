@@ -1,0 +1,15 @@
+[package]
+name = "box-logger"
+version = "0.1.0"
+edition = "2021"
+description = "Unified tracing-based logger for all DSH Box crates (daemon, desktop, CLI)."
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+box-foundation = { workspace = true }
+dirs = "6.0.0"
+
+[lib]
+path = "src/lib.rs"
