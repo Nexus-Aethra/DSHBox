@@ -419,6 +419,40 @@ fn validate_prepared_harness(harness: &Path) -> Result<(), String> {
             ));
         }
     }
+    // The Windows-native optional packages are what postinstall scripts
+    // (esbuild, koffi) and the frontend build (lefthook) resolve at runtime.
+    // A store that lost them — interrupted installs, antivirus quarantine of
+    // the prebuilt binaries — otherwise surfaces much later as confusing
+    // "Failed to find package @esbuild/win32-x64" / CMake-not-found errors.
+    if !cfg!(target_os = "windows") {
+        return Ok(());
+    }
+    let optional_prefixes = ["@esbuild+win32-x64@", "@koromix+koffi-win32-x64@"];
+    let mut found = [false; 2];
+    if let Ok(entries) = harness.join("node_modules/.pnpm").read_dir() {
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            for (index, prefix) in optional_prefixes.iter().enumerate() {
+                if name.starts_with(prefix)
+                    && entry.path().join("node_modules").is_dir()
+                {
+                    found[index] = true;
+                }
+            }
+        }
+    }
+    for (index, prefix) in optional_prefixes.iter().enumerate() {
+        if !found[index] {
+            return Err(format!(
+                "prepared Harness validation failed: the Windows package `{}` was not \
+                 materialized. The pnpm store may have been damaged by an interrupted \
+                 install or antivirus quarantine; retry the pull, and if it persists add \
+                 the DSH Box data directory to your antivirus exclusions.",
+                prefix.trim_end_matches('@')
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -620,6 +654,17 @@ mod tests {
         fs::write(harness.join("apps/cli/src/bin.ts"), "").unwrap();
         assert!(validate_prepared_harness(&harness).is_err());
         fs::write(harness.join("node_modules/tsx/package.json"), "{}").unwrap();
+        // Windows-only optional-package check: the fixture needs the esbuild
+        // and koffi virtual-store entries before validation can pass.
+        for package in ["@esbuild+win32-x64@0.21.5", "@koromix+koffi-win32-x64@3.1.1"] {
+            fs::create_dir_all(
+                harness
+                    .join("node_modules/.pnpm")
+                    .join(package)
+                    .join("node_modules"),
+            )
+            .unwrap();
+        }
         validate_prepared_harness(&harness).unwrap();
     }
 
