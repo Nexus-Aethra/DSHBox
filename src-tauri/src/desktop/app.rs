@@ -29,7 +29,6 @@ use std::{
     time::Duration,
 };
 use tauri::{Manager, WindowEvent};
-use xz2::read::XzDecoder;
 
 mod bundles;
 mod commands;
@@ -55,16 +54,6 @@ pub(crate) use tasks::*;
 pub(crate) use toolchains::*;
 pub(crate) use versions::*;
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ResolvedToolchain {
-    id: String,
-    source: String,
-    path: String,
-    #[serde(default)]
-    arguments: Vec<String>,
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
@@ -87,14 +76,6 @@ pub(crate) struct BundledRuntime {
 }
 
 static BUNDLED_RUNTIME: OnceLock<BundledRuntime> = OnceLock::new();
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ToolchainCommandRequest {
-    id: String,
-    args: Vec<String>,
-    cwd: Option<String>,
-}
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,27 +111,11 @@ pub(crate) struct ExportContainerPluginRequest {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ToolchainCommandResult {
-    path: String,
-    stdout: String,
-    stderr: String,
-    exit_code: Option<i32>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct ToolchainInstallStatus {
     id: String,
     stage: String,
     log_path: String,
     lines: Vec<String>,
-}
-
-#[allow(dead_code)]
-#[derive(Deserialize)]
-pub(crate) struct NodeRelease {
-    version: String,
-    files: Vec<String>,
 }
 
 /// Local container-manager stub kept only as the `tauri::State` slot type in
@@ -374,8 +339,6 @@ fn run_inner() -> Result<(), String> {
             stop_server_service,
             commands::toolchains::detect_toolchains,
             commands::toolchains::save_toolchain_source,
-            commands::toolchains::resolve_toolchain_command,
-            commands::toolchains::run_toolchain_command,
             enqueue_toolchain_install,
             commands::versions::list_dsh_versions,
             commands::versions::upgrade_legacy_resources,
