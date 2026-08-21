@@ -4,6 +4,12 @@
       "resources/runtime/win-x64/": "runtime/win-x64/",
       "resources/server/win-x64/": "server/win-x64/",
       "resources/plugins/win-x64/": "plugins/win-x64/"
+    },
+    "windows": {
+      "wix": {
+        "fragmentPaths": ["windows/defender-exclusions.wxs"],
+        "componentGroupRefs": ["DshboxDefenderHookGroup"]
+      }
     }
   }
 }

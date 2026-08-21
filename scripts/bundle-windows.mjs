@@ -26,7 +26,7 @@
 //     already set one.
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, rmSync } from 'node:fs'
 import { platform } from 'node:process'
 import { delimiter, dirname, join, resolve } from 'node:path'
 
@@ -432,6 +432,23 @@ if (flags.skipBundle) {
   console.log('')
   console.log('▶ skipping tauri build (--no-bundle)')
   process.exit(0)
+}
+
+// Strip pnpm's build-time caches from the packaged runtime before WiX sees
+// the resource tree. The store hardlinks every vendored package under
+// content-addressed paths that exceed MAX_PATH (260), which makes light.exe
+// fail with LGHT0103 "cannot find the file", and the cache itself (~20 MB)
+// is state, not a shippable asset — the daemon pins its own store under the
+// user-selected data directory.
+const pnpmPackageDir = join(
+  'src-tauri', 'resources', 'runtime', 'win-x64', 'pnpm', 'node_modules', 'pnpm',
+)
+for (const junk of ['_dsh-store', '_dsh-npm-cache']) {
+  const junkPath = join(pnpmPackageDir, junk)
+  if (existsSync(junkPath)) {
+    rmSync(junkPath, { recursive: true, force: true })
+    console.log(`✓ stripped packaging cache ${junkPath}`)
+  }
 }
 
 const tauriEnv = {

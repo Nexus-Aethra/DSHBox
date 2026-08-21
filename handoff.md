@@ -27,19 +27,27 @@ backoff), and `container_plugin_add` now runs the DSH CLI against the
 container-local `harness/` copy instead of the removed legacy
 `runtimes/<version>/source` layout.
 
-### Defender exclusions are registered by the desktop shell (2026-08-22)
+### Defender exclusions are registered by the installer (2026-08-22)
 
 The retry classifier loses against Windows Defender on fresh installs: the
 real-time scanner opens every freshly materialized `node_modules` file exactly
 while pnpm reads it back for bin linking, so all four attempts fail with
-`[UNKNOWN] unknown error, open '…package.json'`. The desktop app now asks once
-via UAC (first launch, and again only when the runtime directory changes) to
-exclude the install directory and the runtime data directory
-(`src-tauri/src/desktop/app/defender.rs`; outcome persisted as
-`BoxConfig.defender_exclusions_for`, declined prompts are remembered and never
-re-shown). `scripts/register-defender-exclusion.ps1` remains the manual
-fallback. Without the exclusion, container prepare fails deterministically —
-treat `[UNKNOWN] UNKNOWN` prepare failures as an AV-scan race first.
+`[UNKNOWN] unknown error, open '…package.json'`. Two layers remove the race:
+
+1. **MSI custom action** (`src-tauri/windows/defender-exclusions.wxs`, wired
+   via `fragmentPaths`/`componentGroupRefs` in `tauri.windows.conf.json`): a
+   deferred, elevated (`Impersonate="no"`) custom action excludes INSTALLDIR
+   during install — no UAC prompt, no external script, and hosts without
+   Defender are tolerated (`Return="ignore"`).
+2. **Desktop shell** (`src-tauri/src/desktop/app/defender.rs`): the runtime
+   data directory is chosen after installation, so the app asks once via UAC
+   when it is set or changed (outcome persisted as
+   `BoxConfig.defender_exclusions_for`; declined prompts are remembered and
+   never re-shown). `scripts/register-defender-exclusion.ps1` remains a manual
+   fallback.
+
+Without either layer, container prepare fails deterministically — treat
+`[UNKNOWN] UNKNOWN` prepare failures as an AV-scan race first.
 
 ## Non-negotiable runtime contract
 
