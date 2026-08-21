@@ -89,7 +89,9 @@ impl ResolvedBundledRuntime {
         if entry.is_empty() {
             return None;
         }
-        let executable = self.clean(&self.root.join(entry));
+        // The manifest entry (e.g. "cmd/git.exe") is relative to the git/
+        // subdirectory of the runtime root, not to the root itself.
+        let executable = self.clean(&self.root.join("git").join(entry));
         Some(executable.parent().map(Path::to_path_buf).unwrap_or(self.root.clone()))
     }
 }
