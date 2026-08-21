@@ -4,7 +4,6 @@
 
 use crate::bundles::{install_container_plugin, install_container_skill};
 use crate::toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel};
-use box_dsh_versions::version_directory as dsh_version_directory;
 use box_extensions::transfer::{
     append_plugin_archive, archive_content_root, copy_extension_source, extract_extension_tarball,
 };
@@ -577,7 +576,18 @@ pub(crate) fn container_plugin_add(
     let container = box_containers::scan_containers(&root)?
         .remove(container_id)
         .ok_or("container not found")?;
-    let source = dsh_version_directory(&root, &container.version);
+    // Run the DSH CLI against the container's own harness copy. The legacy
+    // <root>/runtimes/<version>/source layout no longer exists — prepared
+    // bases live under <root>/templates/base-* and each instance carries a
+    // full harness/ snapshot, so the container-local tree is both the
+    // correct working directory and guaranteed to match what the host runs.
+    let source = PathBuf::from(&container.directory).join("harness");
+    if !source.join("apps/cli/src/bin.ts").is_file() {
+        return Err(format!(
+            "container harness is missing the DSH CLI at {}; reinstall the container",
+            source.display()
+        ));
+    }
     let pnpm = resolve_toolchain("pnpm")?;
     task.update("Installing DSH plugin", 60);
     task.log(&format!("adding plugin {spec} to profile {profile}"));
