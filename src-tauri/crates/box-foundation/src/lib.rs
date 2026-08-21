@@ -384,6 +384,13 @@ pub struct BoxConfig {
     /// resource manifest and skips the copy when they match.
     #[serde(default)]
     pub plugins_manifest_digest: Option<String>,
+    /// Windows only: `"<install-dir>|<runtime-dir>"` pair whose Defender
+    /// real-time-scan exclusions were already registered (or found
+    /// unavailable). The desktop shell re-prompts via UAC only when the
+    /// current pair differs, so changing the runtime directory triggers
+    /// exactly one new elevation prompt.
+    #[serde(default)]
+    pub defender_exclusions_for: Option<String>,
 }
 
 fn default_language() -> String {
@@ -406,6 +413,7 @@ impl Default for BoxConfig {
             git_path: None,
             inherit_proxy: default_true(),
             plugins_manifest_digest: None,
+            defender_exclusions_for: None,
         }
     }
 }

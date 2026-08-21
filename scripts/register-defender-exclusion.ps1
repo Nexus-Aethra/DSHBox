@@ -1,11 +1,15 @@
 <#
-DSH Box Defender exclusion registration.
+DSH Box Defender exclusion registration (manual fallback).
 
-When the MSI is installed per-machine this script is shipped next to
-dshbox.exe and invoked by the desktop app on first run via UAC elevation
-so Windows Defender real-time scan does not race with pnpm install
-inside DSH Box's working directories (the EBUSY/UNKNOWN pattern that
-breaks container prepare).
+The desktop app registers these exclusions automatically: on first run it
+asks once via UAC (src-tauri/src/desktop/app/defender.rs) so Windows
+Defender real-time scan does not race pnpm install inside DSH Box's
+working directories (the EBUSY/UNKNOWN pattern that breaks container
+prepare). Run this script by hand only when the automatic prompt was
+dismissed and you want to register later without reinstalling:
+
+  powershell -ExecutionPolicy Bypass -File scripts/register-defender-exclusion.ps1 `
+      -InstallDir 'D:\dshbox' -RuntimeDir 'D:\ddd'
 
 Idempotent: Add-MpPreference accepts duplicate paths without error. The
 script also tolerates hosts without Defender (Server Core, custom

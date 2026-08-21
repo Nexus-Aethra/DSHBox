@@ -28,6 +28,14 @@ pub(crate) fn save_runtime_directory(
         serde_json::json!({ "runtimeDirectory": normalized }),
     )?;
     let config = read_config()?;
+    // The new data directory is unknown to Windows Defender; ask once for a
+    // real-time-scan exclusion so container prepare does not race the scanner.
+    if let Some(install_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(Path::to_path_buf))
+    {
+        defender::ensure_defender_exclusions(install_dir, PathBuf::from(&normalized));
+    }
     refresh_global_state(&app);
     Ok(config)
 }

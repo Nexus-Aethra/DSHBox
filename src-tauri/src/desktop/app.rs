@@ -33,6 +33,7 @@ use tauri::{Manager, WindowEvent};
 mod bundles;
 mod commands;
 mod containers;
+pub(crate) mod defender;
 mod rpc;
 mod events;
 mod extensions;
@@ -283,6 +284,17 @@ fn run_inner() -> Result<(), String> {
             if let Ok(config) = read_config() {
                 if let Some(root) = config.runtime_directory {
                     repair_resources_on_startup(&root);
+                    // Windows only: keep Defender real-time scan out of the
+                    // install and runtime directories so pnpm's bin linking
+                    // does not race the scanner during container prepare.
+                    if let Ok(executable) = env::current_exe() {
+                        if let Some(install_dir) = executable.parent() {
+                            defender::ensure_defender_exclusions(
+                                install_dir.to_path_buf(),
+                                PathBuf::from(&root),
+                            );
+                        }
+                    }
                 }
             }
             write_startup_log("desktop setup completed");
