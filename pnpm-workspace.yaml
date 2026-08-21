@@ -3,4 +3,3 @@ packages:
   - src-tauri/crates/box-dsh-context/dsh-box-context
 allowBuilds:
   esbuild: true
-storeDir: D:\dsh-e2er-e01a851f3a32\pnpm\store-verify

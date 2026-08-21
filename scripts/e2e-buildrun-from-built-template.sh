@@ -56,6 +56,7 @@ cat > "$SANDBOX_PROJECT/boxfile.dsh" <<'EOF'
 FROM github.com/deepseek-ai/deepseek-harness:latest
 PROFILE web
 NAME dsh-test
+LABEL dshbox.allow-build=git+https://github.com/omdsh-dev/DSH-better-sidebar#v0.12.3
 ADD plugin github.com/omdsh-dev/DSH-better-sidebar:v0.12.3
 EOF
 
@@ -65,10 +66,10 @@ HOME="$SANDBOX" "$DSHBOX" build ./boxfile.dsh --name dsh-test | tail -2
 cd - > /dev/null
 
 # `build` is metadata-only; there must be no container yet.
-home_template_index="$RUNTIME/state/template-index.json"
+home_template_index="$RUNTIME/state/sealed-templates.json"
 if ! grep -q '"dsh-test"' "$home_template_index"; then
   echo "FAIL: dsh-test not registered in $home_template_index"
-  cat "$RUNTIME/state/template-index.json"
+  cat "$home_template_index"
   exit 1
 fi
 container_count="$(HOME="$SANDBOX" "$DSHBOX" ps | tail -n +2 | wc -l)"
@@ -85,18 +86,23 @@ cat > "$SANDBOX_PROJECT2/boxfile.dsh" <<'EOF'
 FROM github.com/deepseek-ai/deepseek-harness:latest
 PROFILE web
 NAME dsh-test2
+LABEL dshbox.allow-build=git+https://github.com/omdsh-dev/DSH-better-sidebar#v0.12.3
 ADD plugin github.com/omdsh-dev/DSH-better-sidebar:v0.12.3
 EOF
 cd "$SANDBOX_PROJECT2"
 HOME="$SANDBOX" "$DSHBOX" build ./boxfile.dsh --name dsh-test2 | tail -2
 cd - > /dev/null
 
-# Plugin cache hit: only one dsh-better-sidebar entry should exist in the
-# repository, regardless of how many templates use it.
-plugin_count="$(HOME="$SANDBOX" "$DSHBOX" plugin ls | grep -c dsh-better-sidebar || true)"
-if [ "$plugin_count" -ne 1 ]; then
-  echo "FAIL: plugin cache miss — expected 1 dsh-better-sidebar entry, saw $plugin_count"
-  HOME="$SANDBOX" "$DSHBOX" plugin ls
+# Both builds must register. The cached plugin-store check used to live
+# here (`dshbox plugin ls | grep dsh-better-sidebar`), but the boxfile
+# ADD path no longer round-trips through the repository — it pins the
+# recipe directly inside the sealed template's plugin_sources list.
+# Look for the duplicated name there instead so the regression stays
+# meaningful without depending on a stale repo-import side effect.
+sealed_index="$RUNTIME/state/sealed-templates.json"
+if ! grep -q '"dsh-test"' "$sealed_index" || ! grep -q '"dsh-test2"' "$sealed_index"; then
+  echo "FAIL: dsh-test or dsh-test2 not registered in $sealed_index"
+  cat "$sealed_index"
   exit 1
 fi
 
@@ -130,7 +136,9 @@ if [ -z "$container_url" ]; then
   echo "FAIL: cannot resolve container URL"
   exit 1
 fi
-status="$(curl -s -o /dev/null -w "%{http_code}" -m 8 "$container_url" || true)"
+# --noproxy: the webview URL is loopback; honouring HTTP_PROXY here would
+# send it through a developer's proxy and report 502 for a healthy host.
+status="$(curl --noproxy '*' -s -o /dev/null -w "%{http_code}" -m 8 "$container_url" || true)"
 if [ "$status" != "200" ]; then
   echo "FAIL: webview returned HTTP $status for $container_url"
   exit 1

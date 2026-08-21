@@ -31,3 +31,11 @@
 /src-tauri/dist/
 # Prepare-script content-hash cache: regenerated on demand, never tracked.
 /.cache/
+
+# E2E sandbox fixtures occasionally leave Windows-style absolute paths
+# (e.g. D:\\dsh-e2er-*\\pnpm\\store-verify) at the project root when
+# tests fail to clean up. They confuse tooling that joins cwd + path;
+# never tracked.
+/D:\\*
+src-tauri/box-data/
+src-tauri/crates/box-runtime/box-data/
