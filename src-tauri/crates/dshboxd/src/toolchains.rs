@@ -72,14 +72,23 @@ pub(crate) fn pnpm_policy(
         .map(|root| root.join("pnpm"))
         .unwrap_or_default();
     let install_dir = dshbox_install_directory().ok();
-    let git_dir = bundled_runtime()?.git_dir.as_deref();
+    let bundled_git = bundled_runtime()?.git_dir.as_deref();
+    // Linux host fallback: when no bundled git is published for this target,
+    // resolve the host-installed `git` binary. Windows never falls back —
+    // users without git cannot proceed on Windows, by design.
+    let host_git_dir = if bundled_git.is_none() && box_runtime::bundled::target_is_linux() {
+        box_runtime::bundled::resolve_host_git_dir()
+    } else {
+        None
+    };
     process::bundled_package_manager_policy(
         install_dir.as_deref(),
         &node_dir,
         &pnpm_dir,
         runtime_directory,
         config.npm_registry.as_deref(),
-        git_dir.as_deref(),
+        bundled_git,
+        host_git_dir.as_deref(),
     )
 }
 

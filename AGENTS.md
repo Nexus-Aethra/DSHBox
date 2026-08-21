@@ -109,12 +109,16 @@ they don't run them inline.
 
 ## Known gotchas
 
-- **No system Node/pnpm/Git required.** Bundled Node + pnpm (pinned in
-  `runtime-lock.json`, SHA-256/SHA-512 verified at build time) is invoked via
-  absolute paths. The bundled Git distribution lives next to Node and pnpm
-  (Windows: Git-for-Windows PortableGit; Linux: CI-built private bundle);
-  the daemon clean-room pre-pends `<runtime>/git/cmd` (or `bin`) to `PATH`
-  so pnpm can resolve `github:` plugin specs without a host Git. libgit2
+- **No system Node/pnpm/Git required (Windows); Linux uses host git with isolated
+  config.** Bundled Node + pnpm (pinned in `runtime-lock.json`, SHA-256/SHA-512
+  verified at build time) is invoked via absolute paths. On Windows the bundled
+  Git (PortableGit) is shipped inside `<runtime>/git/` and the clean-room policy
+  prepends it to `PATH`. On Linux, where no bundled git is published yet, the
+  daemon falls back to the host's `git` binary via a clean-room host-passthrough
+  mode — the binary directory is added to `PATH` but `HOME`, `GIT_CONFIG_GLOBAL`,
+  `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, and `XDG_CONFIG_HOME` are
+  redirected to `<storage>/git/...` so the host `~/.gitconfig` cannot leak.
+  Windows never falls back; install Git for Windows manually if needed. libgit2
   still handles DSH's own clones — never shell out to `git`.
 - **DSH web server is loopback-only** (`127.0.0.1`, dynamic port) and requires
   a per-launch capability token from the shell for launcher-only endpoints.

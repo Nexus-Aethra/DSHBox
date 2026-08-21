@@ -2,11 +2,15 @@
 
 ## Status
 
-Implemented for Windows. Linux support is deferred until DSH Box CI can
-produce a private Git bundle (the `git` section of `runtime-lock.json`
-contains only `win-x64` today). The architecture below is the design of
-record; the runtime-manifest schema, clean-room policy, and packager
-helpers are all in place.
+Implemented for Windows. Linux runs in **host-passthrough mode** today:
+when the bundled git distribution is absent for the runtime target, the
+daemon locates the host's `git` binary on Linux only and prepends its
+directory to the clean-room PATH. Git *configuration* and HOME are still
+isolated — only the binary path is trusted from the host. Windows never
+falls back; it stays bundled-only because Windows users do not have git
+by default. The CI-built Linux bundle remains a future goal; once a
+`linux-x64`/`linux-arm64` entry appears in `runtime-lock.json` the
+daemon prefers the bundled binary over the host fallback.
 
 ## Problem
 
@@ -157,6 +161,40 @@ No `GIT_*` setting, proxy setting, credential helper, or PATH segment is
 inherited from the host. Credentials for authenticated Git sources are an
 explicit future Box configuration surface; the initial release supports public
 HTTPS sources only and must fail with a clear authentication message.
+
+## Linux host fallback
+
+When the bundled git distribution is absent for a runtime target (today:
+`linux-x64`, `linux-arm64`, future macOS targets), the daemon uses a
+**host-passthrough** mode:
+
+- The host's `git` binary directory is located by walking `PATH` first
+  (matching the user's distro package manager), then falling back to the
+  FHS locations `/usr/bin` and `/usr/local/bin`.
+- The clean-room policy prepends that directory to `PATH` so pnpm's
+  `git ls-remote` resolves.
+- All git **state and configuration** is still isolated:
+  - `HOME` / `USERPROFILE` → `<storage>/git/home`
+  - `GIT_CONFIG_NOSYSTEM=1`
+  - `GIT_CONFIG_GLOBAL` → `<storage>/git/config/global.gitconfig`
+  - `GIT_TERMINAL_PROMPT=0`
+  - `XDG_CONFIG_HOME` → `<storage>/git/config` (prevents `~/.config/git/config`
+    leakage that `GIT_CONFIG_NOSYSTEM` does not cover)
+- `LD_LIBRARY_PATH` is **not** set; the host system loader resolves `.so`
+  dependencies.
+
+This mode is gated to Linux only (`cfg!(target_os = "linux")`). Windows
+never falls back because users without git cannot proceed on Windows, by
+design — a Windows user without git should install Git for Windows
+manually rather than the daemon silently reaching into the system. The
+fallback also requires both `git_dir == None` and `host_git_dir.is_some()`;
+if neither is available, `bundled_package_manager_policy` returns an
+`Err` with a remediation hint rather than letting pnpm fail with
+`git: not found`.
+
+Once DSH Box CI publishes a Linux git bundle, the `linux-x64` entry in
+`runtime-lock.json` takes precedence and the host fallback is no longer
+exercised for that target.
 
 ## Security and licensing
 

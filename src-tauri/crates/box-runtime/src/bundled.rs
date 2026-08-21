@@ -96,6 +96,50 @@ impl ResolvedBundledRuntime {
     }
 }
 
+/// True when the current compilation target is Linux. Used by callers
+/// that need to make runtime decisions based on the host platform —
+/// for example, whether to allow a host-git passthrough fallback when
+/// the bundled git distribution is absent.
+pub fn target_is_linux() -> bool {
+    std::env::consts::OS == "linux"
+}
+
+/// Locate a usable `git` executable on the host filesystem. The lookup
+/// only runs on Linux targets (Windows always uses the bundled binary).
+/// Resolution order:
+///
+/// 1. Walk the inherited `PATH` and pick the first directory that
+///    contains a `git` executable. This honours the user's distro
+///    package manager and homebrew-style installs without ever spawning
+///    a shell.
+/// 2. Fall back to the well-known FHS locations `/usr/bin/git` and
+///    `/usr/local/bin/git` for hosts where `PATH` is sanitised.
+///
+/// `None` is returned when neither path yields an executable. The
+/// caller is expected to surface this as a user-visible error — DSH
+/// Box never shells out to `git` itself, so a missing host binary
+/// only fails loudly when pnpm actually needs it.
+pub fn resolve_host_git_dir() -> Option<PathBuf> {
+    if !target_is_linux() {
+        return None;
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for entry in std::env::split_paths(&path_var) {
+            let candidate = entry.join("git");
+            if candidate.is_file() {
+                return Some(entry);
+            }
+        }
+    }
+    for well_known in ["/usr/bin", "/usr/local/bin"] {
+        let candidate = PathBuf::from(well_known).join("git");
+        if candidate.is_file() {
+            return Some(PathBuf::from(well_known));
+        }
+    }
+    None
+}
+
 pub fn bundled_target() -> String {
     let os = match std::env::consts::OS {
         "windows" => "win",
