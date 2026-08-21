@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
+    fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -14,6 +15,8 @@ pub struct EnvironmentPolicy {
     defaults: BTreeMap<String, OsString>,
     replace: BTreeMap<String, OsString>,
     prepend_path: Vec<PathBuf>,
+    clean_room: bool,
+    inherited: BTreeSet<String>,
     task_overrides: BTreeMap<String, OsString>,
     protected: BTreeSet<String>,
 }
@@ -21,6 +24,20 @@ pub struct EnvironmentPolicy {
 impl EnvironmentPolicy {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Start the child with no inherited environment except variables explicitly
+    /// requested with [`Self::inherit`]. This is for deterministic toolchain
+    /// work, not interactive host processes.
+    pub fn clean_room(mut self) -> Self {
+        self.clean_room = true;
+        self
+    }
+
+    /// Preserve one parent environment variable when using [`Self::clean_room`].
+    pub fn inherit(mut self, key: impl Into<String>) -> Self {
+        self.inherited.insert(normalize_key(&key.into()));
+        self
     }
 
     pub fn remove(mut self, key: impl Into<String>) -> Self {
@@ -57,6 +74,17 @@ impl EnvironmentPolicy {
     }
 
     pub fn apply(&self, command: &mut Command) {
+        if self.clean_room {
+            let inherited: Vec<(String, OsString)> = self
+                .inherited
+                .iter()
+                .filter_map(|key| env::var_os(key).map(|value| (key.clone(), value)))
+                .collect();
+            command.env_clear();
+            for (key, value) in inherited {
+                command.env(key, value);
+            }
+        }
         for key in &self.remove {
             remove_env_aliases(command, key);
         }
@@ -72,8 +100,10 @@ impl EnvironmentPolicy {
         }
         if !self.prepend_path.is_empty() {
             let mut paths = self.prepend_path.clone();
-            if let Some(existing) = env::var_os("PATH") {
-                paths.extend(env::split_paths(&existing));
+            if !self.clean_room {
+                if let Some(existing) = env::var_os("PATH") {
+                    paths.extend(env::split_paths(&existing));
+                }
             }
             remove_env_aliases(command, "PATH");
             if let Ok(joined) = env::join_paths(paths) {
@@ -94,6 +124,9 @@ impl EnvironmentPolicy {
         input: BTreeMap<String, OsString>,
     ) -> BTreeMap<String, OsString> {
         let mut result = input;
+        if self.clean_room {
+            result.retain(|key, _| self.inherited.iter().any(|allowed| same_key(key, allowed)));
+        }
         for key in &self.remove {
             remove_map_aliases(&mut result, key);
         }
@@ -108,8 +141,10 @@ impl EnvironmentPolicy {
         }
         if !self.prepend_path.is_empty() {
             let mut paths = self.prepend_path.clone();
-            if let Some(existing) = find_map_value(&result, "PATH") {
-                paths.extend(env::split_paths(existing));
+            if !self.clean_room {
+                if let Some(existing) = find_map_value(&result, "PATH") {
+                    paths.extend(env::split_paths(existing));
+                }
             }
             remove_map_aliases(&mut result, "PATH");
             if let Ok(joined) = env::join_paths(paths) {
@@ -124,6 +159,67 @@ impl EnvironmentPolicy {
         }
         result
     }
+}
+
+/// Build a deterministic policy for pnpm/npm tasks owned by DSH Box. Unlike
+/// the general bundled-toolchain policy, this never inherits the user's npm,
+/// pnpm, proxy, or Node configuration.
+pub fn bundled_package_manager_policy(
+    install_dir: Option<&Path>,
+    node_dir: &Path,
+    pnpm_dir: &Path,
+    runtime_dir: &Path,
+    npm_registry: Option<&str>,
+) -> Result<EnvironmentPolicy, String> {
+    const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org/";
+    let package_root = runtime_dir.join("pnpm");
+    let config_dir = package_root.join("config");
+    let home_dir = package_root.join("home");
+    let app_data_dir = package_root.join("app-data");
+    let local_app_data_dir = app_data_dir.join("local");
+    fs::create_dir_all(&config_dir)
+        .map_err(|error| format!("cannot create pnpm config directory: {error}"))?;
+    fs::create_dir_all(&home_dir)
+        .map_err(|error| format!("cannot create pnpm home directory: {error}"))?;
+    fs::create_dir_all(&local_app_data_dir)
+        .map_err(|error| format!("cannot create pnpm application-data directory: {error}"))?;
+    let registry = npm_registry
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_REGISTRY);
+    let npmrc = config_dir.join("npmrc");
+    let global_npmrc = config_dir.join("global-npmrc");
+    fs::write(&npmrc, format!("registry={registry}\n"))
+        .map_err(|error| format!("cannot write managed npm configuration: {error}"))?;
+    fs::write(&global_npmrc, "")
+        .map_err(|error| format!("cannot write managed global npm configuration: {error}"))?;
+
+    let mut policy = EnvironmentPolicy::new()
+        .clean_room()
+        .inherit("SystemRoot")
+        .inherit("WINDIR")
+        .inherit("ComSpec")
+        .inherit("TEMP")
+        .inherit("TMP")
+        .prepend_path(node_dir)
+        .prepend_path(pnpm_dir)
+        .protect("DSHBOX_HOME")
+        .replace("HOME", home_dir.as_os_str().to_owned())
+        .replace("USERPROFILE", home_dir.as_os_str().to_owned())
+        .replace("APPDATA", app_data_dir.as_os_str().to_owned())
+        .replace("LOCALAPPDATA", local_app_data_dir.as_os_str().to_owned())
+        .replace("NPM_CONFIG_USERCONFIG", npmrc.as_os_str().to_owned())
+        .replace("NPM_CONFIG_GLOBALCONFIG", global_npmrc.as_os_str().to_owned())
+        .replace("npm_config_registry", registry)
+        .replace("PNPM_CONFIG_STORE_DIR", package_root.join("store").into_os_string())
+        .replace("npm_config_cache", package_root.join("npm-cache").into_os_string())
+        .replace("npm_config_optional", "true")
+        .replace("pnpm_config_optional", "true")
+        .replace("pnpm_config_verify_deps_before_run", "false");
+    if let Some(directory) = install_dir {
+        policy = policy.prepend_path(directory);
+    }
+    Ok(policy)
 }
 
 fn normalize_key(key: &str) -> String {
@@ -349,6 +445,50 @@ mod tests {
         );
         assert_eq!(output.get("NPM_CONFIG_OPTIONAL").unwrap(), "true");
         assert_eq!(output.get("PNPM_CONFIG_OPTIONAL").unwrap(), "true");
+    }
+
+    #[test]
+    fn clean_room_discards_host_package_manager_configuration() {
+        let mut input = BTreeMap::new();
+        input.insert(
+            "NPM_CONFIG_REGISTRY".to_owned(),
+            OsString::from("https://host-invalid.example/"),
+        );
+        input.insert(
+            "NPM_CONFIG_USERCONFIG".to_owned(),
+            OsString::from("host-npmrc"),
+        );
+        input.insert("HTTPS_PROXY".to_owned(), OsString::from("host-proxy"));
+        input.insert("NODE_PATH".to_owned(), OsString::from("host-node-path"));
+        input.insert("SYSTEMROOT".to_owned(), OsString::from("system-root"));
+        let output = EnvironmentPolicy::new()
+            .clean_room()
+            .inherit("SYSTEMROOT")
+            .replace("NPM_CONFIG_REGISTRY", "https://box.example/")
+            .replace("NPM_CONFIG_USERCONFIG", "box-npmrc")
+            .apply_to_map(input);
+        assert_eq!(output.get("NPM_CONFIG_REGISTRY").unwrap(), "https://box.example/");
+        assert_eq!(output.get("NPM_CONFIG_USERCONFIG").unwrap(), "box-npmrc");
+        assert_eq!(output.get("SYSTEMROOT").unwrap(), "system-root");
+        assert!(!output.contains_key("APPDATA"));
+        assert!(!output.contains_key("LOCALAPPDATA"));
+        assert!(!output.contains_key("HTTPS_PROXY"));
+        assert!(!output.contains_key("NODE_PATH"));
+    }
+
+    #[test]
+    fn clean_room_path_does_not_append_the_host_path() {
+        let mut input = BTreeMap::new();
+        input.insert(
+            "PATH".to_owned(),
+            env::join_paths([PathBuf::from("host-path")]).unwrap(),
+        );
+        let output = EnvironmentPolicy::new()
+            .clean_room()
+            .prepend_path("bundled-node")
+            .apply_to_map(input);
+        let paths: Vec<PathBuf> = env::split_paths(output.get("PATH").unwrap()).collect();
+        assert_eq!(paths, vec![PathBuf::from("bundled-node")]);
     }
 
     #[test]

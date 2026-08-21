@@ -384,7 +384,7 @@ fn run_pnpm_task<const N: usize>(
         .args(["--dir", directory_arg.as_str()])
         .args(args)
         .cwd(directory)
-        .policy(pnpm_policy(pnpm))
+        .policy(pnpm_policy(pnpm)?)
         .kind(ExecutionKind::Logged)
         .log_path(log_path);
     let mut process = run_logged(&spec, label)?;

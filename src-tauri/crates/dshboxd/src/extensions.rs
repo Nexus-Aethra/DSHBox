@@ -82,7 +82,7 @@ fn package_repository_plugin(
         .args(&npm.arguments)
         .args(["pack", "--pack-destination", staging_arg.as_str()])
         .cwd(source)
-        .policy(pnpm_policy(&npm))
+        .policy(pnpm_policy(&npm)?)
         .kind(ExecutionKind::Logged)
         .log_path(&log_path);
     let mut process = run_logged(&spec, "plugin artifact pack")?;
@@ -444,7 +444,7 @@ fn install_plugin_dependencies(
                 "--no-frozen-lockfile"
             },
         ])
-        .policy(pnpm_policy(&pnpm))
+        .policy(pnpm_policy(&pnpm)?)
         .kind(ExecutionKind::Logged)
         .log_path(&task_record.log_path);
     let mut install_logged = run_logged(&install_spec, "pnpm install").map_err(|error| {
@@ -622,7 +622,7 @@ pub(crate) fn container_plugin_add(
             spec,
         ])
         .policy(
-            pnpm_policy(&pnpm)
+            pnpm_policy(&pnpm)?
                 .task_override("DSH_HOME", dsh_home.to_string_lossy().into_owned()),
         )
         .kind(ExecutionKind::Logged)

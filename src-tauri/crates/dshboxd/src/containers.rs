@@ -923,7 +923,7 @@ pub(crate) fn prepare_plugin_source(
             "--force",
             frozen,
         ])
-        .policy(pnpm_policy(&pnpm))
+        .policy(pnpm_policy(&pnpm)?)
         .kind(ExecutionKind::Logged)
         .log_path(&task_record.log_path);
     let mut install_logged = run_logged(&install_spec, "pnpm install")
@@ -947,7 +947,7 @@ pub(crate) fn prepare_plugin_source(
         task.update(format!("Building plugin {name}"), 38);
         let build_spec = ProcessSpec::new(pnpm.path.clone())
             .args(["--dir", directory.to_string_lossy().as_ref(), "run", script])
-            .policy(pnpm_policy(&pnpm))
+            .policy(pnpm_policy(&pnpm)?)
             .kind(ExecutionKind::Logged)
             .log_path(&task_record.log_path);
         let mut build_logged = run_logged(&build_spec, "pnpm build")

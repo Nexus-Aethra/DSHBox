@@ -664,7 +664,7 @@ fn seed_profile_recipe(
                 source.as_str(),
             ])
             .cwd(base_harness)
-            .policy(pnpm_policy(&pnpm).task_override("DSH_HOME", profile_home.clone()))
+            .policy(pnpm_policy(&pnpm)?.task_override("DSH_HOME", profile_home.clone()))
             .kind(ExecutionKind::Logged)
             .log_path(&log_path);
         let mut process = run_logged(&spec, "resolve plugin recipe")?;
@@ -946,7 +946,7 @@ fn run_pnpm_command<const N: usize>(
     client_commit: Option<String>,
 ) -> Result<(), String> {
     let harness_arg = harness.to_string_lossy().into_owned();
-    let mut policy = pnpm_policy(pnpm);
+    let mut policy = pnpm_policy(pnpm)?;
     if let Some(home) = dsh_home {
         policy = policy.task_override("DSH_HOME", home);
     }

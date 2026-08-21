@@ -54,8 +54,15 @@ pub(crate) fn resolve_toolchain(id: &str) -> Result<ResolvedToolchain, String> {
 /// the daemon. Mirrors the desktop's `command_for_toolchain` env setup
 /// but goes through the unified module so daemon children get the same
 /// registry/pnpm store pinning as the desktop.
-pub(crate) fn pnpm_policy(toolchain: &ResolvedToolchain) -> process::EnvironmentPolicy {
-    let config = read_config().ok();
+pub(crate) fn pnpm_policy(
+    toolchain: &ResolvedToolchain,
+) -> Result<process::EnvironmentPolicy, String> {
+    let config = read_config()?;
+    let runtime_directory = config
+        .runtime_directory
+        .as_deref()
+        .map(Path::new)
+        .ok_or("DSH Box storage is not configured")?;
     let node_dir = std::path::Path::new(&toolchain.path)
         .parent()
         .map(Path::to_path_buf)
@@ -65,16 +72,12 @@ pub(crate) fn pnpm_policy(toolchain: &ResolvedToolchain) -> process::Environment
         .map(|root| root.join("pnpm"))
         .unwrap_or_default();
     let install_dir = dshbox_install_directory().ok();
-    process::bundled_toolchain_policy(
+    process::bundled_package_manager_policy(
         install_dir.as_deref(),
         &node_dir,
         &pnpm_dir,
-        config
-            .as_ref()
-            .and_then(|c| c.runtime_directory.as_deref())
-            .map(Path::new),
-        config.as_ref().and_then(|c| c.npm_registry.as_deref()),
-        false,
+        runtime_directory,
+        config.npm_registry.as_deref(),
     )
 }
 

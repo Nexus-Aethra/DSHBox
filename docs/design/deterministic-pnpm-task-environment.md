@@ -1,6 +1,6 @@
 # Deterministic pnpm task environment
 
-Status: proposed debugging and implementation plan, 2026-08-21.
+Status: phase 1 implemented for daemon pnpm/npm tasks, 2026-08-21.
 
 ## Problem statement
 
@@ -37,6 +37,21 @@ dshboxd::toolchains::pnpm_policy
 The current policy intentionally preserves unknown parent variables. It pins
 the Box pnpm store and cache and overrides a few keys, but that preservation
 allows machine-global npm/pnpm configuration to influence scheduled work.
+
+## Implementation record
+
+The daemon now uses a clean-room package-manager policy for every pnpm/npm
+task. It creates Box-owned configuration and application-data paths below the
+selected runtime directory, explicitly selects the configured registry (or
+`https://registry.npmjs.org/`), and does not inherit user npm/pnpm/proxy/Node
+configuration. Windows `APPDATA` and `LOCALAPPDATA` are explicitly redirected
+to the Box runtime because koffi requires them when installing its prebuild.
+
+The policy was verified with real task
+`125de858-ffe4-45b4-9695-3fd926cc99d0`: the official Harness pull completed
+against `D:\ddd` after writing `D:\ddd\pnpm\config\npmrc` with the explicit
+official registry. Earlier failures used the externally inherited npmmirror
+registry even while Box configuration reported no selected registry.
 
 ## Decision
 
@@ -104,6 +119,10 @@ are ever added in the future.
 7. Add an explicit recovery view for network failures: report registry host,
    retry count, and the Box setting to change. Do not relabel a failed download
    as a native build-tool failure.
+
+Items 1 through 5 are complete for daemon pnpm/npm tasks. Items 6 and 7 remain
+follow-up observability work. Proxy support remains intentionally absent until
+it is modelled as a Box setting rather than inherited from the operating system.
 
 ## Tests and acceptance criteria
 

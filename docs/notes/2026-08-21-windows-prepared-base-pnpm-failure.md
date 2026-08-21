@@ -54,6 +54,12 @@ the required Windows x64 native packages).
 the root cause but downloads every platform's optional artifacts, so it is not
 used by the release path.
 
+The release path now also runs pnpm in a Box-owned clean-room environment.
+Registry, npmrc files, pnpm home, cache, store, and Windows application-data
+paths are fixed below the selected runtime directory. Real task
+`125de858-ffe4-45b4-9695-3fd926cc99d0` completed the official Harness pull
+using this policy.
+
 ## Diagnostics retention
 
 Staging directories are correctly removed after a failed pull, but that used
