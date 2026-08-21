@@ -36,6 +36,11 @@ pub(crate) struct BundledRuntime {
     pub(crate) node: PathBuf,
     pub(crate) npm: PathBuf,
     pub(crate) pnpm: PathBuf,
+    /// Directory that contains the bundled `git` entry point (e.g. the
+    /// `cmd/` directory of PortableGit). `None` on targets where DSH Box
+    /// has not yet published a bundled Git — the clean-room policy then
+    /// leaves `PATH` and Git-related variables untouched.
+    pub(crate) git_dir: Option<PathBuf>,
 }
 
 static BUNDLED_RUNTIME: OnceLock<BundledRuntime> = OnceLock::new();
@@ -117,6 +122,7 @@ pub(crate) fn initialize_bundled_runtime() -> Result<(), String> {
         None,
         None,
         false,
+        runtime.git_dir().as_deref(),
     );
     let spec = process::ProcessSpec::new(&node)
         .arg(&npm)
@@ -129,6 +135,7 @@ pub(crate) fn initialize_bundled_runtime() -> Result<(), String> {
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
         .unwrap_or_else(|| "unknown".to_owned());
+    let git_dir = runtime.git_dir();
     BUNDLED_RUNTIME
         .set(BundledRuntime {
             node_version: runtime.manifest.node_version,
@@ -137,6 +144,7 @@ pub(crate) fn initialize_bundled_runtime() -> Result<(), String> {
             node,
             npm,
             pnpm,
+            git_dir,
         })
         .map_err(|_| "bundled runtime was initialized twice".to_owned())
 }

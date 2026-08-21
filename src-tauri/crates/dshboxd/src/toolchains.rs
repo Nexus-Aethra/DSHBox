@@ -72,12 +72,14 @@ pub(crate) fn pnpm_policy(
         .map(|root| root.join("pnpm"))
         .unwrap_or_default();
     let install_dir = dshbox_install_directory().ok();
+    let git_dir = bundled_runtime()?.git_dir.as_deref();
     process::bundled_package_manager_policy(
         install_dir.as_deref(),
         &node_dir,
         &pnpm_dir,
         runtime_directory,
         config.npm_registry.as_deref(),
+        git_dir.as_deref(),
     )
 }
 

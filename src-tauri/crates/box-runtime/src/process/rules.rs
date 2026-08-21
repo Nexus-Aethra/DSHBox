@@ -12,8 +12,9 @@ pub fn bundled_toolchain_policy_for(
     runtime_dir: Option<&Path>,
     npm_registry: Option<&str>,
     host: bool,
+    git_dir: Option<&Path>,
 ) -> EnvironmentPolicy {
-    bundled_toolchain_policy(install_dir, node_dir, pnpm_dir, runtime_dir, npm_registry, host)
+    bundled_toolchain_policy(install_dir, node_dir, pnpm_dir, runtime_dir, npm_registry, host, git_dir)
 }
 
 pub fn dsh_host_spec(node: impl Into<PathBuf>, policy: EnvironmentPolicy) -> ProcessSpec {

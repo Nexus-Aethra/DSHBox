@@ -164,12 +164,21 @@ impl EnvironmentPolicy {
 /// Build a deterministic policy for pnpm/npm tasks owned by DSH Box. Unlike
 /// the general bundled-toolchain policy, this never inherits the user's npm,
 /// pnpm, proxy, or Node configuration.
+///
+/// `git_dir` is the directory that contains the bundled `git` entry point
+/// (the `cmd/` directory inside PortableGit). When `Some`, the directory is
+/// prepended to the clean-room `PATH` and the standard Git clean-room
+/// variables (`GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL`, `GIT_TERMINAL_PROMPT`,
+/// and a Box-owned `HOME`) are injected. When `None`, no Git-related
+/// environment changes are made — this is the path taken on targets where
+/// DSH Box has not yet published a bundled Git (Linux until CI ships it).
 pub fn bundled_package_manager_policy(
     install_dir: Option<&Path>,
     node_dir: &Path,
     pnpm_dir: &Path,
     runtime_dir: &Path,
     npm_registry: Option<&str>,
+    git_dir: Option<&Path>,
 ) -> Result<EnvironmentPolicy, String> {
     const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org/";
     let package_root = runtime_dir.join("pnpm");
@@ -194,6 +203,34 @@ pub fn bundled_package_manager_policy(
     fs::write(&global_npmrc, "")
         .map_err(|error| format!("cannot write managed global npm configuration: {error}"))?;
 
+    // Decide what HOME points at. When Git is bundled we redirect HOME to a
+    // dedicated `<storage>/git/home` directory so host-side `~/.gitconfig` (or
+    // the registry-backed Git config on Windows) cannot leak into the child.
+    // When Git is absent, HOME stays pointed at pnpm's home directory — that
+    // path is what Node/pnpm expect for their `~/.npm` / `.pnpm-state` files.
+    let (effective_home, git_env) = match git_dir {
+        Some(_) => {
+            let git_root = runtime_dir.join("git");
+            let git_home = git_root.join("home");
+            let git_config_dir = git_root.join("config");
+            fs::create_dir_all(&git_home)
+                .map_err(|error| format!("cannot create git home directory: {error}"))?;
+            fs::create_dir_all(&git_config_dir)
+                .map_err(|error| format!("cannot create git config directory: {error}"))?;
+            let global_gitconfig = git_config_dir.join("global.gitconfig");
+            fs::write(&global_gitconfig, "")
+                .map_err(|error| format!("cannot write managed global gitconfig: {error}"))?;
+            (
+                git_home,
+                Some(GitEnvironment {
+                    config_global: global_gitconfig,
+                    lib_dir: git_root.join("lib"),
+                }),
+            )
+        }
+        None => (home_dir, None),
+    };
+
     let mut policy = EnvironmentPolicy::new()
         .clean_room()
         .inherit("SystemRoot")
@@ -204,8 +241,8 @@ pub fn bundled_package_manager_policy(
         .prepend_path(node_dir)
         .prepend_path(pnpm_dir)
         .protect("DSHBOX_HOME")
-        .replace("HOME", home_dir.as_os_str().to_owned())
-        .replace("USERPROFILE", home_dir.as_os_str().to_owned())
+        .replace("HOME", effective_home.as_os_str().to_owned())
+        .replace("USERPROFILE", effective_home.as_os_str().to_owned())
         .replace("APPDATA", app_data_dir.as_os_str().to_owned())
         .replace("LOCALAPPDATA", local_app_data_dir.as_os_str().to_owned())
         .replace("NPM_CONFIG_USERCONFIG", npmrc.as_os_str().to_owned())
@@ -216,10 +253,39 @@ pub fn bundled_package_manager_policy(
         .replace("npm_config_optional", "true")
         .replace("pnpm_config_optional", "true")
         .replace("pnpm_config_verify_deps_before_run", "false");
+    if let Some(directory) = git_dir {
+        policy = policy.prepend_path(directory);
+    }
+    if let Some(git) = git_env {
+        policy = policy
+            .replace("GIT_CONFIG_NOSYSTEM", "1")
+            .replace(
+                "GIT_CONFIG_GLOBAL",
+                git.config_global.as_os_str().to_owned(),
+            )
+            .replace("GIT_TERMINAL_PROMPT", "0");
+        #[cfg(target_os = "linux")]
+        {
+            // Linux CI builds a private lib layout under <runtime>/git/lib;
+            // PortableGit on Windows is self-contained and does not need it.
+            policy = policy.replace(
+                "LD_LIBRARY_PATH",
+                git.lib_dir.as_os_str().to_owned(),
+            );
+        }
+    }
     if let Some(directory) = install_dir {
         policy = policy.prepend_path(directory);
     }
     Ok(policy)
+}
+
+/// Bundle of clean-room variables that govern how the bundled `git`
+/// resolves its configuration and library paths. Only constructed when
+/// the caller passes a `git_dir` to `bundled_package_manager_policy`.
+struct GitEnvironment {
+    config_global: PathBuf,
+    lib_dir: PathBuf,
 }
 
 fn normalize_key(key: &str) -> String {
@@ -287,6 +353,10 @@ fn find_map_value<'a>(map: &'a BTreeMap<String, OsString>, key: &str) -> Option<
 /// resolve the vendored `@deepseek-ai/dsh-box-context` plugin tree); for
 /// toolchain commands we strip it to avoid leaking the host machine's
 /// global Node.js install into the child.
+///
+/// `git_dir` is prepended to `PATH` when supplied, so pnpm can invoke the
+/// bundled `git` for `ADD plugin github.com/...` specs even when the host
+/// PATH has no Git on it.
 pub fn bundled_toolchain_policy(
     install_dir: Option<&Path>,
     node_dir: &Path,
@@ -294,6 +364,7 @@ pub fn bundled_toolchain_policy(
     runtime_dir: Option<&Path>,
     npm_registry: Option<&str>,
     host: bool,
+    git_dir: Option<&Path>,
 ) -> EnvironmentPolicy {
     let mut policy = EnvironmentPolicy::new()
         .remove("SHELL")
@@ -310,6 +381,9 @@ pub fn bundled_toolchain_policy(
         policy = policy.remove("NODE_PATH");
     }
     if let Some(directory) = install_dir {
+        policy = policy.prepend_path(directory);
+    }
+    if let Some(directory) = git_dir {
         policy = policy.prepend_path(directory);
     }
     if let Some(registry) = npm_registry {
@@ -419,6 +493,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .task_override("DSH_HOME", "container-home")
         .apply_to_map(input);
@@ -434,6 +509,7 @@ mod tests {
             Some(Path::new("box-data")),
             None,
             false,
+            None,
         )
         .apply_to_map(BTreeMap::new());
         assert_eq!(
@@ -504,5 +580,83 @@ mod tests {
         let values: Vec<_> = env::split_paths(output.get("PATH").unwrap()).collect();
         assert_eq!(values[0], PathBuf::from("front"));
         assert_eq!(values[1], PathBuf::from("tail"));
+    }
+
+    #[test]
+    fn bundled_package_manager_policy_injects_git_path_and_clean_room_vars() {
+        let mut input = BTreeMap::new();
+        input.insert("PATH".to_owned(), env::join_paths([PathBuf::from("host-path")]).unwrap());
+        input.insert("HOME".to_owned(), OsString::from("C:\\Users\\host"));
+        input.insert(
+            "GIT_CONFIG_GLOBAL".to_owned(),
+            OsString::from("C:\\Users\\host\\.gitconfig"),
+        );
+        input.insert("HTTPS_PROXY".to_owned(), OsString::from("http://host-proxy:8080"));
+
+        let policy = bundled_package_manager_policy(
+            None,
+            Path::new("bundled/node"),
+            Path::new("bundled/pnpm"),
+            Path::new("box-data"),
+            Some("https://registry.npmjs.org/"),
+            Some(Path::new("bundled/git/cmd")),
+        )
+        .unwrap();
+        let output = policy.apply_to_map(input);
+
+        // Git dir is prepended to PATH, after Node/pnpm.
+        let paths: Vec<PathBuf> = env::split_paths(&output["PATH"]).collect();
+        assert_eq!(paths[0], PathBuf::from("bundled/node"));
+        assert_eq!(paths[1], PathBuf::from("bundled/pnpm"));
+        assert_eq!(paths[2], PathBuf::from("bundled/git/cmd"));
+        assert!(!paths.contains(&PathBuf::from("host-path")));
+
+        // Host HOME is replaced by the managed git HOME; the original
+        // sentinel ~/.gitconfig cannot reach the child.
+        let expected_home = PathBuf::from("box-data")
+            .join("git")
+            .join("home");
+        assert_eq!(output["HOME"].as_os_str(), expected_home.as_os_str());
+        let expected_global = PathBuf::from("box-data")
+            .join("git")
+            .join("config")
+            .join("global.gitconfig");
+        assert_eq!(output["GIT_CONFIG_GLOBAL"].as_os_str(), expected_global.as_os_str());
+        assert_eq!(output["GIT_CONFIG_NOSYSTEM"], OsString::from("1"));
+        assert_eq!(output["GIT_TERMINAL_PROMPT"], OsString::from("0"));
+
+        // Host proxy still does not leak.
+        assert!(!output.contains_key("HTTPS_PROXY"));
+    }
+
+    #[test]
+    fn bundled_package_manager_policy_omits_git_when_dir_is_none() {
+        let mut input = BTreeMap::new();
+        input.insert("PATH".to_owned(), env::join_paths([PathBuf::from("host-path")]).unwrap());
+
+        let policy = bundled_package_manager_policy(
+            None,
+            Path::new("bundled/node"),
+            Path::new("bundled/pnpm"),
+            Path::new("box-data"),
+            Some("https://registry.npmjs.org/"),
+            None,
+        )
+        .unwrap();
+        let output = policy.apply_to_map(input);
+
+        let paths: Vec<PathBuf> = env::split_paths(&output["PATH"]).collect();
+        assert_eq!(paths, vec![PathBuf::from("bundled/node"), PathBuf::from("bundled/pnpm")]);
+
+        // No Git-related overrides when git_dir is absent.
+        assert!(!output.contains_key("GIT_CONFIG_NOSYSTEM"));
+        assert!(!output.contains_key("GIT_CONFIG_GLOBAL"));
+        assert!(!output.contains_key("GIT_TERMINAL_PROMPT"));
+
+        // HOME falls back to the pnpm-side home directory.
+        let expected_home = PathBuf::from("box-data")
+            .join("pnpm")
+            .join("home");
+        assert_eq!(output["HOME"].as_os_str(), expected_home.as_os_str());
     }
 }

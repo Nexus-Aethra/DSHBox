@@ -261,6 +261,7 @@ pub(crate) fn initialize_bundled_runtime(resource_directory: PathBuf) -> Result<
         None,
         None,
         false,
+        runtime.git_dir().as_deref(),
     );
     let spec = box_runtime::process::ProcessSpec::new(&node)
         .arg(&npm)
@@ -273,6 +274,7 @@ pub(crate) fn initialize_bundled_runtime(resource_directory: PathBuf) -> Result<
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
         .unwrap_or_else(|| "unknown".to_owned());
+    let git_dir = runtime.git_dir();
     BUNDLED_RUNTIME
         .set(BundledRuntime {
             node_version: runtime.manifest.node_version,
@@ -281,6 +283,7 @@ pub(crate) fn initialize_bundled_runtime(resource_directory: PathBuf) -> Result<
             node,
             npm,
             pnpm,
+            git_dir,
         })
         .map_err(|_| "bundled runtime was initialized twice".to_owned())
 }

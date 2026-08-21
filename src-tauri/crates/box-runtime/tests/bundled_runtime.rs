@@ -13,7 +13,6 @@ use std::{
     env,
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -76,6 +75,7 @@ fn bundled_npm_reports_version() {
         None,
         Some("https://registry.npmjs.org/"),
         false,
+        runtime.git_dir().as_deref(),
     );
     let spec = ProcessSpec::new(runtime.node_executable())
         .arg(runtime.npm_script())
@@ -98,6 +98,7 @@ fn bundled_pnpm_reports_version() {
         None,
         Some("https://registry.npmjs.org/"),
         false,
+        runtime.git_dir().as_deref(),
     );
     let spec = ProcessSpec::new(runtime.node_executable())
         .arg(runtime.pnpm_script())
@@ -127,6 +128,7 @@ fn bundled_policy_overrides_registry_and_store() {
         Some(&runtime_dir),
         Some("https://example.invalid/registry/"),
         false,
+        runtime.git_dir().as_deref(),
     );
     // The test intentionally runs against the bundled Node, but pnpm still
     // consults the user's `~/.npmrc` for `registry`. Pin a clean HOME so the
@@ -153,6 +155,7 @@ fn bundled_policy_overrides_registry_and_store() {
             Some(&runtime_dir),
             Some("https://example.invalid/registry/"),
             false,
+            runtime.git_dir().as_deref(),
         ).remove("HOME").remove("USERPROFILE").task_override("HOME", isolated_home.to_string_lossy().into_owned()).task_override("USERPROFILE", isolated_home.to_string_lossy().into_owned()));
     let output = NativeProcessRunner.run(&probe_store).expect("store dir probe");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -214,6 +217,7 @@ fn bundled_pnpm_runs_logged_and_writes_log_file() {
         None,
         Some("https://registry.npmjs.org/"),
         false,
+        runtime.git_dir().as_deref(),
     );
     let spec = ProcessSpec::new(runtime.node_executable())
         .arg(runtime.pnpm_script())
@@ -257,6 +261,7 @@ fn detached_dsh_smoke_or_skipped() {
         Some(&runtime_dir),
         Some("https://registry.npmjs.org/"),
         false,
+        runtime.git_dir().as_deref(),
     );
     let spec = ProcessSpec::new(runtime.node_executable())
         .arg("--import")

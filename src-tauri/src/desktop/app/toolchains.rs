@@ -79,6 +79,9 @@ pub(crate) fn command_for_toolchain(toolchain: &ResolvedToolchain) -> Command {
             .as_ref()
             .and_then(|c| c.npm_registry.as_deref()),
         false,
+        runtime
+            .as_ref()
+            .and_then(|r| r.git_dir.as_deref()),
     );
     let mut command = Command::new(&toolchain.path);
     box_runtime::process::platform::configure_non_interactive(&mut command, false);
