@@ -28,6 +28,12 @@ pub struct RuntimeManifest {
     pub node_entry: String,
     pub npm_entry: String,
     pub pnpm_entry: String,
+    #[serde(default)]
+    pub git_version: Option<String>,
+    #[serde(default)]
+    pub git_entry: Option<String>,
+    #[serde(default)]
+    pub git_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +78,19 @@ impl ResolvedBundledRuntime {
 
     pub fn pnpm_dir(&self) -> PathBuf {
         self.pnpm_script().parent().map(Path::to_path_buf).unwrap_or(self.root.clone())
+    }
+
+    /// Directory that contains the bundled `git` entry point (e.g. the
+    /// `cmd/` directory inside PortableGit). Returns `None` when the
+    /// runtime manifest was published without a `git` entry — the typical
+    /// case for Linux until DSH Box CI produces its own bundle.
+    pub fn git_dir(&self) -> Option<PathBuf> {
+        let entry = self.manifest.git_entry.as_deref()?.trim();
+        if entry.is_empty() {
+            return None;
+        }
+        let executable = self.clean(&self.root.join(entry));
+        Some(executable.parent().map(Path::to_path_buf).unwrap_or(self.root.clone()))
     }
 }
 
