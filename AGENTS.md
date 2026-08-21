@@ -111,7 +111,11 @@ they don't run them inline.
 
 - **No system Node/pnpm/Git required.** Bundled Node + pnpm (pinned in
   `runtime-lock.json`, SHA-256/SHA-512 verified at build time) is invoked via
-  absolute paths. libgit2 handles clones — never shell out to `git`.
+  absolute paths. The bundled Git distribution lives next to Node and pnpm
+  (Windows: Git-for-Windows PortableGit; Linux: CI-built private bundle);
+  the daemon clean-room pre-pends `<runtime>/git/cmd` (or `bin`) to `PATH`
+  so pnpm can resolve `github:` plugin specs without a host Git. libgit2
+  still handles DSH's own clones — never shell out to `git`.
 - **DSH web server is loopback-only** (`127.0.0.1`, dynamic port) and requires
   a per-launch capability token from the shell for launcher-only endpoints.
   WebView navigation must stay on that loopback origin.

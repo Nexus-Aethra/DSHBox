@@ -60,11 +60,20 @@ handlers and CLI handlers do not execute it inline.
 
 ## Toolchains and process execution
 
-No system Git, Node, npm, or pnpm is required. libgit2 performs checkouts and
-the release bundle carries the integrity-verified Node and pnpm versions pinned
-by `runtime-lock.json`. Always invoke them through the resolver's absolute
-paths, with a task-specific environment and working directory. Never use a
-global pnpm store for a published tree.
+No system Git, Node, npm, or pnpm is required. libgit2 performs checkouts
+that DSH itself owns; the release bundle carries the integrity-verified
+Node, pnpm, and Git versions pinned by `runtime-lock.json`. Windows ships
+Git-for-Windows PortableGit; Linux builds a CI-produced private bundle.
+Always invoke them through the resolver's absolute paths, with a
+task-specific environment and working directory. Never use a global pnpm
+store for a published tree.
+
+The clean-room package-manager policy prepends `<runtime>/git/cmd` (or
+`bin`) to `PATH` and pins `GIT_CONFIG_NOSYSTEM=1`,
+`GIT_CONFIG_GLOBAL=<storage>/git/config/global.gitconfig`, and
+`GIT_TERMINAL_PROMPT=0` so the host's `~/.gitconfig` (or registry-backed
+Git config) cannot leak into pnpm children. Authentication for Git
+sources is unsupported in this release; only public HTTPS is allowed.
 
 Allocate a loopback port immediately before spawning a DSH host. Bind only
 `127.0.0.1`, pass a per-launch capability token, keep WebView navigation on the
