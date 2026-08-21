@@ -652,11 +652,21 @@ mod tests {
                 .into_os_string()
         );
         use std::ffi::OsStr;
-        // The policy stores keys verbatim on non-Windows hosts
-        // (normalize_key only upper-cases on Windows), so the
-        // lower-case npm_config_* spellings are what land in the map.
-        assert_eq!(output.get("npm_config_optional").unwrap(), "true");
-        assert_eq!(output.get("pnpm_config_optional").unwrap(), "true");
+        // `normalize_key` upper-cases on Windows and leaves the
+        // spelling alone elsewhere, so the npm_config_* / pnpm_config_*
+        // keys land in the map as upper-cased under Windows and as
+        // lower-cased under Linux/macOS. The test runs on whatever
+        // host the suite is invoked on, so we check both casings.
+        let upper_optional = output
+            .get("NPM_CONFIG_OPTIONAL")
+            .or_else(|| output.get("npm_config_optional"))
+            .expect("npm_config_optional must be present");
+        assert_eq!(upper_optional, &OsStr::new("true"));
+        let upper_pnpm_optional = output
+            .get("PNPM_CONFIG_OPTIONAL")
+            .or_else(|| output.get("pnpm_config_optional"))
+            .expect("pnpm_config_optional must be present");
+        assert_eq!(upper_pnpm_optional, &OsStr::new("true"));
     }
 
     #[test]
