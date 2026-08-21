@@ -7,6 +7,7 @@ use std::{
     env, fs,
     io::{Cursor, Read},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
 use tar::Archive;
 use xz2::read::XzDecoder;
@@ -19,6 +20,7 @@ struct Lock {
     pnpm_version: String,
     pnpm: Pnpm,
     node: BTreeMap<String, Asset>,
+    git: BTreeMap<String, GitAsset>,
 }
 #[derive(Deserialize)]
 struct Pnpm {
@@ -29,6 +31,13 @@ struct Pnpm {
 struct Asset {
     url: String,
     sha256: String,
+}
+#[derive(Clone, Deserialize)]
+struct GitAsset {
+    version: String,
+    url: String,
+    sha256: String,
+    entry: String,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +50,9 @@ struct Manifest {
     node_entry: String,
     npm_entry: String,
     pnpm_entry: String,
+    git_version: String,
+    git_entry: String,
+    git_sha256: String,
 }
 
 fn main() -> Result<(), String> {
@@ -89,8 +101,32 @@ fn main() -> Result<(), String> {
     } else {
         "pnpm/node_modules/pnpm/bin/pnpm.cjs"
     };
+    let git = lock.git.get(&target).cloned();
+    // Git is best-effort: the runtime works for everything except Git-backed
+    // pnpm specs without it. A missing 7z (or a transient network error)
+    // should not block the Node+pnpm extraction that other DSH Box features
+    // already depend on. The manifest reflects actual state — empty git
+    // fields mean "not bundled" — and the warning names the install step the
+    // developer must run.
+    let installed_git: Option<GitAsset> = match git {
+        Some(asset) => match extract_git(&asset, &cache, &output) {
+            Ok(()) => Some(asset),
+            Err(reason) => {
+                eprintln!(
+                    "warning: bundled git extraction failed ({reason}); pnpm will not be able \
+                     to resolve `github:` specs without a system Git or a re-run of \
+                     `pnpm runtime:prepare` after fixing the cause"
+                );
+                None
+            }
+        },
+        None => {
+            println!("skipping bundled git: no entry for target {target}");
+            None
+        }
+    };
     let manifest = Manifest {
-        target,
+        target: target.clone(),
         node_version: lock.node_version,
         pnpm_version: lock.pnpm_version,
         node_sha256: node.sha256.clone(),
@@ -108,6 +144,9 @@ fn main() -> Result<(), String> {
             "node/lib/node_modules/npm/bin/npm-cli.js".into()
         },
         pnpm_entry: pnpm_entry.into(),
+        git_version: installed_git.as_ref().map(|asset| asset.version.clone()).unwrap_or_default(),
+        git_entry: installed_git.as_ref().map(|asset| asset.entry.clone()).unwrap_or_default(),
+        git_sha256: installed_git.as_ref().map(|asset| asset.sha256.clone()).unwrap_or_default(),
     };
     install_command_shims(&output, windows)?;
     fs::write(
@@ -391,4 +430,163 @@ fn unpack_tar<R: Read>(
 }
 fn strip_first(path: &Path) -> Result<PathBuf, String> {
     Ok(path.components().skip(1).collect())
+}
+
+/// Drive the full bundled-Git extraction flow: locate 7z, fetch the
+/// archive, verify SHA-256, extract, and copy license files. Returns the
+/// failure reason as a string so the caller can surface it in the warning.
+fn extract_git(asset: &GitAsset, cache: &Path, output: &Path) -> Result<(), String> {
+    let seven_zip = find_7z().ok_or_else(seven_zip_install_hint)?;
+    let bytes = cached_download(cache, &asset.url)?;
+    verify_sha256(&bytes, &asset.sha256)?;
+    let destination = output.join("git");
+    unpack_7z(&bytes, &destination, &seven_zip)?;
+    if !destination.join(&asset.entry).is_file() {
+        return Err(format!(
+            "bundled git archive did not contain expected entry {}",
+            asset.entry
+        ));
+    }
+    collect_git_licenses(&destination, &output.join("LICENSES"))?;
+    Ok(())
+}
+
+/// Locate a usable 7-Zip executable. The packager needs `7z` to expand the
+/// PortableGit self-extracting archive; DSH Box does not bundle 7-Zip itself
+/// because it is only required during `runtime:prepare` and never reaches
+/// end users (only the unpacked `git/` tree ships in the installer).
+fn find_7z() -> Option<PathBuf> {
+    if let Ok(path) = which_7z("7z") {
+        return Some(path);
+    }
+    if let Ok(path) = which_7z("7z.exe") {
+        return Some(path);
+    }
+    #[cfg(windows)]
+    {
+        for env_name in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(root) = env::var_os(env_name) {
+                let candidate = PathBuf::from(root).join("7-Zip").join("7z.exe");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn which_7z(name: &str) -> Result<PathBuf, String> {
+    let output = Command::new(name).arg("--help").stdout(Stdio::null()).stderr(Stdio::null()).output();
+    match output {
+        Ok(_) => Ok(PathBuf::from(name)),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Rendered into the runtime-packager error when `find_7z` returns `None`.
+/// Pointing the developer at the official installer keeps the project's
+/// own dependency surface narrow: 7-Zip is a one-shot unpack tool, not part
+/// of the runtime DSH Box ships.
+fn seven_zip_install_hint() -> String {
+    if cfg!(windows) {
+        "PortableGit is distributed as a 7z self-extracting archive, but no \
+         `7z` executable was found on PATH or under %ProgramFiles%\\7-Zip. \
+         Install 7-Zip from <https://www.7-zip.org/> and ensure `7z` is on \
+         PATH, then re-run `pnpm runtime:prepare`."
+            .to_owned()
+    } else if cfg!(target_os = "macos") {
+        "PortableGit is distributed as a 7z self-extracting archive, but no \
+         `7z` executable was found on PATH. Install p7zip via Homebrew \
+         (`brew install p7zip`) or your package manager of choice, then \
+         re-run `pnpm runtime:prepare`."
+            .to_owned()
+    } else {
+        "PortableGit is distributed as a 7z self-extracting archive, but no \
+         `7z` executable was found on PATH. Install p7zip-full \
+         (`apt-get install p7zip-full` on Debian/Ubuntu, equivalent on your \
+         distribution) then re-run `pnpm runtime:prepare`."
+            .to_owned()
+    }
+}
+
+/// Drive `7z` to extract a self-extracting archive into `destination`. The
+/// archive bytes are written to a sibling temp file because `7z` only takes
+/// a path, not stdin. The temp file is removed regardless of outcome.
+fn unpack_7z(bytes: &[u8], destination: &Path, seven_zip: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(stringify)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("git destination {} has no parent", destination.display()))?;
+    let temp_archive = parent.join(format!(
+        ".git-archive-{}.7z.exe",
+        std::process::id()
+    ));
+    fs::write(&temp_archive, bytes).map_err(stringify)?;
+    let result = Command::new(seven_zip)
+        .arg("x")
+        .arg("-y")
+        .arg(format!("-o{}", destination.display()))
+        .arg(&temp_archive)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status();
+    let _ = fs::remove_file(&temp_archive);
+    match result {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "7z exited with {status} while extracting bundled git; ensure 7z is installed and PATH is correct"
+        )),
+        Err(error) => Err(format!("cannot launch 7z at {}: {error}", seven_zip.display())),
+    }
+}
+
+/// Copy Git's license/notices into a top-level `LICENSES/` directory. Git
+/// for Windows places `COPYING.txt`, `LICENSE.txt`, `NOTICE.txt`, and a
+/// per-component `Licenses/` subtree at the archive root.
+fn collect_git_licenses(git_root: &Path, licenses_dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(licenses_dir).map_err(stringify)?;
+    let mut queue: Vec<PathBuf> = vec![git_root.to_path_buf()];
+    let mut index = 0;
+    while index < queue.len() {
+        let current = queue[index].clone();
+        index += 1;
+        let entries = fs::read_dir(&current).map_err(stringify)?;
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                let name_os = entry.file_name();
+                let name = name_os.to_string_lossy();
+                // Skip PortableGit's own bundled Licenses/ subtree here; we
+                // want only the top-level notices to ship with the runtime.
+                if current.as_path() == git_root && name.eq_ignore_ascii_case("Licenses") {
+                    continue;
+                }
+                queue.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let owned_name = match entry.file_name().to_str() {
+                Some(value) => value.to_owned(),
+                None => continue,
+            };
+            let lower = owned_name.to_ascii_lowercase();
+            if !(lower.starts_with("license")
+                || lower.starts_with("notice")
+                || lower == "copying.txt"
+                || lower == "readme.md")
+            {
+                continue;
+            }
+            let target = licenses_dir.join(format!("git-{owned_name}"));
+            fs::copy(&path, &target).map_err(stringify)?;
+        }
+    }
+    Ok(())
 }
