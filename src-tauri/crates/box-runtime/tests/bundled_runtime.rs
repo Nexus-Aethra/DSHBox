@@ -105,6 +105,10 @@ fn bundled_pnpm_reports_version() {
         .arg("--version")
         .policy(pnpm_policy);
     let output = NativeProcessRunner.run(&spec).expect("pnpm --version must succeed");
+    if !output.status.success() {
+        eprintln!("pnpm --version stdout: {}", String::from_utf8_lossy(&output.stdout));
+        eprintln!("pnpm --version stderr: {}", String::from_utf8_lossy(&output.stderr));
+    }
     assert!(output.status.success(), "pnpm --version should exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains('.'), "expected semver-ish output, got: {stdout}");
@@ -143,11 +147,12 @@ fn bundled_policy_overrides_registry_and_store() {
     let output = NativeProcessRunner.run(&probe).expect("node env probe");
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "https://example.invalid/registry/", "policy must inject npm_config_registry into the child");
 
-    // PNPM_STORE_DIR is a private pnpm variable that respects env override,
-    // so we can validate it end-to-end without pnpm's `--location` indirection.
+    // PNPM_CONFIG_STORE_DIR is the pnpm 9+ canonical name for the on-disk
+    // store directory. PNPM_STORE_DIR (the pnpm 7/8 spelling) is no longer
+    // honoured by pnpm 11; the env-policy code in box-runtime matches.
     let probe_store = ProcessSpec::new(runtime.node_executable())
         .arg("-p")
-        .arg("process.env.PNPM_STORE_DIR ?? 'unset'")
+        .arg("process.env.PNPM_CONFIG_STORE_DIR ?? 'unset'")
         .policy(bundled_toolchain_policy(
             None,
             &runtime.node_dir(),
@@ -160,7 +165,7 @@ fn bundled_policy_overrides_registry_and_store() {
     let output = NativeProcessRunner.run(&probe_store).expect("store dir probe");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let expected = runtime_dir.join("pnpm").join("store");
-    assert_eq!(stdout.trim(), expected.to_string_lossy(), "policy must inject PNPM_STORE_DIR into the child env");
+    assert_eq!(stdout.trim(), expected.to_string_lossy(), "policy must inject PNPM_CONFIG_STORE_DIR into the child env");
 
     let _ = fs::remove_dir_all(project);
     let _ = fs::remove_dir_all(&runtime_dir);

@@ -164,9 +164,23 @@ mod tests {
 
     #[test]
     fn wait_or_kill_force_terminates_when_cancelled() {
+        // Own process group (setsid) so the cancellation path's group
+        // kill cannot take the test binary down with it.
         #[cfg(not(windows))]
-        let child = std::process::Command::new("sleep").arg("30")
-            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let child = {
+            use std::os::unix::process::CommandExt;
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap()
+        };
         #[cfg(windows)]
         let child = std::process::Command::new("cmd").args(["/K", "rem hang"])
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();

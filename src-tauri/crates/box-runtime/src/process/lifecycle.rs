@@ -4,6 +4,7 @@
 //! terminated, preventing zombies/orphans on both Windows and Unix.
 
 use std::{
+    io::Read,
     process::{Child, ExitStatus},
     sync::OnceLock,
     thread,
@@ -159,7 +160,6 @@ impl Drop for TrackedChild {
 pub fn kill_tree_pid(pid: u32, pgid: Option<i32>, force: bool) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
         let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
         let target_pgid = pgid.unwrap_or(pid as i32);
         // Negative pid means "send to the whole process group".
@@ -336,13 +336,27 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .spawn()
             .expect("spawn long-running child");
+        // Own process group so the trailing kill_tree() cannot signal the
+        // test binary itself (see probe_pid_alive_and_dead).
         #[cfg(not(windows))]
-        let child = std::process::Command::new("sleep")
-            .arg("30")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn long-running child");
+        let child = {
+            use std::os::unix::process::CommandExt;
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn long-running child")
+        };
         let mut tracked = TrackedChild::wrap(child);
         // Windows `cmd /K` may exit on machines without an interactive console;
         // accept either `None` (still running) or a quick non-zero exit on those
@@ -399,13 +413,29 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .spawn()
             .expect("spawn probe child");
+        // The child must live in its own process group: kill_tree()
+        // signals the whole group of `pid`, and a same-group child would
+        // take the test binary down with it (SIGKILL to our own pgid
+        // surfaces as exit code 137 in sandboxed CI runners).
         #[cfg(not(windows))]
-        let child = std::process::Command::new("sleep")
-            .arg("30")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn probe child");
+        let child = {
+            use std::os::unix::process::CommandExt;
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn probe child")
+        };
         let pid = child.id();
         assert!(matches!(probe_pid(pid), PidState::Alive));
         let mut tracked = TrackedChild::wrap(child);

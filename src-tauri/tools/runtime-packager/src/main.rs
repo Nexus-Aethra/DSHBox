@@ -190,13 +190,37 @@ fn install_command_shims(output: &Path, windows: bool) -> Result<(), String> {
         )
         .map_err(stringify)?;
     } else {
-        fs::write(
-            output.join("pnpm/pnpm"),
+        // Layout: <root>/{pnpm/pnpm, pnpm/bin/pnpm, node/bin/node,
+        // pnpm/node_modules/pnpm/bin/pnpm.cjs}. The node binary lives at
+        // ../node/bin/node relative to pnpm/pnpm (NOT ../bin/node, which
+        // predates the node/<target> nesting); the pnpm.cjs entry lives in
+        // the sibling node_modules of the shim's own pnpm/ tree.
+        let shim_body = |node_up: &str, cjs_up: &str| {
             format!(
-                "#!/bin/sh\nexec \"$(dirname \"$0\")/../{node_entry}\" \"$(dirname \"$0\")/node_modules/pnpm/bin/pnpm.cjs\" \"$@\"\n"
-            ),
-        )
-        .map_err(stringify)?;
+                "#!/bin/sh\nexec \"$(dirname \"$0\")/{node_up}node/bin/node\" \"$(dirname \"$0\")/{cjs_up}node_modules/pnpm/bin/pnpm.cjs\" \"$@\"\n"
+            )
+        };
+        let write_executable = |path: std::path::PathBuf, body: String| -> Result<(), String> {
+            fs::write(&path, body).map_err(stringify)?;
+            // fs::write creates 0644 files; a PATH-resolvable command shim
+            // must carry the executable bit or shells report
+            // "Permission denied" when build scripts invoke bare `pnpm`.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&path).map_err(stringify)?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&path, perms).map_err(stringify)?;
+            }
+            Ok(())
+        };
+        write_executable(output.join("pnpm/pnpm"), shim_body("../", ""))?;
+        // Mirror the Windows `pnpm/pnpm.cmd` layout with a `pnpm/bin/`
+        // subdirectory so policies that prepend `<root>/pnpm/bin` also
+        // resolve an executable named `pnpm`.
+        let pnpm_bin_dir = output.join("pnpm").join("bin");
+        fs::create_dir_all(&pnpm_bin_dir).map_err(stringify)?;
+        write_executable(pnpm_bin_dir.join("pnpm"), shim_body("../../", "../"))?;
         // The Node upstream tarball ships `node/bin/{npm,npx,corepack}` as
         // symlinks into `node/lib/node_modules/...`. Symlinks survive normal
         // tarball extraction, yet the Tauri deb/rpm bundler dereferences them
