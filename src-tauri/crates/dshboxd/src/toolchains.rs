@@ -13,7 +13,7 @@ use box_runtime::process::{
 use box_scheduler::TaskContext;
 use box_toolchains::is_known_toolchain;
 use serde::Serialize;
-use std::path::Path;
+use std::{fs, path::Path};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,6 +81,45 @@ pub(crate) fn pnpm_policy(
     )
 }
 
+/// Add an actionable explanation when pnpm failed after repeatedly losing its
+/// connection to a configured third-party registry. Optional native packages
+/// may be skipped by pnpm after these failures, so the final lifecycle error
+/// (for example a missing esbuild binary) is often misleading on its own.
+pub(crate) fn pnpm_network_failure_hint(log_path: &Path) -> Option<String> {
+    let config = read_config().ok()?;
+    let registry = config.npm_registry?.trim().to_owned();
+    if registry.is_empty() || is_official_npm_registry(&registry) {
+        return None;
+    }
+    let log = fs::read_to_string(log_path).ok()?;
+    let network_errors = [
+        "ECONNRESET",
+        "ETIMEDOUT",
+        "UND_ERR_SOCKET",
+        "error (23)",
+        "ENOTFOUND",
+        "ECONNREFUSED",
+    ];
+    let count = network_errors
+        .iter()
+        .map(|marker| log.matches(marker).count())
+        .sum::<usize>();
+    (count >= 2).then(|| {
+        " The configured npm mirror had repeated network failures while downloading packages. \
+         Switch the npm registry to the official registry or configure a Box-managed proxy, then retry; \
+         pnpm will reuse packages already cached in this storage directory."
+            .to_owned()
+    })
+}
+
+fn is_official_npm_registry(registry: &str) -> bool {
+    let normalized = registry.trim().trim_end_matches('/').to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "https://registry.npmjs.org" | "http://registry.npmjs.org"
+    )
+}
+
 /// Wrap a `TaskContext` (or lack thereof) so it can be passed to the
 /// unified process runner's `wait_or_kill` cancellation check.
 pub(crate) struct TaskCancel<'a>(pub(crate) Option<&'a TaskContext>);
@@ -104,5 +143,19 @@ pub(crate) fn run_logged(spec: &ProcessSpec, description: &str) -> Result<Logged
         _ => Err(format!(
             "internal: expected logged execution for {description}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_official_npm_registry;
+
+    #[test]
+    fn recognizes_the_official_npm_registry() {
+        assert!(is_official_npm_registry("https://registry.npmjs.org/"));
+        assert!(is_official_npm_registry("http://registry.npmjs.org"));
+        assert!(!is_official_npm_registry(
+            "https://repo.huaweicloud.com/repository/npm/"
+        ));
     }
 }

@@ -33,7 +33,9 @@ use tracing::info;
 
 use crate::{
     state::bundled_runtime,
-    toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel},
+    toolchains::{
+        pnpm_network_failure_hint, pnpm_policy, resolve_toolchain, run_logged, TaskCancel,
+    },
 };
 
 pub(crate) fn is_safe_version_name(version: &str) -> bool {
@@ -343,7 +345,10 @@ fn configure_staged_pnpm_platform(harness: &Path) -> Result<(), String> {
     let workspace = harness.join("pnpm-workspace.yaml");
     let contents = fs::read_to_string(&workspace)
         .map_err(|error| format!("cannot read {}: {error}", workspace.display()))?;
-    if contents.lines().any(|line| line.trim() == "supportedArchitectures:") {
+    if contents
+        .lines()
+        .any(|line| line.trim() == "supportedArchitectures:")
+    {
         return Ok(());
     }
     let os = if cfg!(target_os = "windows") {
@@ -394,7 +399,11 @@ fn run_pnpm_task<const N: usize>(
     if status.success() {
         Ok(())
     } else {
-        Err(format!("{label} failed; inspect {}", log_path.display()))
+        let hint = pnpm_network_failure_hint(log_path).unwrap_or_default();
+        Err(format!(
+            "{label} failed; inspect {}.{hint}",
+            log_path.display()
+        ))
     }
 }
 
