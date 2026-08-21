@@ -945,6 +945,47 @@ fn run_pnpm_command<const N: usize>(
     dsh_home: Option<String>,
     client_commit: Option<String>,
 ) -> Result<(), String> {
+    // Windows Defender real-time scan can race pnpm's package.json reads and
+    // surface as a generic [UNKNOWN] UNKNOWN: open '<file>' exit. Retry a
+    // few times with exponential backoff before declaring the command dead,
+    // so transient locks (Defender, indexing service, lingering AV handles)
+    // do not break the container prepare pipeline.
+    const MAX_ATTEMPTS: u32 = 4;
+    let mut last_error: Option<String> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match run_pnpm_command_once(pnpm, harness, args, log_path, task, label, &dsh_home, &client_commit) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let transient = attempt < MAX_ATTEMPTS && log_indicates_transient_io(log_path);
+                if !transient {
+                    return Err(error);
+                }
+                let backoff_ms = 500_u64 * 2u64.saturating_pow(attempt - 1);
+                last_error = Some(error);
+                task.update(
+                    &format!(
+                        "{label}: transient file lock on attempt {attempt}/{MAX_ATTEMPTS}, \
+                         retrying in {backoff_ms}ms"
+                    ),
+                    u8::MAX,
+                );
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| format!("{label} failed after {MAX_ATTEMPTS} attempts")))
+}
+
+fn run_pnpm_command_once<const N: usize>(
+    pnpm: &crate::toolchains::ResolvedToolchain,
+    harness: &Path,
+    args: [&str; N],
+    log_path: &Path,
+    task: &TaskContext,
+    label: &str,
+    dsh_home: &Option<String>,
+    client_commit: &Option<String>,
+) -> Result<(), String> {
     let harness_arg = harness.to_string_lossy().into_owned();
     let mut policy = pnpm_policy(pnpm)?;
     if let Some(home) = dsh_home {
@@ -970,6 +1011,22 @@ fn run_pnpm_command<const N: usize>(
     } else {
         Err(format!("{label} failed; inspect {}", log_path.display()))
     }
+}
+
+/// Inspect the tail of `log_path` for the Windows-specific file-lock
+/// signatures that warrant a transient retry: `EBUSY`, `EPERM`,
+/// `EACCES`, or pnpm's generic `[UNKNOWN] UNKNOWN` that wraps them when
+/// reading package.json files inside `node_modules/`.
+fn log_indicates_transient_io(log_path: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(log_path) else {
+        return false;
+    };
+    let tail_start = contents.len().saturating_sub(4096);
+    let tail = &contents[tail_start..];
+    tail.contains("EBUSY")
+        || tail.contains("EPERM")
+        || tail.contains("EACCES")
+        || tail.contains("[UNKNOWN] UNKNOWN")
 }
 
 /// Copy a reusable source tree while intentionally excluding package-manager
@@ -1080,5 +1137,58 @@ mod tests {
             size_bytes: 0,
         });
         assert!(template.is_none());
+    }
+
+    #[test]
+    fn transient_io_classifier_recognises_windows_file_lock_signatures() {
+        let temporary = tempfile::tempdir().unwrap();
+        let log_path = temporary.path().join("pnpm.log");
+
+        let cases: &[(&str, bool)] = &[
+            (
+                "Progress: resolved 935, added 935, done\n[UNKNOWN] UNKNOWN: unknown error, open 'D:\\foo\\package.json'",
+                true,
+            ),
+            (
+                "ELSPackage pnpm ELSPackage error  EBUSY: resource busy or locked, open 'foo'",
+                true,
+            ),
+            (
+                "Error: EPERM: operation not permitted, open 'C:/foo/package.json'",
+                true,
+            ),
+            (
+                "EACCES: permission denied, scandir '/foo'",
+                true,
+            ),
+            (
+                "ELSPackage error EAGAIN: try again later",
+                false,
+            ),
+            (
+                "ELSPackage error EINVALIDTAG: Package name \"@scope/--\" is invalid",
+                false,
+            ),
+            (
+                "Lockfile is up to date, resolution step is skipped\nDone in 4s using pnpm",
+                false,
+            ),
+        ];
+
+        for (body, expected) in cases {
+            fs::write(&log_path, body).unwrap();
+            assert_eq!(
+                log_indicates_transient_io(&log_path),
+                *expected,
+                "classifier returned wrong verdict for log body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_io_classifier_handles_missing_log_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let missing = temporary.path().join("does-not-exist.log");
+        assert!(!log_indicates_transient_io(&missing));
     }
 }
