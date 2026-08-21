@@ -6,7 +6,7 @@
 use crate::containers::{
     ensure_container_workspace, repair_known_profile_template, write_dshbox_context_snapshot,
 };
-use crate::state::{ContainerManager, ManagedHost};
+use crate::state::{bundled_runtime, ContainerManager, ManagedHost};
 use crate::toolchains::{resolve_toolchain, run_logged};
 use box_containers::container_directory;
 use box_dsh_context::PLUGIN_ID;
@@ -18,6 +18,7 @@ use std::{
     fs,
     net::TcpListener,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{mpsc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -41,6 +42,19 @@ const HOST_BIND_ATTEMPTS: u32 = 3;
 const HOST_READY_PROBES: usize = 240;
 const CONTEXT_PLUGIN_COPY_TIMEOUT: Duration = Duration::from_secs(45);
 const CONTEXT_PLUGIN_MARKER: &str = ".dshbox-materialized";
+
+/// HTTP client for probing loopback DSH web servers. It must never
+/// consult proxy environment variables: a developer's `HTTP_PROXY`
+/// makes reqwest route `127.0.0.1` through the proxy, which answers 502
+/// for other processes' loopback ports — the probes would then kill
+/// perfectly healthy hosts.
+fn loopback_probe_client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .no_proxy()
+        .build()
+        .map_err(|error| format!("build loopback http client: {error}"))
+}
 
 fn allocate_loopback_port() -> Result<u16, String> {
     // This reservation only identifies a currently usable port; DSH owns the
@@ -190,18 +204,19 @@ pub(crate) fn start_dsh_container_inner(
         // script directly lets the node process's stderr propagate to the
         // host.log unmodified.
         let node = resolve_toolchain("node")?;
+        // The pnpm tree hangs off the runtime root (<root>/pnpm) as a
+        // sibling of node/ on every platform. Take it from the manifest
+        // root instead of counting .parent() levels — Windows ships
+        // node/node.exe while Unix ships node/bin/node, so the depth
+        // differs.
+        let runtime_root = bundled_runtime()?.root.clone();
         let policy = process::dsh_host_policy(
             std::path::Path::new(&node.path)
                 .parent()
                 .map(Path::to_path_buf)
                 .as_deref()
                 .unwrap_or(Path::new(".")),
-            std::path::Path::new(&node.path)
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|p| p.join("pnpm"))
-                .as_deref()
-                .unwrap_or(Path::new(".")),
+            &runtime_root.join("pnpm"),
             &plugins_node_modules,
         );
         let policy = policy.task_override(
@@ -270,6 +285,7 @@ pub(crate) fn start_dsh_container_inner(
                 task.log(&format!("warning: cannot write host pid file: {error}"));
             }
         }
+        let probe_client = loopback_probe_client(Duration::from_secs(2))?;
         let ready = (0..HOST_READY_PROBES).any(|attempt| {
             if task.map(TaskContext::cancelled).unwrap_or(false) {
                 let _ = tracked.kill_tree(false, Duration::from_secs(2));
@@ -293,7 +309,9 @@ pub(crate) fn start_dsh_container_inner(
                     task.log(&format!("waiting for DSH host ({}/60s)", attempt / 4));
                 }
             }
-            let available = reqwest::blocking::get(&url)
+            let available = probe_client
+                .get(&url)
+                .send()
                 .map(|response| response.status().is_success())
                 .unwrap_or(false);
             if !available {
@@ -703,13 +721,10 @@ fn spawn_health_watcher(id: &str, url: String) {
         const PROBE_INTERVAL: Duration = Duration::from_secs(2);
         const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
         const UNHEALTHY_THRESHOLD: u32 = 2;
-        let client = match reqwest::blocking::Client::builder()
-            .timeout(PROBE_TIMEOUT)
-            .build()
-        {
+        let client = match loopback_probe_client(PROBE_TIMEOUT) {
             Ok(client) => client,
             Err(error) => {
-                eprintln!("watcher[{id_owned}]: cannot build http client: {error}");
+                eprintln!("watcher[{id_owned}]: {error}");
                 return;
             }
         };

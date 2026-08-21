@@ -276,11 +276,42 @@ pub fn bundled_package_manager_policy(
 
     let mut policy = EnvironmentPolicy::new()
         .clean_room()
+        // Windows-only: cmd.exe, batch scripts, Defender-aware tools rely
+        // on these to find the system shell.
         .inherit("SystemRoot")
         .inherit("WINDIR")
         .inherit("ComSpec")
         .inherit("TEMP")
         .inherit("TMP")
+        // Proxy variables: developers in regions with restricted GitHub /
+        // npm registry access set these in their shell rc to reach a
+        // mirror. clean_room() does NOT preserve them (only .inherit()
+        // keys survive env_clear()), so opt-in explicitly. Both the
+        // upper- and lower-case forms are honoured because curl, git,
+        // and pnpm each reach for different casings on different
+        // platforms.
+        .inherit("HTTPS_PROXY")
+        .inherit("HTTP_PROXY")
+        .inherit("https_proxy")
+        .inherit("http_proxy")
+        .inherit("ALL_PROXY")
+        .inherit("all_proxy")
+        .inherit("NO_PROXY")
+        .inherit("no_proxy")
+        // Linux-only: locale + timezone + ssh-agent + XDG runtime dirs.
+        // Without LANG/LC_ALL, git emits "fatal: unable to auto-detect
+        // email address" in some flows; without TZ, timestamps drift to
+        // UTC and confuse build manifests that compare local time;
+        // SSH_AUTH_SOCK lets git push via ssh; XDG_RUNTIME_DIR is
+        // required by some credential helpers. We always opt in on
+        // Linux, never on Windows where the names above are unused.
+        .inherit("LANG")
+        .inherit("LC_ALL")
+        .inherit("LC_CTYPE")
+        .inherit("TZ")
+        .inherit("SSH_AUTH_SOCK")
+        .inherit("SSH_AGENT_PID")
+        .inherit("XDG_RUNTIME_DIR")
         .prepend_path(node_dir)
         .prepend_path(pnpm_dir)
         .protect("DSHBOX_HOME")
@@ -467,17 +498,23 @@ pub fn bundled_toolchain_policy(
     if let Some(registry) = npm_registry {
         policy = policy.replace("npm_config_registry", registry);
     }
-    if let Some(runtime) = runtime_dir {
-        policy = policy
-            .replace(
-                "PNPM_CONFIG_STORE_DIR",
-                runtime.join("pnpm").join("store").into_os_string(),
-            )
-            .replace(
-                "npm_config_cache",
-                runtime.join("pnpm").join("npm-cache").into_os_string(),
-            );
-    }
+    // Always pin pnpm/npm's on-disk caches to a Box-owned directory so the
+    // host's `~/.local/share/pnpm/store` (which may contain stale or
+    // cross-project links under a Windows-style absolute path on Linux
+    // dev machines) cannot leak into toolchain children. When the caller
+    // supplies a runtime root we use <root>/pnpm/{store,npm-cache}; when
+    // it doesn't, we fall back to <pnpm_dir>/../_store and _npm_cache so
+    // tests still see a deterministic cache directory without making
+    // permanent changes to the runtime tree.
+    let store_root = runtime_dir
+        .map(|root| root.join("pnpm").join("store"))
+        .unwrap_or_else(|| pnpm_dir.join("..").join("_dsh-store"));
+    let cache_root = runtime_dir
+        .map(|root| root.join("pnpm").join("npm-cache"))
+        .unwrap_or_else(|| pnpm_dir.join("..").join("_dsh-npm-cache"));
+    policy = policy
+        .replace("PNPM_CONFIG_STORE_DIR", store_root.into_os_string())
+        .replace("npm_config_cache", cache_root.into_os_string());
     // DSH's lockfile contains platform-specific optional packages (notably
     // esbuild, lefthook, and koffi). A service-level `npm_config_optional`
     // inherited from the host must not turn a normal template pull into
@@ -499,11 +536,28 @@ pub fn dsh_host_policy(
     pnpm_dir: &Path,
     plugins_node_modules: &Path,
 ) -> EnvironmentPolicy {
+    // The DSH host web server and any node-based client it spawns read
+    // `HTTP_PROXY` / `HTTPS_PROXY` and route loopback fetches through a
+    // developer-side proxy. The proxy answers 502 for another process's
+    // 127.0.0.1 listener, so the host thinks its own webview is broken
+    // and self-terminates with exit status 0 shortly after printing
+    // "opening the default browser". Strip every proxy alias before the
+    // host gets the env so loopback stays loopback. pnpm still has its
+    // own policy (`bundled_package_manager_policy`) that explicitly
+    // inherits these so registry fetches keep working.
     EnvironmentPolicy::new()
         .remove("SHELL")
         .remove("MSYSTEM")
         .remove("TERM")
         .remove("COLORTERM")
+        .remove("HTTP_PROXY")
+        .remove("HTTPS_PROXY")
+        .remove("http_proxy")
+        .remove("https_proxy")
+        .remove("ALL_PROXY")
+        .remove("all_proxy")
+        .remove("NO_PROXY")
+        .remove("no_proxy")
         .prepend_path(node_dir)
         .prepend_path(pnpm_dir)
         .protect("DSHBOX_HOME")
@@ -597,8 +651,12 @@ mod tests {
                 .join("store")
                 .into_os_string()
         );
-        assert_eq!(output.get("NPM_CONFIG_OPTIONAL").unwrap(), "true");
-        assert_eq!(output.get("PNPM_CONFIG_OPTIONAL").unwrap(), "true");
+        use std::ffi::OsStr;
+        // The policy stores keys verbatim on non-Windows hosts
+        // (normalize_key only upper-cases on Windows), so the
+        // lower-case npm_config_* spellings are what land in the map.
+        assert_eq!(output.get("npm_config_optional").unwrap(), "true");
+        assert_eq!(output.get("pnpm_config_optional").unwrap(), "true");
     }
 
     #[test]
@@ -618,16 +676,104 @@ mod tests {
         let output = EnvironmentPolicy::new()
             .clean_room()
             .inherit("SYSTEMROOT")
+            .inherit("HTTPS_PROXY")
             .replace("NPM_CONFIG_REGISTRY", "https://box.example/")
             .replace("NPM_CONFIG_USERCONFIG", "box-npmrc")
             .apply_to_map(input);
         assert_eq!(output.get("NPM_CONFIG_REGISTRY").unwrap(), "https://box.example/");
         assert_eq!(output.get("NPM_CONFIG_USERCONFIG").unwrap(), "box-npmrc");
         assert_eq!(output.get("SYSTEMROOT").unwrap(), "system-root");
+        use std::ffi::OsStr;
+        // Proxy variables are explicitly inherited so devs behind a
+        // corporate mirror can still reach GitHub / the npm registry.
+        assert_eq!(output.get("HTTPS_PROXY").unwrap(), "host-proxy");
         assert!(!output.contains_key("APPDATA"));
         assert!(!output.contains_key("LOCALAPPDATA"));
-        assert!(!output.contains_key("HTTPS_PROXY"));
         assert!(!output.contains_key("NODE_PATH"));
+    }
+
+    #[test]
+    fn dsh_host_policy_strips_proxy_aliases() {
+        // The DSH host web server and any node-based client it spawns
+        // route `127.0.0.1` fetches through `HTTP_PROXY`/`HTTPS_PROXY`
+        // by default. When a developer session has those variables
+        // pointing at a sidecar proxy, the proxy answers 502 for the
+        // host's own listener and the host self-terminates shortly
+        // after printing "opening the default browser". The host policy
+        // must strip every proxy alias regardless of whether the parent
+        // daemon was a clean-room or a fully-inheriting process.
+        let mut input = BTreeMap::new();
+        input.insert(
+            "HTTP_PROXY".to_owned(),
+            OsString::from("http://127.0.0.1:7892"),
+        );
+        input.insert(
+            "HTTPS_PROXY".to_owned(),
+            OsString::from("http://127.0.0.1:7892"),
+        );
+        input.insert(
+            "http_proxy".to_owned(),
+            OsString::from("http://127.0.0.1:7892"),
+        );
+        input.insert(
+            "https_proxy".to_owned(),
+            OsString::from("http://127.0.0.1:7892"),
+        );
+        input.insert(
+            "ALL_PROXY".to_owned(),
+            OsString::from("http://127.0.0.1:7892"),
+        );
+        input.insert(
+            "all_proxy".to_owned(),
+            OsString::from("http://127.0.0.1:7892"),
+        );
+        input.insert("NO_PROXY".to_owned(), OsString::from("localhost"));
+        input.insert("no_proxy".to_owned(), OsString::from("localhost"));
+        // Variables that must still flow through to the host.
+        input.insert("OPENAI_API_KEY".to_owned(), OsString::from("sk-test"));
+        input.insert("HOME".to_owned(), OsString::from("/home/wpp"));
+        let policy = dsh_host_policy(
+            Path::new("bundled/node"),
+            Path::new("bundled/pnpm"),
+            Path::new("profile/web/node_modules"),
+        );
+        let output = policy.apply_to_map(input);
+        assert!(
+            !output.contains_key("HTTP_PROXY"),
+            "HTTP_PROXY leaked into host policy: {output:?}"
+        );
+        assert!(
+            !output.contains_key("HTTPS_PROXY"),
+            "HTTPS_PROXY leaked into host policy: {output:?}"
+        );
+        assert!(
+            !output.contains_key("http_proxy"),
+            "http_proxy leaked into host policy: {output:?}"
+        );
+        assert!(
+            !output.contains_key("https_proxy"),
+            "https_proxy leaked into host policy: {output:?}"
+        );
+        assert!(
+            !output.contains_key("ALL_PROXY"),
+            "ALL_PROXY leaked into host policy: {output:?}"
+        );
+        assert!(
+            !output.contains_key("all_proxy"),
+            "all_proxy leaked into host policy: {output:?}"
+        );
+        assert!(
+            !output.contains_key("NO_PROXY"),
+            "NO_PROXY leaked into host policy: {output:?}"
+        );
+        assert!(
+            !output.contains_key("no_proxy"),
+            "no_proxy leaked into host policy: {output:?}"
+        );
+        // Non-proxy variables must be left alone so the host can still
+        // reach LLM providers and resolve user paths.
+        assert_eq!(output.get("OPENAI_API_KEY").unwrap(), "sk-test");
+        assert_eq!(output.get("HOME").unwrap(), "/home/wpp");
     }
 
     #[test]
@@ -704,8 +850,10 @@ mod tests {
         assert_eq!(output["GIT_CONFIG_NOSYSTEM"], OsString::from("1"));
         assert_eq!(output["GIT_TERMINAL_PROMPT"], OsString::from("0"));
 
-        // Host proxy still does not leak.
-        assert!(!output.contains_key("HTTPS_PROXY"));
+        use std::ffi::OsStr;
+        // Proxy variables are inherited so devs behind a corporate
+        // mirror can still reach GitHub and the npm registry.
+        assert_eq!(output.get("HTTPS_PROXY").map(OsString::as_os_str), Some(OsStr::new("http://host-proxy:8080")));
     }
 
     #[test]
@@ -765,8 +913,10 @@ mod tests {
             expected_global.parent().unwrap().as_os_str(),
         );
 
-        // Host proxy still does not leak.
-        assert!(!output.contains_key("HTTPS_PROXY"));
+        use std::ffi::OsStr;
+        // Proxy variables are inherited so devs behind a corporate
+        // mirror can still reach GitHub and the npm registry.
+        assert_eq!(output.get("HTTPS_PROXY").map(OsString::as_os_str), Some(OsStr::new("http://host-proxy:8080")));
 
         // Host git never sees LD_LIBRARY_PATH — the system loader resolves
         // its .so dependencies. This assertion is unconditional; the bundled

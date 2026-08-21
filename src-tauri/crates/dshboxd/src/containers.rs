@@ -502,18 +502,28 @@ builder. Keep skills and data outside a Boxfile until that feature is added.
 
 ## Git plugins with build scripts
 
-pnpm requires an explicit approval for lifecycle scripts. If build fails with
-an `allowBuilds` hint, add the exact line printed by DSH Box, for example:
+pnpm requires an explicit approval for lifecycle scripts. When a plugin or any
+transitive dependency it pulls in runs `install`/`postinstall`/`prepare`, pnpm
+11 surfaces the blocked package through
+`[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: <keys>` and refuses to
+proceed.
+
+`LABEL dshbox.allow-build=<git-source>` is enough: as long as the user has
+authorized the top-level plugin source, DSH Box reads pnpm's ignored-builds
+listing, writes every transitive `package@version` key it names into the
+profile's `pnpm-workspace.yaml` `allowBuilds:` map, and retries the install
+automatically. The hint surfaced by an older Box is no longer required:
 
 ```dsh
 ADD plugin github.com/omdsh-dev/DSH-better-sidebar
-LABEL dshbox.allow-build=git+https://github.com/omdsh-dev/DSH-better-sidebar,node-pty@1.1.0
+LABEL dshbox.allow-build=git+https://github.com/omdsh-dev/DSH-better-sidebar
 ```
 
-The first value authorizes that declared Git source. Additional values are
-exact `package@version` keys for explicitly approved transitive build scripts.
-Do not use a global allow-all setting. Rebuild the template after changing the
-Boxfile.
+Do not use a global allow-all setting — the per-plugin grant is the entire
+trust boundary for plugin build scripts. If a plugin's install fails after
+DSH Box has auto-derived keys, the retained diagnostic will still show the
+exact `package@version` pnpm printed, and that key can be added to the same
+LABEL value as a comma-separated override.
 
 ## Troubleshooting
 

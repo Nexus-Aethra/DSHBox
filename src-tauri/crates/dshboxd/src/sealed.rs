@@ -571,6 +571,33 @@ fn pnpm_allow_build_key(log_path: &Path) -> Option<String> {
     })
 }
 
+/// pnpm 11.7 reports blocked git-hosted direct dependencies under
+/// `[ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED]` and follows the error with a
+/// copy-pasteable snippet showing the exact key the user is expected to
+/// paste under `allowBuilds:`. Extract that key verbatim so the retry
+/// writes the form pnpm will accept without further negotiation.
+fn pnpm_git_allow_build_key(log_path: &Path) -> Option<String> {
+    let log = fs::read_to_string(log_path).ok()?;
+    let (_, after_header) = log.rsplit_once("[ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED]")?;
+    let mut lines = after_header.lines();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed == "allowBuilds:" {
+            // The first `  <key>: true` line under the snippet header
+            // is the exact key pnpm is asking for.
+            let key_line = lines.find(|candidate| {
+                let candidate = candidate.trim();
+                candidate.ends_with(": true") && !candidate.starts_with('#')
+            })?;
+            return key_line
+                .trim()
+                .strip_suffix(": true")
+                .map(|key| key.trim().trim_matches('"').to_owned());
+        }
+    }
+    None
+}
+
 fn pnpm_ignored_build_keys(log_path: &Path) -> Vec<String> {
     let Ok(log) = fs::read_to_string(log_path) else {
         return Vec::new();
@@ -601,18 +628,72 @@ fn build_approval_hint(source: &str, required_key: Option<&str>) -> String {
     )
 }
 
+/// Idempotently insert `key` into the `pnpm-workspace.yaml` `allowBuilds:`
+/// map. Repeated calls merge into a single section: existing key lines are
+/// preserved, new keys are appended in deterministic (sorted) order, and
+/// the section header is never duplicated. The map body is rewritten
+/// verbatim on every call so callers do not have to reason about parser
+/// quirks for complex YAML — the prepared-base manifest we target is a
+/// fixed shape and any complex YAML should be reported as a separate
+/// feature rather than silently mangled here.
 fn add_pnpm_build_approval(workspace_manifest: &Path, key: &str) -> Result<(), String> {
     let existing = fs::read_to_string(workspace_manifest)
         .map_err(|error| format!("cannot read pnpm workspace manifest: {error}"))?;
-    if existing.contains(key) {
-        return Ok(());
-    }
-    let escaped_key = key.replace('"', "\\\"");
-    let updated = if let Some((before, after)) = existing.split_once("allowBuilds:\n") {
-        format!("{before}allowBuilds:\n  \"{escaped_key}\": true\n{after}")
+    // Split around the first `allowBuilds:` section header; everything
+    // outside the section (package list, imports, comments) stays put.
+    let (before, body, after) = match existing.split_once("allowBuilds:\n") {
+        Some((before, after)) => {
+            // The section body ends at the next non-indented line; we
+            // round-trip whatever the user/source control already had.
+            let body_end = after
+                .find("\n\n")
+                .or_else(|| after.find('\n'))
+                .unwrap_or(after.len());
+            (before, &after[..body_end], &after[body_end..])
+        }
+        None => {
+            let separator = if existing.ends_with('\n') { "" } else { "\n" };
+            (existing.as_str(), "", separator)
+        }
+    };
+    let mut keys: std::collections::BTreeSet<String> = body
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_suffix(": true")
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(|key| key.trim_matches('"').to_owned())
+        })
+        .collect();
+    keys.insert(key.to_owned());
+    // pnpm 11.7 emits example keys as bare YAML scalars
+    // (`dsh-better-sidebar@https://codeload.../ab785d...: true`) inside
+    // its error block — without surrounding quotes — and round-trips the
+    // same scalar form back. Older pnpm versions tolerate quoted keys,
+    // but the modern pnpm we bundle requires the unquoted form for the
+    // value to take effect on a retry.
+    let rendered = keys
+        .iter()
+        .map(|existing_key| format!("  {existing_key}: true"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Drop the trailing body we borrowed before reassembling so the
+    // final separator layout is deterministic.
+    let body_text = if rendered.is_empty() {
+        String::new()
     } else {
-        let separator = if existing.ends_with('\n') { "" } else { "\n" };
-        format!("{existing}{separator}allowBuilds:\n  \"{escaped_key}\": true\n")
+        format!("{rendered}\n")
+    };
+    let updated = if body.is_empty() && !after.is_empty() {
+        // Newly created section: `before` is the whole original file and
+        // `after` carries the separator we measured above. Ensure we end
+        // with exactly one trailing newline before the section header.
+        let trailing = if before.ends_with('\n') { "" } else { "\n" };
+        format!("{before}{trailing}allowBuilds:\n{body_text}{after}")
+    } else {
+        format!("{before}allowBuilds:\n{body_text}{after}")
     };
     fs::write(workspace_manifest, updated)
         .map_err(|error| format!("cannot write pnpm build approval: {error}"))
@@ -677,27 +758,67 @@ fn seed_profile_recipe(
             .map_err(|error| format!("plugin add: {error}"))?;
         if !status.success() {
             if allowed_build_sources.contains(source) {
-                let allow_key = pnpm_allow_build_key(&log_path).ok_or_else(|| {
-                    format!(
-                        "plugin add failed without pnpm's allowBuilds key; inspect {}",
-                        log_path.display()
-                    )
-                })?;
-                add_pnpm_build_approval(&workspace_manifest, &allow_key)?;
-                let mut retry = run_logged(&spec, "resolve approved plugin recipe")?;
-                let retry_status = retry
-                    .wait_or_kill(
-                        &TaskCancel(Some(task)),
-                        Duration::from_secs(600),
-                        "resolving approved plugin recipe",
-                    )
-                    .map_err(|error| format!("approved plugin add: {error}"))?;
-                if retry_status.success() {
+                // Two pnpm error shapes can land here, and we have to be
+                // ready for both:
+                //   * `[ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED]` — pnpm 11.7
+                //     fires this when the *direct* git-hosted dependency
+                //     itself needs to run a `prepare` script. The error
+                //     block contains a copy-pasteable `allowBuilds:` map
+                //     showing the exact key the user is expected to add.
+                //   * `[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: …`
+                //     — pnpm 11 fires this when an *indirect* dependency
+                //     (e.g. node-pty) needs a native build script.
+                //
+                // Both can show up in sequence across retries: the
+                // direct-dep approval unblocks the plugin's own prepare
+                // script and pnpm then proceeds far enough to discover
+                // the indirect deps that were hidden behind it. The
+                // retry loop keeps auto-deriving keys until pnpm stops
+                // asking for new ones, capped at a small number of
+                // rounds to keep a malformed manifest from looping
+                // forever.
+                const MAX_AUTO_APPROVAL_ROUNDS: usize = 6;
+                let mut previous_keys: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                let mut last_failed_hint_key: Option<String> = None;
+                let mut auto_approval_resolved = false;
+                for _round in 0..MAX_AUTO_APPROVAL_ROUNDS {
+                    let mut derived_keys: Vec<String> =
+                        pnpm_git_allow_build_key(&log_path).into_iter().collect();
+                    derived_keys.extend(pnpm_ignored_build_keys(&log_path));
+                    derived_keys.sort();
+                    derived_keys.dedup();
+                    let new_keys: Vec<String> = derived_keys
+                        .iter()
+                        .filter(|key| !previous_keys.contains(*key))
+                        .cloned()
+                        .collect();
+                    if new_keys.is_empty() {
+                        break;
+                    }
+                    for key in &new_keys {
+                        add_pnpm_build_approval(&workspace_manifest, key)?;
+                        previous_keys.insert(key.clone());
+                    }
+                    last_failed_hint_key = derived_keys.first().cloned();
+                    let mut retry = run_logged(&spec, "resolve approved plugin recipe")?;
+                    let retry_status = retry
+                        .wait_or_kill(
+                            &TaskCancel(Some(task)),
+                            Duration::from_secs(600),
+                            "resolving approved plugin recipe",
+                        )
+                        .map_err(|error| format!("approved plugin add: {error}"))?;
+                    if retry_status.success() {
+                        auto_approval_resolved = true;
+                        break;
+                    }
+                }
+                if auto_approval_resolved {
                     continue;
                 }
-                let ignored = pnpm_ignored_build_keys(&log_path);
-                if let Some(key) = ignored.first() {
-                    return Err(build_approval_hint(source, Some(key)));
+                if let Some(key) = last_failed_hint_key {
+                    return Err(build_approval_hint(source, Some(&key)));
                 }
             } else if let Some(key) = pnpm_allow_build_key(&log_path) {
                 return Err(build_approval_hint(source, Some(&key)));
@@ -1190,5 +1311,151 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let missing = temporary.path().join("does-not-exist.log");
         assert!(!log_indicates_transient_io(&missing));
+    }
+
+    fn write_manifest(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+    }
+
+    fn read_manifest(path: &Path) -> String {
+        fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn add_pnpm_build_approval_merges_keys_idempotently_into_single_section() {
+        let temporary = tempfile::tempdir().unwrap();
+        let manifest = temporary.path().join("pnpm-workspace.yaml");
+
+        // Case A: no allowBuilds section yet. First call creates the
+        // section; second call must keep a single header and merge.
+        write_manifest(
+            &manifest,
+            "packages:\n  - \"apps/*\"\n  - \"packages/*\"\n",
+        );
+        add_pnpm_build_approval(&manifest, "node-pty@1.1.0").unwrap();
+        add_pnpm_build_approval(&manifest, "sharp@0.33.5").unwrap();
+        let body = read_manifest(&manifest);
+        assert!(
+            body.matches("allowBuilds:").count() == 1,
+            "expected exactly one allowBuilds header, got: {body}"
+        );
+        // pnpm 11.7 reads keys back as bare YAML scalars — no quotes.
+        assert!(body.contains("  node-pty@1.1.0: true"), "{body}");
+        assert!(body.contains("  sharp@0.33.5: true"), "{body}");
+        assert!(
+            body.contains("packages:\n  - \"apps/*\""),
+            "preceding section must be preserved verbatim: {body}"
+        );
+
+        // Case B: pre-existing section with one quoted key (older Box
+        // output). New bare-scalar key merges without duplicating the
+        // header; existing quoted key survives intact.
+        let manifest_b = temporary.path().join("pnpm-workspace-b.yaml");
+        write_manifest(
+            &manifest_b,
+            "packages:\n  - \"apps/*\"\nallowBuilds:\n  \"left-pad@1.3.0\": true\n",
+        );
+        add_pnpm_build_approval(&manifest_b, "right-pad@2.0.0").unwrap();
+        add_pnpm_build_approval(&manifest_b, "right-pad@2.0.0").unwrap(); // duplicate call
+        let body_b = read_manifest(&manifest_b);
+        assert_eq!(
+            body_b.matches("allowBuilds:").count(),
+            1,
+            "section header must not duplicate: {body_b}"
+        );
+        assert_eq!(
+            body_b.matches("  left-pad@1.3.0: true").count(),
+            1,
+            "existing quoted key line is normalized to a bare scalar on rewrite (still present exactly once): {body_b}"
+        );
+        assert_eq!(
+            body_b.matches("  right-pad@2.0.0: true").count(),
+            1,
+            "new key appended exactly once even after duplicate call: {body_b}"
+        );
+
+        // Case C: keys are emitted in deterministic sorted order so the
+        // diff against the original file is stable.
+        let manifest_c = temporary.path().join("pnpm-workspace-c.yaml");
+        write_manifest(&manifest_c, "allowBuilds:\n");
+        add_pnpm_build_approval(&manifest_c, "zeta@1").unwrap();
+        add_pnpm_build_approval(&manifest_c, "alpha@1").unwrap();
+        add_pnpm_build_approval(&manifest_c, "mu@1").unwrap();
+        let body_c = read_manifest(&manifest_c);
+        let alpha_at = body_c.find("  alpha@1: true").unwrap();
+        let mu_at = body_c.find("  mu@1: true").unwrap();
+        let zeta_at = body_c.find("  zeta@1: true").unwrap();
+        assert!(
+            alpha_at < mu_at && mu_at < zeta_at,
+            "keys must be sorted: {body_c}"
+        );
+    }
+
+    #[test]
+    fn pnpm_git_allow_build_key_extracts_pnpm_printable_key() {
+        let temporary = tempfile::tempdir().unwrap();
+        let log_path = temporary.path().join("pnpm.log");
+
+        // Real log captured from `pnpm dsh plugin add` on
+        // dsh-better-sidebar@v0.12.3.
+        let body = "[ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED] Failed to prepare git-hosted package fetched from \"https://codeload.github.com/omdsh-dev/DSH-better-sidebar/tar.gz/ab785d71fb194ea9db4487461af8f5d40e67c216\": The git-hosted package \"dsh-better-sidebar@0.12.3\" needs to execute build scripts but is not in the \"allowBuilds\" allowlist.\n\nThis error happened while installing a direct dependency of /home/wpp/tmp\n\nAdd the package to \"allowBuilds\" in your project's pnpm-workspace.yaml to allow it to run scripts. For example:\nallowBuilds:\n  dsh-better-sidebar@https://codeload.github.com/omdsh-dev/DSH-better-sidebar/tar.gz/ab785d71fb194ea9db4487461af8f5d40e67c216: true\n";
+        fs::write(&log_path, body).unwrap();
+        assert_eq!(
+            pnpm_git_allow_build_key(&log_path).as_deref(),
+            Some(
+                "dsh-better-sidebar@https://codeload.github.com/omdsh-dev/DSH-better-sidebar/tar.gz/ab785d71fb194ea9db4487461af8f5d40e67c216"
+            ),
+        );
+
+        // No marker returns None.
+        let log_b = temporary.path().join("plain.log");
+        fs::write(&log_b, "Done in 12s using pnpm v11.7.0\n").unwrap();
+        assert!(pnpm_git_allow_build_key(&log_b).is_none());
+
+        // Missing file returns None without panicking.
+        let missing = temporary.path().join("missing.log");
+        assert!(pnpm_git_allow_build_key(&missing).is_none());
+    }
+
+    #[test]
+    fn pnpm_ignored_build_keys_extracts_keys_through_prefixed_log_lines() {
+        let temporary = tempfile::tempdir().unwrap();
+        let log_path = temporary.path().join("pnpm.log");
+
+        let cases: &[(&str, &[&str])] = &[
+            // The real shape from `pnpm install` after a plugin add —
+            // a `...hash pnpm-install:` prefix sits before the marker.
+            (
+                "...5639_adc99faf781f12cc1eb3f132dd14e2a5 pnpm-install: [ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: node-pty@1.1.0\n",
+                &["node-pty@1.1.0"],
+            ),
+            // Multi-key form on a single line, comma-separated.
+            (
+                "[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: sharp@0.33.5, esbuild@0.21.5\n",
+                &["sharp@0.33.5", "esbuild@0.21.5"],
+            ),
+            // No marker at all.
+            (
+                "Progress: resolved 341, added 341, done\nDone in 12s\n",
+                &[],
+            ),
+        ];
+
+        for (body, expected) in cases {
+            fs::write(&log_path, body).unwrap();
+            let actual: Vec<String> = pnpm_ignored_build_keys(&log_path);
+            let expected: Vec<String> = expected
+                .iter()
+                .map(|key| (*key).to_owned())
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "pnpm_ignored_build_keys returned wrong keys for log body: {body}"
+            );
+        }
+
+        // Missing file yields an empty vector without panicking.
+        let missing = temporary.path().join("missing.log");
+        assert!(pnpm_ignored_build_keys(&missing).is_empty());
     }
 }
