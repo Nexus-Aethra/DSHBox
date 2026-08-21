@@ -67,17 +67,22 @@ pub(crate) fn pnpm_policy(
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default();
-    let pnpm_dir = node_dir
-        .parent()
-        .map(|root| root.join("pnpm"))
-        .unwrap_or_default();
+    // The pnpm tree hangs directly off the runtime root on every platform
+    // (<root>/pnpm), next to the node/ tree. Derive it from the manifest
+    // root rather than counting .parent() levels off the node binary — the
+    // nesting depth differs (Windows ships node/node.exe, Unix
+    // node/bin/node).
+    let pnpm_dir = bundled_runtime()?.root.join("pnpm");
     let install_dir = dshbox_install_directory().ok();
     let bundled_git = bundled_runtime()?.git_dir.as_deref();
-    // Linux host fallback: when no bundled git is published for this target,
-    // resolve the host-installed `git` binary. Windows never falls back —
-    // users without git cannot proceed on Windows, by design.
-    let host_git_dir = if bundled_git.is_none() && box_runtime::bundled::target_is_linux() {
-        box_runtime::bundled::resolve_host_git_dir()
+    // Linux always runs against the host's git (the developer-supplied
+    // build at BoxConfig.git_path, then PATH, then well-known FHS bins).
+    // Windows sticks with the bundled binary because Windows users do
+    // not install git by default; failing loudly there is intentional.
+    let host_git_dir = if box_runtime::bundled::target_is_linux() {
+        box_runtime::bundled::resolve_host_git_dir(
+            config.git_path.as_deref().map(Path::new),
+        )
     } else {
         None
     };

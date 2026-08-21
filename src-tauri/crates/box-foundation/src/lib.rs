@@ -365,6 +365,19 @@ pub struct BoxConfig {
     /// set, spawned pnpm/npm toolchains receive `npm_config_registry`.
     #[serde(default)]
     pub npm_registry: Option<String>,
+    /// Optional absolute path to a `git` executable the user wants DSH Box
+    /// to use. Linux defaults to the host's PATH-discovered git; this
+    /// override lets a developer point Box at a custom build (e.g.
+    /// /opt/myteam/bin/git) without exporting PATH globally.
+    #[serde(default)]
+    pub git_path: Option<String>,
+    /// When false (the default), DSH Box inherits the host's
+    /// HTTP/HTTPS/NO_PROXY variables into the clean-room package-manager
+    /// child so developers behind a corporate mirror can still reach
+    /// GitHub and the npm registry. Set to true to force a fully
+    /// hermetic child (no proxy of any kind).
+    #[serde(default = "default_true")]
+    pub inherit_proxy: bool,
     /// SHA-256 of the bundled plugins manifest Box wrote into
     /// `<runtimeDirectory>/plugins/node_modules/` on the last vendor pass.
     /// `initialize_bundled_plugins` compares this against the current
@@ -377,6 +390,10 @@ fn default_language() -> String {
     "en".to_owned()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for BoxConfig {
     fn default() -> Self {
         Self {
@@ -386,6 +403,8 @@ impl Default for BoxConfig {
             toolchain_sources: BTreeMap::new(),
             github_mirror: None,
             npm_registry: None,
+            git_path: None,
+            inherit_proxy: default_true(),
             plugins_manifest_digest: None,
         }
     }
@@ -697,6 +716,7 @@ mod tests {
             pnpm_version: "10".to_owned(),
             base_id: None,
             plugin_artifact_ids: Vec::new(),
+            plugin_sources: Vec::new(),
             harness_digest: "digest".to_owned(),
             profile_digest: Some("profile".to_owned()),
             size_bytes: 1,

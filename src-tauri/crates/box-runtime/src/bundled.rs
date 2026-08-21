@@ -108,20 +108,30 @@ pub fn target_is_linux() -> bool {
 /// only runs on Linux targets (Windows always uses the bundled binary).
 /// Resolution order:
 ///
-/// 1. Walk the inherited `PATH` and pick the first directory that
+/// 1. If `override_path` points at an executable file, return its parent
+///    directory verbatim. This honours the developer-supplied
+///    `BoxConfig.git_path` (a custom build at /opt/myteam/bin/git, a
+///    distro-packaged git at a non-standard prefix, etc.) without
+///    requiring the user to export PATH globally.
+/// 2. Walk the inherited `PATH` and pick the first directory that
 ///    contains a `git` executable. This honours the user's distro
 ///    package manager and homebrew-style installs without ever spawning
 ///    a shell.
-/// 2. Fall back to the well-known FHS locations `/usr/bin/git` and
+/// 3. Fall back to the well-known FHS locations `/usr/bin/git` and
 ///    `/usr/local/bin/git` for hosts where `PATH` is sanitised.
 ///
-/// `None` is returned when neither path yields an executable. The
-/// caller is expected to surface this as a user-visible error — DSH
-/// Box never shells out to `git` itself, so a missing host binary
+/// `None` is returned when none of the paths yields an executable.
+/// The caller is expected to surface this as a user-visible error —
+/// DSH Box never shells out to `git` itself, so a missing host binary
 /// only fails loudly when pnpm actually needs it.
-pub fn resolve_host_git_dir() -> Option<PathBuf> {
+pub fn resolve_host_git_dir(override_path: Option<&Path>) -> Option<PathBuf> {
     if !target_is_linux() {
         return None;
+    }
+    if let Some(path) = override_path {
+        if path.is_file() {
+            return path.parent().map(Path::to_path_buf);
+        }
     }
     if let Some(path_var) = std::env::var_os("PATH") {
         for entry in std::env::split_paths(&path_var) {

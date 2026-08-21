@@ -33,6 +33,13 @@ pub(crate) struct BundledRuntime {
     pub(crate) node_version: String,
     pub(crate) npm_version: String,
     pub(crate) pnpm_version: String,
+    /// Runtime root (`<install>/runtime/<target>`). The `node/` and
+    /// `pnpm/` trees hang directly off this directory on every platform,
+    /// so consumers should derive sibling paths from here instead of
+    /// counting `.parent()` levels off the node binary (the nesting
+    /// depth differs between Windows `node/node.exe` and Unix
+    /// `node/bin/node`).
+    pub(crate) root: PathBuf,
     pub(crate) node: PathBuf,
     pub(crate) npm: PathBuf,
     pub(crate) pnpm: PathBuf,
@@ -136,11 +143,13 @@ pub(crate) fn initialize_bundled_runtime() -> Result<(), String> {
         .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
         .unwrap_or_else(|| "unknown".to_owned());
     let git_dir = runtime.git_dir();
+    let root = runtime.root.clone();
     BUNDLED_RUNTIME
         .set(BundledRuntime {
             node_version: runtime.manifest.node_version,
             npm_version,
             pnpm_version: runtime.manifest.pnpm_version,
+            root,
             node,
             npm,
             pnpm,
