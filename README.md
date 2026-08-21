@@ -11,7 +11,7 @@ DSH Box is a lightweight desktop shell built with [Tauri 2](https://tauri.app) t
 
 - **Isolated DSH Containers** — install multiple DSH versions side by side and create independent Containers per project. Every Container gets its own profile (`web` / `headless` / custom), workspace, plugin set, and host process, so experiments never cross-contaminate.
 - **Embedded WebView, no browser needed** — the DSH frontend opens in a native WebView window managed by DSH Box. No port-forwarding, no copy-pasting URLs, no tab clutter.
-- **Zero-dependency install** — a private Node, npm, and pnpm runtime is bundled with every release. No system Node, no manual toolchain setup, no PATH hacking.
+- **Zero-dependency install** — a private Node, npm, pnpm, and Git (Windows) runtime is bundled with every release. No system Node, no manual toolchain setup, no PATH hacking. Git-backed Boxfile sources (`github.com/owner/repo:tag`) resolve through the managed binary in DSH Box's clean-room environment — host `~/.gitconfig` never leaks into builds. On Linux, DSH Box uses your system Git (`apt install git`) while still isolating its configuration under the runtime directory.
 - **Version manager built in** — browse DSH releases from `deepseek-ai/deepseek-harness`, install or uninstall any tag with one click, and pin a version per Container.
 - **Boxfile / sealed-template pipeline** — describe a Container with a small declarative `.dsh` script (`FROM` + `PROFILE` + `ADD plugin|skill|data`); `dshbox build` produces a reusable source recipe and `dshbox run <template>` prepares it once in the final Container directory. See [Architecture → Boxfile](#boxfile-and-the-built-template-pipeline).
 - **Portable built templates** — building a Boxfile materialises its plugin, skill, and data payloads into the template. Containers receive their own copied payloads, so they do not depend on workspace paths, pnpm links, or a mutable extension repository.
@@ -43,7 +43,7 @@ Download the installer for your platform from the **Releases** page of this repo
 
 > Grab the latest version from the [Releases page](https://github.com/Nexus-Aethra/DSHBox/releases) — artifact names follow the `<product>-<version>-<arch>` convention and may differ per release. Other formats (`.msi`, `.rpm`, `.AppImage`) are produced per release where supported.
 
-No runtime prerequisites — the bundled Node/npm/pnpm runtime travels inside the installer.
+No runtime prerequisites on Windows — the bundled Node/npm/pnpm/Git runtime travels inside the installer. Linux needs a system Git (`apt install git` or your distro equivalent); its configuration is isolated per-runtime-directory, so your host `~/.gitconfig` is never read by DSH Box builds.
 
 ---
 
@@ -152,21 +152,23 @@ Containers, templates, plugins, and skill packs all share a single `resource-map
 | Desktop shell | Tauri 2, Rust (Cargo workspace under `src-tauri/`) |
 | UI | React 18, TypeScript, Vite |
 | Background service | `dshboxd` sidecar (single HTTP entry: `POST /rpc` + `GET /events`) |
-| Bundled runtime | Node / npm / pnpm (per-platform archive) |
+| Bundled runtime | Node / npm / pnpm / Git-Windows-only (per-platform archive, SHA-256-pinned in `runtime-lock.json`) |
 | Targets | Windows x64/arm64, Linux x64/arm64, macOS x64/arm64 |
 
 ---
 
 ## Building from source
 
-Prerequisites: [Node.js](https://nodejs.org) 20+ with pnpm, and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform.
+Prerequisites: [Node.js](https://nodejs.org) 20+ with pnpm, the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform, and **7-Zip** (needed once by `runtime:prepare` to unpack the Windows PortableGit archive — install from [7-zip.org](https://www.7-zip.org/) or `apt install p7zip-full`, and make sure `7z` is on `PATH`). 7-Zip is a build-time-only tool; it never ships in the installer.
 
 ```bash
 pnpm install
-pnpm runtime:prepare    # fetch the bundled Node/pnpm runtime manifest
+pnpm runtime:prepare    # fetch + verify + extract the bundled Node/pnpm/Git runtime
 pnpm server:prepare     # build the dshboxd sidecar
 pnpm tauri dev          # run in development
 ```
+
+`runtime:prepare` verifies every archive against the SHA-256 pins in `runtime-lock.json` before extraction and aborts on mismatch. If 7-Zip is missing the Git step is skipped with a warning (Node/pnpm still prepare); re-run after installing it.
 
 Release bundles (per platform):
 
