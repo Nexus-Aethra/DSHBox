@@ -11,6 +11,8 @@ export function useContainers(
   const [containerDetails, setContainerDetails] = useState<ContainerExtensions | null>(null)
   const [templates, setTemplates] = useState<TemplateInfo[]>([])
   const [selectedTemplate, setSelectedTemplate] = useState('')
+  const [templatesLoading, setTemplatesLoading] = useState(false)
+  const [templatesError, setTemplatesError] = useState<string | null>(null)
   const [creatingContainer, setCreatingContainer] = useState(false)
   const [creatingContainerView, setCreatingContainerView] = useState(false)
   const [containerName, setContainerName] = useState('')
@@ -22,10 +24,8 @@ export function useContainers(
   // the Resources > Template tab) load this state when entered, so the
   // daemon is never queried for pages the user has not opened.
 
-  // Default the create form to the latest base template once known, and
-  // pre-fill the profile from the template's own PROFILE directive.
   useEffect(() => {
-    setSelectedTemplate((current) => current || templates.find((template) => template.name.endsWith(':latest'))?.name || templates[0]?.name || '')
+    setSelectedTemplate((current) => templates.some((template) => template.name === current) ? current : '')
   }, [templates])
   useEffect(() => {
     const template = templates.find((item) => item.name === selectedTemplate)
@@ -37,13 +37,36 @@ export function useContainers(
   }
 
   async function loadTemplates(): Promise<void> {
-    try { setTemplates(await boxApi.listTemplates()); onError(null) } catch (reason) { onError(String(reason)) }
+    setTemplatesLoading(true)
+    setTemplatesError(null)
+    setTemplates([])
+    setSelectedTemplate('')
+    try {
+      setTemplates(await boxApi.listTemplates())
+      onError(null)
+    } catch (reason) {
+      const message = String(reason)
+      setTemplatesError(message)
+      onError(message)
+    } finally {
+      setTemplatesLoading(false)
+    }
+  }
+
+  async function openCreateContainerView(): Promise<void> {
+    setCreatingContainerView(true)
+    await loadTemplates()
   }
 
   async function createContainer(): Promise<void> {
-    if (!selectedTemplate) return
+    if (templatesLoading || templatesError !== null) return
+    const template = templates.find((item) => item.name === selectedTemplate)
+    if (template === undefined) {
+      onError('The selected template is no longer available. Refresh the template list and choose again.')
+      return
+    }
     setCreatingContainer(true)
-    try { await boxApi.createContainerFromTemplate(containerName, selectedTemplate, newContainerProfile); setCreatingContainerView(false); setContainerName(''); setNewContainerProfile('web'); setSelectedTemplate(''); await loadContainers(); onError(null) } catch (reason) { onError(String(reason)) } finally { setCreatingContainer(false) }
+    try { await boxApi.createContainerFromTemplate(containerName, template.name, newContainerProfile); setCreatingContainerView(false); setContainerName(''); setNewContainerProfile('web'); setSelectedTemplate(''); await loadContainers(); onError(null) } catch (reason) { onError(String(reason)) } finally { setCreatingContainer(false) }
   }
 
   async function showContainerDetails(container: DshContainer): Promise<void> {
@@ -113,8 +136,8 @@ export function useContainers(
 
   return {
     containers, setContainers, selectedContainer, setSelectedContainer, containerDetails, setContainerDetails,
-    templates, loadTemplates, selectedTemplate, setSelectedTemplate,
-    creatingContainer, creatingContainerView, setCreatingContainerView,
+    templates, loadTemplates, selectedTemplate, setSelectedTemplate, templatesLoading, templatesError,
+    creatingContainer, creatingContainerView, setCreatingContainerView, openCreateContainerView,
     containerName, setContainerName, newContainerProfile, setNewContainerProfile, containerMenuId, setContainerMenuId,
     workspaceExtensions, setWorkspaceExtensions, loadContainers, createContainer, showContainerDetails,
     refreshSelectedContainer, addContainerProfile, setContainerProfile, addContainerExtension,

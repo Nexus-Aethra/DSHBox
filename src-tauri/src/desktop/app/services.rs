@@ -118,7 +118,27 @@ pub(crate) fn reconcile_daemon_build(server: &Path) {
     }
     #[cfg(windows)]
     {
-        let _ = restart_user_service();
+        // Windows uses a per-user scheduled task (dshboxd) for the daemon,
+        // but schtasks /RL LIMITED is fragile: it silently fails when the
+        // task hasn't been created yet, when the user lacks rights, or
+        // when the desktop session is detached. Without a fallback the UI
+        // hangs on "Starting DSH Box server…" forever, because no
+        // discovery.json ever gets written. So on Windows we always run
+        // the scheduled task AND, if it didn't bring the daemon up,
+        // spawn the sidecar directly. The single-instance check in
+        // dshboxd keeps the duplicate from clobbering the live process.
+        match restart_user_service() {
+            Ok(()) => write_startup_log("daemon restart via scheduled task"),
+            Err(error) => write_startup_log(&format!(
+                "daemon restart via scheduled task failed ({error}); spawning directly"
+            )),
+        }
+        // Give the task a moment to start before we decide to fall back.
+        // If the task succeeded, the fallback is a no-op (daemon_alive
+        // returns true and spawn_daemon_fallback skips itself).
+        if !daemon_alive() {
+            spawn_daemon_fallback(server);
+        }
     }
     if let Some(client) = wait_for_daemon(Duration::from_secs(5)) {
         let stamp = client
@@ -148,13 +168,39 @@ pub(crate) fn spawn_daemon_fallback(server: &Path) {
     }
     let mut command = Command::new(server);
     command.arg("--service");
+    // Detach so the daemon outlives the desktop app and keeps running in
+    // the system tray. Without this, closing the main window on Windows
+    // would tear down the daemon and the UI would re-hang on the next
+    // launch.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         let _ = command.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_PROCESS_GROUP so the daemon outlives the desktop
+        // app closing and stays around in the system tray.
+        // CREATE_NO_WINDOW suppresses the flash console window every time
+        // the desktop has to fall back to spawning the daemon itself.
+        // (DETACHED_PROCESS would also suppress the window but it would
+        //  also strip the daemon of any chance to receive Ctrl+C / close
+        //  notifications, which is overkill here.)
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        // Don't keep the daemon tied to our console / pipe handles.
+        command.stdin(std::process::Stdio::null());
+        command.stdout(std::process::Stdio::null());
+        command.stderr(std::process::Stdio::null());
+    }
     match command.spawn() {
-        Ok(_) => write_startup_log(&format!("spawned dshboxd fallback: {}", server.display())),
+        Ok(child) => write_startup_log(&format!(
+            "spawned dshboxd fallback: {} (pid {})",
+            server.display(),
+            child.id()
+        )),
         Err(error) => write_startup_log(&format!("dshboxd fallback spawn failed: {error}")),
     }
 }
@@ -193,44 +239,51 @@ pub(crate) fn link_daemon_into_path(server: &Path) {
 
 
 pub(crate) fn initialize_bundled_runtime(resource_directory: PathBuf) -> Result<(), String> {
-    let root = resource_directory.join("runtime").join(bundled_target());
-    let manifest: BundledRuntimeManifest = serde_json::from_str(
-        &fs::read_to_string(root.join("runtime-manifest.json")).map_err(|_| {
-            format!(
-                "bundled runtime is missing for {}; reinstall DSH Box",
-                bundled_target()
-            )
-        })?,
+    let runtime = box_runtime::bundled::ResolvedBundledRuntime::from_path(
+        &resource_directory.join("runtime").join(bundled_target()),
     )
-    .map_err(|error| format!("cannot parse bundled runtime manifest: {error}"))?;
-    // Tauri's resource_dir returns verbatim `\\?\` paths on Windows, and
-    // bundled Node crashes with `EISDIR lstat 'D:'` when a verbatim entry
-    // script reaches `Module._findPath`. Store plain absolute paths instead.
-    let node = PathBuf::from(strip_verbatim_prefix(&root.join(&manifest.node_entry).to_string_lossy()));
-    let npm = PathBuf::from(strip_verbatim_prefix(&root.join(&manifest.npm_entry).to_string_lossy()));
-    let pnpm = PathBuf::from(strip_verbatim_prefix(&root.join(&manifest.pnpm_entry).to_string_lossy()));
+    .map_err(|error| {
+        format!(
+            "bundled runtime is missing for {}: {error}",
+            bundled_target()
+        )
+    })?;
+    let node = runtime.node_executable();
+    let npm = runtime.npm_script();
+    let pnpm = runtime.pnpm_script();
     if !node.is_file() || !npm.is_file() || !pnpm.is_file() {
         return Err("bundled runtime is incomplete; reinstall DSH Box".to_owned());
     }
-    let mut version_probe = Command::new(&node);
-    suppress_console_window(&mut version_probe);
-    let npm_version = version_probe
+    let policy = box_runtime::process::bundled_toolchain_policy(
+        None,
+        &runtime.node_dir(),
+        &runtime.pnpm_dir(),
+        None,
+        None,
+        false,
+        runtime.git_dir().as_deref(),
+    );
+    let spec = box_runtime::process::ProcessSpec::new(&node)
         .arg(&npm)
         .arg("--version")
-        .output()
+        .policy(policy);
+    let npm_version = box_runtime::process::NativeProcessRunner
+        .run(&spec)
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
         .unwrap_or_else(|| "unknown".to_owned());
+    let git_dir = runtime.git_dir();
     BUNDLED_RUNTIME
         .set(BundledRuntime {
-            node_version: manifest.node_version,
+            node_version: runtime.manifest.node_version,
             npm_version,
-            pnpm_version: manifest.pnpm_version,
+            pnpm_version: runtime.manifest.pnpm_version,
             node,
             npm,
             pnpm,
+            git_dir,
         })
         .map_err(|_| "bundled runtime was initialized twice".to_owned())
 }
@@ -331,8 +384,12 @@ pub(crate) fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 let _ = restart_user_service();
             }
             "tray-quit" => {
-                // The daemon owns container hosts, so quitting the UI leaves
-                // them running under dshboxd; nothing to stop here.
+                // Quit means "I'm done with DSH Box". Leaving dshboxd
+                // running would leave orphan container hosts in the
+                // user's tray with no UI to control them; stop it
+                // alongside the UI. best-effort: errors are logged but
+                // never block exit.
+                let _ = stop_user_service();
                 app.exit(0);
             }
             _ => {}
@@ -436,19 +493,35 @@ pub(crate) fn initialize_bundled_plugins(resource_directory: &Path) -> Result<()
     Ok(())
 }
 
-/// Recursive directory copy used by `initialize_bundled_plugins` and the
-/// Windows fallback in `lifecycle::link_vendored_plugin` (directory
-/// symlinks need Developer Mode or an elevated shell there).
+/// Recursive directory copy with `cp -rL` semantics: any symlinks
+/// inside the source tree are dereferenced and their target contents
+/// materialised, never re-exported as a link. Identical in shape to
+/// `dshboxd::lifecycle::copy_tree_following`; the two copies are kept
+/// independent because they live in different binaries (the daemon and
+/// the desktop shell), and the surface is small enough that the
+/// duplication is cheaper than threading another crate boundary.
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> {
     fs::create_dir_all(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let from = entry.path();
         let to = destination.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
+        let metadata = fs::symlink_metadata(&from)?;
+        if metadata.file_type().is_symlink() {
+            // Resolve through the symlink. The resolved target may still
+            // be a directory (recursed below via the next branch) or a
+            // file (handled via fs::copy).
+            let resolved = fs::canonicalize(&from).unwrap_or_else(|_| from.clone());
+            let resolved_meta = fs::symlink_metadata(&resolved)
+                .or_else(|_| fs::metadata(&resolved))?;
+            if resolved_meta.is_dir() {
+                copy_dir_recursive(&resolved, &to)?;
+            } else {
+                fs::copy(&resolved, &to)?;
+            }
+        } else if metadata.is_dir() {
             copy_dir_recursive(&from, &to)?;
-        } else if file_type.is_file() {
+        } else if metadata.is_file() {
             fs::copy(&from, &to)?;
         }
     }

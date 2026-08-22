@@ -3,24 +3,24 @@
 //! Mirrors the desktop's `extensions.rs` paths without Tauri deps.
 
 use crate::bundles::{install_container_plugin, install_container_skill};
-use crate::toolchains::{command_for_toolchain, resolve_toolchain, wait_for_process};
-use box_dsh_versions::version_directory as dsh_version_directory;
+use crate::toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel};
 use box_extensions::transfer::{
     append_plugin_archive, archive_content_root, copy_extension_source, extract_extension_tarball,
 };
 use box_extensions::{
-    detect_extension_kind, read_bundles, read_extension_records, remove_plugin_record,
+    detect_extension_kind, read_bundles, remove_plugin_record,
     repository_root, scan_repository, write_bundles, write_repository_index, ExtensionKind,
     RepositoryExtension,
 };
 use box_foundation::{is_safe_identifier, mirror_url, now_seconds, read_config};
+use box_runtime::process::{ExecutionKind, ProcessSpec};
 use box_runtime::shallow_clone_with_cancel;
 use box_scheduler::TaskContext;
 use flate2::{write::GzEncoder, Compression};
+use std::time::Duration;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
 };
 
 /// True when the plugin's package.json declares any runtime or build
@@ -42,6 +42,74 @@ fn plugin_declares_deps(directory: &Path) -> bool {
             .is_some_and(|object| !object.is_empty())
     };
     non_empty("dependencies") || non_empty("devDependencies")
+}
+
+/// Immutable local package input for a repository plugin. The source tree is
+/// retained only for inspection/export; template construction must consume
+/// this archive instead of a workspace or absolute source path.
+pub(crate) fn repository_plugin_artifact(entry: &RepositoryExtension) -> Result<PathBuf, String> {
+    if entry.kind != ExtensionKind::Plugin {
+        return Err("only plugins have installable artifacts".to_owned());
+    }
+    PathBuf::from(&entry.source_path)
+        .parent()
+        .map(|directory| directory.join("artifact.tgz"))
+        .ok_or("repository plugin source has no parent".to_owned())
+}
+
+fn package_repository_plugin(
+    task: &TaskContext,
+    source: &Path,
+    artifact: &Path,
+    name: &str,
+) -> Result<(), String> {
+    if artifact.is_file() {
+        return Ok(());
+    }
+    let artifact_parent = artifact.parent().ok_or("plugin artifact has no parent")?;
+    let staging = artifact_parent.join(format!(".pack-{}", task.task_id));
+    if staging.exists() {
+        fs::remove_dir_all(&staging).map_err(|error| error.to_string())?;
+    }
+    fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
+    let npm = resolve_toolchain("npm")?;
+    let log_path = task.manager.task(&task.task_id)?.log_path;
+    task.update("Packing plugin artifact", 82);
+    task.log(&format!("packing immutable local artifact for {name}"));
+    let staging_arg = staging.to_string_lossy().into_owned();
+    let spec = ProcessSpec::new(npm.path.clone())
+        .args(&npm.arguments)
+        .args(["pack", "--pack-destination", staging_arg.as_str()])
+        .cwd(source)
+        .policy(pnpm_policy(&npm)?)
+        .kind(ExecutionKind::Logged)
+        .log_path(&log_path);
+    let mut process = run_logged(&spec, "plugin artifact pack")?;
+    let status = process
+        .wait_or_kill(
+            &TaskCancel(Some(task)),
+            Duration::from_secs(300),
+            "packing plugin artifact",
+        )
+        .map_err(|error| format!("plugin artifact pack: {error}"))?;
+    if !status.success() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!("plugin artifact pack failed; inspect {log_path}"));
+    }
+    let packed = fs::read_dir(&staging)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_file() && matches!(path.extension().and_then(|ext| ext.to_str()), Some("tgz") | Some("gz")))
+        .ok_or("npm pack produced no tarball")?;
+    fs::rename(&packed, artifact).map_err(|error| {
+        format!(
+            "cannot publish plugin artifact {}: {error}",
+            artifact.display()
+        )
+    })?;
+    let _ = fs::remove_dir_all(&staging);
+    Ok(())
 }
 
 pub(crate) fn repository_metadata(
@@ -173,15 +241,6 @@ pub(crate) fn link_repository_extension(
                     box_extensions::ReferenceKind::Template,
                     template_id,
                 )?;
-            } else {
-                // Direct (non-template) link from CLI: record the
-                // container as the owner so `plugin prune` keeps it.
-                box_extensions::add_reference_owner(
-                    Path::new(&root),
-                    &entry.id,
-                    box_extensions::ReferenceKind::Container,
-                    container_id,
-                )?;
             }
         }
         ExtensionKind::Skill => {
@@ -231,6 +290,10 @@ pub(crate) fn import_into_repository(
             && !existing_source.join("node_modules").is_dir()
         {
             install_plugin_dependencies(task, existing_source, &name, version.as_deref())?;
+        }
+        if matches!(kind, ExtensionKind::Plugin) {
+            let artifact = repository_plugin_artifact(&existing)?;
+            package_repository_plugin(task, existing_source, &artifact, &existing.name)?;
         }
         let kind_label = match existing.kind {
             ExtensionKind::Plugin => "plugin",
@@ -307,10 +370,21 @@ pub(crate) fn import_into_repository(
         source: Some(source.to_string_lossy().into_owned()),
     });
     write_repository_index(Path::new(&root), &entries)?;
-    Ok(entries
+    let created = entries
         .into_iter()
         .find(|entry| entry.id == entry_id)
-        .expect("entry we just pushed"))
+        .expect("entry we just pushed");
+    if matches!(&created.kind, ExtensionKind::Plugin) {
+        let artifact = repository_plugin_artifact(&created)?;
+        if let Err(error) = package_repository_plugin(task, Path::new(&created.source_path), &artifact, &created.name) {
+            let mut rollback = scan_repository(Path::new(&root));
+            rollback.retain(|entry| entry.id != created.id);
+            let _ = write_repository_index(Path::new(&root), &rollback);
+            let _ = fs::remove_dir_all(Path::new(&created.source_path).parent().unwrap_or(Path::new(".")));
+            return Err(error);
+        }
+    }
+    Ok(created)
 }
 
 fn install_plugin_dependencies(
@@ -350,18 +424,14 @@ fn install_plugin_dependencies(
         .map_err(|error| format!("cannot write workspace manifest: {error}"))?;
     }
     let task_record = task.manager.task(&task.task_id)?;
-    let log = fs::OpenOptions::new()
-        .append(true)
-        .open(&task_record.log_path)
-        .map_err(|error| error.to_string())?;
     let frozen = directory.join("pnpm-lock.yaml").is_file();
     task.log(&format!(
         "installing dependencies for {}{}",
         name,
         version.map(|v| format!("@{v}")).unwrap_or_default(),
     ));
-    let mut install = command_for_toolchain(&pnpm);
-    install
+    let install_spec = ProcessSpec::new(pnpm.path.clone())
+        .args(&pnpm.arguments)
         .args([
             "--dir",
             directory.to_string_lossy().as_ref(),
@@ -373,16 +443,19 @@ fn install_plugin_dependencies(
                 "--no-frozen-lockfile"
             },
         ])
-        .stdout(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .stderr(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ));
-    let mut child = install
-        .spawn()
-        .map_err(|error| format!("cannot start plugin dependency install: {error}"))?;
-    let status = wait_for_process(&mut child, Some(task), "installing plugin dependencies")?;
+        .policy(pnpm_policy(&pnpm)?)
+        .kind(ExecutionKind::Logged)
+        .log_path(&task_record.log_path);
+    let mut install_logged = run_logged(&install_spec, "pnpm install").map_err(|error| {
+        format!("cannot start plugin dependency install: {error}")
+    })?;
+    let status = install_logged
+        .wait_or_kill(
+            &TaskCancel(Some(task)),
+            Duration::from_secs(900),
+            "installing plugin dependencies",
+        )
+        .map_err(|error| format!("pnpm install: {error}"))?;
     if status.success() {
         Ok(())
     } else {
@@ -441,13 +514,6 @@ pub(crate) fn remove_repository_extension(id: &str) -> Result<(), String> {
         .unwrap_or_default();
     if !owners.is_empty() {
         let mut parts = Vec::new();
-        if !owners.containers.is_empty() {
-            parts.push(format!(
-                "{} container(s) [{}]",
-                owners.containers.len(),
-                owners.containers.iter().cloned().collect::<Vec<_>>().join(", ")
-            ));
-        }
         if !owners.templates.is_empty() {
             parts.push(format!(
                 "{} template(s) [{}]",
@@ -510,16 +576,51 @@ pub(crate) fn container_plugin_add(
     let container = box_containers::scan_containers(&root)?
         .remove(container_id)
         .ok_or("container not found")?;
-    let source = dsh_version_directory(&root, &container.version);
+    // Run the DSH CLI against the container's own harness copy. The legacy
+    // <root>/runtimes/<version>/source layout no longer exists — prepared
+    // bases live under <root>/templates/base-* and each instance carries a
+    // full harness/ snapshot, so the container-local tree is both the
+    // correct working directory and guaranteed to match what the host runs.
+    let source = PathBuf::from(&container.directory).join("harness");
+    if !source.join("apps/cli/src/bin.ts").is_file() {
+        return Err(format!(
+            "container harness is missing the DSH CLI at {}; reinstall the container",
+            source.display()
+        ));
+    }
     let pnpm = resolve_toolchain("pnpm")?;
     task.update("Installing DSH plugin", 60);
     task.log(&format!("adding plugin {spec} to profile {profile}"));
+
+    // Ensure the profile's pnpm-workspace.yaml allows build scripts
+    // (dangerouslyAllowAllBuilds: true) so pnpm ≥10 does not block
+    // native module compilation (e.g. node-pty) with ERR_PNPM_IGNORED_BUILDS.
+    let profile_dir = PathBuf::from(&container.directory)
+        .join("profile")
+        .join("profiles")
+        .join(profile);
+    let workspace_manifest = profile_dir.join("pnpm-workspace.yaml");
+    let needs_rewrite = match fs::read_to_string(&workspace_manifest) {
+        Ok(content) => !content.contains("dangerouslyAllowAllBuilds"),
+        Err(_) => true,
+    };
+    if needs_rewrite {
+        let ws_content = if workspace_manifest.is_file() {
+            let text = fs::read_to_string(&workspace_manifest)
+                .map_err(|error| format!("cannot read workspace yaml: {error}"))?;
+            let trailing = if text.ends_with('\n') { "" } else { "\n" };
+            format!("{text}{trailing}dangerouslyAllowAllBuilds: true\n")
+        } else {
+            "packages:\n  - .\n\nnodeLinker: hoisted\ndangerouslyAllowAllBuilds: true\n".to_owned()
+        };
+        fs::write(&workspace_manifest, &ws_content)
+            .map_err(|error| format!("cannot write workspace manifest: {error}"))?;
+    }
+
     let task_record = task.manager.task(&task.task_id)?;
-    let log = fs::OpenOptions::new()
-        .append(true)
-        .open(&task_record.log_path)
-        .map_err(|error| error.to_string())?;
-    let mut child = command_for_toolchain(&pnpm)
+    let dsh_home = PathBuf::from(&container.directory).join("profile");
+    let install_spec = ProcessSpec::new(pnpm.path.clone())
+        .args(&pnpm.arguments)
         .args([
             "--dir",
             source.to_string_lossy().as_ref(),
@@ -530,17 +631,21 @@ pub(crate) fn container_plugin_add(
             "add",
             spec,
         ])
-        .env(
-            "DSH_HOME",
-            PathBuf::from(&container.directory).join("profile"),
+        .policy(
+            pnpm_policy(&pnpm)?
+                .task_override("DSH_HOME", dsh_home.to_string_lossy().into_owned()),
         )
-        .stdout(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .stderr(Stdio::from(log))
-        .spawn()
+        .kind(ExecutionKind::Logged)
+        .log_path(&task_record.log_path);
+    let mut install_logged = run_logged(&install_spec, "dsh plugin add")
         .map_err(|error| format!("cannot start plugin install: {error}"))?;
-    let status = wait_for_process(&mut child, Some(task), "installing plugin")?;
+    let status = install_logged
+        .wait_or_kill(
+            &TaskCancel(Some(task)),
+            Duration::from_secs(900),
+            "installing plugin",
+        )
+        .map_err(|error| format!("dsh plugin add: {error}"))?;
     if !status.success() {
         return Err(format!("dsh plugin add exited with {status}"));
     }
@@ -635,17 +740,6 @@ pub(crate) fn install_container_extension(
     // shared repository entry. Local / tarball installs have no
     // `repository_id`, so the owner set never grows for them — they
     // also never show up as `unused_repository_ids`.
-    if source_kind == "repository" {
-        let root = read_config()?
-            .runtime_directory
-            .ok_or("DSH Box storage is not configured")?;
-        box_extensions::add_reference_owner(
-            Path::new(&root),
-            source,
-            box_extensions::ReferenceKind::Container,
-            container_id,
-        )?;
-    }
     let _ = fs::remove_dir_all(staging);
     task.update("Refreshing container extensions", 95);
     Ok(())
@@ -781,23 +875,7 @@ pub(crate) fn remove_repository_plugin(id: &str, profile: &str, name: &str) -> R
     // record so the `repository_id` is still available. Local /
     // tarball installs have no `repository_id`, and the remove is a
     // no-op for them.
-    let repository_id = read_extension_records(&container)
-        .into_iter()
-        .find(|record| {
-            record.kind == ExtensionKind::Plugin
-                && record.profile.as_deref() == Some(profile)
-                && record.name == name
-        })
-        .and_then(|record| record.repository_id);
     remove_plugin_record(&container, profile, name)?;
-    if let Some(repository_id) = repository_id.as_deref() {
-        box_extensions::remove_reference_owner(
-            Path::new(&root),
-            repository_id,
-            box_extensions::ReferenceKind::Container,
-            &container.id,
-        )?;
-    }
     Ok(())
 }
 
@@ -863,22 +941,35 @@ mod tests {
     }
 
     fn test_task(runtime: &Path) -> TaskContext {
+        let paths = BoxPaths {
+            config: runtime.join("config.json"),
+            runtime: Some(runtime.to_path_buf()),
+        };
+        let manager = TaskManager::default();
+        let record = manager
+            .enqueue(&paths, "test", Vec::new(), serde_json::json!({}))
+            .unwrap();
         TaskContext {
-            manager: TaskManager::default(),
-            paths: BoxPaths {
-                config: runtime.join("config.json"),
-                runtime: Some(runtime.to_path_buf()),
-            },
+            manager,
+            paths,
             notifier: std::sync::Arc::new(NoopNotifier),
-            task_id: "test-task".to_owned(),
+            task_id: record.id,
             profile_dir: None,
         }
     }
 
     fn make_plugin_source(name: &str, version: &str) -> PathBuf {
+        // Mix nanosecond timestamp with PID so back-to-back invocations
+        // never collide on the same directory name. Seconds-resolution
+        // timestamps were prone to races when cargo test ran two cases
+        // within the same wall-clock second.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
         let dir = env::temp_dir().join(format!(
-            "dshboxd-ext-src-{name}-{version}-{}",
-            now_seconds()
+            "dshboxd-ext-src-{name}-{version}-{pid}-{nanos}"
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -912,7 +1003,17 @@ mod tests {
         let home = sandbox("dedup-home");
         let runtime = sandbox("dedup-runtime");
         write_config(&home, &runtime);
+        // `box_foundation::config_path` honours `DSHBOX_CONFIG_DIR`; this
+        // is what production-like reads see on Windows where `HOME` is
+        // ignored by `dirs::home_dir()`. The HOME line is kept for
+        // compatibility with Linux/macOS where `dirs` falls back to it.
         let _guard = EnvGuard::set("HOME", &home);
+        let _dshbox_dir = EnvGuard::set("DSHBOX_CONFIG_DIR", &home.join(".dsh-box"));
+        // Repository imports now produce an immutable `npm pack` artifact.
+        // Production initializes this once during daemon startup; unit tests
+        // exercise the same path explicitly (another concurrent test may
+        // have initialized it already, which is equally valid).
+        let _ = crate::state::initialize_bundled_runtime();
 
         let source_a = make_plugin_source("dsh-better-sidebar", "0.12.3");
         let task = test_task(&runtime);
@@ -938,10 +1039,7 @@ mod tests {
 
         // Different version skews the cache key.
         let source_c = make_plugin_source("dsh-better-sidebar", "0.12.4");
-        let task_v2 = TaskContext {
-            task_id: "test-task-v2".to_owned(),
-            ..task
-        };
+        let task_v2 = test_task(&runtime);
         let third = import_into_repository(&task_v2, &source_c).unwrap();
         assert_ne!(
             first.id, third.id,
@@ -980,5 +1078,25 @@ mod tests {
                 None => unsafe { env::remove_var(self.key) },
             }
         }
+    }
+
+    #[test]
+    fn plugin_artifact_lives_next_to_the_repository_source() {
+        let entry = RepositoryExtension {
+            id: "img-1".to_owned(),
+            kind: ExtensionKind::Plugin,
+            name: "@example/plugin".to_owned(),
+            version: Some("1.0.0".to_owned()),
+            description: None,
+            content_digest: "digest".to_owned(),
+            source_path: "D:/runtime/repository/plugins/img-1/source".to_owned(),
+            imported_at: 0,
+            diagnostic: None,
+            source: None,
+        };
+        assert_eq!(
+            repository_plugin_artifact(&entry).unwrap(),
+            PathBuf::from("D:/runtime/repository/plugins/img-1/artifact.tgz")
+        );
     }
 }

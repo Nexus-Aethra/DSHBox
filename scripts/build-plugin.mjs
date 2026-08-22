@@ -1,8 +1,8 @@
-import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, statSync, readFileSync, createWriteStream } from 'node:fs'
+import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, statSync, readFileSync, writeFileSync, createWriteStream } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { dirname, join, relative } from 'node:path'
+import { delimiter, dirname, join, relative } from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { isFresh } from './mtime.mjs'
+import { hashInputs, isFresh } from './mtime.mjs'
 
 // Resolve the target triple, mirroring scripts/prepare-runtime.mjs.
 const target = process.argv.includes('--target')
@@ -30,8 +30,76 @@ if (isFresh(output, sources, force)) {
   process.exit(0)
 }
 
+// Stronger hash-cache: hash the plugin's package.json + the lockfile so
+// `pnpm build` only runs when the plugin's declared dependencies or
+// version actually changed. Without this, every workspace mtime drift
+// (Cargo.lock, sibling crates, etc.) wastes a full pnpm install + build.
+const cacheRoot = join(root, '.cache', 'dsh-box', 'plugin')
+mkdirSync(cacheRoot, { recursive: true })
+const cacheFile = join(cacheRoot, `${target}.sha256`)
+const hashInputs_ = [
+  join(pluginSource, 'package.json'),
+  join(pluginSource, 'pnpm-lock.yaml'),
+  join(pluginSource, 'tsconfig.json'),
+]
+if (hashInputs(cacheFile, hashInputs_, force)) {
+  if (existsSync(join(output, 'plugins-manifest.json'))) {
+    console.log(`plugin inputs unchanged (hash cache hit at ${cacheFile}); skipping pnpm build`)
+    process.exit(0)
+  }
+}
+
 // 1. Build the TypeScript plugin into dist/.
-const build = spawnSync('pnpm', ['--dir', pluginSource, 'build'], { stdio: 'inherit' })
+//    On Windows, `pnpm` is typically pnpm.cmd. Bare spawnSync('pnpm')
+//    without shell:true hits EINVAL. Walk PATH + well-known dirs to find
+//    pnpm (.cmd/.exe) and prefer corepack as a fallback (it ships with
+//    every modern Node install and can dispatch to pnpm directly).
+function findCommand(cmd, extraDirs = []) {
+  const names = process.platform === 'win32'
+    ? [`${cmd}.cmd`, `${cmd}.bat`, `${cmd}.exe`, cmd]
+    : [cmd]
+  const dirs = (process.env.PATH || '').split(delimiter).filter(Boolean)
+  for (const dir of [...dirs, ...extraDirs]) {
+    for (const name of names) {
+      if (existsSync(join(dir, name))) return join(dir, name)
+    }
+  }
+  return null
+}
+
+function wellKnownBin() {
+  const sysdrive = process.env.SystemDrive || 'C:'
+  const programFiles = process.env['ProgramFiles'] || join(sysdrive, 'Program Files')
+  const userprofile = process.env.USERPROFILE || ''
+  return [
+    join(sysdrive, 'nodejs'),
+    join(sysdrive, 'nodejs', 'node_global'),
+    join(programFiles, 'nodejs'),
+    join(userprofile, '.cargo', 'bin'),
+  ]
+}
+
+function resolvePnpmInvocation() {
+  const pnpmArgs = ['--dir', pluginSource, 'build']
+  if (process.platform !== 'win32') {
+    return { cmd: 'pnpm', args: pnpmArgs, shell: false }
+  }
+  const direct = findCommand('pnpm', wellKnownBin())
+  if (direct) {
+    const lower = direct.toLowerCase()
+    const shell = lower.endsWith('.cmd') || lower.endsWith('.bat')
+    return { cmd: direct, args: pnpmArgs, shell }
+  }
+  const corepack = findCommand('corepack', wellKnownBin())
+  if (corepack) {
+    return { cmd: corepack, args: ['pnpm', ...pnpmArgs], shell: true }
+  }
+  // Last resort: assume pnpm is on PATH through the user's shell init.
+  return { cmd: 'pnpm', args: pnpmArgs, shell: true }
+}
+
+const pnpm = resolvePnpmInvocation()
+const build = spawnSync(pnpm.cmd, pnpm.args, { stdio: 'inherit', shell: pnpm.shell })
 if (build.status !== 0) process.exit(build.status ?? 1)
 
 // 2. Clean the destination and copy the package skeleton.

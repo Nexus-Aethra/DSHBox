@@ -21,6 +21,21 @@
 /.zcode/
 # Throwaway packaging artefacts.
 /dshbox-*.tgz
+# Isolated Windows/Linux lifecycle experiments. These roots can contain cloned
+# Harness trees and pnpm stores; they are deliberately never source inputs.
+/.e2e-config-*/
+/.e2e-runtime-*/
+/.e2e-*.dsh
 # Vite build output (dist is bundled into the desktop binary by Tauri's
 # beforeBuildCommand; never edit files under this directory).
 /src-tauri/dist/
+# Prepare-script content-hash cache: regenerated on demand, never tracked.
+/.cache/
+
+# E2E sandbox fixtures occasionally leave Windows-style absolute paths
+# (e.g. D:\\dsh-e2er-*\\pnpm\\store-verify) at the project root when
+# tests fail to clean up. They confuse tooling that joins cwd + path;
+# never tracked.
+/D:\\*
+src-tauri/box-data/
+src-tauri/crates/box-runtime/box-data/

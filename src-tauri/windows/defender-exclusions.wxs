@@ -1,0 +1,37 @@
+<!--
+  DSH Box WiX fragment: register Windows Defender real-time-scan
+  exclusions as part of the MSI transaction.
+
+  Container prepare materializes hundreds of thousands of small files
+  under the install directory (bundled Node/pnpm/git) and the
+  user-selected runtime data directory. Defender's real-time scanner
+  opens each freshly written file exactly while pnpm reads package.json
+  back during bin linking, which fails container prepare with
+  `[UNKNOWN] unknown error, open '…package.json'`. Excluding the install
+  directory removes the largest deterministic source of that race at
+  install time: the deferred custom action below runs elevated (perMachine
+  scope, Impersonate=no), so no UAC prompt and no external script is ever
+  involved. Hosts without the Defender interface simply fail the command,
+  which Return="ignore" swallows so installation always succeeds.
+
+  The runtime data directory is chosen after installation, so the desktop
+  shell asks once for its exclusion via UAC
+  (src-tauri/src/desktop/app/defender.rs); see BoxConfig.defender_exclusions_for.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <!-- Referenced from the product so this fragment is linked in. -->
+    <ComponentGroup Id="DshboxDefenderHookGroup" />
+    <CustomAction
+        Id="DshboxRegisterDefenderExclusions"
+        Directory="INSTALLDIR"
+        Execute="deferred"
+        Impersonate="no"
+        Return="ignore"
+        ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command &quot;Add-MpPreference -ExclusionPath '[INSTALLDIR]' -ErrorAction SilentlyContinue&quot;" />
+    <InstallExecuteSequence>
+      <!-- Fresh installs and repairs; never during uninstall/remove. -->
+      <Custom Action="DshboxRegisterDefenderExclusions" After="InstallFiles"><![CDATA[NOT REMOVE~="ALL"]]></Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

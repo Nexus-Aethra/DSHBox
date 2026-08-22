@@ -16,12 +16,7 @@
 use box_containers::container_directory;
 use box_foundation::{now_seconds, read_config, BoxResult};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    io,
-    path::{Path, PathBuf},
-    process::ExitStatus,
-};
+use std::{fs, io, path::PathBuf, process::ExitStatus};
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -79,7 +74,9 @@ pub struct ContainerHostRecord {
 
 /// Path to the record file inside a container's `state/` directory.
 pub fn host_record_path(runtime_root: &str, id: &str) -> PathBuf {
-    container_directory(runtime_root, id).join("state").join("host.json")
+    container_directory(runtime_root, id)
+        .join("state")
+        .join("host.json")
 }
 
 /// Read the record for `id`, or `None` if the file is absent / corrupt.
@@ -92,10 +89,7 @@ pub fn read_host_record(id: &str) -> BoxResult<Option<ContainerHostRecord>> {
 
 /// Read `host.json` under a specific runtime root. Public so tests can
 /// drive the CAS logic without rewriting `~/.dsh-box/config.json`.
-pub fn read_host_record_in(
-    runtime_root: &str,
-    id: &str,
-) -> BoxResult<Option<ContainerHostRecord>> {
+pub fn read_host_record_in(runtime_root: &str, id: &str) -> BoxResult<Option<ContainerHostRecord>> {
     let path = host_record_path(runtime_root, id);
     match fs::read_to_string(&path) {
         Ok(text) => match serde_json::from_str::<ContainerHostRecord>(&text) {
@@ -106,15 +100,15 @@ pub fn read_host_record_in(
             }
         },
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("cannot read {path}: {error}", path = path.display())),
+        Err(error) => Err(format!(
+            "cannot read {path}: {error}",
+            path = path.display()
+        )),
     }
 }
 
 /// Atomic write under a specific runtime root.
-pub fn write_host_record_in(
-    runtime_root: &str,
-    record: &ContainerHostRecord,
-) -> BoxResult<()> {
+pub fn write_host_record_in(runtime_root: &str, record: &ContainerHostRecord) -> BoxResult<()> {
     let path = host_record_path(runtime_root, &record.id);
     let parent = path
         .parent()
@@ -143,15 +137,14 @@ pub fn write_host_record(record: &ContainerHostRecord) -> BoxResult<()> {
 
 /// Outcome of [`compare_and_swap_host_record`].
 #[derive(Debug)]
+#[allow(dead_code)] // fields are read by integration tests, not by daemon internals.
 pub enum CasOutcome {
     /// Caller's update was persisted; `record` now reflects the new state.
     Applied(ContainerHostRecord),
     /// The on-disk generation was higher than the caller's snapshot,
     /// meaning a fresher writer (the active daemon) already touched the
     /// record. Caller should drop its update and re-read.
-    Stale {
-        on_disk: ContainerHostRecord,
-    },
+    Stale { on_disk: ContainerHostRecord },
 }
 
 /// Compare-and-swap under a specific runtime root (test seam).
@@ -170,7 +163,10 @@ where
             .map_err(|error| format!("cannot parse host.json for {id}: {error}"))?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => snapshot.clone(),
         Err(error) => {
-            return Err(format!("cannot read {path}: {error}", path = path.display()))
+            return Err(format!(
+                "cannot read {path}: {error}",
+                path = path.display()
+            ))
         }
     };
     if on_disk.generation > snapshot.generation {
@@ -275,7 +271,9 @@ fn host_json_path_for(id: &str) -> BoxResult<PathBuf> {
 /// daemon startup. Missing or corrupt files are silently skipped (the
 /// caller treats them as already-cleaned).
 pub fn list_all_host_records() -> BoxResult<Vec<ContainerHostRecord>> {
-    let root = read_config()?.runtime_directory.ok_or("DSH Box storage is not configured")?;
+    let root = read_config()?
+        .runtime_directory
+        .ok_or("DSH Box storage is not configured")?;
     list_all_host_records_in(&root)
 }
 
@@ -303,6 +301,7 @@ pub fn list_all_host_records_in(runtime_root: &str) -> BoxResult<Vec<ContainerHo
 }
 
 /// Helper: produce a process description from an exit pair for logging.
+#[allow(dead_code)] // exercised by integration tests; daemon core uses describe_exit_inline.
 pub fn describe_exit(status: Option<i32>, signal: Option<i32>) -> String {
     match (status, signal) {
         (_, Some(sig)) => format!("signal {sig}"),
@@ -382,20 +381,20 @@ mod tests {
 
     #[test]
     fn exit_status_to_parts_handles_success() {
-        let status = std::process::Command::new("true")
+        let status = exit_status_command(0)
             .status()
-            .expect("spawn true");
-        let (code, signal) = exit_status_to_parts(status);
+            .expect("spawn successful command");
+        let (code, _signal) = exit_status_to_parts(status);
         assert_eq!(code, 0);
         #[cfg(unix)]
-        assert_eq!(signal, None);
+        assert_eq!(_signal, None);
     }
 
     #[test]
     fn exit_status_to_parts_handles_failure() {
-        let status = std::process::Command::new("false")
+        let status = exit_status_command(1)
             .status()
-            .expect("spawn false");
+            .expect("spawn failing command");
         let (code, _signal) = exit_status_to_parts(status);
         assert_eq!(code, 1);
     }
@@ -408,28 +407,37 @@ mod tests {
         assert_eq!(describe_exit(None, None), "unknown exit");
     }
 
+    fn exit_status_command(code: i32) -> std::process::Command {
+        #[cfg(windows)]
+        {
+            let mut command = std::process::Command::new("cmd.exe");
+            command.args(["/C", "exit", &code.to_string()]);
+            command
+        }
+        #[cfg(not(windows))]
+        {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", &format!("exit {code}")]);
+            command
+        }
+    }
+
     // CAS tests need a writable runtime dir; they call the `_in`
     // variants directly with a tempdir rather than rewriting
     // `~/.dsh-box/config.json`.
     #[test]
     fn cas_bumps_generation_and_persists() {
         let runtime_root = tempdir_runtime_root();
-        std::fs::create_dir_all(host_record_path(&runtime_root, "c-1").parent().unwrap())
-            .unwrap();
+        std::fs::create_dir_all(host_record_path(&runtime_root, "c-1").parent().unwrap()).unwrap();
         let mut snap = snapshot("c-1", 1);
         snap.state = HostState::Starting;
         write_host_record_in(&runtime_root, &snap).unwrap();
 
-        let outcome = compare_and_swap_host_record_in(
-            &runtime_root,
-            "c-1",
-            &snap,
-            |on_disk| {
-                let mut next = on_disk.clone();
-                next.state = HostState::Ready;
-                next
-            },
-        )
+        let outcome = compare_and_swap_host_record_in(&runtime_root, "c-1", &snap, |on_disk| {
+            let mut next = on_disk.clone();
+            next.state = HostState::Ready;
+            next
+        })
         .unwrap();
         match outcome {
             CasOutcome::Applied(next) => {
@@ -446,8 +454,7 @@ mod tests {
     #[test]
     fn cas_returns_stale_when_generation_moves() {
         let runtime_root = tempdir_runtime_root();
-        std::fs::create_dir_all(host_record_path(&runtime_root, "c-2").parent().unwrap())
-            .unwrap();
+        std::fs::create_dir_all(host_record_path(&runtime_root, "c-2").parent().unwrap()).unwrap();
         let snap = snapshot("c-2", 1);
         write_host_record_in(&runtime_root, &snap).unwrap();
         // Simulate a concurrent writer bumping generation to 5.
@@ -456,16 +463,11 @@ mod tests {
         fresh.state = HostState::Stopped;
         write_host_record_in(&runtime_root, &fresh).unwrap();
 
-        let outcome = compare_and_swap_host_record_in(
-            &runtime_root,
-            "c-2",
-            &snap,
-            |on_disk| {
-                let mut next = on_disk.clone();
-                next.state = HostState::Crashed;
-                next
-            },
-        )
+        let outcome = compare_and_swap_host_record_in(&runtime_root, "c-2", &snap, |on_disk| {
+            let mut next = on_disk.clone();
+            next.state = HostState::Crashed;
+            next
+        })
         .unwrap();
         match outcome {
             CasOutcome::Stale { on_disk } => {
@@ -483,6 +485,4 @@ mod tests {
         std::mem::forget(dir);
         path
     }
-
-
 }

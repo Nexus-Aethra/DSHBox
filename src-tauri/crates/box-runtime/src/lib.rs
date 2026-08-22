@@ -7,6 +7,9 @@ use std::{
     process::{Command, Output},
 };
 
+pub mod bundled;
+pub mod process;
+
 /// Add `directory` to the user's PATH (HKCU\Environment\Path on
 /// Windows, `~/.config/.../path` on Linux, `~/Library/.../path` on
 /// macOS) so subsequent shells and agent-runner subprocesses can
@@ -183,8 +186,8 @@ pub trait ProcessRunner: Send + Sync {
 }
 
 #[derive(Default)]
-pub struct NativeProcessRunner;
-impl ProcessRunner for NativeProcessRunner {
+pub struct LegacyProcessRunner;
+impl ProcessRunner for LegacyProcessRunner {
     fn run(
         &self,
         executable: &Path,

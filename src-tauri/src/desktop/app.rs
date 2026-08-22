@@ -5,17 +5,13 @@ use box_dsh_context::{
 use box_containers::{
     container_directory, scan_containers, CreateDshContainerRequest, DshContainer,
 };
-use box_dsh_versions::{
-    version_directory as dsh_version_directory,
-    upgrade_legacy_harness, DshVersion, DSH_REPOSITORY,
-};
+use box_dsh_versions::{DshVersion};
 use box_extensions::{scan_workspace_extensions, ExtensionBundle};
 use box_foundation::{
-    is_safe_identifier, mirror_url, normalize_optional_url, normalize_runtime_directory,
-    now_seconds, read_config, strip_verbatim_prefix, suppress_console_window, write_config,
+    is_safe_identifier, normalize_optional_url, normalize_runtime_directory,
+    now_seconds, read_config, strip_verbatim_prefix, write_config,
     BoxConfig, BoxPaths,
 };
-use box_runtime::{remove_checkout, shallow_clone_with_cancel};
 use box_scheduler::{run_queued, TaskContext, TaskManager, TaskNotifier, TaskRecord};
 use box_server_core::{
     install_tray_autostart, install_user_service, restart_user_service, service_status,
@@ -26,7 +22,6 @@ use box_toolchains::{is_known_toolchain, ToolchainStatus};
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
-    ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
     sync::OnceLock,
@@ -34,12 +29,13 @@ use std::{
     time::Duration,
 };
 use tauri::{Manager, WindowEvent};
-use xz2::read::XzDecoder;
 
 mod bundles;
 mod commands;
 mod containers;
+pub(crate) mod defender;
 mod rpc;
+mod events;
 mod extensions;
 pub(crate) mod image;
 pub(crate) mod lifecycle;
@@ -52,24 +48,16 @@ pub(crate) use bundles::*;
 pub(crate) use containers::*;
 pub(crate) use extensions::*;
 pub(crate) use rpc::*;
+pub(crate) use events::*;
 pub(crate) use lifecycle::*;
 pub(crate) use services::*;
 pub(crate) use tasks::*;
 pub(crate) use toolchains::*;
 pub(crate) use versions::*;
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ResolvedToolchain {
-    id: String,
-    source: String,
-    path: String,
-    #[serde(default)]
-    arguments: Vec<String>,
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub(crate) struct BundledRuntimeManifest {
     node_version: String,
     pnpm_version: String,
@@ -85,17 +73,10 @@ pub(crate) struct BundledRuntime {
     node: PathBuf,
     npm: PathBuf,
     pnpm: PathBuf,
+    git_dir: Option<PathBuf>,
 }
 
 static BUNDLED_RUNTIME: OnceLock<BundledRuntime> = OnceLock::new();
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ToolchainCommandRequest {
-    id: String,
-    args: Vec<String>,
-    cwd: Option<String>,
-}
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,27 +112,11 @@ pub(crate) struct ExportContainerPluginRequest {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ToolchainCommandResult {
-    path: String,
-    stdout: String,
-    stderr: String,
-    exit_code: Option<i32>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct ToolchainInstallStatus {
     id: String,
     stage: String,
     log_path: String,
     lines: Vec<String>,
-}
-
-#[allow(dead_code)]
-#[derive(Deserialize)]
-pub(crate) struct NodeRelease {
-    version: String,
-    files: Vec<String>,
 }
 
 /// Local container-manager stub kept only as the `tauri::State` slot type in
@@ -170,26 +135,49 @@ pub(super) fn run() {
 }
 
 /// Startup repair pass for the template system:
-/// 1. `upgrade_legacy_harness` corrects legacy harness metadata and
-///    generates a base template per installed version.
+/// 1. Mirror every `runtimes/<tag>/source/` runtime into the template
+///    index. Older installs used a separate writer that left the runtime
+///    clone without an index entry; the Harness tab and the Container
+///    dropdown both rely on the index, so this is required for them to
+///    see the user's existing harnesses.
 /// 2. Containers created before the template system are bound to the base
 ///    template of their harness version when one exists locally; containers
 ///    that cannot be bound fall back to the startup validation error.
 ///
 /// Every step is best-effort and logged; failures never block startup.
 fn repair_resources_on_startup(root: &str) {
-    match upgrade_legacy_harness(root) {
-        Ok(reports) => {
-            for report in reports {
-                if report.template_created {
-                    write_startup_log(&format!(
-                        "generated base template {}",
-                        report.template_path
-                    ));
-                }
+    if let Ok(installed) = box_dsh_versions::installed_versions(root) {
+        let index = box_dsh_versions::read_template_index(root);
+        let already_indexed: std::collections::BTreeSet<String> = index
+            .values()
+            .filter_map(|entry| entry.harness_ref.clone())
+            .collect();
+        for tag in installed {
+            if already_indexed.contains(&tag) {
+                continue;
+            }
+            let ref_value = format!("github.com/deepseek-ai/deepseek-harness:{tag}");
+            let body =
+                format!("FROM {ref_value}\nPROFILE web\nNAME {ref_value}\nVERSION latest\n");
+            match box_dsh_versions::write_template_with_entry(
+                root,
+                &ref_value,
+                &body,
+                Some(tag.clone()),
+                "web",
+                Some(ref_value.clone()),
+                now_seconds(),
+                box_dsh_versions::TemplateKind::Root,
+            ) {
+                Ok(entry) => write_startup_log(&format!(
+                    "registered harness `{tag}` in template index ({})",
+                    entry.id
+                )),
+                Err(error) => write_startup_log(&format!(
+                    "cannot register harness `{tag}` in template index: {error}"
+                )),
             }
         }
-        Err(error) => write_startup_log(&format!("legacy harness upgrade failed: {error}")),
     }
     let instances = PathBuf::from(root).join("instances");
     let mut bound = 0usize;
@@ -274,9 +262,11 @@ fn run_inner() -> Result<(), String> {
                 link_daemon_into_path(&server);
                 if let Err(error) = install_user_service(&server) {
                     write_startup_log(&format!("dshboxd service installation failed: {error}"));
-                    // Platforms without a per-user service manager (macOS)
-                    // and broken service setups still get a running daemon.
-                    #[cfg(unix)]
+                    // Platforms without a per-user service manager (macOS),
+                    // broken systemd units, and Windows where the
+                    // scheduled task creation was rejected all still need
+                    // a running daemon — fall back to spawning the sidecar
+                    // directly so the UI never gets stuck waiting.
                     spawn_daemon_fallback(&server);
                 }
                 // Protocol handshake: restart a daemon built in a different
@@ -294,6 +284,17 @@ fn run_inner() -> Result<(), String> {
             if let Ok(config) = read_config() {
                 if let Some(root) = config.runtime_directory {
                     repair_resources_on_startup(&root);
+                    // Windows only: keep Defender real-time scan out of the
+                    // install and runtime directories so pnpm's bin linking
+                    // does not race the scanner during container prepare.
+                    if let Ok(executable) = env::current_exe() {
+                        if let Some(install_dir) = executable.parent() {
+                            defender::ensure_defender_exclusions(
+                                install_dir.to_path_buf(),
+                                PathBuf::from(&root),
+                            );
+                        }
+                    }
                 }
             }
             write_startup_log("desktop setup completed");
@@ -307,6 +308,10 @@ fn run_inner() -> Result<(), String> {
             }
             let handle = app.handle().clone();
             thread::spawn(move || refresh_global_state(&handle));
+            // Bridge daemon `/events` SSE stream to the Tauri event bus so
+            // every state transition the daemon emits surfaces as a
+            // `daemon://event` payload the frontend can subscribe to.
+            spawn_event_subscriber(app.handle().clone());
             if let Some(id) = initial_container.clone() {
                 let client = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -346,8 +351,6 @@ fn run_inner() -> Result<(), String> {
             stop_server_service,
             commands::toolchains::detect_toolchains,
             commands::toolchains::save_toolchain_source,
-            commands::toolchains::resolve_toolchain_command,
-            commands::toolchains::run_toolchain_command,
             enqueue_toolchain_install,
             commands::versions::list_dsh_versions,
             commands::versions::upgrade_legacy_resources,

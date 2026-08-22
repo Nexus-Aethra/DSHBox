@@ -10,16 +10,18 @@ mod bundles;
 mod containers;
 mod data;
 mod dispatch;
+mod events;
 mod extensions;
 mod host;
-mod image;
 mod lifecycle;
+mod sealed;
 mod state;
 #[cfg(test)]
 mod test_support;
 mod toolchains;
 mod versions;
 
+use box_runtime::process;
 use box_server_core::{read_discovery, remove_discovery, write_discovery, ServerDiscovery};
 use state::{initialize_bundled_plugins, initialize_bundled_runtime, DaemonState};
 use std::{
@@ -28,13 +30,32 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tracing::{error, info, warn};
 
 pub fn run() {
+    // Install SIGTERM/SIGINT/SIGHUP handlers so an externally signalled
+    // shutdown still walks the graceful path. The shared atomic lets the
+    // listener loop notice the request and call `graceful_shutdown`.
+    process::install_signal_handlers();
+
+    // Initialise the unified logger before any output. The log directory
+    // is `<runtime>/logs/daemon/`; the file appender is daily-rolling.
+    {
+        let log_dir = box_logger::log_dir(
+            box_logger::LogComponent::Daemon,
+            box_foundation::read_config()
+                .ok()
+                .and_then(|c| c.runtime_directory)
+                .as_deref(),
+        );
+        let _ = box_logger::init(box_logger::LogComponent::Daemon, &log_dir);
+    }
+
     if let Err(error) = initialize_bundled_runtime() {
-        eprintln!("warning: bundled runtime unavailable: {error}");
+        warn!("bundled runtime unavailable: {error}");
     }
     if let Err(error) = initialize_bundled_plugins() {
-        eprintln!("warning: bundled plugins unavailable: {error}");
+        warn!("bundled plugins unavailable: {error}");
     }
 
     // Prevent multiple daemon instances: read the existing discovery file,
@@ -50,7 +71,7 @@ pub fn run() {
     let state = match DaemonState::load() {
         Ok(state) => Arc::new(state),
         Err(error) => {
-            eprintln!("dshboxd: cannot load state: {error}");
+            error!("cannot load state: {error}");
             std::process::exit(1);
         }
     };
@@ -69,11 +90,22 @@ pub fn run() {
     let port = listener.local_addr().expect("get local port").port();
     let discovery = write_discovery(port).expect("write server discovery");
 
-    eprintln!(
-        "dshboxd listening on 127.0.0.1:{} (pid {})",
-        port,
-        std::process::id()
-    );
+    info!("listening on 127.0.0.1:{port} (pid {})", std::process::id());
+
+    // Graceful shutdown: every managed host gets a TERM-by-pgroup, a
+    // bounded wait, then a forced kill. Without this loop the OS would
+    // hand every running container over to init as an orphan whenever the
+    // daemon exits.
+    let listener_state = state.clone();
+    let listener_discovery = discovery.clone();
+    std::thread::spawn(move || {
+        while !process::shutdown_requested() {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        graceful_shutdown(&listener_state);
+        remove_discovery_with(&listener_discovery);
+        std::process::exit(0);
+    });
 
     for stream in listener.incoming() {
         let token = discovery.token.clone();
@@ -83,8 +115,46 @@ pub fn run() {
                 handle_http(stream, state, &token);
             }
         });
+        if process::shutdown_requested() {
+            break;
+        }
     }
+    graceful_shutdown(&state);
     remove_discovery();
+}
+
+fn remove_discovery_with(_discovery: &ServerDiscovery) {
+    let _ = remove_discovery();
+}
+
+/// Stop every managed host gracefully. Each host gets a TERM-by-pgroup,
+/// then a 5 s grace window, then a forced kill. Stale state records are
+/// cleared so the next daemon start doesn't try to resume dead hosts.
+fn graceful_shutdown(state: &DaemonState) {
+    let hosts = match state.containers.running.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let drained: Vec<(String, u32)> = hosts
+        .iter()
+        .filter_map(|(id, host)| host.child.id().map(|pid| (id.clone(), pid)))
+        .collect();
+    for (id, pid) in &drained {
+        let _ = id;
+        let _ = process::kill_tree_pid(*pid, None, false);
+    }
+    drop(hosts);
+    std::thread::sleep(Duration::from_secs(5));
+    let mut hosts = match state.containers.running.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for host in hosts.values_mut() {
+        if let Some(pid) = host.child.id() {
+            let _ = process::kill_tree_pid(pid, None, true);
+        }
+    }
+    hosts.clear();
 }
 
 /// Parse an HTTP/1.1 request and dispatch it to `dispatch::dispatch`.
@@ -93,127 +163,137 @@ pub fn run() {
 /// line), then reads exactly `Content-Length` bytes for the body. This
 /// avoids blocking on `read_to_string` which waits for the client to close
 /// the connection — in HTTP/1.1 the client waits for a response before
-/// closing.
+/// Read the request line and headers of an incoming HTTP request. Returns
+/// the method and path on success, or `None` on parse error (the caller
+/// should write an error response and return).
+/// Handle a single HTTP request on `stream`. Routes:
+///
+/// - `GET /events?token=...` → SSE event stream (long-lived connection).
+/// - `POST /rpc` → JSON-RPC handler (returns immediately).
 fn handle_http(mut stream: TcpStream, state: Arc<DaemonState>, token: &str) {
-    let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
+    let mut reader = BufReader::new(&mut stream);
 
-    // Request line
-    if reader.read_line(&mut line).is_err() {
+    // Read request line
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).is_err() || request_line.trim().is_empty() {
         return;
     }
-    let request_line = line.clone();
-    line.clear();
 
-    // Header lines until blank line
+    // Read headers until blank line, track Content-Length
     let mut content_length: u64 = 0;
     loop {
-        if reader.read_line(&mut line).is_err() {
-            write_http_error(&mut stream, 400, "bad request");
-            return;
-        }
-        if line.trim().is_empty() {
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
             break;
         }
         let lower = line.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("content-length:") {
             content_length = rest.trim().parse::<u64>().unwrap_or(0);
         }
-        line.clear();
     }
 
-    // Body: read exactly Content-Length bytes
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    let method = parts.first().unwrap_or(&"").to_string();
+    let path = parts.get(1).unwrap_or(&"").to_string();
+
+    // SSE event stream
+    if method == "GET" && path.starts_with("/events") {
+        let query_token = path.split('?').nth(1).unwrap_or("")
+            .split('&')
+            .find_map(|pair| {
+                let mut kv = pair.splitn(2, '=');
+                let key = kv.next()?;
+                let val = kv.next()?;
+                if key == "token" { Some(val.to_owned()) } else { None }
+            });
+        if query_token.as_deref() != Some(token) {
+            let _ = write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            return;
+        }
+        handle_sse(stream, &state);
+        return;
+    }
+
+    // POST /rpc — JSON-RPC
+    if method != "POST" || path != "/rpc" {
+        let _ = write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    }
+
+    // Read body from the BufReader (which may have buffered data)
     let mut body_bytes = Vec::with_capacity(content_length as usize);
     let mut remaining = content_length as usize;
     while remaining > 0 {
         let buf = match reader.fill_buf() {
-            Ok(n) if n.is_empty() => {
-                if remaining > 0 {
-                    write_http_error(&mut stream, 400, "bad request");
-                    return;
-                }
-                break;
-            }
+            Ok(n) if n.is_empty() => break,
             Ok(n) => n,
-            Err(_) => {
-                write_http_error(&mut stream, 400, "bad request");
-                return;
-            }
+            Err(_) => break,
         };
         let to_read = std::cmp::min(buf.len(), remaining);
         body_bytes.extend_from_slice(&buf[..to_read]);
-        let _ = reader.consume(to_read);
+        reader.consume(to_read);
         remaining -= to_read;
     }
-    let body = match std::str::from_utf8(&body_bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => {
-            write_http_error(&mut stream, 400, "invalid utf-8");
-            return;
-        }
+    let Ok(body) = String::from_utf8(body_bytes) else {
+        let _ = write!(stream, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
     };
 
-    // Method must be POST
-    if !request_line.starts_with("POST ") {
-        write_http_error(&mut stream, 405, "method not allowed");
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(&body) else {
+        let _ = write!(stream, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
-    }
-
-    // Path must be /rpc
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    let path = parts.get(1).unwrap_or(&"");
-    if path.trim_end_matches('/').trim_end_matches('/') != "/rpc" {
-        write_http_error(&mut stream, 404, "not found");
-        return;
-    }
-
-    // Parse JSON body
-    let request: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(value) => value,
-        Err(_) => {
-            write_http_error(&mut stream, 400, "invalid json");
-            return;
-        }
     };
 
-    // Auth check
     if request["token"].as_str() != Some(token) {
-        write_http_error(&mut stream, 401, "unauthorized");
+        let _ = write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     }
 
     let response_value = dispatch::dispatch(&state, &request);
     let response_str = serde_json::to_string(&response_value)
         .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize error"}"#.to_string());
-    write_http_success(&mut stream, &response_str);
+    let _ = writeln!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        response_str.len(),
+        response_str
+    );
+    let _ = stream.flush();
 
     if dispatch::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
         std::process::exit(0);
     }
 }
 
-fn write_http_success(stream: &mut TcpStream, body: &str) {
-    let _ = writeln!(
+/// SSE event stream: subscribe to the daemon's event bus and write received
+/// events as `text/event-stream` lines. The connection stays open until the
+/// client disconnects.
+fn handle_sse(mut stream: TcpStream, state: &DaemonState) {
+    // Write SSE headers
+    if writeln!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+    ).is_err() { return; }
     let _ = stream.flush();
-}
 
-fn write_http_error(stream: &mut TcpStream, status: u16, reason: &str) {
-    let body = serde_json::json!({"ok": false, "error": reason});
-    let body_str = serde_json::to_string(&body).unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
-    let _ = writeln!(
-        stream,
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        status,
-        reason,
-        body_str.len(),
-        body_str
-    );
+    // Subscribe to events
+    let (_sid, rx) = state.events.subscribe();
+
+    // Write snapshot of current state
+    let snapshot = serde_json::json!({
+        "tasks": state.manager.list().unwrap_or_default(),
+        "resources": {},
+    });
+    let _ = writeln!(stream, "event: snapshot\ndata: {}\n", snapshot);
     let _ = stream.flush();
+
+    // Forward events as they arrive
+    while let Ok(event) = rx.recv() {
+        let name = event.event_name();
+        let json = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned());
+        let _ = writeln!(stream, "event: {name}\ndata: {json}\n");
+        let _ = stream.flush();
+    }
 }
 
 /// Prevent multiple daemon instances from competing on the same discovery file.
@@ -248,7 +328,7 @@ fn ensure_single_instance() -> Option<ServerDiscovery> {
         }
         Err(_) => {
             // Port unreachable — stale discovery from a crashed daemon.
-            eprintln!("dshboxd: removing stale discovery at {} (pid {}) — proceeding", addr, existing.pid);
+            info!("removing stale discovery at {} (pid {}) — proceeding", addr, existing.pid);
             remove_discovery();
             None
         }

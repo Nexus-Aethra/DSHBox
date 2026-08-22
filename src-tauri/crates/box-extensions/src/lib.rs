@@ -169,8 +169,6 @@ pub type OwnerSet = BTreeSet<String>;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferenceCount {
     #[serde(default)]
-    pub containers: OwnerSet,
-    #[serde(default)]
     pub templates: OwnerSet,
 }
 
@@ -178,27 +176,23 @@ impl ReferenceCount {
     /// Total number of owners (containers + templates). Kept as `u32`
     /// for back-compat with the old numeric snapshot.
     pub fn total(&self) -> u32 {
-        (self.containers.len() + self.templates.len()) as u32
+        self.templates.len() as u32
     }
 
     pub fn is_empty(&self) -> bool {
-        self.containers.is_empty() && self.templates.is_empty()
+        self.templates.is_empty()
     }
 
     /// Returns true when the id was newly inserted.
     pub fn add(&mut self, kind: ReferenceKind, owner_id: &str) -> bool {
-        match kind {
-            ReferenceKind::Container => self.containers.insert(owner_id.to_owned()),
-            ReferenceKind::Template => self.templates.insert(owner_id.to_owned()),
-        }
+        let _ = kind;
+        self.templates.insert(owner_id.to_owned())
     }
 
     /// Returns true when the id was actually removed.
     pub fn remove(&mut self, kind: ReferenceKind, owner_id: &str) -> bool {
-        match kind {
-            ReferenceKind::Container => self.containers.remove(owner_id),
-            ReferenceKind::Template => self.templates.remove(owner_id),
-        }
+        let _ = kind;
+        self.templates.remove(owner_id)
     }
 }
 
@@ -207,7 +201,6 @@ impl ReferenceCount {
 /// are recorded against one built template's `list.json`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReferenceKind {
-    Container,
     Template,
 }
 
@@ -252,13 +245,6 @@ pub fn read_references(runtime: &Path) -> BTreeMap<String, ReferenceCount> {
         // never valid, so treat the numbers as zero and rewrite on next save.
         if let Some(object) = entry.as_object() {
             let mut rebuilt = ReferenceCount::default();
-            if let Some(arr) = object.get("containers").and_then(Value::as_array) {
-                for item in arr {
-                    if let Some(id) = item.as_str() {
-                        rebuilt.containers.insert(id.to_owned());
-                    }
-                }
-            }
             if let Some(arr) = object.get("templates").and_then(Value::as_array) {
                 for item in arr {
                     if let Some(id) = item.as_str() {
@@ -336,28 +322,6 @@ pub fn reconcile_owner_index(runtime: &Path) -> Result<ReconcileReport, String> 
 
     let mut truth: BTreeMap<String, ReferenceCount> = BTreeMap::new();
 
-    // Container-side owners: every container's per-container extension
-    // records that carry a `repository_id` count as one container owner
-    // for that plugin.
-    if let Ok(containers) = box_containers::scan_containers(root_str) {
-        for container in containers.values() {
-            let records = read_extension_records(container);
-            for record in records {
-                if record.kind != ExtensionKind::Plugin {
-                    continue;
-                }
-                let Some(repository_id) = record.repository_id.as_deref() else {
-                    continue;
-                };
-                truth
-                    .entry(repository_id.to_owned())
-                    .or_default()
-                    .containers
-                    .insert(container.id.clone());
-            }
-        }
-    }
-
     // Template-side owners: every built template's `list.json` Reference
     // resource counts as one template owner for the referenced plugin.
     let template_index = box_dsh_versions::read_template_index(root_str);
@@ -371,9 +335,20 @@ pub fn reconcile_owner_index(runtime: &Path) -> Result<ReconcileReport, String> 
             Err(_) => continue,
         };
         for resource in &list.resources {
-            if let box_api::TemplateResource::Reference { entry_id, .. } = resource {
+            if resource.source_kind != "plugin" {
+                continue;
+            }
+            // v8 manifests contain artifact-local paths and content hashes,
+            // not a repository id. Resolve the build-cache bookkeeping row
+            // by immutable package identity instead of reintroducing a path
+            // reference into the template format.
+            if let Some(repository_entry) = scan_repository(runtime).into_iter().find(|candidate| {
+                candidate.kind == ExtensionKind::Plugin
+                    && candidate.name == resource.name
+                    && candidate.content_digest == resource.sha256
+            }) {
                 truth
-                    .entry(entry_id.clone())
+                    .entry(repository_entry.id)
                     .or_default()
                     .templates
                     .insert(entry.id.clone());
@@ -387,14 +362,6 @@ pub fn reconcile_owner_index(runtime: &Path) -> Result<ReconcileReport, String> 
     report.owners_rebuilt = truth.len();
     for (id, true_set) in &truth {
         let cur = current.get(id);
-        let containers_added = match cur {
-            Some(prev) => true_set.containers.difference(&prev.containers).count(),
-            None => true_set.containers.len(),
-        };
-        let containers_pruned = match cur {
-            Some(prev) => prev.containers.difference(&true_set.containers).count(),
-            None => 0,
-        };
         let templates_added = match cur {
             Some(prev) => true_set.templates.difference(&prev.templates).count(),
             None => true_set.templates.len(),
@@ -403,8 +370,6 @@ pub fn reconcile_owner_index(runtime: &Path) -> Result<ReconcileReport, String> 
             Some(prev) => prev.templates.difference(&true_set.templates).count(),
             None => 0,
         };
-        report.containers_added += containers_added;
-        report.containers_pruned += containers_pruned;
         report.templates_added += templates_added;
         report.templates_pruned += templates_pruned;
     }
@@ -414,7 +379,6 @@ pub fn reconcile_owner_index(runtime: &Path) -> Result<ReconcileReport, String> 
         if truth.contains_key(id) {
             continue;
         }
-        report.containers_pruned += cur.containers.len();
         report.templates_pruned += cur.templates.len();
     }
 
@@ -950,34 +914,13 @@ mod tests {
         assert_eq!(reference_count(&root, "img-a"), 0);
         assert!(unused_repository_ids(&root).is_empty());
 
-        // Adding a container owner twice for two distinct ids produces a
-        // count of 2 (the set dedupes identical ids, so the second add
-        // for the same id is a no-op).
-        add_reference_owner(&root, "img-a", ReferenceKind::Container, "container-1").unwrap();
-        add_reference_owner(&root, "img-a", ReferenceKind::Container, "container-2").unwrap();
-        add_reference_owner(&root, "img-a", ReferenceKind::Container, "container-2").unwrap();
-        assert_eq!(reference_count(&root, "img-a"), 2);
-
-        // Template owners live in their own set.
         add_reference_owner(&root, "img-a", ReferenceKind::Template, "tpl-1").unwrap();
-        assert_eq!(reference_count(&root, "img-a"), 3);
+        add_reference_owner(&root, "img-a", ReferenceKind::Template, "tpl-1").unwrap();
+        assert_eq!(reference_count(&root, "img-a"), 1);
 
         // Persistence: a fresh read sees both sets.
         let snapshot = read_references(&root);
-        assert_eq!(snapshot["img-a"].containers.len(), 2);
         assert_eq!(snapshot["img-a"].templates.len(), 1);
-
-        // Removing one container id leaves the other intact.
-        remove_reference_owner(&root, "img-a", ReferenceKind::Container, "container-1").unwrap();
-        assert_eq!(read_references(&root)["img-a"].containers.len(), 1);
-
-        // Removing an unknown id is a no-op (no panic on drift).
-        remove_reference_owner(&root, "img-a", ReferenceKind::Container, "ghost").unwrap();
-        assert_eq!(read_references(&root)["img-a"].containers.len(), 1);
-
-        // Cross-kind removal does not touch the other set.
-        remove_reference_owner(&root, "img-a", ReferenceKind::Container, "container-2").unwrap();
-        assert_eq!(read_references(&root)["img-a"].templates.len(), 1);
 
         // Empty entries are dropped from the on-disk map so the file
         // stays compact for the unused check.
@@ -1092,13 +1035,6 @@ mod tests {
         // the canonical sources.
         let mut seeded = BTreeMap::new();
         seeded.insert(
-            "img-real".to_owned(),
-            ReferenceCount {
-                containers: BTreeSet::from(["container-ghost".to_owned()]),
-                ..ReferenceCount::default()
-            },
-        );
-        seeded.insert(
             "img-orphan".to_owned(),
             ReferenceCount {
                 templates: BTreeSet::from(["tpl-orphan".to_owned()]),
@@ -1108,21 +1044,11 @@ mod tests {
         write_references(&root, &seeded).unwrap();
 
         let report = reconcile_owner_index(&root).unwrap();
-        // The pre-seeded ghost container owner for `img-real` is
-        // dropped because no real container references it; the real
-        // container-alpha owner is added because the seed didn't
-        // know about it.
-        assert_eq!(report.containers_pruned, 1, "stale container owner dropped");
-        assert_eq!(report.containers_added, 1, "real container owner added");
         // `img-orphan` has no canonical reference, so the whole entry
         // (its template owner set) is wiped from the on-disk map.
         assert_eq!(report.templates_pruned, 1, "orphan entry dropped");
 
         let after = read_references(&root);
-        assert_eq!(
-            after["img-real"].containers,
-            BTreeSet::from(["container-alpha".to_owned()])
-        );
         assert!(after.get("img-orphan").is_none());
 
         if let Some(value) = prev_home {

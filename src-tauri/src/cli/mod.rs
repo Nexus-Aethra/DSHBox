@@ -22,6 +22,20 @@ use serde_json::json;
 use std::env;
 
 pub fn run() -> Option<i32> {
+    // Initialise the unified logger before any output. The CLI uses the
+    // standard `~/.dsh-box/logs/cli/` directory when no runtime is configured;
+    // the daemon path uses `<runtime>/logs/daemon/`.
+    {
+        let log_dir = box_logger::log_dir(
+            box_logger::LogComponent::Cli,
+            box_foundation::read_config()
+                .ok()
+                .and_then(|c| c.runtime_directory)
+                .as_deref(),
+        );
+        let _ = box_logger::init(box_logger::LogComponent::Cli, &log_dir);
+    }
+
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     // `container open` starts a GUI client with this private hand-off
     // argument. The desktop process then creates the DSH webview itself;

@@ -1,5 +1,7 @@
-//! DSH runtime DTOs, source repository constants, and the auto-generation
-//! of base templates for every installed DSH version.
+//! DSH runtime DTOs, source repository constants, and the harness clone +
+//! template-index pipeline. Templates are the single source of truth — the
+//! Harness tab in the UI is a derived view over the template index, no
+//! separate harness resource type is written any more.
 
 use box_foundation::{is_safe_identifier, mirror_url, now_seconds, read_config, BoxResult};
 use box_runtime::{remove_checkout, shallow_clone_with_cancel};
@@ -8,14 +10,17 @@ use std::{
     fs,
     path::PathBuf,
 };
+use tracing::info;
 
 pub const DSH_REPOSITORY: &str = "https://github.com/deepseek-ai/deepseek-harness.git";
 pub const DSH_TAGS_API: &str =
     "https://api.github.com/repos/deepseek-ai/deepseek-harness/tags?per_page=100";
 
-/// Canonical FROM reference used by every base template that this crate
-/// auto-generates. The `harness` Resources tab is now just a UI alias for
-/// these templates — there is no separate harness resource type any more.
+/// Canonical FROM reference used by every harness template this crate
+/// generates. Harness clones live at `<root>/runtimes/<tag>/source/` and
+/// their matching template entries sit in `<root>/state/template-index.json`
+/// — there is no separate harness resource type any more, the Harness tab
+/// in the UI is a derived view over the template index.
 pub const HARNESS_STANDARD_REF: &str = "github.com/deepseek-ai/deepseek-harness:latest";
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -23,18 +28,6 @@ pub const HARNESS_STANDARD_REF: &str = "github.com/deepseek-ai/deepseek-harness:
 pub struct DshVersion {
     pub name: String,
     pub installed: bool,
-}
-
-/// What one migration pass produced for a single installed DSH version.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct HarnessUpgradeReport {
-    pub version: String,
-    /// Absolute path of the base template this version owns.
-    pub template_path: String,
-    /// The base template was created by this pass. Existing templates are
-    /// never overwritten, so a second run reports `false` for every version.
-    pub template_created: bool,
 }
 
 /// A `pull template <ref>` request broken into its constituent pieces. The
@@ -123,7 +116,11 @@ pub fn templates_directory(root: &str) -> PathBuf {
     PathBuf::from(root).join("templates")
 }
 
-/// `<root>/templates/<version>.dsh` — base build script for a version.
+/// `<root>/templates/<version>.dsh` — base build script for a version. Older
+/// `pull_template` runs dropped a flat alias here so `build_image` could
+/// resolve templates by their DSH version. Newer versions write the script
+/// body to the content-addressable hash directory and keep this alias only
+/// as a read-side fallback for users that already have one on disk.
 pub fn harness_template_path(root: &str, version: &str) -> PathBuf {
     templates_directory(root).join(format!("{version}.dsh"))
 }
@@ -168,7 +165,10 @@ pub fn template_content_path(root: &str, id: &str) -> PathBuf {
 }
 
 pub fn template_manifest_path(root: &str, id: &str) -> PathBuf {
-    template_storage_root(root).join(id).join("manifest.json")
+    // `manifest.json` is the v8 built-template resource list. Keep the
+    // index-facing metadata separate so writing one cannot overwrite the
+    // other (source templates use this file too).
+    template_storage_root(root).join(id).join("entry.json")
 }
 
 /// FNV-1a 64-bit hash of a single template script. The content is the
@@ -202,6 +202,47 @@ pub struct TemplateEntry {
     /// (`list.json`) instead of a source script (`script.dsh`).
     #[serde(default)]
     pub built: bool,
+    /// `Root` for the official `github.com/deepseek-ai/deepseek-harness*`
+    /// template family (gets the optimised install path with `.dsh-prepared`
+    /// + `prepared-source` symlink so DSH host boot skips `pnpm install`),
+    /// `Common` for everything else (user-authored, imported, built). New
+    /// field — older index files default to `Common` so legacy installs
+    /// keep working without a migration.
+    #[serde(default)]
+    pub kind: TemplateKind,
+}
+
+/// Whether a template is part of the official harness family (`Root`) or a
+/// user-authored / imported / built template (`Common`). The split exists so
+/// `Root` templates can take a faster install path; the storage layout,
+/// data-scheduler bookkeeping, and IPC DTOs are identical between the two.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TemplateKind {
+    #[default]
+    Common,
+    Root,
+}
+
+impl TemplateKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Common => "common",
+            Self::Root => "root",
+        }
+    }
+}
+
+/// True when `ref_value` is part of the official harness family. The check
+/// is purely a prefix match on the user-facing ref so a hypothetical fork
+/// (`github.com/<fork>/deepseek-harness`) stays `Common` and only the
+/// upstream repo triggers the optimised path.
+pub fn classify_kind(ref_value: &str) -> TemplateKind {
+    if ref_value.starts_with("github.com/deepseek-ai/deepseek-harness") {
+        TemplateKind::Root
+    } else {
+        TemplateKind::Common
+    }
 }
 
 pub type TemplateIndex = std::collections::BTreeMap<String, TemplateEntry>;
@@ -237,6 +278,7 @@ pub fn write_template_with_entry(
     profile: &str,
     from_ref: Option<String>,
     imported_at: u64,
+    kind: TemplateKind,
 ) -> Result<TemplateEntry, String> {
     let id = template_content_hash(text);
     let dir = template_storage_root(root).join(&id);
@@ -250,6 +292,7 @@ pub fn write_template_with_entry(
         imported_at,
         from_ref,
         built: false,
+        kind,
     };
     let manifest = serde_json::json!({
         "name": entry.name,
@@ -258,6 +301,7 @@ pub fn write_template_with_entry(
         "profile": entry.profile,
         "importedAt": entry.imported_at,
         "fromRef": entry.from_ref,
+        "kind": entry.kind.as_str(),
     });
     fs::write(
         template_manifest_path(root, &id),
@@ -288,7 +332,23 @@ pub fn collect_unreferenced_template_hash(root: &str, id: &str, index: &Template
 }
 
 pub fn built_template_list_path(root: &str, id: &str) -> PathBuf {
-    template_storage_root(root).join(id).join("list.json")
+    template_storage_root(root).join(id).join("manifest.json")
+}
+
+/// The on-disk directory for one built template — every resource row in
+/// `manifest.json` references files under this path (relative), so the
+/// materialiser can copy them into the container profile without going
+/// through the runtime plugin repository.
+pub fn built_template_artifact_dir(root: &str, id: &str) -> PathBuf {
+    template_storage_root(root).join(id)
+}
+
+pub fn built_template_repository_dir(root: &str, id: &str) -> PathBuf {
+    template_storage_root(root).join(id).join("repository")
+}
+
+pub fn built_template_data_dir(root: &str, id: &str) -> PathBuf {
+    template_storage_root(root).join(id).join("data")
 }
 
 /// Persist a built template (the metadata-only product of `dshbox build`)
@@ -296,6 +356,14 @@ pub fn built_template_list_path(root: &str, id: &str) -> PathBuf {
 /// there is no separate image registry, only built templates. The id is
 /// the fnv1a64 hash of the serialised resource list; re-building under
 /// the same name retires the previous hash.
+///
+/// Every resource referenced by the list is expected to already live
+/// under `<root>/templates/<id>/repository/...` or
+/// `<root>/templates/<id>/data/<digest>/` — this function only writes
+/// `manifest.json` (the resource list) and the per-hash `manifest.json`
+/// index entry. The resource materialisation itself happens in the
+/// caller so we can fail loudly for one row without abandoning an
+/// otherwise-good build.
 pub fn write_built_template(
     root: &str,
     list: &box_api::TemplateResourceList,
@@ -304,7 +372,12 @@ pub fn write_built_template(
     let id = template_content_hash(&body);
     let dir = template_storage_root(root).join(&id);
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-    fs::write(dir.join("list.json"), &body).map_err(|error| error.to_string())?;
+    fs::write(dir.join("manifest.json"), &body).map_err(|error| error.to_string())?;
+    // Built templates inherit their kind from the base ref. The `base` field
+    // is the user-facing reference (`github.com/.../deepseek-harness:latest`
+    // for harness builds, anything else for user-authored builds), so the
+    // same classify function drives both pull and build classification.
+    let kind = classify_kind(&list.base);
     let entry = TemplateEntry {
         name: list.name.clone(),
         id: id.clone(),
@@ -313,6 +386,7 @@ pub fn write_built_template(
         imported_at: list.created_at,
         from_ref: Some(list.base.clone()),
         built: true,
+        kind,
     };
     let manifest = serde_json::json!({
         "name": entry.name,
@@ -322,6 +396,7 @@ pub fn write_built_template(
         "importedAt": entry.imported_at,
         "fromRef": entry.from_ref,
         "built": true,
+        "kind": entry.kind.as_str(),
     });
     fs::write(
         template_manifest_path(root, &id),
@@ -352,11 +427,12 @@ pub fn read_built_template(
     if !entry.built {
         return Ok(None);
     }
-    let path = built_template_list_path(root, &entry.id);
+    let dir = template_storage_root(root).join(&entry.id);
+    let path = dir.join("manifest.json");
     if !path.is_file() {
         return Err(format!(
-            "built template `{name}` is corrupt: {} missing",
-            path.display()
+            "built template `{name}` is corrupt: manifest.json missing in {}",
+            dir.display()
         ));
     }
     let text = fs::read_to_string(&path)
@@ -382,8 +458,10 @@ pub fn referenced_snapshot_digests(root: &str) -> Result<Vec<String>, String> {
             continue;
         };
         for resource in &list.resources {
-            if let box_api::TemplateResource::Snapshot { digest, .. } = resource {
-                digests.push(digest.clone());
+            if resource.source_kind != "plugin" {
+                if let Some(digest) = resource.source.strip_prefix("data/") {
+                    digests.push(digest.to_owned());
+                }
             }
         }
     }
@@ -418,57 +496,6 @@ pub fn installed_versions(root: &str) -> BoxResult<Vec<String>> {
     Ok(versions)
 }
 
-/// Ensure every installed DSH version has a base `.dsh` template under
-/// `<root>/templates/`. The template is the canonical harness reference —
-/// the Resources page surfaces it both as a "Harness" entry (for new users)
-/// and as a regular template that can be extended with `ADD` lines.
-///
-/// Idempotent: a second run reports every flag `false`. A version that
-/// fails to materialise its template is skipped without aborting the others.
-pub fn upgrade_legacy_harness(root: &str) -> BoxResult<Vec<HarnessUpgradeReport>> {
-    let mut reports = Vec::new();
-    for version in installed_versions(root)? {
-        let report = HarnessUpgradeReport {
-            version: version.clone(),
-            template_path: harness_template_path(root, &version)
-                .to_string_lossy()
-                .into_owned(),
-            template_created: write_base_template(root, &version),
-        };
-        reports.push(report);
-    }
-    Ok(reports)
-}
-
-/// Returns `true` when the base template was created. Existing templates
-/// are left untouched so user edits survive re-runs.
-pub fn write_base_template(root: &str, version: &str) -> bool {
-    let path = harness_template_path(root, version);
-    if path.exists() {
-        return false;
-    }
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let body = format!(
-        "# DSH Box base template (auto-generated)\n\
-         # Extend this script with ADD plugin|skill lines and build it from\n\
-         # the Template tab.\n\
-         FROM {HARNESS_STANDARD_REF}\n\
-         PROFILE web\n\
-         NAME {version}\n\
-         VERSION latest\n"
-    );
-    fs::write(&path, body).is_ok()
-}
-
-/// Idempotent entry point used right after a harness install: generates the
-/// base template when it does not exist yet and reports whether it was
-/// created. Existing templates are never overwritten.
-pub fn ensure_base_template(root: &str, version: &str) -> bool {
-    write_base_template(root, version)
-}
-
 /// Pull a template by reference: clone the upstream repository into the
 /// runtime directory, record the commit, and materialise the base template
 /// that other containers can extend. Returns the resolved `version` slug.
@@ -483,11 +510,46 @@ pub fn pull_template(
 ) -> BoxResult<String> {
     let parsed = parse_template_ref(ref_value)?;
     let destination = version_directory(root, &parsed.version);
+    info!(ref = %ref_value, version = %parsed.version, dest = %destination.display(), "pulling template");
     if destination.exists() {
-        return Err(format!(
-            "template version already exists: {}",
-            destination.display()
-        ));
+        let index = read_template_index(root);
+        let indexed = index.values().any(|entry| {
+            entry.harness_ref.as_deref() == Some(parsed.version.as_str())
+        });
+        let complete = destination.join(".dshbox-runtime.json").is_file();
+        if indexed {
+            // Fully installed harness the index still knows about — the
+            // user is re-pulling a version that never went away. Refuse
+            // rather than silently re-clone over their work.
+            return Err(format!(
+                "template version already exists: {}",
+                destination.display()
+            ));
+        }
+        if complete {
+            // Orphaned but complete runtime clone: the template index entry
+            // was removed (e.g. `template rm`, `remove_template`) but the
+            // clone was left behind. Reuse it and re-materialise the index
+            // entry — faster than re-cloning hundreds of megabytes, and
+            // this is exactly the "delete template then reinstall" flow.
+            let marker: serde_json::Value = fs::read_to_string(
+                destination.join(".dshbox-runtime.json"),
+            )
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+            let commit = marker
+                .get("commit")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            write_pulled_base_template(root, &parsed, ref_value, &commit, destination.to_str())?;
+            return Ok(parsed.version);
+        }
+        // Incomplete clone (half-removed, or killed mid-download): discard
+        // the partial directory and re-clone from scratch. A dangling
+        // `.dshbox-runtime.json` and/or partial checkout is not usable.
+        remove_checkout(&destination);
     }
     fs::create_dir_all(
         destination
@@ -530,6 +592,7 @@ pub fn pull_template(
     // the harness tag (e.g. `latest` or `v0.1.0`) is part of the filename
     // and two distinct refs do not overwrite each other.
     write_pulled_base_template(root, &parsed, &ref_value, &commit, destination.to_str())?;
+    info!(version = %parsed.version, commit = %commit, "template pull complete");
     Ok(parsed.version)
 }
 
@@ -558,6 +621,7 @@ fn write_pulled_base_template(
     // Always surface a non-empty `version` so the UI / CLI can render the
     // template's harness tag column. A bare pull resolves to `:latest`.
     let harness_ref = Some(parsed.tag.clone().unwrap_or_else(|| "latest".to_owned()));
+    let kind = classify_kind(ref_value);
     let _ = write_template_with_entry(
         root,
         &name,
@@ -566,9 +630,11 @@ fn write_pulled_base_template(
         "web",
         Some(ref_value.to_owned()),
         now_seconds(),
+        kind,
     )?;
-    // Legacy alias kept for `build_image` compatibility: the old build
-    // path reads `templates/<version>.dsh` to resolve the script body.
+    // Legacy flat alias — keep writing it so older `build_image` callers
+    // (and CLI users resolving templates by `latest`/`v0.1.0`) continue
+    // to find the script body at the path they expect.
     let legacy = harness_template_path(root, &parsed.version);
     let _ = std::fs::write(&legacy, &body);
     Ok(())
@@ -608,67 +674,6 @@ mod tests {
         fs::create_dir_all(source.join(".git")).unwrap();
         let versions = installed_versions(dir.to_str().unwrap()).unwrap();
         assert_eq!(versions, vec!["v0.1.0"]);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn generates_base_template_for_each_installed_version() {
-        let dir = fixture("generate");
-        let root = dir.to_str().unwrap();
-        let reports = upgrade_legacy_harness(root).unwrap();
-        assert_eq!(reports.len(), 1);
-        let report = &reports[0];
-        assert_eq!(report.version, "v0.1.0");
-        assert!(report.template_created);
-        assert!(report.template_path.ends_with("templates/v0.1.0.dsh"));
-
-        let template = fs::read_to_string(dir.join("templates/v0.1.0.dsh")).unwrap();
-        assert!(template.contains(&format!("FROM {HARNESS_STANDARD_REF}")));
-        assert!(template.contains("PROFILE web"));
-        assert!(template.contains("NAME v0.1.0"));
-        assert!(!template.contains("ADD data"));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn second_run_is_idempotent() {
-        let dir = fixture("idempotent");
-        let root = dir.to_str().unwrap();
-        upgrade_legacy_harness(root).unwrap();
-        let reports = upgrade_legacy_harness(root).unwrap();
-        assert_eq!(reports.len(), 1);
-        assert!(!reports[0].template_created);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn existing_template_is_not_overwritten() {
-        let dir = fixture("keep-template");
-        fs::create_dir_all(dir.join("templates")).unwrap();
-        fs::write(dir.join("templates/v0.1.0.dsh"), "custom template body").unwrap();
-        let root = dir.to_str().unwrap();
-        let reports = upgrade_legacy_harness(root).unwrap();
-        assert!(!reports[0].template_created);
-        assert_eq!(
-            fs::read_to_string(dir.join("templates/v0.1.0.dsh")).unwrap(),
-            "custom template body"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn ensure_base_template_is_idempotent() {
-        let dir = fixture("ensure-template");
-        let root = dir.to_str().unwrap();
-        assert!(ensure_base_template(root, "v0.1.0"));
-        let path = dir.join("templates/v0.1.0.dsh");
-        assert!(path.is_file());
-        let body = fs::read_to_string(&path).unwrap();
-        assert!(body.contains("FROM github.com/deepseek-ai/deepseek-harness:latest"));
-        // Second run must not overwrite user edits.
-        fs::write(&path, "edited").unwrap();
-        assert!(!ensure_base_template(root, "v0.1.0"));
-        assert_eq!(fs::read_to_string(&path).unwrap(), "edited");
         let _ = fs::remove_dir_all(&dir);
     }
 

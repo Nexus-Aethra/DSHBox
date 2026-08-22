@@ -3,7 +3,7 @@
 //! profile scaffolding it needs) plus the startup helpers the daemon
 //! lifecycle uses (workspace, context snapshot, profile preflight).
 
-use crate::toolchains::{command_for_toolchain, resolve_toolchain, wait_for_process};
+use crate::toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel};
 use box_containers::DshContainer;
 use box_dsh_context::{
     render_patch_yml, render_snapshot, DshContextFiles, DEFAULT_ORDER, PATCH_FILENAME,
@@ -11,11 +11,12 @@ use box_dsh_context::{
 };
 use box_dsh_versions::version_directory as dsh_version_directory;
 use box_foundation::{is_safe_identifier, read_config};
+use box_runtime::process::{ExecutionKind, ProcessSpec};
 use box_scheduler::TaskContext;
+use std::time::Duration;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -23,7 +24,8 @@ use std::{
 /// can open the workspace and immediately read how a boxfile is written.
 /// The body covers every supported directive and source shape so users do
 /// not have to leave the container to consult documentation.
-const BOXFILE_GUIDE_SKILL: &str = r#"---
+#[cfg(any())]
+const LEGACY_BOXFILE_GUIDE_SKILL: &str = r#"---
 name: dshbox-guide
 description: Use when working with DSH Box — authoring a boxfile (`.dsh`), choosing ADD sources for 插件/技能/数据, running `dshbox` commands to manage templates and containers, or troubleshooting anything that touches container lifecycle, plugins, skills, or the dshbox daemon.
 ---
@@ -32,7 +34,7 @@ description: Use when working with DSH Box — authoring a boxfile (`.dsh`), cho
 
 `dshbox` 是 DSH 容器**外部**的管理 CLI——它装模板、拉插件、起停容器、跑 boxfile build/run 全链路。`dsh` 是 DSH 容器**内部**的 agent CLI——你在容器里跟 agent 对话时调的是 `dsh`,不是 `dshbox`。
 
-> 记住这条边界: **容器管理走 `dshbox`;容器内跟 agent 对话走 `dsh`。** 容器里 `dshbox` 也在 PATH 上(它是 thin RPC client,跟本地 daemon 通讯),但你日常基本不会直接调它。
+36	> 记住这条边界: **容器管理走 `dshbox`;容器内跟 agent 对话走 `dsh`。** 容器里 `dshbox` 也在 PATH 上(它是 thin RPC client,跟本地 daemon 通过 HTTP 通讯),但你日常基本不会直接调它。
 
 `dshbox` 命令分四组:**Workflow**(init / pull / build / run 起一个完整容器)、**Template 管理**(template ls / show / rm)、**Plugin & Skill**(plugin ls / import / install / skill install)、**Container 操作**(ps / container start / stop / restart / rm / logs / url)。完整列表 `dshbox help`。
 
@@ -233,32 +235,55 @@ DSH Box 在 build 阶段会自动:
 
 ### 单 daemon + 多 thin client
 
-DSH Box 只有一个长进程:**`dshboxd`**。它拥有 task queue、所有运行中的容器 host 进程、plugin 安装、template store。`dshbox` CLI 和桌面 Tauri 都是 thin RPC client,跟 daemon 通过 `127.0.0.1:<port>` 上的 `POST /rpc` 通讯(token 在 JSON body 里)。
+	DSH Box 只有一个长进程:**`dshboxd`**。它拥有 task queue、所有运行中的容器 host 进程、plugin 安装、template store。`dshbox` CLI 和桌面 Tauri 都是 thin RPC client,跟 daemon 通过 `127.0.0.1:<port>` 上的 `POST /rpc` 通讯(token 在 JSON body 里)。
 
-```
-        ┌────────────────────────┐
-        │ dshboxd (single owner) │
-        │  - tasks / plugins     │
-        │  - container hosts     │
-        │  - template store      │
-        │  - ~/.dsh-box/server/  │
-        └───────────▲────────────┘
-                    │ JSON-RPC (token in body)
-        ┌───────────┴────────────┐
-        │  thin clients         │
-        │  - `dsh` CLI          │
-        │  - Tauri desktop UI   │
-        │  - WebView container  │
-        └────────────────────────┘
-```
+	```
+	        ┌────────────────────────┐
+	        │ dshboxd (single owner) │
+	        │  - tasks / plugins     │
+	        │  - container hosts     │
+	        │  - template store      │
+	        │  - ~/.dsh-box/server/  │
+	        └───────────▲────────────┘
+	                    │ POST /rpc + GET /events (SSE)
+	        ┌───────────┴────────────┐
+	        │  thin clients         │
+	        │  - `dshbox` CLI       │
+	        │  - Tauri desktop UI   │
+	        │  - curl (debug)       │
+	        └────────────────────────┘
+	```
 
-### 单实例保护
+	### 双模 RPC: sync / async
 
-`dshboxd` 启动时读 `~/.dsh-box/server/discovery.json` 里的旧 daemon 的 PID/端口,做 `TCP connect_timeout(250ms)`。连得上 → 旧 daemon 还活着,新 daemon 退出。连不上 → 僵尸 discovery,清掉继续 bind。所以两个 `dshboxd` 不会并发跑。
+	`POST /rpc` 是所有客户端的唯一入口。daemon 自己决定 sync 还是 async：
 
-### 容器 host 进程的生命周期
+	- **同步方法**（`list_templates`, `ping`, `cancel_task`, `save_*`）直接返回 JSON：`{"ok":true,"result":...}`
+	- **异步方法**（`pull_template`, `create_container_from_template`, `enqueue_container_start`）排队任务后立即返回 `{"ok":true,"task":{...},"eventsUrl":"/events"}`
+	- 客户端不需要指定 sync/async——daemon 通过 `HandlerResult::Sync/Async` 枚举自动区分
 
-每个容器启动时:
+	### SSE 事件流 (GET /events)
+
+	异步任务的进度通过 SSE (Server-Sent Events) 实时推送：
+
+	```
+	curl -N "http://127.0.0.1:<port>/events?token=..."
+
+	→ event: snapshot    data: {"tasks":[...]}
+	→ event: TaskStage   data: {"id":"...","stage":"Installing","progress":45}
+	→ event: TaskLog     data: {"id":"...","log":"downloading..."}
+	→ event: TaskFinished data: {"id":"...","status":"succeeded"}
+	```
+
+	桌面 Tauri 的 `events.rs` 订阅 SSE 并桥接为 `daemon://event` 事件，`useTasks.ts` 前端按 `event` 字段路由。跑 `curl -N` 就能一行行看到所有任务进度。
+
+	### 单实例保护
+
+	`dshboxd` 启动时读 `~/.dsh-box/server/discovery.json` 里的旧 daemon 的 PID/端口,做 `TCP connect_timeout(250ms)`。连得上 → 旧 daemon 还活着,新 daemon 退出。连不上 → 僵尸 discovery,清掉继续 bind。所以两个 `dshboxd` 不会并发跑。
+
+	### 容器 host 进程的生命周期
+
+	每个容器启动时:
 
 1. `start_dsh_container_inner` 用 `setsid` 让 host 成为 process group leader,spawn `pnpm dsh --profile ...`
 2. 写入 `instances/<id>/state/host.json`(字段: `hostPid`, `hostPgid`, `hostPort`, `hostUrl`, `state`, `generation`, ...)
@@ -337,7 +362,175 @@ DSH Box 只有一个长进程:**`dshboxd`**。它拥有 task queue、所有运�
 - `dsh --version` 确认 CLI 和 daemon 来自同一 build batch。Daemon 启动时做 build-stamp 校验,如果不一致会自动重启。
 - `tail -f ~/.dsh-box/logs/daemon.log`(或 `dsh logs daemon`)—— daemon 自身的 stdout/stderr,看 start-up / reconcile / RPC error。
 
-完整命令清单:`dsh help` 或 `dsh <command> help`(例如 `dsh run help`)。
+	完整命令清单:`dsh help` 或 `dsh <command> help`(例如 `dsh run help`)。
+
+	## §7 — RPC API 参考
+
+	所有客户端（CLI、桌面 UI、curl）都走 `POST /rpc` 单一入口。daemon 自动决定 sync/async：
+
+	```
+	# 同步——直接返回结果
+	POST /rpc   {"method":"ping","token":"..."}
+	→ {"ok":true, "result": {"pid":123,"status":"running"}}
+
+	# 异步——排队任务，返回 TaskRecord
+	POST /rpc   {"method":"pull_template","ref":"github.com/...","token":"..."}
+	→ {"ok":true, "task": {"id":"...","kind":"template-pull","status":"queued"}, "eventsUrl":"/events"}
+
+	# 错误
+	→ {"ok":false, "error":"template not found"}
+	```
+
+	### 同步方法一览
+
+	| method | 参数 | 返回 |
+	|--------|------|------|
+	| `ping` | — | daemon 运行状态 |
+	| `get_info` | — | 版本、runtime、容器数、插件数 |
+	| `list_containers` | — | `[DshContainer]` |
+	| `list_templates` | — | `[TemplateInfo]` |
+	| `list_bundles` | — | 扩展包列表 |
+	| `list_repository_extensions` | — | 仓库插件/技能列表 |
+	| `list_installed_dsh_versions` | — | 已安装 DSH 版本 |
+	| `list_dsh_catalog` | — | 可安装的 DSH 版本（含 installed 标记） |
+	| `list_tasks` | — | `[TaskRecord]` |
+	| `list_data_entries` | — | 数据条目 |
+	| `list_repository_reference_counts` | — | 引用计数 |
+	| `task_status` | `id` | 单个 TaskRecord |
+	| `cancel_task` | `id` | `{"cancelled":true}` |
+	| `delete_task` | `id` | — |
+	| `container_url` | `id` | 容器 webview URL |
+	| `template_info` | `name` | 模板详情 |
+	| `read_template` | `name` | 模板脚本正文 |
+	| `read_template_list` | `name` | built template 资源清单 |
+	| `save_mirror_settings` | `githubMirror`, `npmRegistry` | — |
+	| `save_runtime_directory` | `directory` | — |
+	| `container_list_plugins` | `containerId`, `profile` | 插件列表 |
+	| `remove_template` | `name` | — |
+	| `remove_repository_plugin` | `id`, `profile`, `name` | — |
+	| `delete_extension_bundle` | `id` | — |
+	| `shutdown` | — | 停止 daemon |
+
+	### 异步方法一览
+
+	异步方法返回 `TaskRecord` 后，通过 `GET /events?token=...` 订阅进度：
+
+	| method | 参数 | kind |
+	|--------|------|------|
+	| `pull_template` | `ref` | `template-pull` |
+	| `create_container_from_template` | `name`, `template`, `profile` | `template-container` |
+	| `enqueue_container_start` | `id` | `container-start` |
+	| `enqueue_container_stop` | `id` | `container-stop` |
+	| `enqueue_container_rebuild` | `id` | `container-rebuild` |
+	| `enqueue_container_restart` | `id` | `container-restart` |
+	| `enqueue_container_extension_add` | `id`, `profile`, `source` | `container-extension-add` |
+	| `enqueue_container_extension_copy` | `id`, `profile`, `repositoryId` | `container-extension-copy` |
+	| `enqueue_container_bundle_install` | `id`, `profile`, `bundleId`, `conflict` | `container-bundle-install` |
+	| `enqueue_build` | `scriptPath`, `outputPath`, `containerName` | `image-build` |
+	| `enqueue_repository_extension_import` | `source` | `repository-extension-import` |
+	| `enqueue_repository_extension_export` | `repositoryId`, `destination` | `repository-extension-export` |
+	| `enqueue_workspace_extension_import` | `id`, `relativePath` | `workspace-extension-import` |
+	| `enqueue_plugin_export` | `sourceContainerId`, `sourcePath`, `destination` | `plugin-export` |
+	| `enqueue_bundle_import` | `archive`, `conflict` | `bundle-import` |
+	| `enqueue_bundle_export` | `bundleId`, `destination`, `mode` | `bundle-export` |
+	| `refresh_dsh_catalog` | — | `dsh-catalog-refresh` |
+
+	### 调试示例
+
+	```bash
+	# 1. 取 token + port
+	cat ~/.dsh-box/server/discovery.json
+
+	# 2. 同步：ping
+	curl -s -X POST http://127.0.0.1:<port>/rpc \
+	  -H "Content-Type: application/json" \
+	  -d '{"method":"ping","token":"<token>"}'
+
+	# 3. 异步：拉模板
+	curl -s -X POST http://127.0.0.1:<port>/rpc \
+	  -H "Content-Type: application/json" \
+	  -d '{"method":"pull_template","ref":"github.com/deepseek-ai/deepseek-harness:latest","token":"<token>"}'
+	# → {"ok":true,"task":{...},"eventsUrl":"/events"}
+
+	# 4. 订阅事件（新开 terminal）
+	curl -N "http://127.0.0.1:<port>/events?token=<token>"
+	# → event: snapshot
+	# → event: TaskStage    data: {"id":"...","stage":"Cloning","progress":10}
+	# → event: TaskFinished data: {"id":"...","status":"succeeded"}
+	```"#;
+
+const BOXFILE_GUIDE_SKILL: &str = r#"---
+name: dshbox-guide
+description: Use when creating or troubleshooting DSH Box templates and containers.
+---
+
+# DSH Box Guide
+
+`dshbox` manages templates and containers. `dsh` is the Harness command that
+runs inside a container profile.
+
+## Standard workflow
+
+```bash
+dshbox pull template github.com/deepseek-ai/deepseek-harness:<tag>
+dshbox build ./boxfile.dsh
+dshbox run <template-name>
+```
+
+`build` creates a reusable template recipe. `run` creates a new container,
+installs its dependencies in the final container path, builds Harness, and
+starts the host. Use `dshbox ps`, `dshbox container logs <id>`, and
+`dshbox container stop <id>` for lifecycle operations.
+
+## Current Boxfile syntax
+
+```dsh
+FROM github.com/deepseek-ai/deepseek-harness:dsh-v0.1.0-rc.8
+PROFILE web
+NAME my-template
+VERSION 1.0.0
+ADD plugin github.com/owner/plugin-repository
+```
+
+Supported directives are `FROM`, `PROFILE`, `NAME`, `VERSION`, `LABEL`, and
+`ADD plugin <pnpm-source>`. A source may be a registry package, a GitHub short
+form (`github.com/owner/repo`), or a pnpm Git spec (`git+https://...`). Pull
+the exact `FROM` template before building.
+
+`ADD skill` and `ADD data` are not supported by the current sealed-template
+builder. Keep skills and data outside a Boxfile until that feature is added.
+
+## Git plugins with build scripts
+
+pnpm requires an explicit approval for lifecycle scripts. When a plugin or any
+transitive dependency it pulls in runs `install`/`postinstall`/`prepare`, pnpm
+11 surfaces the blocked package through
+`[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: <keys>` and refuses to
+proceed.
+
+`LABEL dshbox.allow-build=<git-source>` is enough: as long as the user has
+authorized the top-level plugin source, DSH Box reads pnpm's ignored-builds
+listing, writes every transitive `package@version` key it names into the
+profile's `pnpm-workspace.yaml` `allowBuilds:` map, and retries the install
+automatically. The hint surfaced by an older Box is no longer required:
+
+```dsh
+ADD plugin github.com/omdsh-dev/DSH-better-sidebar
+LABEL dshbox.allow-build=git+https://github.com/omdsh-dev/DSH-better-sidebar
+```
+
+Do not use a global allow-all setting — the per-plugin grant is the entire
+trust boundary for plugin build scripts. If a plugin's install fails after
+DSH Box has auto-derived keys, the retained diagnostic will still show the
+exact `package@version` pnpm printed, and that key can be added to the same
+LABEL value as a comma-separated override.
+
+## Troubleshooting
+
+- `template not found`: run `dshbox pull template` with the same `FROM` ref.
+- `plugin add failed`: read the task error; it includes a copyable
+  `dshbox.allow-build` label when pnpm needs approval.
+- Host fails after build: use `dshbox container logs <id>`.
 "#;
 
 const BOXFILE_GUIDE_SKILL_NAME: &str = "dshbox-guide";
@@ -492,10 +685,15 @@ pub(crate) fn ensure_container_workspace(directory: &Path) -> Result<PathBuf, St
 /// Render the per-container JSON snapshot Box writes on every container start.
 /// The snapshot becomes a `dsh-box:container` PromptContext section (order
 /// 130) that the agent receives as a user-role history snapshot.
+///
+/// `dshbox_home` is the absolute path to the dshbox installation directory
+/// (e.g. `D:\dshbox\`), resolved by the caller so the snapshot carries the
+/// install location for the in-container agent.
 pub(crate) fn write_dshbox_context_snapshot(
     directory: &Path,
     container: &serde_json::Value,
     profile: &str,
+    dshbox_home: &Path,
 ) -> Result<DshContextFiles, String> {
     let workspace = ensure_container_workspace(directory)?;
     let container_name = container["name"].as_str().unwrap_or("DSH Container");
@@ -516,6 +714,21 @@ pub(crate) fn write_dshbox_context_snapshot(
     let snapshot_path = state_dir.join(SNAPSHOT_FILENAME);
     let patch_path = state_dir.join(PATCH_FILENAME);
 
+    // Compute the dshbox CLI binary path. On Windows the binary has `.exe`
+    // extension; on Unix it's bare. The agent uses this path when `dshbox`
+    // is not in PATH (e.g. DSH subprocesses that inherit a sanitised env).
+    let dshbox_cli = {
+        let mut binary = dshbox_home.to_path_buf();
+        binary.push("dshbox");
+        // EXE_SUFFIX includes the leading dot (".exe"); set_extension
+        // adds its own dot, so strip the prefix.
+        binary.set_extension(
+            std::env::consts::EXE_SUFFIX
+                .strip_prefix('.')
+                .unwrap_or("exe"),
+        );
+        binary
+    };
     let snapshot_body = render_snapshot(
         container_id,
         container_name,
@@ -526,6 +739,8 @@ pub(crate) fn write_dshbox_context_snapshot(
         &plugins_root,
         &skills_root,
         &logs_root,
+        dshbox_home,
+        &dshbox_cli,
         &api_key_envs,
     );
     // Atomic write: stage to .tmp then rename so a racing read never sees a
@@ -608,6 +823,7 @@ pub(crate) fn repair_known_profile_template(
 /// Ensures every non-bundled DSH plugin selected by a profile has its
 /// declared runtime entry, preparing TypeScript sources before the DSH
 /// loader attempts to import them.
+#[allow(dead_code, reason = "superseded by DSH-managed plugin preparation")]
 pub(crate) fn preflight_profile_plugins(
     container_directory: &Path,
     profile: &str,
@@ -671,6 +887,7 @@ pub(crate) fn preflight_profile_plugins(
     Ok(())
 }
 
+#[allow(dead_code, reason = "only used by the retired profile preflight path")]
 fn plugin_source_directory(plugin_directory: &Path) -> PathBuf {
     fs::canonicalize(plugin_directory.join("node_modules"))
         .ok()
@@ -678,6 +895,7 @@ fn plugin_source_directory(plugin_directory: &Path) -> PathBuf {
         .unwrap_or_else(|| plugin_directory.to_path_buf())
 }
 
+#[allow(dead_code, reason = "only used by the retired profile preflight path")]
 pub(crate) fn plugin_runtime_entry(manifest: &serde_json::Value) -> Option<String> {
     manifest
         .get("main")
@@ -691,6 +909,7 @@ pub(crate) fn plugin_runtime_entry(manifest: &serde_json::Value) -> Option<Strin
         })
 }
 
+#[allow(dead_code, reason = "only used by the retired profile preflight path")]
 pub(crate) fn prepare_plugin_source(
     directory: &Path,
     name: &str,
@@ -700,16 +919,13 @@ pub(crate) fn prepare_plugin_source(
 ) -> Result<(), String> {
     let pnpm = resolve_toolchain("pnpm")?;
     let task_record = task.manager.task(&task.task_id)?;
-    let log = fs::OpenOptions::new()
-        .append(true)
-        .open(&task_record.log_path)
-        .map_err(|error| error.to_string())?;
     let frozen = if directory.join("pnpm-lock.yaml").is_file() {
         "--frozen-lockfile"
     } else {
         "--no-frozen-lockfile"
     };
-    let mut install = command_for_toolchain(&pnpm)
+    let install_spec = ProcessSpec::new(pnpm.path.clone())
+        .args(&pnpm.arguments)
         .args([
             "--dir",
             directory.to_string_lossy().as_ref(),
@@ -717,15 +933,18 @@ pub(crate) fn prepare_plugin_source(
             "--force",
             frozen,
         ])
-        .stdout(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .stderr(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .spawn()
+        .policy(pnpm_policy(&pnpm)?)
+        .kind(ExecutionKind::Logged)
+        .log_path(&task_record.log_path);
+    let mut install_logged = run_logged(&install_spec, "pnpm install")
         .map_err(|error| format!("cannot install dependencies for plugin {name}: {error}"))?;
-    let status = wait_for_process(&mut install, Some(task), "installing plugin dependencies")?;
+    let status = install_logged
+        .wait_or_kill(
+            &TaskCancel(Some(task)),
+            Duration::from_secs(900),
+            "installing plugin dependencies",
+        )
+        .map_err(|error| format!("pnpm install: {error}"))?;
     if !status.success() {
         return Err(format!(
             "plugin {name} dependency installation exited with {status}"
@@ -736,15 +955,20 @@ pub(crate) fn prepare_plugin_source(
     }
     if let Some(script) = plugin_build_script(directory, entry)? {
         task.update(format!("Building plugin {name}"), 38);
-        let mut build = command_for_toolchain(&pnpm)
+        let build_spec = ProcessSpec::new(pnpm.path.clone())
             .args(["--dir", directory.to_string_lossy().as_ref(), "run", script])
-            .stdout(Stdio::from(
-                log.try_clone().map_err(|error| error.to_string())?,
-            ))
-            .stderr(Stdio::from(log))
-            .spawn()
+            .policy(pnpm_policy(&pnpm)?)
+            .kind(ExecutionKind::Logged)
+            .log_path(&task_record.log_path);
+        let mut build_logged = run_logged(&build_spec, "pnpm build")
             .map_err(|error| format!("cannot build plugin {name}: {error}"))?;
-        let status = wait_for_process(&mut build, Some(task), "building plugin")?;
+        let status = build_logged
+            .wait_or_kill(
+                &TaskCancel(Some(task)),
+                Duration::from_secs(900),
+                "building plugin",
+            )
+            .map_err(|error| format!("pnpm build: {error}"))?;
         if !status.success() {
             return Err(format!("plugin {name} build exited with {status}"));
         }
@@ -763,6 +987,7 @@ pub(crate) fn prepare_plugin_source(
 /// Returns true when an already-built entry predates a source file.  Linked
 /// source directories are intentionally followed: repository-backed plugins
 /// expose `src/` and `lib/` through links inside each container profile.
+#[allow(dead_code, reason = "only used by the retired profile preflight path")]
 fn plugin_source_is_newer_than_entry(directory: &Path, entry: &Path) -> Result<bool, String> {
     let Ok(entry_modified) = fs::metadata(entry).and_then(|metadata| metadata.modified()) else {
         return Ok(false);
@@ -770,6 +995,7 @@ fn plugin_source_is_newer_than_entry(directory: &Path, entry: &Path) -> Result<b
     plugin_source_tree_is_newer(directory, entry_modified)
 }
 
+#[allow(dead_code, reason = "only used by the retired profile preflight path")]
 fn plugin_source_tree_is_newer(
     directory: &Path,
     entry_modified: SystemTime,
@@ -780,8 +1006,16 @@ fn plugin_source_tree_is_newer(
         if matches!(
             name.to_str(),
             Some(
-                ".git" | "node_modules" | "lib" | "dist" | "build" | "out" | ".cache"
-                    | "pnpm-lock.yaml" | "pnpm-workspace.yaml" | "package.json"
+                ".git"
+                    | "node_modules"
+                    | "lib"
+                    | "dist"
+                    | "build"
+                    | "out"
+                    | ".cache"
+                    | "pnpm-lock.yaml"
+                    | "pnpm-workspace.yaml"
+                    | "package.json"
             )
         ) {
             continue;
@@ -818,10 +1052,8 @@ fn plugin_source_tree_is_newer(
 ///
 /// If no buildable script is found, return `None` so the caller knows the
 /// entry cannot be produced and should report a clear error.
-fn plugin_build_script(
-    directory: &Path,
-    entry: &str,
-) -> Result<Option<&'static str>, String> {
+#[allow(dead_code, reason = "only used by the retired profile preflight path")]
+fn plugin_build_script(directory: &Path, entry: &str) -> Result<Option<&'static str>, String> {
     let manifest: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(directory.join("package.json"))
             .map_err(|error| format!("cannot read plugin manifest: {error}"))?,
@@ -906,4 +1138,3 @@ fn plugin_build_script(
     }
     Ok(None)
 }
-

@@ -134,7 +134,27 @@ export function MainApp() {
   }
 
   async function removeTemplateByName(name: string): Promise<void> {
-    try { await resources.removeTemplateByName(name); await containers.loadTemplates(); } catch (reason) { setError(String(reason)) }
+    try {
+      await resources.removeTemplateByName(name)
+      // The template was deleted from the index; the derived harness list
+      // and the container dropdown must both refresh, otherwise the user
+      // can still submit the now-deleted name and the in-flight task can
+      // still reference it.
+      await Promise.all([containers.loadTemplates(), settings.loadDshVersions()])
+    } catch (reason) { setError(String(reason)) }
+  }
+
+  // Wrap the install/uninstall handlers so the post-action refresh runs
+  // for both stores: pulling or removing a harness mutates the template
+  // index (canonical) and the Harness tab reads through it, so they
+  // have to be kept in lockstep on this client.
+  async function installDshVersion(version: string): Promise<void> {
+    await settings.installDshVersion(version)
+    await Promise.all([settings.loadDshVersions(), containers.loadTemplates()])
+  }
+  async function uninstallDshVersion(version: string): Promise<void> {
+    await settings.uninstallDshVersion(version)
+    await Promise.all([settings.loadDshVersions(), containers.loadTemplates()])
   }
 
   // Page-scoped data loading: every section fetches its own resources the
@@ -225,7 +245,7 @@ export function MainApp() {
       <section className="workspace">
         <div className="workspace-heading">
           <div><p className="eyebrow">CONTAINER</p><h1>{text.containerTitle}</h1></div>
-          <Button variant="primary" shape="icon" size="lg" aria-label={text.createContainer} title={text.createContainer} onClick={() => { containers.setCreatingContainerView(true) }}>+</Button>
+          <Button variant="primary" shape="icon" size="lg" aria-label={text.createContainer} title={text.createContainer} onClick={() => { void containers.openCreateContainerView() }}>+</Button>
         </div>
         <div className="version-list container-list">
           {containers.containers.map((container) => {
@@ -276,13 +296,20 @@ export function MainApp() {
             <Field label={text.containerName} required>
               {(id) => <Input id={id} value={containers.containerName} placeholder={text.namePlaceholder} onChange={(event) => { containers.setContainerName(event.target.value) }} autoFocus />}
             </Field>
-            <Field label={text.template} required help={containers.templates.length === 0 ? text.noTemplate : undefined}>
-              {(id) => containers.templates.length > 0 ? (
+            <Field
+              label={text.template}
+              required
+              help={containers.templatesLoading ? text.loadingTemplates : containers.templatesError !== null ? text.templateLoadFailed : containers.templates.length === 0 ? text.noTemplate : undefined}
+            >
+              {(id) => !containers.templatesLoading && containers.templatesError === null && containers.templates.length > 0 ? (
                 <Select
                   id={id}
                   value={containers.selectedTemplate}
                   onChange={(event) => { containers.setSelectedTemplate(event.target.value) }}
-                  options={containers.templates.map((template) => ({ value: template.name, label: `${template.name}${template.harnessRef ? ` (${template.harnessRef})` : ''}` }))}
+                  options={[
+                    { value: '', label: text.templateRequired },
+                    ...containers.templates.map((template) => ({ value: template.name, label: `${template.name}${template.harnessRef ? ` (${template.harnessRef})` : ''}` })),
+                  ]}
                 />
               ) : null}
             </Field>
@@ -290,7 +317,21 @@ export function MainApp() {
               {(id) => <Input id={id} value={containers.newContainerProfile} placeholder={text.profilePlaceholder} onChange={(event) => { containers.setNewContainerProfile(event.target.value) }} />}
             </Field>
             <div>
-              <Button variant="primary" size="lg" loading={containers.creatingContainer} disabled={!containers.containerName.trim() || !containers.newContainerProfile.trim() || !containers.selectedTemplate} onClick={() => { void containers.createContainer() }}>{containers.creatingContainer ? text.creating : text.createContainer}</Button>
+              <Button
+                variant="primary"
+                size="lg"
+                loading={containers.creatingContainer}
+                disabled={
+                  containers.templatesLoading
+                  || containers.templatesError !== null
+                  || !containers.containerName.trim()
+                  || !containers.newContainerProfile.trim()
+                  || !containers.templates.some((template) => template.name === containers.selectedTemplate)
+                }
+                onClick={() => { void containers.createContainer() }}
+              >
+                {containers.creatingContainer ? text.creating : text.createContainer}
+              </Button>
             </div>
           </Stack>
         </Card>
@@ -355,7 +396,7 @@ export function MainApp() {
         {error !== null && <p className="error" role="alert">{error}</p>}
       </section>
     )}
-    {section === 'resources' && <ResourcesPage plugins={resources.plugins} bundles={resources.bundles} references={resources.references} dshVersions={settings.dshVersions} installedDshVersions={settings.installedDshVersions} installingVersion={settings.installingVersion} loadingVersions={settings.loadingVersions} upgradingResources={settings.upgradingResources} upgradeReport={settings.upgradeReport} activeTaskFor={activeTaskFor} templates={containers.templates} scriptPreview={resources.scriptPreview} text={text} onImportPlugin={resources.importPlugin} onChooseArchive={chooseExtensionArchive} onExportPlugin={async (entry) => { await resources.exportPlugin(entry, text) }} onDeletePlugin={resources.deletePlugin} onLoadBundles={resources.loadBundles} onCreateBundle={resources.createBundle} onDeleteBundle={resources.deleteBundle} onExportBundle={async (bundle, mode) => { await resources.exportBundle(bundle, mode, text) }} onImportBundle={resources.importBundle} onInstallDshVersion={settings.installDshVersion} onUninstallDshVersion={settings.uninstallDshVersion} onRefreshDshCatalog={settings.refreshDshCatalog} onUpgradeResources={settings.upgradeResources} onReloadPlugins={resources.loadPlugins} onLoadTemplates={containers.loadTemplates} onChooseScript={async () => resources.chooseScriptFile(text)} onBuildTemplate={resources.buildTemplate} onImportTemplate={importTemplateArchive} onChooseExportDestination={chooseTemplateExportDestination} onExportTemplate={exportTemplateToPath} onRemoveTemplate={removeTemplateByName} />}
+    {section === 'resources' && <ResourcesPage plugins={resources.plugins} bundles={resources.bundles} references={resources.references} dshVersions={settings.dshVersions} installedDshVersions={settings.installedDshVersions} installingVersion={settings.installingVersion} loadingVersions={settings.loadingVersions} upgradingResources={settings.upgradingResources} upgradeReport={settings.upgradeReport} activeTaskFor={activeTaskFor} templates={containers.templates} scriptPreview={resources.scriptPreview} text={text} onImportPlugin={resources.importPlugin} onChooseArchive={chooseExtensionArchive} onExportPlugin={async (entry) => { await resources.exportPlugin(entry, text) }} onDeletePlugin={resources.deletePlugin} onLoadBundles={resources.loadBundles} onCreateBundle={resources.createBundle} onDeleteBundle={resources.deleteBundle} onExportBundle={async (bundle, mode) => { await resources.exportBundle(bundle, mode, text) }} onImportBundle={resources.importBundle} onInstallDshVersion={installDshVersion} onUninstallDshVersion={uninstallDshVersion} onRefreshDshCatalog={settings.refreshDshCatalog} onUpgradeResources={settings.upgradeResources} onReloadPlugins={resources.loadPlugins} onLoadTemplates={containers.loadTemplates} onChooseScript={async () => resources.chooseScriptFile(text)} onBuildTemplate={resources.buildTemplate} onImportTemplate={importTemplateArchive} onChooseExportDestination={chooseTemplateExportDestination} onExportTemplate={exportTemplateToPath} onRemoveTemplate={removeTemplateByName} />}
     {tasks.taskPanelOpen && <TaskPanel tasks={tasks.tasks} logs={tasks.taskLogs} text={text} onClose={() => { tasks.setTaskPanelOpen(false) }} onCancel={tasks.cancelTask} onRetry={tasks.retryTask} onLog={tasks.showTaskLog} onDelete={tasks.deleteTask} />}
   </main>
 }

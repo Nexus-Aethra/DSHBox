@@ -66,9 +66,23 @@ fn spinner_while<T>(label: &'static str, work: impl FnOnce() -> T) -> T {
     result
 }
 
-/// Call one daemon method and return the `result` value.
+/// Call one daemon method and return the `result` value (sync reply).
+/// Async methods return `Err` here — use [`enqueue`] for those.
 pub(crate) fn call(client: &RpcClient, method: &str, params: Value) -> Result<Value, String> {
     client.call(method, params)
+}
+
+/// Call an async daemon method and return its `TaskRecord`. The caller is
+/// expected to either poll `task_status` ([`wait_task`]) or open an SSE
+/// stream via the `eventsUrl` the response advertises.
+pub(crate) fn enqueue(
+    client: &RpcClient,
+    method: &str,
+    params: Value,
+) -> Result<TaskRecord, String> {
+    let value = client.enqueue(method, params)?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("invalid task record from daemon: {error}"))
 }
 
 /// Resolve a user-supplied path against the client's working directory
@@ -92,9 +106,7 @@ pub(crate) fn absolutize_path(path: &str) -> String {
 /// worker) and block until it finishes, printing `[{progress}%] {stage}`
 /// and log lines to stderr so stdout stays reserved for command output.
 pub(crate) fn run_task(client: &RpcClient, method: &str, params: Value) -> Result<(), String> {
-    let value = client.call(method, params)?;
-    let task: TaskRecord = serde_json::from_value(value)
-        .map_err(|error| format!("invalid task record from daemon: {error}"))?;
+    let task = enqueue(client, method, params)?;
     wait_task(client, &task.id)
 }
 

@@ -1,14 +1,6 @@
 export type Language = 'en' | 'zh-CN'
 export type ToolchainStatus = { id: string; name: string; version: string | null }
 export type DshVersion = { name: string; installed: boolean }
-// Result of one base-template generation pass for a single installed DSH
-// version. The harness tab in the UI is now a friendly alias for these
-// templates; there is no separate harness resource type any more.
-export type HarnessUpgradeReport = {
-  version: string
-  templatePath: string
-  templateCreated: boolean
-}
 export type DshContainer = { id: string; name: string; version: string; profile: string; template?: string; directory: string; status: string }
 // Local template surfaced by the daemon. Stored under
 // `<runtime>/templates/<content-hash>/script.dsh` and looked up through

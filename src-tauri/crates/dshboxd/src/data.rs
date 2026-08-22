@@ -23,9 +23,13 @@ use std::path::{Path, PathBuf};
 pub(crate) use box_api::{DataEntry, DataUse};
 
 /// Download a remote tarball URL and extract it into `destination`.
+#[allow(
+    dead_code,
+    reason = "remote data import is not exposed by the current IPC"
+)]
 pub(crate) fn download_remote_tarball(url: &str, destination: &Path) -> Result<(), String> {
-    let response = reqwest::blocking::get(url)
-        .map_err(|error| format!("download {url}: {error}"))?;
+    let response =
+        reqwest::blocking::get(url).map_err(|error| format!("download {url}: {error}"))?;
     let bytes = response
         .bytes()
         .map_err(|error| format!("download {url}: {error}"))?;
@@ -80,6 +84,10 @@ fn read_container_data(container: &DshContainer) -> Vec<DataUse> {
         .unwrap_or_default()
 }
 
+#[allow(
+    dead_code,
+    reason = "only used by the deferred data materialization path"
+)]
 fn write_container_data(container: &DshContainer, uses: &[DataUse]) -> Result<(), String> {
     let path = container_data_path(container);
     fs::create_dir_all(path.parent().ok_or("container data record has no parent")?)
@@ -94,6 +102,10 @@ fn write_container_data(container: &DshContainer, uses: &[DataUse]) -> Result<()
 /// fnv1a64 hex digest of a directory tree. Reuses the extension digest
 /// walker but strips its `fnv1a64:` prefix so the value matches the pure
 /// hex digests used by image manifests.
+#[allow(
+    dead_code,
+    reason = "only used by the deferred data materialization path"
+)]
 fn content_digest(directory: &Path) -> Result<String, String> {
     box_extensions::extension_digest(directory)
         .map(|value| value.trim_start_matches("fnv1a64:").to_owned())
@@ -101,6 +113,10 @@ fn content_digest(directory: &Path) -> Result<String, String> {
 
 /// Human-readable name for a data source: the store key and the
 /// per-container directory name.
+#[allow(
+    dead_code,
+    reason = "only used by the deferred data materialization path"
+)]
 fn data_source_name(source: &ParsedSource) -> String {
     match source {
         ParsedSource::Github { url, .. } => url
@@ -133,7 +149,9 @@ fn data_source_name(source: &ParsedSource) -> String {
             .unwrap_or("data")
             .to_owned(),
         ParsedSource::BareName { name, .. } => name.clone(),
-        ParsedSource::GitPrefix { .. } | ParsedSource::NpmPrefix { .. } | ParsedSource::Passthrough { .. } => {
+        ParsedSource::GitPrefix { .. }
+        | ParsedSource::NpmPrefix { .. }
+        | ParsedSource::Passthrough { .. } => {
             // Unreachable in practice — `stage_source` rejects these
             // variants for `ADD data` — but the match must be exhaustive.
             "data".to_owned()
@@ -141,6 +159,10 @@ fn data_source_name(source: &ParsedSource) -> String {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "only used by the deferred data materialization path"
+)]
 fn describe_source(source: &ParsedSource) -> String {
     match source {
         ParsedSource::Github { url, ref_ } => match ref_ {
@@ -172,6 +194,10 @@ fn describe_source(source: &ParsedSource) -> String {
 /// Entry point for one `ADD data` op: import the payload into the store
 /// (or look it up by name) and copy it into the container under
 /// `extensions/data/<name>`.
+#[allow(
+    dead_code,
+    reason = "only used by the deferred data materialization path"
+)]
 pub(crate) fn materialize_data_add(
     task: &TaskContext,
     container: &DshContainer,
@@ -183,6 +209,10 @@ pub(crate) fn materialize_data_add(
     materialize_data_add_at(Path::new(&runtime), task, container, source)
 }
 
+#[allow(
+    dead_code,
+    reason = "only used by the deferred data materialization path"
+)]
 fn materialize_data_add_at(
     runtime: &Path,
     task: &TaskContext,
@@ -221,6 +251,10 @@ fn materialize_data_add_at(
 /// `extensions/data/foo`). The copy is fully detached from the store —
 /// in-container edits never write back. Data-kind snapshots keep the usual
 /// `state/data.json` bookkeeping so `image prune` knows real usage.
+#[allow(
+    dead_code,
+    reason = "only used by the deferred data materialization path"
+)]
 pub(crate) fn hard_copy_snapshot(
     runtime: &Path,
     container: &DshContainer,
@@ -256,6 +290,10 @@ pub(crate) fn hard_copy_snapshot(
 /// non-plugin ADD is staged through here so its content lands in
 /// `data/<digest>/` with a `name -> digest` mapping (spec:
 /// docs/specs/image-build.md).
+#[allow(
+    dead_code,
+    reason = "only used by the deferred data materialization path"
+)]
 pub(crate) fn import_or_resolve(
     task: &TaskContext,
     runtime: &Path,
@@ -270,9 +308,11 @@ pub(crate) fn import_or_resolve(
         });
     }
     let name = data_source_name(source);
-    let staging = data_root(runtime)
-        .join("staging")
-        .join(format!("data-{}-{}", std::process::id(), now_seconds()));
+    let staging = data_root(runtime).join("staging").join(format!(
+        "data-{}-{}",
+        std::process::id(),
+        now_seconds()
+    ));
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
     let source_dir = stage_source(task, source, &staging)?;
@@ -297,6 +337,10 @@ pub(crate) fn import_or_resolve(
 
 /// Stage one non-bare data source into `staging/source` and return the
 /// content root (the directory tree whose digest identifies the payload).
+#[allow(
+    dead_code,
+    reason = "only used by the deferred data materialization path"
+)]
 fn stage_source(
     task: &TaskContext,
     source: &ParsedSource,
@@ -374,9 +418,7 @@ fn prune_orphaned_data_at(runtime: &Path) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
     let mut in_use: HashSet<String> = HashSet::new();
-    for container in box_containers::scan_containers(&runtime.to_string_lossy())?
-        .into_values()
-    {
+    for container in box_containers::scan_containers(&runtime.to_string_lossy())?.into_values() {
         for item in read_container_data(&container) {
             in_use.insert(item.digest);
         }
@@ -388,12 +430,7 @@ fn prune_orphaned_data_at(runtime: &Path) -> Result<Vec<String>, String> {
         if name == "index.json" || name == "staging" {
             continue;
         }
-        if entry
-            .file_type()
-            .map(|kind| kind.is_dir())
-            .unwrap_or(false)
-            && !in_use.contains(&name)
-        {
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) && !in_use.contains(&name) {
             fs::remove_dir_all(entry.path()).map_err(|error| error.to_string())?;
             removed.push(name);
         }
@@ -520,7 +557,10 @@ mod tests {
         let runtime = test_root("dedupe");
         let task = test_task(&runtime);
         let first_source = runtime.join("sources/first");
-        write_tree(&first_source, &[("README.md", "hello"), ("data.bin", "\x00\x01")]);
+        write_tree(
+            &first_source,
+            &[("README.md", "hello"), ("data.bin", "\x00\x01")],
+        );
 
         let first = import_or_resolve(&task, &runtime, &local_dir_source(&first_source)).unwrap();
         assert_eq!(first.name, "first");
@@ -530,7 +570,10 @@ mod tests {
         // Identical content (different source name) deduplicates to the same
         // digest and reuses the existing store directory.
         let second_source = runtime.join("sources/second");
-        write_tree(&second_source, &[("README.md", "hello"), ("data.bin", "\x00\x01")]);
+        write_tree(
+            &second_source,
+            &[("README.md", "hello"), ("data.bin", "\x00\x01")],
+        );
         let second = import_or_resolve(&task, &runtime, &local_dir_source(&second_source)).unwrap();
         assert_eq!(second.digest, first.digest);
         assert_ne!(second.name, first.name);
@@ -540,7 +583,12 @@ mod tests {
         assert_eq!(index["first"].digest, first.digest);
         assert_eq!(index["second"].digest, first.digest);
         let staging = data_root(&runtime).join("staging");
-        assert_eq!(fs::read_dir(&staging).map(|entries| entries.count()).unwrap_or(0), 0);
+        assert_eq!(
+            fs::read_dir(&staging)
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            0
+        );
         let _ = fs::remove_dir_all(&runtime);
     }
 
@@ -549,13 +597,15 @@ mod tests {
         let runtime = test_root("materialize");
         let task = test_task(&runtime);
         let source = runtime.join("sources/payload");
-        write_tree(&source, &[("config.yaml", "k: v"), ("assets/logo.png", "png")]);
+        write_tree(
+            &source,
+            &[("config.yaml", "k: v"), ("assets/logo.png", "png")],
+        );
         let container = test_container(&runtime, "c1");
 
         materialize_data_add_at(&runtime, &task, &container, &local_dir_source(&source)).unwrap();
 
-        let payload = PathBuf::from(&container.directory)
-            .join("extensions/data/payload");
+        let payload = PathBuf::from(&container.directory).join("extensions/data/payload");
         assert!(payload.join("config.yaml").is_file());
         assert!(payload.join("assets/logo.png").is_file());
         let uses = read_container_data(&container);
@@ -594,7 +644,8 @@ mod tests {
         let kept = import_or_resolve(&task, &runtime, &local_dir_source(&kept_source)).unwrap();
         let orphan = import_or_resolve(&task, &runtime, &local_dir_source(&orphan_source)).unwrap();
         let container = test_container(&runtime, "c1");
-        materialize_data_add_at(&runtime, &task, &container, &local_dir_source(&kept_source)).unwrap();
+        materialize_data_add_at(&runtime, &task, &container, &local_dir_source(&kept_source))
+            .unwrap();
 
         let removed = prune_orphaned_data_at(&runtime).unwrap();
         assert!(removed.contains(&orphan.digest));

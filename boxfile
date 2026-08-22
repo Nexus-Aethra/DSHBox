@@ -1,4 +1,6 @@
-FROM github.com/deepseek-ai/deepseek-harness:latest
+FROM github.com/deepseek-ai/deepseek-harness:dsh-v0.1.1-rc.2
 PROFILE web
 NAME better-sidebar-demo
-ADD plugin github.com/omdsh-dev/DSH-better-sidebar:v0.12.2
+ADD plugin github.com/omdsh-dev/DSH-better-sidebar:v0.14.0
+
+LABEL dshbox.allow-build=git+https://github.com/omdsh-dev/DSH-better-sidebar#v0.14.0

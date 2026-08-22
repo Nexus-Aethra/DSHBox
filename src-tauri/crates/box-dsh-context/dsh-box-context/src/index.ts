@@ -39,7 +39,7 @@ export const Config: z<Config> = z.object({
 
 interface Snapshot {
   container?: { id?: string; name?: string; version?: string; profile?: string }
-  paths?: Partial<Record<'workspace' | 'profileHome' | 'plugins' | 'skills' | 'logs', string>>
+  paths?: Partial<Record<'workspace' | 'profileHome' | 'plugins' | 'skills' | 'logs' | 'dshboxHome' | 'dshboxCli', string>>
   credentials?: { providers?: Array<{ apiKeyEnv?: string }> }
 }
 
@@ -79,6 +79,8 @@ function renderSnapshot(s: Snapshot | null): string {
     '- paths.plugins = ' + field(p.plugins, '<unknown>'),
     '- paths.skills = ' + field(p.skills, '<unknown>'),
     '- paths.logs = ' + field(p.logs, '<unknown>'),
+    '- paths.dshboxHome = ' + field(p.dshboxHome, '<unknown>'),
+    '- paths.dshboxCli = ' + field(p.dshboxCli, '<unknown>') + ' (use this path if `dshbox` is not in PATH)',
     '- credentials.providers = ' + JSON.stringify(providers),
     '',
     'Constraint: project and creation-mode changes stay in paths.workspace; profile / plugin / skill changes stay inside this Container; do not modify another Container or system paths unless the user explicitly asks.',

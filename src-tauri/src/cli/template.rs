@@ -2,36 +2,44 @@
 //! templates (pulled/imported) and built templates (the metadata-only
 //! product of `dshbox build`).
 //!
-//! Mirrors the docker-style `plugin`/`bundle` shape: every action is a thin
-//! RPC against the daemon (the daemon owns the storage). The archive format
-//! is a gzip tarball containing a single `<name>.dsh` file.
+//! Every subcommand is a thin RPC against the daemon; the CLI is
+//! deliberately aligned with the UI so any change in storage semantics
+//! lands in exactly one place (`dshboxd`).
 
-use box_api::{TemplateInfo, TemplateResource, TemplateResourceList};
 use serde_json::json;
 
 use super::rpc;
 
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     let Some(action) = arguments.first().map(String::as_str) else {
-        return Err("expected template ls|show|info|import|export|rm|prune".to_owned());
+        return Err(
+            "expected template install|uninstall|list|show|info|import|export|rm|prune"
+                .to_owned(),
+        );
     };
     if matches!(action, "help" | "--help" | "-h") {
-        println!("dshbox template ls");
+        println!("dshbox template install <ref>     pull + register a template (root or common)");
         println!(
-            "dshbox template show <name>         script body, or the resource list when built"
+            "dshbox template uninstall <name>  soft-delete + schedule background hard-delete"
+        );
+        println!("dshbox template list              list all registered templates");
+        println!(
+            "dshbox template show <name>       script body, or the resource list when built"
         );
         println!(
-            "dshbox template info <name>         build timestamp, id, version, labels"
+            "dshbox template info <name>       build timestamp, id, version, labels"
         );
         println!("dshbox template import <archive.tar.gz> [--name <name>]");
         println!("dshbox template export <name> [<dest.tar.gz>]");
         println!("dshbox template rm <name>");
         println!(
-            "dshbox template prune               GC data-store snapshots no built template uses"
+            "dshbox template prune             GC data-store snapshots no built template uses"
         );
         return Ok(());
     }
     match action {
+        "install" => install(arguments.get(1).ok_or("expected a template reference (e.g. `github.com/deepseek-ai/deepseek-harness:tag`)")?),
+        "uninstall" => uninstall(arguments.get(1).ok_or("expected a template name")?),
         "ls" | "list" => list(),
         "show" | "cat" => show(arguments.get(1).ok_or("expected a template name")?),
         "info" => info(arguments.get(1).ok_or("expected a template name")?),
@@ -49,63 +57,83 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     }
 }
 
+/// Read the runtime directory directly from the user config. Kept as a
+/// diagnostic helper — production paths should always go through the
+/// daemon so storage layout stays in one place.
+#[allow(dead_code)]
+fn local_runtime() -> Result<String, String> {
+    let config = box_foundation::read_config()
+        .map_err(|error| format!("cannot read dsh-box config: {error}"))?;
+    config
+        .runtime_directory
+        .ok_or_else(|| "DSH Box storage is not configured; run `dshbox config set runtime <dir>` first".to_owned())
+}
+
+/// `dshbox template install <ref>` — pull a template by reference and
+/// register it in the local runtime. Routes through `pull_template`,
+/// which the daemon runs inside a task worker so the same code path the
+/// UI exercises is hit here too; `run_task` blocks until completion and
+/// streams progress on stderr.
+fn install(ref_value: &str) -> Result<(), String> {
+    let ref_value = ref_value.trim();
+    if ref_value.is_empty() {
+        return Err("template reference cannot be empty".to_owned());
+    }
+    println!("installing template {ref_value} (this may take a while)...");
+    let client = rpc::connect()?;
+    rpc::run_task(
+        &client,
+        "pull_template",
+        json!({ "ref": ref_value }),
+    )?;
+    println!("installed {ref_value}");
+    Ok(())
+}
+
+/// `dshbox template uninstall <name>` — soft-delete by name. The actual
+/// removal of the cloned source happens in the data-scheduler's
+/// background deletion queue, so this returns within a few hundred
+/// milliseconds even for multi-GB clones.
+fn uninstall(name: &str) -> Result<(), String> {
+    let client = rpc::connect()?;
+    // `remove_template` is the daemon-owned soft-delete; running it via
+    // `run_task` ensures progress and final status are surfaced the same
+    // way as every other long-running template RPC.
+    rpc::run_task(&client, "remove_template", json!({ "name": name }))?;
+    println!("uninstalled {name}");
+    Ok(())
+}
+
+/// `dshbox template list` — mirror the UI columns; data comes from the
+/// daemon's `list_templates` so the CLI cannot drift from the store.
+/// Rendered from raw JSON so we don't have to mirror a Rust type here.
 fn list() -> Result<(), String> {
     let client = rpc::connect()?;
     let value = rpc::call(&client, "list_templates", json!({}))?;
-    // Shared box-api type: the CLI and the desktop passthrough deserialize
-    // the very struct the daemon serializes, so neither can drift.
-    let templates: Vec<TemplateInfo> = serde_json::from_value(value)
-        .map_err(|error| format!("invalid template list from daemon: {error}"))?;
-    println!("NAME\tVERSION\tPROFILE\tFORM");
-    for template in templates {
-        let version = template.harness_ref.as_deref().unwrap_or("-");
-        let form = if template.built { "built" } else { "script" };
-        println!("{}\t{version}\t{}\t{form}", template.name, template.profile);
+    let entries = value.as_array().ok_or_else(|| {
+        "invalid list_templates response from daemon: expected an array".to_owned()
+    })?;
+    if entries.is_empty() {
+        println!("(no templates installed)");
+        return Ok(());
+    }
+    println!("NAME\tHARNESS\tPROFILE\tKIND");
+    for entry in entries {
+        let name = entry["name"].as_str().unwrap_or("?");
+        let version = entry["harnessRef"].as_str().unwrap_or("-");
+        let profile = entry["profile"].as_str().unwrap_or("-");
+        let kind = if entry["built"].as_bool().unwrap_or(false) {
+            "sealed"
+        } else {
+            "prepared"
+        };
+        println!("{name}\t{version}\t{profile}\t{kind}");
     }
     Ok(())
 }
 
 fn show(name: &str) -> Result<(), String> {
     let client = rpc::connect()?;
-    // Built templates render their resource list; source scripts their body.
-    if let Ok(value) = rpc::call(&client, "read_template_list", json!({ "name": name })) {
-        let list: TemplateResourceList = serde_json::from_value(value)
-            .map_err(|error| format!("invalid built template from daemon: {error}"))?;
-        println!("name:     {}", list.name);
-        println!("base:     {}", list.base);
-        println!("profile:  {}", list.profile);
-        println!("harness:  {}", list.harness_ref.as_deref().unwrap_or("-"));
-        println!("created:  {}", list.created_at);
-        println!("resources: ({} total)", list.resources.len());
-        for (index, resource) in list.resources.iter().enumerate() {
-            match resource {
-                TemplateResource::Reference {
-                    kind,
-                    name,
-                    version,
-                    entry_id,
-                } => {
-                    println!(
-                        "  {}. {kind} {name} {} (reference -> repository entry {entry_id})",
-                        index + 1,
-                        version.as_deref().unwrap_or("-")
-                    );
-                }
-                TemplateResource::Snapshot {
-                    kind,
-                    name,
-                    digest,
-                    destination,
-                } => {
-                    println!(
-                        "  {}. {kind} {name} (snapshot data/{digest} -> {destination})",
-                        index + 1
-                    );
-                }
-            }
-        }
-        return Ok(());
-    }
     let value = rpc::call(&client, "read_template", json!({ "name": name }))?;
     let text = value["text"]
         .as_str()
@@ -173,44 +201,14 @@ fn info(name: &str) -> Result<(), String> {
     println!("id:          {}", value["id"].as_str().unwrap_or("-"));
     println!("built:       {}", value["built"].as_bool().unwrap_or(false));
 
-    if value["built"].as_bool() == Some(true) {
-        println!("base:        {}", value["base"].as_str().unwrap_or("-"));
-        println!("profile:     {}", value["profile"].as_str().unwrap_or("-"));
-        println!(
-            "harness:     {}",
-            value["harnessRef"].as_str().unwrap_or("-")
-        );
-        println!(
-            "schemaVer:   {}",
-            value["schemaVersion"].as_u64().unwrap_or(0)
-        );
-        println!(
-            "createdAt:   {} ({})",
-            value["createdAt"].as_u64().unwrap_or(0),
-            value["createdAtIso"].as_str().unwrap_or("-")
-        );
-        println!(
-            "resources:   {}",
-            value["resources"].as_u64().unwrap_or(0)
-        );
-        if let Some(labels) = value["labels"].as_object() {
-            if !labels.is_empty() {
-                println!("labels:");
-                for (k, v) in labels {
-                    println!("  {}: {}", k, v.as_str().unwrap_or("-"));
-                }
-            }
-        }
-    } else {
-        println!("profile:     {}", value["profile"].as_str().unwrap_or("-"));
-        println!(
-            "harness:     {}",
-            value["harnessRef"].as_str().unwrap_or("-")
-        );
-        println!(
-            "importedAt:  {}",
-            value["importedAt"].as_u64().unwrap_or(0)
-        );
+    println!("base:        {}", value["base"].as_str().unwrap_or("-"));
+    println!("base id:     {}", value["baseId"].as_str().unwrap_or("-"));
+    println!("profile:     {}", value["profile"].as_str().unwrap_or("-"));
+    println!("schema:      {}", value["schemaVersion"].as_u64().unwrap_or(0));
+    println!("created:     {}", value["createdAt"].as_u64().unwrap_or(0));
+    println!("size bytes:  {}", value["sizeBytes"].as_u64().unwrap_or(0));
+    if let Some(artifacts) = value["pluginArtifacts"].as_array() {
+        println!("plugins:     {}", artifacts.len());
     }
     Ok(())
 }

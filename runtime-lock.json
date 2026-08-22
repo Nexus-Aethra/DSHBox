@@ -12,5 +12,13 @@
     "win-arm64": { "url": "https://nodejs.org/dist/v24.11.1/node-v24.11.1-win-arm64.zip", "sha256": "ce9ee4e547ebdff355beb48e309b166c24df6be0291c9eaf103ce15f3de9e5b4" },
     "macos-x64": { "url": "https://nodejs.org/dist/v24.11.1/node-v24.11.1-darwin-x64.tar.xz", "sha256": "3793aa4aa52eb1f464d7848cd4e254880d9abca989c7cdc79a32c51bfeec1806" },
     "macos-arm64": { "url": "https://nodejs.org/dist/v24.11.1/node-v24.11.1-darwin-arm64.tar.xz", "sha256": "064b017da9efd6b5d2bd0fadd56d3b8a50fcb369af3ccf91102c7a07a6cf4deb" }
+  },
+  "git": {
+    "win-x64": {
+      "version": "2.55.0.windows.5",
+      "url": "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/PortableGit-2.55.0.5-64-bit.7z.exe",
+      "sha256": "5aa8a20f6e9abb2c755f0e73c91c687701a46b309ad84a0ca6509380fa4ae290",
+      "entry": "cmd/git.exe"
+    }
   }
 }

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { pickText } from '../i18n'
 import { boxApi } from '../shared/api/box-api'
-import type { BoxConfig, DshVersion, HarnessUpgradeReport, Language, ServerServiceStatus, ToolchainStatus } from '../shared/types/domain'
+import type { BoxConfig, DshVersion, Language, ServerServiceStatus, ToolchainStatus } from '../shared/types/domain'
 
 export const INITIAL_CONFIG: BoxConfig = { runtimeDirectory: null, selectedDshVersion: null, language: 'en', toolchainSources: {}, githubMirror: null, npmRegistry: null }
 
@@ -25,7 +25,7 @@ export function useSettings(onError: (message: string | null) => void) {
   const [installingVersion, setInstallingVersion] = useState<string | null>(null)
   const [installedDshVersions, setInstalledDshVersions] = useState<string[]>([])
   const [upgradingResources, setUpgradingResources] = useState(false)
-  const [upgradeReport, setUpgradeReport] = useState<HarnessUpgradeReport[] | null>(null)
+  const [upgradeReport, setUpgradeReport] = useState<string[] | null>(null)
   const [githubMirror, setGithubMirror] = useState('')
   const [npmRegistry, setNpmRegistry] = useState('')
   const [npmRegistryCustom, setNpmRegistryCustom] = useState('')
@@ -55,14 +55,10 @@ export function useSettings(onError: (message: string | null) => void) {
   async function loadDshVersions(): Promise<void> {
     setLoadingVersions(true)
     try {
-      const versions = await boxApi.listDshVersions()
-      // `latest` (the default branch) is a virtual entry the Harness tab
-      // always offers first: pulling without a tag resolves to it, so the
-      // option must exist even when the repo carries no tags at all.
-      if (!versions.some((version) => version.name === 'latest')) {
-        versions.unshift({ name: 'latest', installed: false })
-      }
-      setDshVersions(versions)
+      // The daemon derives the list from the template index — every entry
+      // (including the implicit `latest` reference) is returned directly,
+      // no client-side synthesis needed.
+      setDshVersions(await boxApi.listDshVersions())
       onError(null)
     } catch (reason) { onError(String(reason)) } finally { setLoadingVersions(false) }
   }
@@ -85,14 +81,15 @@ export function useSettings(onError: (message: string | null) => void) {
     try { const versions = await boxApi.listInstalledDshVersions(); setInstalledDshVersions(versions) } catch (reason) { onError(String(reason)) }
   }
 
-  // Explicit legacy-data migration: upgrades old harness records to the
-  // standard reference and generates base templates, then refreshes the
-  // version list so the Harness tab reflects the new state.
+  // One-shot migration: mirror every runtime clone into the template index.
+// Older installs used a writer that left the runtime directory without a
+// matching index entry; without this pass the Harness tab and the
+// Container dropdown both miss those harnesses.
   async function upgradeResources(): Promise<void> {
     setUpgradingResources(true)
     try {
-      const report = await boxApi.upgradeLegacyResources()
-      setUpgradeReport(report)
+      const registered = await boxApi.upgradeLegacyResources()
+      setUpgradeReport(registered)
       await loadDshVersions()
       onError(null)
     } catch (reason) { onError(String(reason)) } finally { setUpgradingResources(false) }

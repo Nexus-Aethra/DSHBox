@@ -153,7 +153,8 @@ pub(crate) fn run_queued_task(
             manager: manager.clone(),
             app: app.clone(),
         };
-        run_queued(&manager, &paths, std::sync::Arc::new(notifier), &task_id, work);
+        let rollback: Option<Box<dyn FnOnce(&TaskContext) + Send + 'static>> = None;
+        run_queued(&manager, &paths, std::sync::Arc::new(notifier), &task_id, work, rollback);
         if let Ok(task) = manager.task(&task_id) {
             let _ = app.emit("task://finished", task);
         }

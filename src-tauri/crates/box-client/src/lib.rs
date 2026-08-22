@@ -11,12 +11,21 @@ use serde_json::Value;
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 
-/// Response frame every daemon method returns.
+/// Response frame every daemon method returns. The daemon now produces
+/// either a `result` (sync) or a `task` (async) field, plus an
+/// `eventsUrl` pointer when the call enqueued a worker; we accept both
+/// shapes so legacy callers that read `result` keep working and async
+/// callers can pick up the task record through the same struct.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RpcResponse {
     pub ok: bool,
     pub result: Option<Value>,
+    #[serde(default)]
+    pub task: Option<Value>,
+    #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub events_url: Option<String>,
 }
 
 /// A connected client bound to one daemon discovery.
@@ -33,6 +42,18 @@ impl RpcClient {
             port: discovery.port,
             token: discovery.token.clone(),
         }
+    }
+
+    /// Bearer token the daemon issued for this session. Used by callers
+    /// that need to open a second connection (for example the SSE stream
+    /// in the desktop event subscriber) without re-reading discovery.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Loopback port the daemon is listening on.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     /// Locate the daemon, spawning it from `PATH` when it is not running.
@@ -131,8 +152,9 @@ impl RpcClient {
             .map_err(|error| format!("dshboxd response error: {error}"))
     }
 
-    /// Call a method with JSON params; returns the `result` field or the
-    /// daemon's error message.
+    /// Call a method with JSON params; returns the `result` field (sync) or
+/// the `task` field (async), whichever the daemon set. Error replies fall
+/// through to the daemon's message.
     pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
         let mut request = serde_json::json!({
             "token": self.token,
@@ -145,12 +167,29 @@ impl RpcClient {
         }
         let response = self.exchange(request)?;
         if response.ok {
-            Ok(response.result.unwrap_or(Value::Null))
+            Ok(response
+                .result
+                .or(response.task)
+                .unwrap_or(Value::Null))
         } else {
             Err(response
                 .error
                 .unwrap_or_else(|| "unknown daemon error".to_owned()))
         }
+    }
+
+    /// Enqueue an async task and return the task record. Equivalent to
+    /// `call(method, params)` for async methods, but type-checking the
+    /// presence of the `task` field gives a clearer error if the daemon
+    /// replied synchronously.
+    pub fn enqueue(&self, method: &str, params: Value) -> Result<Value, String> {
+        let value = self.call(method, params)?;
+        if value.is_null() {
+            return Err(format!(
+                "daemon replied without a task record for async method `{method}`"
+            ));
+        }
+        Ok(value)
     }
 
     /// Health probe: the daemon answers without a token check failure.

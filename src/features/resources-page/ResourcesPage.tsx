@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { DshVersion, ExtensionBundle, HarnessUpgradeReport, PreviewScriptResult, RepositoryExtension, TemplateInfo } from '../../shared/types/domain'
+import type { DshVersion, ExtensionBundle, PreviewScriptResult, RepositoryExtension, TemplateInfo } from '../../shared/types/domain'
 import { Badge } from '../../ui/Badge'
 import { Button } from '../../ui/Button'
 import { Card } from '../../ui/Card'
@@ -24,8 +24,8 @@ type Text = {
   buildTemplate: string; noScriptPreview: string; operations: string; scriptPreviewTitle: string
   importTemplate: string; exportTemplate: string; removeTemplate: string; browseExport: string
   deleteTemplateConfirm: (name: string) => string
-  checkUpdates: string; upgradeRun: string; templateReady: string
-  templatePending: string; upgradeDone: string; upToDate: string; upgradeFailed: string
+  checkUpdates: string; upgradeRun: string
+  upgradeDone: string; upToDate: string; upgradeFailed: string
   noTemplate: string; templateName: string; templateHarness: string
   pickEntries: string; bundleExtensionCount: (n: number) => string
   confirmTitle: string; dialogCancel: string; dialogConfirm: string
@@ -44,7 +44,7 @@ type Props = {
   installingVersion: string | null
   loadingVersions: boolean
   upgradingResources: boolean
-  upgradeReport: HarnessUpgradeReport[] | null
+  upgradeReport: string[] | null
   activeTaskFor: (resourceKey: string) => { stage: string } | undefined
   text: Text
   onImportPlugin: (source: string) => Promise<void>
@@ -178,21 +178,17 @@ export function ResourcesPage({
             </Toolbar>
             {upgradeReport !== null && (upgradeReport.length > 0
               ? <p className="upgrade-note">{text.upgradeDone
-                  .replace('{created}', String(upgradeReport.filter((report) => report.templateCreated).length))}</p>
+                  .replace('{registered}', String(upgradeReport.length))}</p>
               : <p className="upgrade-note">{text.upToDate}</p>)}
             {dshVersions.length > 0 ? (
               <div className="version-list">
                 {dshVersions.map((version) => {
                   const task = activeTaskFor(`runtime:${version.name}`)
                   const busy = task !== undefined
-                  const reportFor = upgradeReport?.find((report) => report.version === version.name)
                   return (
                     <section key={version.name} className="version-row">
                       <div className="harness-info">
                         <code>{version.name}</code>
-                        {version.installed && reportFor && (
-                          <p className="harness-ref"><span className="label">{reportFor.templateCreated ? text.templateReady : text.templatePending}</span> <code>{reportFor.templatePath}</code></p>
-                        )}
                       </div>
                       <div className="version-actions">
                         {version.installed ? (
@@ -237,8 +233,7 @@ export function ResourcesPage({
                     <Badge variant="primary">{entry.kind}</Badge>
                     <code>{entry.version ?? '—'}</code>
                     {isGithub(entry.source) && <Badge variant="primary">{text.githubOnly}</Badge>}
-                    {(references[entry.id]?.containers ?? 0) > 0 && <Badge variant="neutral">{text.usedByContainers(references[entry.id]?.containers ?? 0)}</Badge>}
-                    {(references[entry.id]?.templates ?? 0) > 0 && <Badge variant="neutral">{text.usedByTemplates(references[entry.id]?.templates ?? 0)}</Badge>}
+                {(references[entry.id]?.templates ?? 0) > 0 && <Badge variant="neutral">{text.usedByTemplates(references[entry.id]?.templates ?? 0)}</Badge>}
                     <Button variant="secondary" size="sm" onClick={() => { void onExportPlugin(entry) }}>{text.exportPlugin}</Button>
                     <Button variant="danger" size="sm" onClick={() => { requestDeletePlugin(entry) }}>{text.remove}</Button>
                   </div>

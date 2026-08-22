@@ -1,18 +1,19 @@
 //! Toolchain resolution for daemon-run tasks. Mirrors the desktop's
 //! `toolchains.rs` but resolves against the daemon-owned bundled runtime.
+//!
+//! Also provides the shared `pnpm_policy`, `run_logged`, and `TaskCancel`
+//! helpers that all daemon modules use for unified process execution.
 
-use crate::state::bundled_runtime;
-use box_foundation::{read_config, suppress_console_window};
+use crate::state::{bundled_runtime, dshbox_install_directory};
+use box_foundation::read_config;
+use box_runtime::process::{
+    self, runner::CancellationToken, ExecutionResult, LoggedProcess, NativeProcessRunner,
+    ProcessSpec,
+};
 use box_scheduler::TaskContext;
 use box_toolchains::is_known_toolchain;
 use serde::Serialize;
-use std::{
-    ffi::OsString,
-    io::{BufRead, BufReader},
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    time::Duration,
-};
+use std::{fs, path::Path};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,125 +50,128 @@ pub(crate) fn resolve_toolchain(id: &str) -> Result<ResolvedToolchain, String> {
     })
 }
 
-pub(crate) fn command_for_toolchain(toolchain: &ResolvedToolchain) -> Command {
-    let mut command = Command::new(&toolchain.path);
-    suppress_console_window(&mut command);
-    command.args(&toolchain.arguments);
-    // Prepend the bundled runtime bin directories so child processes can
-    // resolve bare `pnpm`/`npm` commands.
-    if let Ok(runtime) = bundled_runtime() {
-        if let Some(node_dir) = runtime.node.parent() {
-            let pnpm_dir = node_dir.parent().map(|root| root.join("pnpm"));
-            if let Some(existing) = std::env::var_os("PATH") {
-                let mut parts: Vec<OsString> = vec![node_dir.as_os_str().to_owned()];
-                if let Some(pnpm_dir) = pnpm_dir {
-                    parts.push(pnpm_dir.as_os_str().to_owned());
-                }
-                parts.push(existing);
-                if let Ok(joined) = std::env::join_paths(parts) {
-                    command.env("PATH", joined);
-                }
-            }
-        }
-    }
-    if let Ok(config) = read_config() {
-        if let Some(registry) = config.npm_registry.as_deref() {
-            command.env("npm_config_registry", registry);
-        }
-        // Pin pnpm's store under DSHBox's runtime directory so the cache
-        // moves with the install and is removed on uninstall — the default
-        // `~/.local/share/pnpm/store` would otherwise scatter outside of
-        // DSHBox's control.
-        if let Some(runtime_dir) = config.runtime_directory.as_deref() {
-            let pnpm_root = PathBuf::from(runtime_dir).join("pnpm");
-            let _ = std::fs::create_dir_all(&pnpm_root);
-            command.env("PNPM_STORE_DIR", pnpm_root.join("store"));
-            // npm is used by `fetch_extension_via_npm_pack` for GitHub/Git
-            // URL plugin sources. Without pinning its cache, `npm pack`
-            // leaks into `~/.npm/_cacache/` and can collide with other
-            // npm instances when doing concurrent `git --mirror` clones.
-            let npm_cache = pnpm_root.join("npm-cache");
-            let _ = std::fs::create_dir_all(&npm_cache);
-            command.env("npm_config_cache", npm_cache);
-        }
-    }
-    command
+/// Build a `bundled_toolchain_policy` for pnpm/npm invocations spawned by
+/// the daemon. Mirrors the desktop's `command_for_toolchain` env setup
+/// but goes through the unified module so daemon children get the same
+/// registry/pnpm store pinning as the desktop.
+pub(crate) fn pnpm_policy(
+    toolchain: &ResolvedToolchain,
+) -> Result<process::EnvironmentPolicy, String> {
+    let config = read_config()?;
+    let runtime_directory = config
+        .runtime_directory
+        .as_deref()
+        .map(Path::new)
+        .ok_or("DSH Box storage is not configured")?;
+    let node_dir = std::path::Path::new(&toolchain.path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    // The pnpm tree hangs directly off the runtime root on every platform
+    // (<root>/pnpm), next to the node/ tree. Derive it from the manifest
+    // root rather than counting .parent() levels off the node binary — the
+    // nesting depth differs (Windows ships node/node.exe, Unix
+    // node/bin/node).
+    let pnpm_dir = bundled_runtime()?.root.join("pnpm");
+    let install_dir = dshbox_install_directory().ok();
+    let bundled_git = bundled_runtime()?.git_dir.as_deref();
+    // Linux always runs against the host's git (the developer-supplied
+    // build at BoxConfig.git_path, then PATH, then well-known FHS bins).
+    // Windows sticks with the bundled binary because Windows users do
+    // not install git by default; failing loudly there is intentional.
+    let host_git_dir = if box_runtime::bundled::target_is_linux() {
+        box_runtime::bundled::resolve_host_git_dir(
+            config.git_path.as_deref().map(Path::new),
+        )
+    } else {
+        None
+    };
+    process::bundled_package_manager_policy(
+        install_dir.as_deref(),
+        &node_dir,
+        &pnpm_dir,
+        runtime_directory,
+        config.npm_registry.as_deref(),
+        bundled_git,
+        host_git_dir.as_deref(),
+    )
 }
 
-pub(crate) fn wait_for_process(
-    child: &mut Child,
-    task: Option<&TaskContext>,
-    description: &str,
-) -> Result<std::process::ExitStatus, String> {
-    loop {
-        if task.map(TaskContext::cancelled).unwrap_or(false) {
-            kill_process_tree(child.id());
-            let _ = child.wait();
-            return Err(format!("task cancelled while {description}"));
-        }
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            return Ok(status);
-        }
-        std::thread::sleep(Duration::from_millis(100));
+/// Add an actionable explanation when pnpm failed after repeatedly losing its
+/// connection to a configured third-party registry. Optional native packages
+/// may be skipped by pnpm after these failures, so the final lifecycle error
+/// (for example a missing esbuild binary) is often misleading on its own.
+pub(crate) fn pnpm_network_failure_hint(log_path: &Path) -> Option<String> {
+    let config = read_config().ok()?;
+    let registry = config.npm_registry?.trim().to_owned();
+    if registry.is_empty() || is_official_npm_registry(&registry) {
+        return None;
+    }
+    let log = fs::read_to_string(log_path).ok()?;
+    let network_errors = [
+        "ECONNRESET",
+        "ETIMEDOUT",
+        "UND_ERR_SOCKET",
+        "error (23)",
+        "ENOTFOUND",
+        "ECONNREFUSED",
+    ];
+    let count = network_errors
+        .iter()
+        .map(|marker| log.matches(marker).count())
+        .sum::<usize>();
+    (count >= 2).then(|| {
+        " The configured npm mirror had repeated network failures while downloading packages. \
+         Switch the npm registry to the official registry or configure a Box-managed proxy, then retry; \
+         pnpm will reuse packages already cached in this storage directory."
+            .to_owned()
+    })
+}
+
+fn is_official_npm_registry(registry: &str) -> bool {
+    let normalized = registry.trim().trim_end_matches('/').to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "https://registry.npmjs.org" | "http://registry.npmjs.org"
+    )
+}
+
+/// Wrap a `TaskContext` (or lack thereof) so it can be passed to the
+/// unified process runner's `wait_or_kill` cancellation check.
+pub(crate) struct TaskCancel<'a>(pub(crate) Option<&'a TaskContext>);
+
+impl CancellationToken for TaskCancel<'_> {
+    fn cancelled(&self) -> bool {
+        self.0.map(TaskContext::cancelled).unwrap_or(false)
     }
 }
 
-/// Spawns a child with piped output and forwards every line to both the
-/// given log file and the task's live log.
-pub(crate) fn spawn_forwarding_log(
-    command: &mut Command,
-    log_file: &Path,
-    task: Option<&TaskContext>,
-) -> Result<Child, String> {
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    let stdout = child.stdout.take().ok_or("missing piped stdout")?;
-    let stderr = child.stderr.take().ok_or("missing piped stderr")?;
-    let log_file = log_file.to_path_buf();
-    for stream in [
-        Box::new(stdout) as Box<dyn std::io::Read + Send>,
-        Box::new(stderr),
-    ] {
-        let task = task.cloned();
-        let log_file = log_file.clone();
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                let _ = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_file)
-                    .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
-                if let Some(task) = &task {
-                    let trimmed = line.trim_end();
-                    if !trimmed.is_empty() {
-                        task.log(trimmed);
-                    }
-                }
-                line.clear();
-            }
-        });
-    }
-    Ok(child)
-}
-
-pub(crate) fn kill_process_tree(pid: u32) {
-    #[cfg(target_os = "windows")]
+/// Helper that wraps `NativeProcessRunner::execute` and only accepts the
+/// logged variant, returning the inner `LoggedProcess`. The DSH host and
+/// all pnpm/npm invocations funnel through this so error reporting is
+/// uniform.
+pub(crate) fn run_logged(spec: &ProcessSpec, description: &str) -> Result<LoggedProcess, String> {
+    match NativeProcessRunner
+        .execute(spec)
+        .map_err(|error| format!("cannot start {description}: {error}"))?
     {
-        let mut command = std::process::Command::new("taskkill");
-        suppress_console_window(&mut command);
-        let _ = command
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
+        ExecutionResult::Logged(logged) => Ok(logged),
+        _ => Err(format!(
+            "internal: expected logged execution for {description}"
+        )),
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_official_npm_registry;
+
+    #[test]
+    fn recognizes_the_official_npm_registry() {
+        assert!(is_official_npm_registry("https://registry.npmjs.org/"));
+        assert!(is_official_npm_registry("http://registry.npmjs.org"));
+        assert!(!is_official_npm_registry(
+            "https://repo.huaweicloud.com/repository/npm/"
+        ));
     }
 }

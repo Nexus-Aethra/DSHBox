@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import type { BoxConfig, ContainerExtensions, DataEntry, DshContainer, DshVersion, ExtensionBundle, HarnessUpgradeReport, Language, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, ResourceState, ServerServiceStatus, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
+import type { BoxConfig, ContainerExtensions, DataEntry, DshContainer, DshVersion, ExtensionBundle, Language, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, ResourceState, ServerServiceStatus, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
 
 type ToolchainPayload = { id: string; name: string; managedVersion: string | null }
 
@@ -21,7 +21,7 @@ export const boxApi = {
   listInstalledDshVersions: () => invoke<string[]>('list_installed_dsh_versions'),
   pullTemplate: (version: string) => invoke<TaskRecord>('enqueue_pull_template', { version }),
   openDshFrontBrowser: (id: string) => invoke<void>('open_dsh_front_browser', { id }),
-  upgradeLegacyResources: () => invoke<HarnessUpgradeReport[]>('upgrade_legacy_resources'),
+  upgradeLegacyResources: () => invoke<string[]>('upgrade_legacy_resources'),
   createContainer: (name: string, version: string, profile: string) => invoke<DshContainer>('create_dsh_container', { request: { name, version, profile } }),
     listTemplates: () => invoke<TemplateInfo[]>('list_templates'),
     readTemplate: (name: string) => invoke<{ name: string; text: string }>('read_template', { name }),
