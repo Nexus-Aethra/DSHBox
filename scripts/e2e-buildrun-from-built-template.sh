@@ -32,7 +32,11 @@ fi
 echo "[1/10] starting dshboxd in $SANDBOX"
 HOME="$SANDBOX" "$DSHBOXD" > "$SANDBOX/daemon.log" 2>&1 &
 DAEMON_PID=$!
-trap 'kill "$DAEMON_PID" 2>/dev/null || true; sleep 0.2; rm -rf "$SANDBOX"' EXIT
+if [ -n "${E2E_KEEP_SANDBOX:-}" ]; then
+  trap 'kill "$DAEMON_PID" 2>/dev/null || true' EXIT
+else
+  trap 'kill "$DAEMON_PID" 2>/dev/null || true; sleep 0.2; rm -rf "$SANDBOX"' EXIT
+fi
 
 # Wait for the daemon to write its discovery file.
 for _ in $(seq 1 50); do
@@ -129,7 +133,12 @@ fi
 echo "[8/10] curl the webview URL"
 container_url="$(HOME="$SANDBOX" "$DSHBOX" container url dsh-test-runtime 2>/dev/null || true)"
 if [ -z "$container_url" ]; then
-  # Fall back to extracting the URL from the run log.
+  # Fall back to extracting the URL from the run log. Prefer the
+  # token-authenticated URL (DSH 0.1.2+ fence); older runtimes serve the
+  # bare URL, which the second grep catches.
+  container_url="$(grep -oE 'http://127\.0\.0\.1:[0-9]+/\?token=[A-Za-z0-9_+-]+' "$SANDBOX/run.log" | tail -1)"
+fi
+if [ -z "$container_url" ]; then
   container_url="$(grep -oE 'http://127\.0\.0\.1:[0-9]+' "$SANDBOX/run.log" | tail -1)"
 fi
 if [ -z "$container_url" ]; then
@@ -138,7 +147,10 @@ if [ -z "$container_url" ]; then
 fi
 # --noproxy: the webview URL is loopback; honouring HTTP_PROXY here would
 # send it through a developer's proxy and report 502 for a healthy host.
-status="$(curl --noproxy '*' -s -o /dev/null -w "%{http_code}" -m 8 "$container_url" || true)"
+# -L -c -b: DSH 0.1.2+ mints an auth cookie with a 303 on the token URL and
+# answers tokenless requests with 401 — replay what the webview does.
+cookies="$SANDBOX/e2e-cookies.txt"
+status="$(curl --noproxy '*' -sL -c "$cookies" -b "$cookies" -o /dev/null -w "%{http_code}" -m 8 "$container_url" || true)"
 if [ "$status" != "200" ]; then
   echo "FAIL: webview returned HTTP $status for $container_url"
   exit 1

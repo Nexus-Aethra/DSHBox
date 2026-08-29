@@ -824,7 +824,13 @@ fn container_url_rpc(state: &DaemonState, request: &Value) -> Result<Value, Stri
         .lock()
         .map_err(|_| "container manager lock failed".to_owned())?;
     if let Some(host) = running.get(&id) {
-        return Ok(json!({ "id": id, "url": host.url }));
+        // DSH 0.1.2+ rejects tokenless requests with 401, so prefer the
+        // authenticated URL when the start path parsed one.
+        let url = host
+            .authenticated_url
+            .clone()
+            .unwrap_or_else(|| host.url.clone());
+        return Ok(json!({ "id": id, "url": url }));
     }
     drop(running);
     let record =
@@ -835,7 +841,13 @@ fn container_url_rpc(state: &DaemonState, request: &Value) -> Result<Value, Stri
             HostState::Starting | HostState::Ready | HostState::Running
         ) && box_containers::is_host_pid_alive(record.host_pid)
     }) {
-        Some(record) => Ok(json!({ "id": id, "url": record.host_url })),
+        Some(record) => {
+            // DSH 0.1.2+ rejects tokenless requests with 401, so hand the
+            // webview the authenticated URL whenever the start path parsed
+            // one from the host log.
+            let url = record.authenticated_url.unwrap_or(record.host_url);
+            Ok(json!({ "id": id, "url": url }))
+        }
         None => Err(format!("container is not running: {id}")),
     }
 }
@@ -1057,7 +1069,13 @@ fn describe_container_rpc(state: &DaemonState, request: &Value) -> Result<Handle
         .lock()
         .map_err(|_| "container manager lock failed".to_owned())?
         .get(&id)
-        .map(|host| host.url.clone());
+        // DSH 0.1.2+ rejects tokenless requests with 401, so prefer the
+        // authenticated URL when the start path parsed one.
+        .map(|host| {
+            host.authenticated_url
+                .clone()
+                .unwrap_or_else(|| host.url.clone())
+        });
     let host_pid = read_live_host_pid(&container);
     let status = if host_pid.is_some() {
         "running"
@@ -1380,7 +1398,7 @@ mod tests {
         let config = read_config().unwrap();
         let paths = BoxPaths::from_config(&config).unwrap();
         let state = DaemonState {
-            manager: box_scheduler::TaskManager::default(),
+            manager: box_scheduler::TaskManager::memory(),
             paths: RwLock::new(paths),
             containers: Arc::new(ContainerManager::default()),
             resources: box_state::ResourceStateManager::default(),

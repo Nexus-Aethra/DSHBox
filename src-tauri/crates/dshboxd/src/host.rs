@@ -62,6 +62,13 @@ pub struct ContainerHostRecord {
     pub host_pgid: i32,
     pub host_port: u16,
     pub host_url: String,
+    /// The `dsh web:` URL parsed from the host log, carrying the
+    /// per-launch capability token. DSH 0.1.2+ serves 401 on every path
+    /// without this token (browser-trust fence), so both the health
+    /// probe and the desktop webview must use it. Absent for older DSH
+    /// runtimes that served the bare URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_url: Option<String>,
     pub started_at: u64,
     pub last_seen: u64,
     pub state: HostState,
@@ -232,6 +239,7 @@ pub fn initial_record(
         host_pgid,
         host_port,
         host_url: host_url.to_owned(),
+        authenticated_url: None,
         started_at,
         last_seen: started_at,
         state: HostState::Starting,
@@ -338,6 +346,7 @@ pub fn write_corrupted_record(
         host_pgid: 0,
         host_port: 0,
         host_url: String::new(),
+        authenticated_url: None,
         started_at: now_seconds(),
         last_seen: 0,
         state: HostState::Corrupted,
@@ -368,6 +377,7 @@ mod tests {
             host_pgid: 1234,
             host_port: 40000,
             host_url: "http://127.0.0.1:40000".to_owned(),
+            authenticated_url: None,
             started_at: 1,
             last_seen: 1,
             state: HostState::Running,
@@ -377,6 +387,24 @@ mod tests {
             unhealthy_count: 0,
             probe_count: 0,
         }
+    }
+
+    #[test]
+    fn authenticated_url_round_trips_and_defaults_to_none() {
+        let mut snap = snapshot("c-auth", 1);
+        snap.authenticated_url =
+            Some("http://127.0.0.1:40000/?token=abc".to_owned());
+        let text = serde_json::to_string(&snap).unwrap();
+        assert!(text.contains("authenticatedUrl"));
+        let parsed: ContainerHostRecord = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed.authenticated_url.as_deref(), Some("http://127.0.0.1:40000/?token=abc"));
+
+        // A legacy record written before the field existed parses fine.
+        let mut legacy_value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        legacy_value.as_object_mut().unwrap().remove("authenticatedUrl").unwrap();
+        let parsed_legacy: ContainerHostRecord =
+            serde_json::from_value(legacy_value).unwrap();
+        assert_eq!(parsed_legacy.authenticated_url, None);
     }
 
     #[test]
