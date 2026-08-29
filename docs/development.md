@@ -41,9 +41,10 @@ package depends on Tauri. It owns windows and IPC adapters; business behavior
 lives in framework-free crates.
 
 ```text
-box-foundation  paths, config, JSON persistence, validation
+box-foundation  paths, config, document-store contract, JSON persistence, validation
 box-runtime     absolute-path process execution and libgit2 checkout
 box-scheduler   task records, locks, cancellation, recovery
+box-store       SQLite document-store backend + legacy JSON import
 box-state       ResourceStateManager read model
 box-toolchains  bundled Node/npm/pnpm resolution
 box-containers  container metadata and host registry

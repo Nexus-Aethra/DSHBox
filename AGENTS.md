@@ -44,7 +44,7 @@ pnpm bundle:linux         # .deb/.rpm
 pnpm bundle:macos         # .dmg
 
 # Tests
-cd src-tauri && cargo test --workspace            # full Rust suite (107 passing)
+cd src-tauri && cargo test --workspace            # full Rust suite (160+ passing)
 scripts/e2e-*.sh                                   # sandbox-isolated end-to-end
 ```
 
@@ -123,8 +123,20 @@ they don't run them inline.
 - **DSH web server is loopback-only** (`127.0.0.1`, dynamic port) and requires
   a per-launch capability token from the shell for launcher-only endpoints.
   WebView navigation must stay on that loopback origin.
+- **Proxy env is poison for loopback + host spawn.** Never let `HTTP_PROXY` /
+  `HTTPS_PROXY` / `ALL_PROXY` (any case) reach (a) dshboxd's own loopback
+  probes — use a reqwest client with `.no_proxy()` — or (b) the spawned DSH
+  host process — `dsh_host_policy` (`box-runtime/src/process/env.rs`) strips
+  all 8 proxy aliases. A host that inherits a proxy self-terminates with an
+  "opening the default browser" error.
 - **Plugin lifecycle scripts are user-approved code execution.** Do not relax
   pnpm supply-chain checks (lifecycle-script approval, minimum-release-age).
+  The `dshbox.allow-build` LABEL in a boxfile authorizes the **top-level
+  source only**; the daemon auto-derives transitive `package@version` keys
+  from pnpm's `[ERR_PNPM_IGNORED_BUILDS]` /
+  `[ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED]` markers and retries (multi-round
+  loop in `dshboxd/src/sealed.rs`, `add_pnpm_build_approval` is an idempotent
+  YAML merge producing a single bare-scalar `allowBuilds:` section).
 - **Runtime archive integrity.** Verify SHA-256 (Node) and SHA-512 (pnpm)
   before use; a failed verification aborts startup, no silent fallback.
 - **Prepared/sealed templates.** Pulling a root Harness template prepares a
@@ -146,6 +158,11 @@ they don't run them inline.
 - **DSH update flow** is atomic: download → verify → health-check → switch
   `current` → install bridge → restart. On any failure, keep current runtime
   and retain the failed diagnostic log.
+- **Tauri deb/rpm bundler dereferences symlinks.** The bundled runtime must
+  ship plain executable shims (not symlinks) for `npm`/`npx`/`corepack` — see
+  `tools/runtime-packager`. Dev runs are unaffected; only installed packages
+  break if this regresses. Tracked children spawn with `setsid` pre_exec so
+  kill_tree can't take down unrelated process groups.
 - **`src-tauri/dist/` is generated** by Vite before the Tauri build and
   bundled into the desktop binary — never edit files under it.
 
@@ -158,6 +175,7 @@ they don't run them inline.
 | Template system behavior | `docs/template-system.md` |
 | Plugin pnpm install flow | `docs/design/pnpm-managed-plugin-install.md` |
 | Recent bugs / partial fixes | `docs/notes/2026-08-17-bugs-plugin-cache-and-template-not-found.md` |
+| Linux host-git passthrough / Windows pnpm base | `docs/notes/2026-08-21-*.md` |
 | Release handoff snapshot | `handoff.md` (repo root) |
 
 ## Conventions quick-reference
@@ -166,7 +184,16 @@ they don't run them inline.
   framework-free functions over Tauri-coupled types inside crates.
 - Frontend: TypeScript strict, React 18, Vite 6, no extra UI library — build
   primitives under `src/ui/`.
-- Persistence: JSON files under the runtime dir + `~/.dsh-box/`. No
-  alternative task formats or persistence layouts in adapters.
+- **Persistence: document store, not scattered files.** Persisted indexes go
+  through `box_foundation::collection::DocumentStore` (SQLite backend in
+  `box-store` at `<runtime>/state/dshbox.db`; JSON backend only as legacy
+  import source and fallback). Domain code holds a typed `Collection<T>` and
+  never touches SQL; upserts never delete (daemon + desktop share the store),
+  deletion goes through `delete_document`. Legacy per-domain JSON files
+  migrate on first open via `LEGACY_SCOPES` in `box-store`, then are renamed
+  `*.pre-sqlite`. Content-addressed directories (`templates/<hash>/`,
+  `data/<digest>/`, `runtimes/`) stay on disk. `config.json` stays in
+  `~/.dsh-box/` — machine-local, never enters the store. Schema changes are
+  forward-only migrations gated by `PRAGMA user_version` — no downgrade path.
 - Errors: surface them — Box keeps failed diagnostic logs and a recovery view
   rather than silently falling back.

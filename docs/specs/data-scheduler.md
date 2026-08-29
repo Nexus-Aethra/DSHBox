@@ -5,7 +5,8 @@ Status: schema-10 design, 2026-08-20.
 ## Single source of truth
 
 `state/resource-map.json` is the authoritative index of published resources.
-Task state is persisted separately in `state/task-store.json`; task-private
+Task state is persisted in the document store (`state/dshbox.db`; the
+legacy file was `state/tasks.json`); task-private
 files live only in `staging/<task-id>/`. Filesystem scans may diagnose drift but
 must not silently recreate state records.
 
