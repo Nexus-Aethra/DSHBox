@@ -44,6 +44,7 @@
 //! attempted and also failed). Otherwise `Failed` can transition to
 //! `RollingBack` for automatic rollback.
 
+use box_foundation::collection::Collection;
 use box_foundation::{now_seconds, BoxPaths, BoxResult};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -378,25 +379,53 @@ struct State {
     running: usize,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TaskManager {
     state: Arc<Mutex<State>>,
+    /// Durable projection of the in-memory set, keyed by task id. The
+    /// concrete backend (SQLite via `box-store`, JSON files, in-memory) is
+    /// chosen by the host at construction; see `box_foundation::collection`.
+    store: Collection<TaskRecord>,
+}
+
+fn task_key(record: &TaskRecord) -> &str {
+    record.id.as_str()
 }
 
 impl TaskManager {
-    /// Merge tasks from the persisted state file without overwriting
-    /// in-memory tasks that are still queued or running. This lets the CLI
-    /// and UI share the same task queue: the CLI enqueues and runs tasks,
-    /// the UI picks up the new records without breaking its own in-flight
-    /// work.
-    pub fn merge_from_disk(&self, paths: &BoxPaths) -> BoxResult<()> {
-        let path = paths.tasks_state()?;
-        if !path.exists() {
-            return Ok(());
+    /// Create a manager persisting every mutation through `collection`. The
+    /// in-memory map stays the working set; the collection is the durable
+    /// projection (see `persist`).
+    pub fn new(collection: Collection<TaskRecord>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(State::default())),
+            store: collection,
         }
-        let tasks: Vec<TaskRecord> =
-            serde_json::from_str(&fs::read_to_string(&path).map_err(|error| error.to_string())?)
-                .map_err(|error| error.to_string())?;
+    }
+
+    /// File-backed manager over the legacy JSON layout
+    /// (`<runtime>/state/tasks.json`).
+    pub fn json(paths: &BoxPaths) -> BoxResult<Self> {
+        let root = paths
+            .runtime
+            .as_ref()
+            .ok_or("DSH Box storage is not configured")?
+            .join("state");
+        Ok(Self::new(Collection::json_dir(root, "tasks", task_key)))
+    }
+
+    /// In-memory manager for hosts with no configured runtime and for
+    /// tests that never cross manager instances.
+    pub fn memory() -> Self {
+        Self::new(Collection::memory("tasks", task_key))
+    }
+
+    /// Merge tasks from the durable store without overwriting in-memory
+    /// tasks that are still queued or running. This lets the CLI and UI
+    /// share the same task queue: the CLI enqueues and runs tasks, the UI
+    /// picks up the new records without breaking its own in-flight work.
+    pub fn merge_from_disk(&self, _paths: &BoxPaths) -> BoxResult<()> {
+        let tasks = self.store.load_all()?;
         let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
         for task in tasks {
             if !state.tasks.contains_key(&task.id) {
@@ -406,14 +435,10 @@ impl TaskManager {
         Ok(())
     }
 
-    pub fn restore(&self, paths: &BoxPaths) -> BoxResult<()> {
-        let path = paths.tasks_state()?;
-        if !path.exists() {
-            return Ok(());
-        }
-        let mut tasks: Vec<TaskRecord> =
-            serde_json::from_str(&fs::read_to_string(&path).map_err(|error| error.to_string())?)
-                .map_err(|error| error.to_string())?;
+    /// Load every stored task, mark active ones `interrupted` (daemon
+    /// restart recovery), and adopt the result as the in-memory set.
+    pub fn restore(&self, _paths: &BoxPaths) -> BoxResult<()> {
+        let mut tasks = self.store.load_all()?;
         for task in &mut tasks {
             let current = TaskState::from(task.status.as_str());
             if current.is_active() || task.status == "waiting_input" {
@@ -429,7 +454,7 @@ impl TaskManager {
             .into_iter()
             .map(|task| (task.id.clone(), task))
             .collect();
-        self.persist(paths)
+        self.persist()
     }
 
     pub fn list(&self) -> BoxResult<Vec<TaskRecord>> {
@@ -490,11 +515,11 @@ impl TaskManager {
             .map_err(|_| "task manager lock failed")?
             .tasks
             .insert(id, task.clone());
-        self.persist(paths)?;
+        self.persist()?;
         Ok(task)
     }
 
-    pub fn request_cancel(&self, paths: &BoxPaths, id: &str) -> BoxResult<()> {
+    pub fn request_cancel(&self, _paths: &BoxPaths, id: &str) -> BoxResult<()> {
         let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
         let task = state.tasks.get_mut(id).ok_or("task not found")?;
         let current = TaskState::from(task.status.as_str());
@@ -502,13 +527,13 @@ impl TaskManager {
             task.cancel_requested = true;
         }
         drop(state);
-        self.persist(paths)
+        self.persist()
     }
 
     /// Remove a finished task record and its log file. Active tasks
     /// (queued, running, rolling_back) stay protected so resource locks
     /// and the concurrency counter never go stale.
-    pub fn remove(&self, paths: &BoxPaths, id: &str) -> BoxResult<Option<TaskRecord>> {
+    pub fn remove(&self, _paths: &BoxPaths, id: &str) -> BoxResult<Option<TaskRecord>> {
         let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
         let task = match state.tasks.get(id) {
             Some(task) => task.clone(),
@@ -521,14 +546,14 @@ impl TaskManager {
         state.tasks.remove(id);
         drop(state);
         let _ = fs::remove_file(&task.log_path);
-        self.persist(paths)?;
+        self.store.remove(id)?;
         Ok(Some(task))
     }
 
     /// Mark a queued task as running only when its resource locks and the
     /// global concurrency limit permit execution. Returns the updated task
     /// if the transition was applied, or `None` if the task is still waiting.
-    pub fn try_start(&self, paths: &BoxPaths, id: &str) -> BoxResult<Option<TaskRecord>> {
+    pub fn try_start(&self, _paths: &BoxPaths, id: &str) -> BoxResult<Option<TaskRecord>> {
         let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
         let task = state.tasks.get(id).cloned().ok_or("task not found")?;
         if task.cancel_requested {
@@ -538,7 +563,7 @@ impl TaskManager {
             task.finished_at = Some(now_seconds());
             let updated = task.clone();
             drop(state);
-            self.persist(paths)?;
+            self.persist()?;
             return Ok(Some(updated));
         }
         if state.running >= 2
@@ -559,13 +584,13 @@ impl TaskManager {
         task.started_at = Some(now_seconds());
         let updated = task.clone();
         drop(state);
-        self.persist(paths)?;
+        self.persist()?;
         Ok(Some(updated))
     }
 
     pub fn update(
         &self,
-        paths: &BoxPaths,
+        _paths: &BoxPaths,
         id: &str,
         stage: impl Into<String>,
         progress: u8,
@@ -576,7 +601,7 @@ impl TaskManager {
         task.progress = progress.min(100);
         let updated = task.clone();
         drop(state);
-        self.persist(paths)?;
+        self.persist()?;
         Ok(updated)
     }
 
@@ -584,7 +609,7 @@ impl TaskManager {
     /// `TaskState` transition is validated before the status string is set.
     pub fn finish(
         &self,
-        paths: &BoxPaths,
+        _paths: &BoxPaths,
         id: &str,
         result: &BoxResult<()>,
     ) -> BoxResult<TaskRecord> {
@@ -615,7 +640,7 @@ impl TaskManager {
         }
         let updated = task.clone();
         drop(state);
-        self.persist(paths)?;
+        self.persist()?;
         Ok(updated)
     }
 
@@ -623,7 +648,7 @@ impl TaskManager {
     /// locks are temporarily retained so the rollback has exclusive access.
     /// Returns the updated task record, or an error if the transition is
     /// invalid (e.g., the task is not in `Failed` state).
-    pub fn start_rollback(&self, paths: &BoxPaths, id: &str) -> BoxResult<TaskRecord> {
+    pub fn start_rollback(&self, _paths: &BoxPaths, id: &str) -> BoxResult<TaskRecord> {
         let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
         let task = state.tasks.get_mut(id).ok_or("task not found")?;
         task.transition_to(TaskState::RollingBack)
@@ -632,7 +657,7 @@ impl TaskManager {
         task.progress = 0;
         let updated = task.clone();
         drop(state);
-        self.persist(paths)?;
+        self.persist()?;
         Ok(updated)
     }
 
@@ -640,7 +665,7 @@ impl TaskManager {
     /// (RollingBack → Failed with `rollback_error`). Releases resource locks.
     pub fn finish_rollback(
         &self,
-        paths: &BoxPaths,
+        _paths: &BoxPaths,
         id: &str,
         rollback_result: &BoxResult<()>,
     ) -> BoxResult<TaskRecord> {
@@ -669,7 +694,7 @@ impl TaskManager {
         task.finished_at = Some(now_seconds());
         let updated = task.clone();
         drop(state);
-        self.persist(paths)?;
+        self.persist()?;
         Ok(updated)
     }
 
@@ -683,15 +708,12 @@ impl TaskManager {
             }))
     }
 
-    pub fn persist(&self, paths: &BoxPaths) -> BoxResult<()> {
-        let path = paths.tasks_state()?;
-        fs::create_dir_all(path.parent().ok_or("task state has no parent")?)
-            .map_err(|error| error.to_string())?;
-        fs::write(
-            path,
-            serde_json::to_string_pretty(&self.list()?).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())
+    /// Durably project the in-memory set through the collection: every
+    /// record is insert-or-replaced by id, and no id is ever deleted here
+    /// (cross-process rows are removed only via `remove`).
+    pub fn persist(&self) -> BoxResult<()> {
+        let records = self.list()?;
+        self.store.upsert(&records)
     }
 }
 
@@ -934,7 +956,7 @@ mod tests {
     #[test]
     fn queued_task_reserves_its_resource_for_short_transactions() {
         let paths = paths("resource");
-        let manager = TaskManager::default();
+        let manager = TaskManager::json(&paths).unwrap();
         manager
             .enqueue(
                 &paths,
@@ -951,7 +973,7 @@ mod tests {
     #[test]
     fn restore_marks_incomplete_tasks_interrupted() {
         let paths = paths("restore");
-        let manager = TaskManager::default();
+        let manager = TaskManager::json(&paths).unwrap();
         manager
             .enqueue(
                 &paths,
@@ -960,7 +982,7 @@ mod tests {
                 serde_json::json!({ "version": "latest" }),
             )
             .unwrap();
-        let restored = TaskManager::default();
+        let restored = TaskManager::json(&paths).unwrap();
         restored.restore(&paths).unwrap();
         assert_eq!(restored.list().unwrap()[0].status, "interrupted");
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
@@ -969,7 +991,7 @@ mod tests {
     #[test]
     fn only_two_distinct_resources_start_at_once() {
         let paths = paths("concurrency");
-        let manager = TaskManager::default();
+        let manager = TaskManager::json(&paths).unwrap();
         let first = manager
             .enqueue(
                 &paths,
@@ -1026,7 +1048,7 @@ mod tests {
     #[test]
     fn remove_deletes_finished_tasks_but_keeps_running_ones() {
         let paths = paths("remove");
-        let manager = TaskManager::default();
+        let manager = TaskManager::json(&paths).unwrap();
         let finished = manager
             .enqueue(
                 &paths,
@@ -1057,7 +1079,7 @@ mod tests {
     #[test]
     fn same_resource_waits_until_the_first_task_finishes() {
         let paths = paths("lock");
-        let manager = TaskManager::default();
+        let manager = TaskManager::json(&paths).unwrap();
         let first = manager
             .enqueue(
                 &paths,
@@ -1105,7 +1127,7 @@ mod tests {
     #[test]
     fn run_queued_executes_work_and_reports_progress() {
         let paths = paths("run");
-        let manager = TaskManager::default();
+        let manager = TaskManager::json(&paths).unwrap();
         let task = manager
             .enqueue(&paths, "test", vec!["r".to_owned()], serde_json::json!({}))
             .unwrap();
@@ -1144,7 +1166,7 @@ mod tests {
     #[test]
     fn run_queued_reports_failure_and_releases_the_resource() {
         let paths = paths("run-fail");
-        let manager = TaskManager::default();
+        let manager = TaskManager::json(&paths).unwrap();
         let task = manager
             .enqueue(&paths, "test", vec!["r".to_owned()], serde_json::json!({}))
             .unwrap();
@@ -1171,7 +1193,7 @@ mod tests {
     #[test]
     fn run_queued_skips_work_for_a_cancelled_task() {
         let paths = paths("run-cancel");
-        let manager = TaskManager::default();
+        let manager = TaskManager::json(&paths).unwrap();
         let task = manager
             .enqueue(&paths, "test", vec!["r".to_owned()], serde_json::json!({}))
             .unwrap();

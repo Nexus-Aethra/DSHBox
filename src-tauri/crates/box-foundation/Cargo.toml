@@ -3,6 +3,11 @@ name = "box-foundation"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Exposes `collection::test_kit` so backend crates (box-store today, a
+# future Postgres crate) can run the shared DocumentStore contract suite.
+test-kit = []
+
 [dependencies]
 dirs = "6.0.0"
 serde = { version = "1.0", features = ["derive"] }

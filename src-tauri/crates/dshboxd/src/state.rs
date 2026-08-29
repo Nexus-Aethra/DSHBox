@@ -18,6 +18,11 @@ use std::{
 pub(crate) struct ManagedHost {
     pub(crate) child: TrackedChild,
     pub(crate) url: String,
+    /// The `dsh web:` URL parsed from the host log (per-launch capability
+    /// token). `None` for DSH runtimes without the browser-trust fence, or
+    /// before the host log announced it. `container_url` hands this to the
+    /// webview; the bare `url` only proves the port is bound.
+    pub(crate) authenticated_url: Option<String>,
 }
 
 /// Registry of containers running inside this daemon process. The daemon
@@ -279,7 +284,30 @@ impl DaemonState {
         let config = read_config().map_err(|error| format!("cannot read config: {error}"))?;
         let paths = BoxPaths::from_config(&config)
             .map_err(|error| format!("cannot derive box paths: {error}"))?;
-        let manager = TaskManager::default();
+        // SQLite document store with a one-time import of the legacy JSON
+        // queue. If no runtime directory is configured yet (fresh install),
+        // or the store cannot be opened (torn legacy file), degrade: JSON
+        // backend when the legacy layout is usable, in-memory otherwise —
+        // matching the old behaviour where a missing runtime only made
+        // persistence impossible. The error is logged for diagnosis.
+        let manager = match paths.runtime.as_ref() {
+            None => {
+                tracing::warn!("no runtime directory configured; task queue is memory-only");
+                TaskManager::memory()
+            }
+            Some(_) => match box_store::open_task_collection(&paths) {
+                Ok(collection) => TaskManager::new(collection),
+                Err(error) => {
+                    tracing::error!(
+                        "SQLite task store unavailable, using legacy JSON store: {error}"
+                    );
+                    TaskManager::json(&paths).unwrap_or_else(|json_error| {
+                        tracing::error!("JSON task store also unavailable: {json_error}");
+                        TaskManager::memory()
+                    })
+                }
+            },
+        };
         let _ = manager.restore(&paths);
         Ok(Self {
             manager,
@@ -331,7 +359,7 @@ impl TaskNotifier for DaemonNotifier {
         if let Ok(task) = self.manager.task(task_id) {
             self.resources.apply_task_update(task);
         }
-        let _ = self.manager.persist(&self.paths);
+        let _ = self.manager.persist();
         self.events.broadcast(crate::events::DaemonEvent::TaskStage {
             task_id: task_id.to_owned(),
             stage: stage.to_owned(),
@@ -362,7 +390,7 @@ impl TaskNotifier for DaemonNotifier {
         if let Ok(task) = self.manager.task(task_id) {
             self.resources.apply_task_update(task);
         }
-        let _ = self.manager.persist(&self.paths);
+        let _ = self.manager.persist();
         self.events.broadcast(crate::events::DaemonEvent::TaskFinished {
             task_id: task_id.to_owned(),
             status: status.to_owned(),

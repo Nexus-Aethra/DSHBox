@@ -226,7 +226,7 @@ fn run_inner() -> Result<(), String> {
         .filter(|id| is_safe_identifier(id));
     tauri::Builder::default()
         .manage(ContainerManager::default())
-        .manage(TaskManager::default())
+        .manage(tasks::build_task_manager())
         .manage(ResourceStateManager::default())
         .setup(move |app| {
             let resources = app
@@ -328,9 +328,7 @@ fn run_inner() -> Result<(), String> {
             let shutdown_handle = app.handle().clone();
             ctrlc::set_handler(move || {
                 write_startup_log("shutdown signal received; persisting task state");
-                if let Ok(paths) = task_paths() {
-                    let _ = shutdown_handle.state::<TaskManager>().persist(&paths);
-                }
+                let _ = shutdown_handle.state::<TaskManager>().persist();
                 write_startup_log("shutdown complete");
                 std::process::exit(0);
             })

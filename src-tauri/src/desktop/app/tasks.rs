@@ -58,8 +58,27 @@ pub(crate) fn task_paths() -> Result<BoxPaths, String> {
     BoxPaths::from_config(&config)
 }
 
+/// Build the desktop task manager: the SQLite document store at
+/// `<runtime>/state/dshbox.db` (with a one-time import of the legacy JSON
+/// queue) when a runtime directory is configured, else an in-memory store.
+/// Desktop diagnostics are intentionally non-fatal, so an unusable store
+/// degrades to memory instead of blocking the shell.
+pub(crate) fn build_task_manager() -> TaskManager {
+    let collection =
+        task_paths().and_then(|paths| box_store::open_task_collection(&paths));
+    match collection {
+        Ok(collection) => TaskManager::new(collection),
+        Err(error) => {
+            write_startup_log(&format!(
+                "task store unavailable, task list degrades to in-memory: {error}"
+            ));
+            TaskManager::memory()
+        }
+    }
+}
+
 pub(crate) fn persist_tasks(manager: &TaskManager) -> Result<(), String> {
-    manager.persist(&task_paths()?)
+    manager.persist()
 }
 
 pub(crate) fn queue_task(

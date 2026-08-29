@@ -463,7 +463,7 @@ mod tests {
 
     fn test_task(runtime: &Path) -> TaskContext {
         TaskContext {
-            manager: TaskManager::default(),
+            manager: TaskManager::memory(),
             paths: BoxPaths {
                 config: runtime.join("config.json"),
                 runtime: Some(runtime.to_path_buf()),
