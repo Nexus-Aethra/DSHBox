@@ -945,7 +945,7 @@ mod tests {
             config: runtime.join("config.json"),
             runtime: Some(runtime.to_path_buf()),
         };
-        let manager = TaskManager::default();
+        let manager = TaskManager::memory();
         let record = manager
             .enqueue(&paths, "test", Vec::new(), serde_json::json!({}))
             .unwrap();

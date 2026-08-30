@@ -77,6 +77,25 @@ fn is_transient_loopback_bind_failure(output: &[u8]) -> bool {
         || output.contains("address already in use 127.0.0.1")
 }
 
+/// Parse the `dsh web: <url>` announcement from the host log tail.
+///
+/// Upstream DSH (0.1.2+) prints this line once its Loader tree settles and
+/// serves 401 on every tokenless request (browser-trust fence); the line is
+/// the supervisor contract for obtaining the per-launch capability URL. The
+/// line may carry a `(LAN: ...)` suffix — only the first token is a URL, and
+/// only loopback URLs are trusted.
+fn parse_announced_host_url(log_tail: &str) -> Option<String> {
+    log_tail.lines().rev().find_map(|line| {
+        let candidate = line.trim().strip_prefix("dsh web: ")?
+            .split_whitespace()
+            .next()?
+            .to_owned();
+        candidate
+            .starts_with("http://127.0.0.1:")
+            .then_some(candidate)
+    })
+}
+
 /// Start the DSH host for `id` and wait until its frontend answers.
 /// The running map is the daemon-owned registry; containers already
 /// running return their existing URL.
@@ -286,6 +305,12 @@ pub(crate) fn start_dsh_container_inner(
             }
         }
         let probe_client = loopback_probe_client(Duration::from_secs(2))?;
+        // Upstream DSH (0.1.2+) serves 401 on every path without a
+        // per-launch capability token (browser-trust fence) and announces
+        // the authenticated URL on stdout for supervisors to pick up. Poll
+        // the host log for that line and probe the authenticated URL when
+        // present; the bare-URL probe keeps older runtimes working.
+        let mut announced_url: Option<String> = None;
         let ready = (0..HOST_READY_PROBES).any(|attempt| {
             if task.map(TaskContext::cancelled).unwrap_or(false) {
                 let _ = tracked.kill_tree(false, Duration::from_secs(2));
@@ -309,11 +334,35 @@ pub(crate) fn start_dsh_container_inner(
                     task.log(&format!("waiting for DSH host ({}/60s)", attempt / 4));
                 }
             }
-            let available = probe_client
-                .get(&url)
-                .send()
-                .map(|response| response.status().is_success())
-                .unwrap_or(false);
+            if announced_url.is_none() {
+                if let Ok(text) = fs::read_to_string(&log_path) {
+                    announced_url = parse_announced_host_url(
+                        text.get(log_offset as usize..).unwrap_or(""),
+                    );
+                }
+            }
+            let available = if let Some(authenticated) = announced_url.as_deref() {
+                probe_client
+                    .get(authenticated)
+                    .send()
+                    .map(|response| !response.status().is_server_error())
+                    .unwrap_or(false)
+            } else {
+                match probe_client.get(&url).send() {
+                    Ok(response) => {
+                        let status = response.status();
+                        if status.is_client_error() {
+                            // Browser-trust fence detected (DSH 0.1.2+): the
+                            // server is up but the token URL hasn't been
+                            // announced yet — keep waiting for the log line.
+                            false
+                        } else {
+                            !status.is_server_error()
+                        }
+                    }
+                    Err(_) => false,
+                }
+            };
             if !available {
                 thread::sleep(Duration::from_millis(250));
             }
@@ -328,6 +377,9 @@ pub(crate) fn start_dsh_container_inner(
                 let mut next = on_disk.clone();
                 next.state = HostState::Ready;
                 next.last_seen = box_foundation::now_seconds();
+                if let Some(authenticated) = announced_url.clone() {
+                    next.authenticated_url = Some(authenticated);
+                }
                 next
             });
             spawn_health_watcher(id, url.clone());
@@ -339,6 +391,7 @@ pub(crate) fn start_dsh_container_inner(
                     ManagedHost {
                         child: tracked,
                         url: url.clone(),
+                        authenticated_url: announced_url.clone(),
                     },
                 );
             if let Some(task) = task {
@@ -707,9 +760,10 @@ pub(crate) fn replace_tree_following(source: &Path, destination: &Path) -> std::
 ///   2. Calls `try_wait` on the host PID via `kill -0`. ESRCH = dead,
 ///      bump `state` to `Crashed` with the captured exit info and exit
 ///      the loop.
-///   3. Otherwise HTTP GETs the URL. On 2xx, bumps `last_seen` and
+///   3. Otherwise HTTP GETs the URL. On any non-5xx response (2xx, the
+///      303+401 auth dance of DSH 0.1.2+, …), bumps `last_seen` and
 ///      `probe_count`, resets `unhealthy_count`. On transport failure
-///      or non-2xx, increments `unhealthy_count`; after `UNHEALTHY_THRESHOLD`
+///      or 5xx, increments `unhealthy_count`; after `UNHEALTHY_THRESHOLD`
 ///      consecutive failures, marks the host `Crashed` and exits.
 ///
 /// The watcher never auto-restarts — a `Crashed` record is a tombstone
@@ -746,11 +800,23 @@ fn spawn_health_watcher(id: &str, url: String) {
                 });
                 return;
             }
-            // Step 2: HTTP probe.
+            // Step 2: HTTP probe. DSH 0.1.2+ rejects tokenless requests
+            // with 401, so prefer the authenticated URL the start path
+            // parsed from the host log; fall back to the bare URL for
+            // runtimes without the browser-trust fence.
+            let probe_url = snapshot
+                .authenticated_url
+                .clone()
+                .unwrap_or_else(|| url.clone());
+            // "Healthy" means the DSH origin is answering. DSH 0.1.2+ mints
+            // an auth cookie via 303 and answers tokenless requests with
+            // 401, so any non-5xx response proves the server is up; a 5xx
+            // keeps meaning the loopback request was hijacked (proxy) or
+            // the app itself is broken.
             let healthy = client
-                .get(&url)
+                .get(&probe_url)
                 .send()
-                .map(|response| response.status().is_success())
+                .map(|response| !response.status().is_server_error())
                 .unwrap_or(false);
             let _ = host::compare_and_swap_host_record(&id_owned, &snapshot, |on_disk| {
                 let mut next = on_disk.clone();
@@ -981,6 +1047,37 @@ fn probe_pid(pid: u32) -> PidProbe {
 mod dependency_ready_tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn parses_the_announced_authenticated_url_from_the_log_tail() {
+        let log = "\
+dsh web: http://127.0.0.1:40413/?token=3xqhaJFec8uZFUxRsyzL0lXRqfVxpi-li-F93sBnqdE
+dsh web: opening the default browser; pass --no-open to disable
+";
+        assert_eq!(
+            parse_announced_host_url(log),
+            Some("http://127.0.0.1:40413/?token=3xqhaJFec8uZFUxRsyzL0lXRqfVxpi-li-F93sBnqdE".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_takes_the_url_token_and_ignores_the_lan_suffix() {
+        let log = "dsh web: http://127.0.0.1:3080/?token=abc (LAN: http://192.168.1.4:3080/?token=abc)\n";
+        assert_eq!(
+            parse_announced_host_url(log),
+            Some("http://127.0.0.1:3080/?token=abc".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_ignores_noise_and_non_loopback_lines() {
+        assert_eq!(parse_announced_host_url(""), None);
+        assert_eq!(parse_announced_host_url("worker started\n"), None);
+        assert_eq!(
+            parse_announced_host_url("dsh web: http://192.168.1.4:3080/?token=abc\n"),
+            None
+        );
+    }
 
     #[test]
     fn requires_the_tsx_manifest_not_just_node_modules() {

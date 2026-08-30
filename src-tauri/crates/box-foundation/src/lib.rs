@@ -1,5 +1,7 @@
 //! Filesystem, configuration, and validation primitives shared by DSH Box features.
 
+pub mod collection;
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -438,6 +440,15 @@ impl BoxPaths {
             .as_ref()
             .ok_or("DSH Box storage is not configured")?
             .join("state/tasks.json"))
+    }
+    /// `<runtime>/state/dshbox.db` — the SQLite database backing the
+    /// `box-store` persistence layer (pilot domain: the task queue).
+    pub fn store_db(&self) -> BoxResult<PathBuf> {
+        Ok(self
+            .runtime
+            .as_ref()
+            .ok_or("DSH Box storage is not configured")?
+            .join("state/dshbox.db"))
     }
     pub fn task_log(&self, id: &str) -> BoxResult<PathBuf> {
         Ok(self
