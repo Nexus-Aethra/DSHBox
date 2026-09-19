@@ -53,7 +53,12 @@ struct Node<'a> {
 /// splitting dual-face packages does not renumber the rest of the graph. Only when
 /// both halves are present does the client half need a suffix to stay distinct.
 fn nodes_of(plugin: &Discovered) -> Vec<Node<'_>> {
-    let Some(client) = plugin.client.as_ref() else {
+    // A half that declares nothing is not a node, whichever side it is on. The
+    // caller already drops an empty browser half, and the check is repeated here so
+    // a half that declares nothing cannot become a node with no relations just
+    // because it was handed over as present.
+    let client = plugin.client.as_ref().filter(|scan| declares(scan));
+    let Some(client) = client else {
         return vec![Node { id: plugin.name.clone(), half: Half::Host, scan: &plugin.host, plugin }];
     };
     // A browser-only package is one node, and it is the client half: reporting it
@@ -175,14 +180,41 @@ pub fn assemble(
                     let self_provided = node.scan.provides.contains(provided);
                     let mut satisfied_here = self_provided;
                     if !self_provided {
-                        for provider in names {
+                        // A service name implemented in each application resolves
+                        // within the requiring plugin's own application: that is
+                        // what an isolation scope means, and it is why a name can
+                        // have an owner on each side without conflict. The other
+                        // side's providers are reached only when this side has
+                        // none, and the link then says so.
+                        let same_half: Vec<&String> = names
+                            .iter()
+                            .filter(|provider| {
+                                nodes
+                                    .iter()
+                                    .find(|candidate| &candidate.id == *provider)
+                                    .is_some_and(|candidate| candidate.half == node.half)
+                            })
+                            .collect();
+                        let reachable: Vec<&String> = if same_half.is_empty() {
+                            names.iter().collect()
+                        } else {
+                            same_half
+                        };
+                        for provider in reachable {
+                            let cross_context = nodes
+                                .iter()
+                                .find(|candidate| &candidate.id == provider)
+                                .is_none_or(|candidate| candidate.half != node.half);
                             links.push(PluginLink {
                                 from: node.id.clone(),
                                 to: provider.clone(),
                                 service: provided.to_owned(),
+                                cross_context,
                             });
-                            let provider_package =
-                                package_of.get(provider.as_str()).copied().unwrap_or(provider);
+                            let provider_package = package_of
+                                .get(provider.as_str())
+                                .copied()
+                                .unwrap_or(provider.as_str());
                             if is_activated(provider_package) {
                                 satisfied_here = true;
                             }
@@ -218,7 +250,14 @@ pub fn assemble(
         .collect();
 
     let names: Vec<String> = nodes.iter().map(|node| node.id.clone()).collect();
-    let (order, cycles) = sort_plugins(&names, &links);
+    // Only within-context links order anything: a link across applications is
+    // resolved by the other application's own mount, so it constrains nothing.
+    let ordered_links: Vec<PluginLink> = links
+        .iter()
+        .filter(|link| !link.cross_context)
+        .cloned()
+        .collect();
+    let (order, cycles) = sort_plugins(&names, &ordered_links);
 
     // Compared on the activated plugins only: one the profile never loads does not
     // register anything, so counting it would describe a tree that is not running.

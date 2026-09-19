@@ -32,6 +32,9 @@ export type PluginGraphText = {
   pluginGraphLegendPlugin: string
   pluginGraphLegendService: string
   pluginGraphHalfClient: string
+  pluginGraphHalfHost: string
+  pluginGraphHalvesBoth: string
+  pluginGraphSplitHalves: string
   pluginGraphLegendInactive: string
   // Red marks three conditions; each names itself and carries its own count.
   pluginGraphLegendMissing: (count: number) => string
@@ -120,6 +123,10 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
   const [query, setQuery] = useState('')
   const [showHelp, setShowHelp] = useState(false)
   const [showParseNotes, setShowParseNotes] = useState(false)
+  // Merged by default: a dual-face package is one plugin to a reader looking for
+  // their plugins, and the two halves are there on request. The analysis never
+  // merges — see `displayId`.
+  const [splitHalves, setSplitHalves] = useState(false)
   const canvasRef = useRef<HTMLDivElement | null>(null)
   // A node a filter hides has no box to centre, so revealing it and centring it
   // cannot happen in the same pass. The reveal re-renders, and this carries the
@@ -145,13 +152,35 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
     return map
   }, [graph])
 
+  // A dual-face package's host and browser halves are two nodes in the graph and
+  // one entry in the drawing, unless the reader asks for them apart. Edges are
+  // remapped through this too, so a link to the browser half lands on the package
+  // the reader sees.
+  const halfOf = useMemo(() => {
+    const map = new Map<string, string>()
+    if (!splitHalves) {
+      for (const plugin of graph?.plugins ?? []) {
+        if (plugin.half === 'client' && plugin.id.endsWith('#client')) {
+          map.set(plugin.id, plugin.id.slice(0, -'#client'.length))
+        }
+      }
+    }
+    return map
+  }, [graph, splitHalves])
+  const displayId = (id: string): string => halfOf.get(id) ?? id
+  /** The nodes a display node stands for: one, or a dual-face package's two. */
+  const halvesOf = (id: string): PluginGraph['plugins'] =>
+    (graph?.plugins ?? []).filter((plugin) => displayId(plugin.id) === id)
+
   // The label a node box shows. A browser half carries a marker, because its
   // package name is shared with the host node and the two would otherwise be
   // indistinguishable in the drawing.
   const nodeLabel = (id: string): string => {
     const plugin = byId.get(id)
     const base = plugin?.name ?? id
-    if (plugin?.half !== 'client') return shortLabel(base)
+    // Only a separated browser half needs the marker; merged, the box is the
+    // package and its name says everything.
+    if (plugin?.half !== 'client' || !splitHalves) return shortLabel(base)
     const marker = ` ·${text.pluginGraphHalfClient}`
     return `${shortLabel(base, MAX_LABEL_CHARS - marker.length)}${marker}`
   }
@@ -264,8 +293,9 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
   }, [graph])
 
   const shownPlugins = useMemo(
-    () => new Set(visible.plugins.map((plugin) => plugin.id)),
-    [visible.plugins],
+    () => new Set(visible.plugins.map((plugin) => displayId(plugin.id))),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [visible.plugins, halfOf],
   )
 
   // Both views read left to right as load order: prerequisites first, dependents
@@ -278,32 +308,38 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
       // A repeated pair collapses inside the layout, which combines both the
       // service labels and the hover text.
       return graph.links
-        .filter((link) => shownPlugins.has(link.from) && shownPlugins.has(link.to))
+        .filter((link) => shownPlugins.has(displayId(link.from)) && shownPlugins.has(displayId(link.to)))
+        .filter((link) => displayId(link.from) !== displayId(link.to))
         .map((link) => ({
-          from: link.to,
-          to: link.from,
+          from: displayId(link.to),
+          to: displayId(link.from),
           label: link.service,
-          title: text.pluginGraphEdge(link.from, link.to, link.service),
+          title: text.pluginGraphEdge(
+            fullName(link.from),
+            fullName(link.to),
+            link.service,
+          ),
         }))
     }
     return [
       ...graph.provides
-        .filter((edge) => shownPlugins.has(edge.plugin))
+        .filter((edge) => shownPlugins.has(displayId(edge.plugin)))
         .map((edge) => ({
-          from: edge.plugin,
+          from: displayId(edge.plugin),
           to: edge.service,
-          title: text.pluginGraphProvidesEdge(edge.plugin, edge.service),
+          title: text.pluginGraphProvidesEdge(fullName(edge.plugin), edge.service),
         })),
       ...graph.requires
-        .filter((edge) => shownPlugins.has(edge.plugin))
+        .filter((edge) => shownPlugins.has(displayId(edge.plugin)))
         .filter((edge) => !selfProvided.has(`${edge.plugin}\u0000${edge.service}`))
         .map((edge) => ({
           from: edge.service,
-          to: edge.plugin,
-          title: text.pluginGraphRequiresEdge(edge.plugin, edge.service),
+          to: displayId(edge.plugin),
+          title: text.pluginGraphRequiresEdge(fullName(edge.plugin), edge.service),
         })),
     ]
-  }, [graph, view, text, selfProvided, shownPlugins])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graph, view, text, selfProvided, shownPlugins, halfOf])
 
   // The service view adds a pill per service. Services nothing left in the graph
   // touches would be dead ends, so they follow the same filter as the plugins.
@@ -321,8 +357,9 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
 
   const nodes = useMemo(() => {
     if (graph === null) return []
-    const names = visible.plugins.map((plugin) => plugin.id)
-    return view === 'services' ? [...names, ...serviceNodes] : names
+    const names = visible.plugins.map((plugin) => displayId(plugin.id))
+    const unique = [...new Set(names)]
+    return view === 'services' ? [...unique, ...serviceNodes] : unique
   }, [graph, view, visible.plugins, serviceNodes])
 
   const layout = useMemo(
@@ -338,9 +375,10 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
   // Centre a node in the stage. A search hit or a diagnostic entry has to land
   // somewhere the reader can see, not at whatever pan they happened to leave.
   const focusNode = (target: string): void => {
-    setSelected(target)
+    const node_ = displayId(target)
+    setSelected(node_)
     const container = canvasRef.current
-    const node = layout.nodes.find((entry) => entry.id === target)
+    const node = layout.nodes.find((entry) => entry.id === node_)
     if (container === null || node === undefined) return
     setTransform((current) => clampTransform({
       scale: current.scale,
@@ -358,7 +396,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
       setView(nextView)
       return
     }
-    if (drawn.has(target)) {
+    if (drawn.has(displayId(target))) {
       focusNode(target)
       return
     }
@@ -387,7 +425,10 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
     if (needle === '') return null
     const matched = new Set<string>()
     for (const plugin of visible.plugins) {
-      if (plugin.name.toLowerCase().includes(needle)) matched.add(plugin.id)
+      // Through `displayId`, and so deduplicated: merged, both halves of a
+      // dual-face package are one box, and a set of raw ids would outline only
+      // whichever half happens to be keyed by a drawn node.
+      if (plugin.name.toLowerCase().includes(needle)) matched.add(displayId(plugin.id))
     }
     if (view === 'services') {
       for (const service of serviceNodes) {
@@ -395,7 +436,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
       }
     }
     const hidden = (graph?.plugins ?? [])
-      .filter((plugin) => !drawn.has(plugin.id) && plugin.name.toLowerCase().includes(needle))
+      .filter((plugin) => !drawn.has(displayId(plugin.id)) && plugin.name.toLowerCase().includes(needle))
       .map((plugin) => plugin.name)
     return { matched, hidden }
   }, [query, visible.plugins, serviceNodes, graph, drawn, view])
@@ -423,21 +464,25 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
     // real hang. Marking every consumer would paint the whole diagram red over
     // packages that are merely absent from this tree. A cycle member is marked
     // whatever its activation: the cycle is why no load order exists at all.
-    const runs = plugin?.activated ?? false
-    const issue = cycleMembers.has(nodeId)
-      ? 'cycle'
-      : !runs
-        ? null
-        : marks.missing.has(nodeId)
-          ? 'missing'
-          : marks.inactiveProvider.has(nodeId)
-            ? 'inactive-provider'
-            : null
+    const issueOf = (id: string): GraphNodeMeta['issue'] => {
+      if (cycleMembers.has(id)) return 'cycle'
+      if (!(byId.get(id)?.activated ?? false)) return null
+      if (marks.missing.has(id)) return 'missing'
+      if (marks.inactiveProvider.has(id)) return 'inactive-provider'
+      return null
+    }
+    // A merged box stands for both halves, so it carries whichever half is marked.
+    // The halves never share a cycle — that is what resolving within a context
+    // means — but one of them can be blocked while the other is fine.
+    const ranked: GraphNodeMeta['issue'][] = ['cycle', 'missing', 'inactive-provider']
+    const issues = halvesOf(nodeId).map((half) => issueOf(half.id))
+    const issue = ranked.find((kind) => issues.includes(kind)) ?? null
+    const both = halvesOf(nodeId).length > 1
     return {
       label: nodeLabel(nodeId),
-      title: fullName(nodeId),
+      title: both ? `${fullName(nodeId)} (${text.pluginGraphHalvesBoth})` : fullName(nodeId),
       kind: 'plugin',
-      activated: runs,
+      activated: plugin?.activated ?? false,
       issue,
     }
   }
@@ -552,6 +597,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
   }
 
   const selectedPlugin = selected !== null ? byId.get(selected) : undefined
+  const selectedHalves = selected !== null ? halvesOf(selected) : []
   const selectedIsService = selected !== null && (graph?.services.includes(selected) ?? false)
 
   // The path a selected cycle member sits on, walked through the links inside its
@@ -584,6 +630,21 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
     (graph?.inactiveProviders.length ?? 0) > 0 ||
     (graph?.cycles.length ?? 0) > 0
 
+  // One entry per drawn node: merged, a package's two halves would otherwise
+  // appear twice in a list that is read as "the order".
+  const orderEntries = useMemo(() => {
+    const seen = new Set<string>()
+    const entries: string[] = []
+    for (const id of graph?.order ?? []) {
+      const shown = displayId(id)
+      if (seen.has(shown)) continue
+      seen.add(shown)
+      entries.push(shown)
+    }
+    return entries
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graph, halfOf])
+
   // Keep the load order list pointing at whatever the reader selected in the
   // diagram, so "where does this sit in the order" is answered by looking rather
   // than by scrolling 144 rows.
@@ -611,6 +672,15 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
           />
           <Button variant="ghost" size="sm" className={showInactive ? 'active' : ''} onClick={() => { setShowInactive((current) => !current) }}>{text.pluginGraphShowInactive}</Button>
           <Button variant="ghost" size="sm" className={showIsolated ? 'active' : ''} onClick={() => { setShowIsolated((current) => !current) }}>{text.pluginGraphShowIsolated}</Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className={splitHalves ? 'active' : ''}
+            aria-pressed={splitHalves}
+            onClick={() => { setSplitHalves((current) => !current) }}
+          >
+            {text.pluginGraphSplitHalves}
+          </Button>
           <Button
             variant="ghost"
             size="sm"
@@ -753,6 +823,31 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
                         {(serviceConsumers.get(selected) ?? []).join(', ') || text.pluginGraphNothing}
                       </p>
                     </>
+                  ) : selectedHalves.length > 1 ? (
+                    // The merged box's honest breakdown: which half registers what.
+                    // The two are different cordis plugins, so one list would claim
+                    // the package does something neither half does.
+                    <>
+                      {selectedHalves.map((half) => (
+                        <p className="plugin-graph-detail-line" key={half.id}>
+                          <span className="label">
+                            {half.half === 'client' ? text.pluginGraphHalfClient : text.pluginGraphHalfHost}
+                          </span>{' '}
+                          {(half.provides.join(', ') || text.pluginGraphNothing)}
+                          {' ← '}
+                          {(half.requires.join(', ') || text.pluginGraphNothing)}
+                        </p>
+                      ))}
+                      <p className="plugin-graph-detail-line">
+                        <span className="label">{text.pluginGraphSource}</span> <code>{selectedHalves[0].source}</code>
+                      </p>
+                      {cyclePath !== null && (
+                        <p className="plugin-graph-detail-line danger">
+                          <span className="label">{text.pluginGraphDetailCycle}</span>{' '}
+                          <code>{cyclePath.map((id) => fullName(id)).join(' → ')}</code>
+                        </p>
+                      )}
+                    </>
                   ) : selectedPlugin !== undefined ? (
                     <>
                       <p className="plugin-graph-detail-line">
@@ -884,7 +979,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
               <h3>{text.pluginGraphOrder}</h3>
               {graph.order.length > 0 && (
                 <ol>
-                  {graph.order.map((name) => (
+                  {orderEntries.map((name) => (
                     // The order covers every plugin in the graph, so entries that
                     // never load are muted rather than dropped: the chain through
                     // them is still what the declarations imply. Cycle members are

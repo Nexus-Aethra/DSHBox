@@ -439,6 +439,59 @@ fn a_browser_only_package_is_a_client_node_not_a_host_one() {
 }
 
 #[test]
+fn a_requirement_resolves_within_its_own_context_first() {
+    // `sessions` is registered on both sides in the real tree — by `dsh-session` in
+    // the host app and by the session controller's browser half. cordis resolves a
+    // name within an isolation scope, so the browser consumer must reach the
+    // browser registration, not whatever the host happens to offer.
+    let graph = build(
+        &["ui", "controller", "core"],
+        vec![
+            dual_face("controller", (&["sessionController"], &[]), (&["sessions"], &[])),
+            dual_face("ui", (&[], &[]), (&["slots"], &["sessions"])),
+            discovered("core", &["sessions"], &[]),
+        ],
+    );
+    let to: Vec<&str> = graph
+        .links
+        .iter()
+        .filter(|link| link.from == "ui")
+        .map(|link| link.to.as_str())
+        .collect();
+    assert_eq!(to, vec!["controller#client"], "the host owner of `sessions` is not the browser's provider");
+    assert!(graph.links.iter().all(|link| !link.cross_context));
+}
+
+#[test]
+fn mutually_context_crossing_links_are_not_a_cycle() {
+    // The shapes the real tree has on both sides of the boundary: a browser half
+    // needs the framework's loader, which only the host package's sources declare
+    // (the browser app mounts its own copy of that builtin, and nothing on disk
+    // says so); and a host plugin needs a service the browser half owns. Each is a
+    // real requirement, and neither is a load-order dependency — cordis resolves a
+    // name inside an isolation scope, so the two applications never wait on each
+    // other. Ordering by them reported a cycle in the merged graph, four plugins
+    // wide, on a container that starts up fine.
+    let graph = build(
+        &["browser", "host"],
+        vec![
+            dual_face("browser", (&[], &[]), (&["slots"], &["loader"])),
+            dual_face("host", (&["loader"], &["slots"]), (&[], &[])),
+        ],
+    );
+    let mut crossing: Vec<(&str, &str)> = graph
+        .links
+        .iter()
+        .filter(|link| link.cross_context)
+        .map(|link| (link.from.as_str(), link.to.as_str()))
+        .collect();
+    crossing.sort();
+    assert_eq!(crossing, vec![("browser", "host"), ("host", "browser")]);
+    assert!(graph.cycles.is_empty());
+    assert_eq!(graph.order.len(), 2);
+}
+
+#[test]
 fn a_namespaced_requirement_is_satisfied_by_its_root_service() {
     // The client plugins inject `remote.session` on top of the `remote` service
     // the API gateway provides (packages/api/session-controller/src/client/
@@ -919,6 +972,7 @@ fn the_wire_shape_round_trips() {
     // A node is a plugin, not a package: the UI keys on `id` and shows `half`.
     assert!(value["plugins"][0].get("id").is_some());
     assert!(value["plugins"][0].get("half").is_some());
+    assert!(value["links"][0].get("crossContext").is_some());
     assert!(value.get("scannedAt").is_some());
     assert!(value["plugins"][0].get("activated").is_some());
 }

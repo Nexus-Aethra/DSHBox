@@ -50,6 +50,9 @@ const COPY = {
     pluginGraphLegendPlugin: 'Plugin', pluginGraphLegendService: 'Service',
     // Marks the browser half of a dual-face package next to its host node.
     pluginGraphHalfClient: 'browser',
+    pluginGraphHalfHost: 'host',
+    pluginGraphHalvesBoth: 'host + browser halves',
+    pluginGraphSplitHalves: 'Split halves',
     pluginGraphLegendInactive: 'Not activated',
     // Red marks three different conditions, and one swatch labelled "blocked"
     // explained none of them: a reader seeing only cycle members had no way to
@@ -140,6 +143,9 @@ const COPY = {
     pluginGraphHiddenIsolated: (n: number) => `已隐藏 ${n} 个无依赖关系的插件。`,
     pluginGraphLegendPlugin: '插件', pluginGraphLegendService: '服务',
     pluginGraphHalfClient: '浏览器',
+    pluginGraphHalfHost: '宿主',
+    pluginGraphHalvesBoth: '宿主 + 浏览器两个半身',
+    pluginGraphSplitHalves: '分开半身',
     pluginGraphLegendInactive: '未激活',
     pluginGraphLegendMissing: (n: number) => `缺失服务（${n}）`,
     pluginGraphLegendInactiveProvider: (n: number) => `提供者未加载（${n}）`,

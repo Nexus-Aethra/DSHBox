@@ -122,6 +122,13 @@ pub struct PluginLink {
     pub from: String,
     pub to: String,
     pub service: String,
+    /// The two ends are in different cordis applications. cordis resolves a
+    /// service name within an isolation scope, so this edge is not a load-order
+    /// dependency — the requirement is met by whatever the other application
+    /// mounts, which for a framework builtin is not in the graph at all. It is
+    /// reported because the requirement is real, and kept out of the order
+    /// because only within-context edges order anything.
+    pub cross_context: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -46,7 +46,11 @@ export type GraphPlugin = {
   requires: string[]
 }
 export type ServiceEdge = { plugin: string; service: string }
-export type PluginLink = { from: string; to: string; service: string }
+// `crossContext` links join a host node to a client one. cordis resolves a service
+// name inside an isolation scope, so such a link is a real requirement but not a
+// load-order dependency — the other application's own mount satisfies it, and for
+// a framework builtin that mount is not in this graph at all.
+export type PluginLink = { from: string; to: string; service: string; crossContext: boolean }
 // A service name more than one activated plugin registers. Not a conflict: cordis
 // resolves a name per isolation scope, so a host implementation and a browser one
 // are the design. It is reported because this graph merges the contexts, which
