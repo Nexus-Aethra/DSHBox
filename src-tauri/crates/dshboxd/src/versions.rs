@@ -10,7 +10,8 @@
 //! persisted.
 
 use box_dsh_versions::{
-    installed_versions, parse_template_ref, read_template_index, DshVersion, HARNESS_STANDARD_REF,
+    installed_versions, parse_template_ref, read_template_index, sort_catalog, DshVersion,
+    HARNESS_STANDARD_REF,
 };
 use box_foundation::{
     atomic_write_json, mirror_url, now_seconds, read_config, write_config, write_template_manifest,
@@ -577,7 +578,11 @@ pub(crate) fn list_dsh_versions_derived(
         installed: false,
     });
 
-    Ok(by_name.into_values().collect())
+    // Collected by name for dedup, which is also byte order — oldest first, and
+    // `latest` last because `l` sorts after `d`. Ordered for reading instead.
+    let mut versions: Vec<DshVersion> = by_name.into_values().collect();
+    sort_catalog(&mut versions);
+    Ok(versions)
 }
 
 /// Just the `installed` subset — useful for the Container page badge.
