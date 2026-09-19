@@ -532,6 +532,30 @@ fn a_bundle_reports_what_its_patch_inserts() {
 }
 
 #[test]
+fn a_published_package_is_read_from_its_lib() {
+    // A third-party plugin ships compiled output and nothing else. `lib/` is build
+    // output in a package that has `src/`, but here it is the only code there is —
+    // skipping it by name made `@nexus-aethra/dshell-commands` arrive with no
+    // declarations at all even though it carries `export const inject = [...]`.
+    let root = sandbox("published-package");
+    let package = root.join("packages/plugin");
+    fs::create_dir_all(package.join("lib")).unwrap();
+    fs::write(package.join("package.json"), r#"{"name":"@scope/plugin"}"#).unwrap();
+    fs::write(package.join("lib/index.js"), "export const inject = ['tools']\n").unwrap();
+    let published = source_files(&package, &mut Vec::new());
+    assert!(published.iter().any(|file| file.ends_with("lib/index.js")));
+
+    // The same package once it has sources: `lib/` is generated output again and
+    // reading it too would count every declaration twice.
+    fs::create_dir_all(package.join("src")).unwrap();
+    fs::write(package.join("src/index.ts"), "export const inject = ['tools']\n").unwrap();
+    let sourced = source_files(&package, &mut Vec::new());
+    assert!(sourced.iter().any(|file| file.ends_with("src/index.ts")));
+    assert!(!sourced.iter().any(|file| file.ends_with("lib/index.js")));
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn a_namespaced_requirement_is_satisfied_by_its_root_service() {
     // The client plugins inject `remote.session` on top of the `remote` service
     // the API gateway provides (packages/api/session-controller/src/client/

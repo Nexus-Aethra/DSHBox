@@ -449,12 +449,15 @@ fn read_manifest(directory: &Path) -> Option<(String, Option<String>)> {
 
 /// Package directory names that never hold plugin sources worth scanning.
 fn is_skipped_dir(name: &str) -> bool {
-    matches!(
-        name,
-        "node_modules" | "dist" | "lib" | "build" | "coverage" | ".git" | ".cache"
-    ) || name == "tests"
-        || name == "test"
-        || name == "__tests__"
+    is_build_dir(name)
+        || matches!(name, "node_modules" | ".git" | ".cache")
+        || matches!(name, "tests" | "test" | "__tests__")
+}
+
+/// Output directories that hold generated copies of a package's sources. They are
+/// skipped only when the sources themselves are there to read instead.
+fn is_build_dir(name: &str) -> bool {
+    matches!(name, "dist" | "lib" | "build" | "coverage")
 }
 
 /// Collect core plugin packages under `<harness>/packages`, which groups them one
@@ -567,14 +570,20 @@ fn short_display(path: &Path) -> String {
 
 /// Source files to scan inside one package, preferring `src/` when it exists.
 fn source_files(package: &Path, diagnostics: &mut Vec<String>) -> Vec<PathBuf> {
-    let start = if package.join("src").is_dir() {
+    let has_source_tree = package.join("src").is_dir();
+    let start = if has_source_tree {
         package.join("src")
     } else {
         package.to_path_buf()
     };
     let mut files = Vec::new();
     let mut discovered = 0usize;
-    collect_sources(&start, &mut files, &mut discovered);
+    // A package with no `src/` is a published artifact, and its `lib/` is not
+    // build output — it is the only code there is. Skipping it by name made every
+    // third-party plugin look like it declared nothing: `@nexus-aethra/dshell-commands`
+    // carries `export const inject = [...]` and still arrived an isolated node,
+    // which the panel then hid.
+    collect_sources(&start, !has_source_tree, &mut files, &mut discovered);
     if discovered > files.len() {
         diagnostics.push(format!(
             "{} has {discovered} source files; scanning the first {}",
@@ -590,7 +599,12 @@ fn source_files(package: &Path, diagnostics: &mut Vec<String>) -> Vec<PathBuf> {
 /// [`MAX_SOURCE_FILES`] so one pathological package cannot make the read path
 /// unbounded. The count still reflects the whole tree, so the diagnostic that
 /// reports truncation does not claim to have seen exactly the cap.
-fn collect_sources(directory: &Path, files: &mut Vec<PathBuf>, discovered: &mut usize) {
+fn collect_sources(
+    directory: &Path,
+    reads_build_output: bool,
+    files: &mut Vec<PathBuf>,
+    discovered: &mut usize,
+) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
@@ -598,10 +612,11 @@ fn collect_sources(directory: &Path, files: &mut Vec<PathBuf>, discovered: &mut 
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
-            if is_skipped_dir(&name) || name.starts_with('.') {
+            let skipped = is_skipped_dir(&name) && !(reads_build_output && is_build_dir(&name));
+            if skipped || name.starts_with('.') {
                 continue;
             }
-            collect_sources(&path, files, discovered);
+            collect_sources(&path, reads_build_output, files, discovered);
             continue;
         }
         if name.ends_with(".d.ts") || !is_source_file(&name) {
