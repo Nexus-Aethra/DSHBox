@@ -219,6 +219,199 @@ fn skip_balanced(bytes: &[u8], at: usize, open: u8, close: u8) -> Option<usize> 
     None
 }
 
+/// The dotted callee written immediately before the `(` at `open`, e.g.
+/// `ctx.plugin` for `ctx.plugin({ … })`.
+fn callee_before(code: &[u8], open: usize) -> &[u8] {
+    let mut start = open;
+    while start > 0 && code[start - 1].is_ascii_whitespace() {
+        start -= 1;
+    }
+    let end = start;
+    while start > 0 && (is_ident(code[start - 1]) || code[start - 1] == b'.') {
+        start -= 1;
+    }
+    &code[start..end]
+}
+
+/// Whether the declaration at `at` is an argument of a `*.plugin(…)` call, which
+/// is how cordis is handed a plugin that is not a module's own export.
+///
+/// Walking outwards and deciding at the first unclosed `(` is what keeps a
+/// callback's *body* from counting: an `inject` inside `Object.assign(cb, { … })`
+/// never reaches a `.plugin` callee, because the first unclosed `(` it meets is
+/// `Object.assign`'s own.
+fn argument_of_plugin_call(code: &[u8], at: usize) -> bool {
+    let mut depth = 0i32;
+    let mut i = at;
+    while i > 0 {
+        i -= 1;
+        match code[i] {
+            b'}' | b')' | b']' => depth += 1,
+            // An object or array literal is not what is being called; keep going
+            // outwards to whatever it is an argument of.
+            b'{' | b'[' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            b'(' => {
+                if depth == 0 {
+                    return callee_before(code, i).ends_with(b".plugin");
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether the `=` at `at` introduces a binding, as opposed to `==`, `=>` or a
+/// compound assignment.
+fn is_plain_assignment(code: &[u8], at: usize) -> bool {
+    let before = code.get(at.wrapping_sub(1)).copied();
+    let after = code.get(at + 1).copied();
+    let compound = matches!(before, Some(b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'?'));
+    !compound && after != Some(b'=') && after != Some(b'>')
+}
+
+/// The `=` binding the value that contains `at`, when that value is a plain
+/// expression or an `Object.assign(…)` of one.
+///
+/// `None` for anything else, and that is the point: a property inside some other
+/// call — `ctx.slots.register({ inject: … }, Row)` — has no binding to speak of,
+/// and reporting `None` keeps the previous statement's `=` from being read as
+/// this value's.
+fn assignment_before(code: &[u8], at: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = at;
+    while i > 0 {
+        i -= 1;
+        match code[i] {
+            b'}' | b')' | b']' => depth += 1,
+            b'{' | b'[' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            b'(' => {
+                if depth == 0 && callee_before(code, i) != b"Object.assign" {
+                    return None;
+                }
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            b';' if depth == 0 => return None,
+            b'=' if depth == 0 && is_plain_assignment(code, i) => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether the value that contains `at` is bound by an exported declaration,
+/// e.g. `export const plugin = { … }`.
+///
+/// A module's export is what the loader is handed, so only an exported binding
+/// registers what it holds. The `export` is looked for on the binding's own
+/// source line: DSH writes one declaration per line, and a bounded window cannot
+/// be fooled by the previous statement the way a walk to the file start would —
+/// these sources carry no semicolons, so "the next `;` going backwards" is the
+/// top of the file.
+fn binding_is_exported(code: &[u8], at: usize) -> bool {
+    let Some(equals) = assignment_before(code, at) else {
+        return false;
+    };
+    let line_start = code[..equals]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    find_word(&code[line_start..equals], "export", 0).is_some()
+}
+
+/// The `{` opening the object literal that contains `at`.
+fn enclosing_object_brace(code: &[u8], at: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = at;
+    while i > 0 {
+        i -= 1;
+        match code[i] {
+            b'}' | b')' | b']' => depth += 1,
+            b'{' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+            b'[' | b'(' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether `code[..end]` ends with `word` at an identifier boundary.
+fn ends_with_word(code: &[u8], end: usize, word: &[u8]) -> bool {
+    if end < word.len() || &code[end - word.len()..end] != word {
+        return false;
+    }
+    let before = end - word.len();
+    before == 0 || !is_ident(code[before - 1])
+}
+
+/// Whether the object literal containing `at` is a function's return value.
+///
+/// The factory idiom builds a plugin and hands it back —
+/// `function remoteProxiesPlugin(…): ClientPluginModule { return { inject:
+/// ['connection'], apply(ctx) { … } } }` in `dsh-client-test-runtime` — and the
+/// registration happens in whoever mounts the result. Nothing at this site says
+/// so, so the `return` has to stand in for it; dropping the declaration would
+/// hide a real wait, which is the one failure mode this scanner must not have.
+fn is_returned_object(code: &[u8], at: usize) -> bool {
+    let Some(brace) = enclosing_object_brace(code, at) else {
+        return false;
+    };
+    let mut i = brace;
+    while i > 0 && code[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if ends_with_word(code, i, b"return") {
+        return true;
+    }
+    // An arrow's implicit return: `() => ({ … })`.
+    if code.get(i.wrapping_sub(1)) == Some(&b'(') {
+        let mut j = i - 1;
+        while j > 0 && code[j - 1].is_ascii_whitespace() {
+            j -= 1;
+        }
+        return code[..j].ends_with(b"=>");
+    }
+    false
+}
+
+/// Whether an object property such as `inject: […]` belongs to something cordis
+/// actually registers.
+///
+/// The same property syntax carries declarations that are not plugins at all.
+/// DSH writes every package's invariant companion as
+/// `const install: InvariantInstaller = Object.assign((ctx, fail) => { … },
+/// { inject: ['sessions'] })`, where that `inject` is documented as the services
+/// a child installer fiber may access and is read by the invariants service, not
+/// by cordis. Reading it as a package requirement invented one dependency per
+/// companion — 26 of the 39 `invariant.ts` files in a real checkout, 17 of them
+/// on `sessions` — and with them a load cycle that does not exist; the container
+/// never had it. The property declares a dependency only when it sits in a value
+/// cordis is given: an argument of `*.plugin(…)`, an exported binding, or a
+/// value a factory returns for its caller to mount.
+fn object_property_is_plugin_declaration(code: &[u8], at: usize) -> bool {
+    argument_of_plugin_call(code, at) || binding_is_exported(code, at) || is_returned_object(code, at)
+}
+
 /// Read the string literal starting at `at` in the literals view.
 fn read_literal(literals: &[u8], at: usize) -> Option<(String, usize)> {
     let quote = *literals.get(at)?;
@@ -423,9 +616,16 @@ fn record(scan: &mut Scan, source: &str, offset: usize, what: &str, value: Value
 
 /// `inject` in all of its declaration positions: `export const inject = [...]`,
 /// `static inject = [...]` / `static override inject = [...]`,
-/// `inject: [...]` / `inject: {...}` object properties, and the scoped
-/// `ctx.inject([...], callback)` call. A type annotation between the name and
-/// the value (`export const inject: string[] = []`) is stepped over.
+/// `inject: [...]` / `inject: {...}` object properties of a plugin cordis is
+/// given, and the scoped `ctx.inject([...], callback)` call. A type annotation
+/// between the name and the value (`export const inject: string[] = []`) is
+/// stepped over.
+///
+/// The two `=` forms are declarations wherever they appear: an identifier named
+/// `inject` carrying a service list is a cordis plugin field, and `static
+/// inject` is the service class's own. Only the object *property* form needs
+/// asking whether anything registers it — see
+/// [`object_property_is_plugin_declaration`].
 fn scan_inject(code: &[u8], literals: &[u8], source: &str, scan: &mut Scan) {
     let mut from = 0usize;
     while let Some(pos) = find_word(code, "inject", from) {
@@ -453,10 +653,22 @@ fn scan_inject(code: &[u8], literals: &[u8], source: &str, scan: &mut Scan) {
             Some(b':') => {
                 let after = skip_ws(code, i + 1);
                 if starts_value(code.get(after)) {
+                    // The object-property form, and the only one that needs
+                    // asking who registers it. A property nobody does declares
+                    // nothing, and stays silent rather than being noted: the
+                    // near-misses are routine (`ctx.slots.register({ inject: … })`
+                    // fills a UI slot, and the invariant companions' installers
+                    // are read by the invariants service).
+                    if !object_property_is_plugin_declaration(code, pos) {
+                        continue;
+                    }
                     let value = read_value(code, literals, after);
                     record(scan, source, pos, "inject", value, false);
                 } else if let Some(equals) = find_assignment(code, after) {
-                    // `inject: <type> = <value>`.
+                    // `inject: <type> = <value>` — a *binding* named `inject`,
+                    // which is the module-level plugin field with its type
+                    // spelled out (`export const inject: string[] = []`), not an
+                    // object property.
                     let value = read_value(code, literals, skip_ws(code, equals + 1));
                     record(scan, source, pos, "inject", value, false);
                 }

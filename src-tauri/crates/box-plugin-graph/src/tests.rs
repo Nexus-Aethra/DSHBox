@@ -92,13 +92,83 @@ fn a_type_annotation_before_the_value_is_stepped_over() {
 }
 
 #[test]
-fn object_property_and_assign_forms_are_read() {
-    // e.g. packages/session/session-title/src/invariant.ts
+fn an_object_property_declares_only_what_something_registers() {
+    // An exported binding is the plugin object the loader is handed, so its
+    // property is a declaration — including when the export is an
+    // `Object.assign`ed function, which is how DSH writes a plugin that is also
+    // a callback.
     assert_eq!(
         requires("export const plugin = Object.assign(fn, {\n  inject: ['sessions'],\n})\n"),
         vec!["sessions"]
     );
-    assert_eq!(requires("const p = { inject: ['llm', 'tools'] }\n"), vec!["llm", "tools"]);
+    assert_eq!(
+        requires("export const SessionMediaReferences = { inject: ['connection', 'fs'] }\n"),
+        vec!["connection", "fs"]
+    );
+    // `ctx.plugin({ … })` hands the object to cordis directly.
+    assert_eq!(
+        requires("ctx.plugin({ name: 'tools', inject: ['tools', 'systemPrompt'] })\n"),
+        vec!["systemPrompt", "tools"]
+    );
+}
+
+#[test]
+fn an_unregistered_object_property_is_not_a_dependency() {
+    // The invariant companions of a real checkout: the `inject` here is attached
+    // to an `InvariantInstaller` callback and documents the services a child
+    // installer fiber may reach. It is read by the invariants service, never by
+    // cordis, so the package does not wait on it. 26 of that checkout's 39
+    // `invariant.ts` files are written this way, 17 of them naming `sessions`,
+    // and reading them invented a load cycle the container never had.
+    assert_eq!(
+        requires(concat!(
+            "const install: InvariantInstaller = Object.assign((ctx: Context, fail) => {\n",
+            "  ctx.on('session/event', () => fail('x'))\n",
+            "}, { inject: ['sessions'] })\n",
+        )),
+        Vec::<String>::new()
+    );
+    // A bare local object is not a plugin either.
+    assert_eq!(requires("const p = { inject: ['llm', 'tools'] }\n"), Vec::<String>::new());
+    // Nor is a descriptor passed to something else — the slot registry takes an
+    // `inject` key that names no service anything provides.
+    assert_eq!(
+        requires("ctx.slots.register({ id: 'language', inject: injected }, LanguageRow)\n"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_returned_plugin_object_is_read() {
+    // e.g. dsh-client-test-runtime/src/assembly/remote-proxies.ts: the factory
+    // builds a `ClientPluginModule` and its caller mounts it, so this `inject` is
+    // a real wait even though nothing at the site registers it.
+    assert_eq!(
+        requires(concat!(
+            "export function remoteProxiesPlugin(namespaces: readonly string[]): ClientPluginModule {\n",
+            "  return {\n",
+            "    inject: ['connection'],\n",
+            "    apply(ctx: Context) { ctx.provide('x', null) },\n",
+            "  }\n",
+            "}\n",
+        )),
+        vec!["connection"]
+    );
+    // An arrow's implicit return is the same thing.
+    assert_eq!(
+        requires("const make = () => ({ inject: ['tools'], apply(ctx) {} })\n"),
+        vec!["tools"]
+    );
+}
+
+#[test]
+fn an_unregistered_property_is_not_reported_as_unresolved() {
+    // Staying silent is the point: these sites are routine, so a note per site
+    // would be noise in the diagnostics rather than something to act on.
+    assert!(scan("const p = { inject: ['llm'] }\n").unresolved.is_empty());
+    // An *exported* property that cannot be read as a literal still reports,
+    // because that one really is a declaration.
+    assert_eq!(scan("export const plugin = { inject: [name] }\n").unresolved.len(), 1);
 }
 
 #[test]
