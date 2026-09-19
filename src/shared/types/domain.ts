@@ -76,6 +76,10 @@ export type PluginGraph = {
   missing: ServiceEdge[]
   inactiveProviders: ServiceEdge[]
   sharedServices: SharedService[]
+  // Plugins a template's boxfile added. Their sources are not in the template
+  // tree — they are installed when a container is created — so they are listed and
+  // drawn as nodes rather than being absent from the preview.
+  recipePlugins: string[]
   diagnostics: string[]
   scannedAt: number
 }

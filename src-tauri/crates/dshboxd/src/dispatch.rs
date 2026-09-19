@@ -415,7 +415,7 @@ fn list_repository_reference_counts_rpc() -> Result<Value, String> {
 /// `inject` / service-registration declarations out of them. `kind` decides
 /// whether `id` names a sealed template or a container.
 fn plugin_dependency_graph_rpc(request: &Value) -> Result<Value, String> {
-    use box_plugin_graph::{build_graph, GraphSource, ScanRoots};
+    use box_plugin_graph::{build_graph, GraphPlugin, GraphSource, Half, ScanRoots};
 
     let id = request["id"].as_str().unwrap_or("").to_owned();
     if id.is_empty() {
@@ -447,7 +447,7 @@ fn plugin_dependency_graph_rpc(request: &Value) -> Result<Value, String> {
         other => return Err(format!("unknown plugin graph source `{other}`")),
     };
 
-    let graph = build_graph(
+    let mut graph = build_graph(
         source,
         &id,
         &profile,
@@ -458,6 +458,56 @@ fn plugin_dependency_graph_rpc(request: &Value) -> Result<Value, String> {
         },
         now_seconds(),
     );
+    // A sealed template's tree holds the base, not the plugins its boxfile added:
+    // those live in the manifest's recipe and are installed when a container is
+    // created. Scanning therefore finds none of them, so they are added here —
+    // otherwise the preview of a template omits the very package its boxfile names.
+    if matches!(source, GraphSource::Template) {
+        let manifest = std::fs::read_to_string(directory.join("manifest.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        let recipes: Vec<String> = manifest
+            .as_ref()
+            .and_then(|value| value.get("pluginSources"))
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for spec in recipes {
+            if spec.is_empty() {
+                continue;
+            }
+            if !graph.plugins.iter().any(|plugin| plugin.name == spec) {
+                let version = spec
+                    .rsplit_once('@')
+                    .filter(|(_, tail)| !tail.contains('/'))
+                    .map(|(_, tail)| tail.to_owned());
+                graph.plugins.push(GraphPlugin {
+                    id: spec.clone(),
+                    name: spec.clone(),
+                    half: Half::Host,
+                    version,
+                    activated: true,
+                    source: "template recipe — installed when a container is created".to_owned(),
+                    provides: Vec::new(),
+                    requires: Vec::new(),
+                    inserts: Vec::new(),
+                });
+            }
+            graph.recipe_plugins.push(spec);
+        }
+        if !graph.recipe_plugins.is_empty() {
+            graph.diagnostics.push(format!(
+                "{} plugin(s) come from this template's boxfile and are installed when a container is created, so their sources are not in the template tree",
+                graph.recipe_plugins.len()
+            ));
+        }
+    }
     serde_json::to_value(graph).map_err(|error| format!("cannot serialize plugin graph: {error}"))
 }
 

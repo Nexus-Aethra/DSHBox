@@ -221,6 +221,9 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
     for (const plugin of graph?.plugins ?? []) {
       idsByName.set(plugin.name, [...(idsByName.get(plugin.name) ?? []), plugin.id])
     }
+    // A boxfile's plugins are real nodes of the preview even though nothing in the
+    // template tree declares them, so they must not be dropped as isolated.
+    for (const spec of graph?.recipePlugins ?? []) set.add(spec)
     for (const plugin of graph?.plugins ?? []) {
       const inserts = plugin.inserts ?? []
       if (inserts.length === 0) continue

@@ -177,6 +177,15 @@ pub struct PluginGraph {
     /// reader seeing a cycle or a hairball cannot tell from the drawing alone
     /// that the same name is implemented once per context.
     pub shared_services: Vec<SharedService>,
+    /// Plugins a template's boxfile added, whose sources are not in its tree.
+    ///
+    /// A sealed template holds the base tree and a recipe: `ADD plugin` entries are
+    /// installed when a container is created from it, so scanning the template
+    /// cannot find them. They are listed here — and added as nodes — so that the
+    /// one package the reader added is visible in the preview instead of silently
+    /// absent from it.
+    #[serde(default)]
+    pub recipe_plugins: Vec<String>,
     pub diagnostics: Vec<String>,
     pub scanned_at: u64,
 }

@@ -296,6 +296,7 @@ pub fn assemble(
         missing,
         inactive_providers,
         shared_services,
+        recipe_plugins: Vec::new(),
         diagnostics,
         scanned_at,
     }
