@@ -48,9 +48,9 @@ export type PluginGraphText = {
   pluginGraphMissing: (count: number) => string
   pluginGraphInactive: (count: number) => string
   pluginGraphCycles: (count: number) => string
-  pluginGraphConflicts: (count: number) => string
-  pluginGraphConflict: (providers: string) => string
-  pluginGraphConflictHint: string
+  pluginGraphSharedServices: (count: number) => string
+  pluginGraphSharedService: (providers: string) => string
+  pluginGraphSharedServiceHint: string
   pluginGraphParseNotes: (count: number) => string
   pluginGraphParseNotesHint: string
   pluginGraphOrder: string
@@ -227,9 +227,9 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
   }, [graph])
   const cycleMembers = marks.cycle
   // `pnpm dev` serves this panel against a daemon the reader started themselves,
-  // so the two halves can be different builds; `conflicts` is absent from a daemon
-  // that predates it and reading it unguarded would blank the panel.
-  const conflicts = graph?.conflicts ?? []
+  // so the two halves can be different builds; `sharedServices` is absent from a
+  // daemon that predates it and reading it unguarded would blank the panel.
+  const sharedServices = graph?.sharedServices ?? []
 
   // Providers per service, and which (plugin, service) pairs a plugin provides
   // for itself. Real DSH packages do require a service they also provide
@@ -807,24 +807,26 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
                   </ul>
                 </div>
               )}
-              {/* Not an error on its own — nothing is pending because of it — but
-                  it is the one fact that explains why a service carries a line to
-                  every one of its owners, and often why a cycle exists at all. */}
-              {conflicts.length > 0 && (
+              {/* Not an error, and not a conflict: cordis scopes a service name to
+                  one context, so a host implementation and a browser one coexist
+                  by design. It is worth saying because this diagram merges those
+                  contexts, and that is where the extra lines come from — and often
+                  where a cycle comes from too. */}
+              {sharedServices.length > 0 && (
                 <div className="plugin-graph-issue">
-                  <Badge variant="neutral">{text.pluginGraphConflicts(conflicts.length)}</Badge>
-                  <p className="plugin-graph-note">{text.pluginGraphConflictHint}</p>
+                  <Badge variant="neutral">{text.pluginGraphSharedServices(sharedServices.length)}</Badge>
+                  <p className="plugin-graph-note">{text.pluginGraphSharedServiceHint}</p>
                   <ul>
-                    {conflicts.map((conflict) => (
-                      <li key={conflict.service}>
+                    {sharedServices.map((service) => (
+                      <li key={service.service}>
                         {/* The service name is the way in: its owners are separate
                             plugins and either one is arbitrary, so the jump goes
                             to the hub that both of them register. */}
-                        <button type="button" onClick={() => { requestFocus(conflict.service, 'services') }}>
-                          {conflict.service}
+                        <button type="button" onClick={() => { requestFocus(service.service, 'services') }}>
+                          {service.service}
                         </button>
                         {' '}
-                        {text.pluginGraphConflict(conflict.providers.map(shortLabel).join(', '))}
+                        {text.pluginGraphSharedService(service.providers.map(shortLabel).join(', '))}
                       </li>
                     ))}
                   </ul>

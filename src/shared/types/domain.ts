@@ -38,10 +38,11 @@ export type GraphPlugin = {
 }
 export type ServiceEdge = { plugin: string; service: string }
 export type PluginLink = { from: string; to: string; service: string }
-// A service name registered by more than one activated plugin. cordis resolves a
-// name to one provider, so the extra registrations are a wiring conflict and the
-// traceable cause of the fan-out and of most reported cycles.
-export type ServiceConflict = { service: string; providers: string[] }
+// A service name more than one activated plugin registers. Not a conflict: cordis
+// resolves a name per isolation scope, so a host implementation and a browser one
+// are the design. It is reported because this graph merges the contexts, which
+// draws the name as a fan-out wider than the running tree has.
+export type SharedService = { service: string; providers: string[] }
 export type PluginGraph = {
   source: GraphSourceKind
   sourceId: string
@@ -58,7 +59,7 @@ export type PluginGraph = {
   cycles: string[][]
   missing: ServiceEdge[]
   inactiveProviders: ServiceEdge[]
-  conflicts: ServiceConflict[]
+  sharedServices: SharedService[]
   diagnostics: string[]
   scannedAt: number
 }

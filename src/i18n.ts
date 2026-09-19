@@ -58,7 +58,7 @@ const COPY = {
     pluginGraphLegendCycle: (n: number) => `Load cycle (${n})`,
     pluginGraphMissingHint: 'A service these plugins require is declared by no plugin in the graph, so they wait forever.',
     pluginGraphInactiveProviderHint: 'The plugin providing what they require is installed but the profile does not load it.',
-    pluginGraphCycleHint: 'These plugins depend on each other, so no load order exists and cordis leaves them pending. A package shipping both a host and a browser half is drawn as one node, so a reported cycle can span both contexts. A shared service below is usually what closes the loop: a requirement whose name has several owners is drawn against all of them, and one of those extra edges can complete a circle that no single provider makes.',
+    pluginGraphCycleHint: 'These plugins depend on each other, so no load order exists and cordis leaves them pending. A package shipping both a host and a browser half is drawn as one node, so a reported cycle can span both contexts. A name with more than one registration below is usually what closes the loop: a requirement whose name has several owners is drawn against all of them, and one of those extra edges can complete a circle that no single provider makes.',
     pluginGraphBackEdgeHint: 'Dashed red arrows close a cycle — they point at a plugin the order has already passed.',
     pluginGraphDetailCycle: 'Load cycle',
     pluginGraphDiagnostics: 'Diagnostics',
@@ -66,12 +66,12 @@ const COPY = {
     pluginGraphMissing: (n: number) => `${n} missing service${n === 1 ? '' : 's'}`,
     pluginGraphInactive: (n: number) => `${n} inactive provider${n === 1 ? '' : 's'}`,
     pluginGraphCycles: (n: number) => `${n} dependency cycle${n === 1 ? '' : 's'}`,
-    // A service name with several owners. Not a failure by itself, but it is why
-    // one service carries N×M lines and why a cycle is reported at all, so it is
-    // named rather than left for the reader to infer from the drawing.
-    pluginGraphConflicts: (n: number) => `${n} shared service${n === 1 ? '' : 's'}`,
-    pluginGraphConflict: (providers: string) => `is registered by ${providers}`,
-    pluginGraphConflictHint: 'cordis resolves a service name to one provider. When several loaded plugins register the same name, every consumer is drawn against all of them, and that redundancy alone can close a loop neither plugin has on its own.',
+    // A service name implemented once per context. Not a failure and not a
+    // conflict — but it is why one name carries N×M lines and why a cycle is
+    // reported at all, so it is named rather than left to be inferred.
+    pluginGraphSharedServices: (n: number) => `${n} service name${n === 1 ? '' : 's'} with more than one registration`,
+    pluginGraphSharedService: (providers: string) => `is also registered by ${providers}`,
+    pluginGraphSharedServiceHint: 'cordis resolves a service name per isolation scope, so a host implementation and a browser implementation of the same name coexist by design — usually the same package shipping both halves. This diagram merges those contexts, so such a name and the lines reaching it are drawn wider than the running tree has them.',
     pluginGraphParseNotes: (n: number) => `${n} unresolved declaration${n === 1 ? '' : 's'}`,
     pluginGraphParseNotesHint: 'Declarations the scanner could not read as a literal name, such as a computed service name. A limit of reading source statically, not a problem with the plugins.',
     pluginGraphOrder: 'Load order',
@@ -143,7 +143,7 @@ const COPY = {
     pluginGraphLegendCycle: (n: number) => `依赖环（${n}）`,
     pluginGraphMissingHint: '这些插件需要的服务，图中没有任何插件提供，因此会一直等待。',
     pluginGraphInactiveProviderHint: '它们需要的服务由已安装但 profile 未加载的插件提供。',
-    pluginGraphCycleHint: '这些插件互相依赖，排不出加载顺序，cordis 会让它们保持挂起。同时包含宿主与浏览器半身的包会画成一个节点，因此这里报告的环可能跨越两种上下文。下方列出的多主服务通常才是闭合这个环的原因：一个服务名被多个插件注册时，使用方会被画到全部提供者上，多出的那条边就足以连成一个任何单一提供者都不会形成的圈。',
+    pluginGraphCycleHint: '这些插件互相依赖，排不出加载顺序，cordis 会让它们保持挂起。同时包含宿主与浏览器半身的包会画成一个节点，因此这里报告的环可能跨越两种上下文。下方列出的“有多个注册者的服务名”通常才是闭合这个环的原因：一个服务名被多个插件注册时，使用方会被画到全部提供者上，多出的那条边就足以连成一个任何单一提供者都不会形成的圈。',
     pluginGraphBackEdgeHint: '红色虚线箭头是构成环的回边——它指向加载顺序已经越过的插件。',
     pluginGraphDetailCycle: '依赖环',
     pluginGraphDiagnostics: '诊断',
@@ -151,9 +151,9 @@ const COPY = {
     pluginGraphMissing: (n: number) => `${n} 个缺失服务`,
     pluginGraphInactive: (n: number) => `${n} 个未激活提供者`,
     pluginGraphCycles: (n: number) => `${n} 个依赖环`,
-    pluginGraphConflicts: (n: number) => `${n} 个多主服务`,
-    pluginGraphConflict: (providers: string) => `由 ${providers} 同时注册`,
-    pluginGraphConflictHint: 'cordis 把一个服务名解析到唯一提供者。多个已加载插件注册同一个名字时，每个使用者都会被连到它们全部，仅这层冗余本身就可能闭合成环。',
+    pluginGraphSharedServices: (n: number) => `${n} 个服务名有多个注册者`,
+    pluginGraphSharedService: (providers: string) => `另由 ${providers} 注册`,
+    pluginGraphSharedServiceHint: 'cordis 按 isolation scope 解析服务名，所以同一个名字在宿主与浏览器各有一个实现是设计如此——通常就是同一个包的两半身。本图把这两个上下文合并绘制，因此这类服务名以及连到它的边比运行时更宽。',
     pluginGraphParseNotes: (n: number) => `${n} 处无法解析的声明`,
     pluginGraphParseNotesHint: '扫描器无法读成字面量名字的声明，例如计算出来的服务名。这是静态读源码的局限，不是插件的问题。',
     pluginGraphOrder: '加载顺序',

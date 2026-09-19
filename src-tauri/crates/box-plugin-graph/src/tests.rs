@@ -555,13 +555,14 @@ fn a_plugin_that_provides_what_it_requires_is_satisfied() {
     assert!(graph.links.is_empty());
 }
 
-// ── service conflicts ─────────────────────────────────────────────────────
+// ── service names with several registrations ──────────────────────────────
 
 #[test]
-fn a_service_with_two_loaded_providers_is_reported_as_a_conflict() {
+fn a_service_with_two_loaded_registrations_is_reported() {
     // The real web profile registers `sessions` from both the session controller
-    // and the core session plugin. Nothing in the drawing says so, and the
-    // fan-out it causes is what a reader sees as a hairball.
+    // and the core session plugin — legitimately, in different cordis contexts.
+    // Nothing in the drawing says so, and the fan-out it causes is what a reader
+    // sees as a hairball.
     let graph = build(
         &["a", "b", "consumer"],
         vec![
@@ -570,16 +571,16 @@ fn a_service_with_two_loaded_providers_is_reported_as_a_conflict() {
             discovered("consumer", &[], &["s"]),
         ],
     );
-    assert_eq!(graph.conflicts.len(), 1);
-    assert_eq!(graph.conflicts[0].service, "s");
-    assert_eq!(graph.conflicts[0].providers, vec!["a".to_owned(), "b".to_owned()]);
+    assert_eq!(graph.shared_services.len(), 1);
+    assert_eq!(graph.shared_services[0].service, "s");
+    assert_eq!(graph.shared_services[0].providers, vec!["a".to_owned(), "b".to_owned()]);
 }
 
 #[test]
-fn an_unloaded_second_provider_is_not_a_conflict() {
-    // `b` never registers `s`, so there is nothing to conflict with. Counting it
-    // would report a conflict on the real container for `remote`, `fileUpload`
-    // and `workspaces`, whose only other provider is the unloaded test runtime.
+fn an_unloaded_second_registration_is_not_reported() {
+    // `b` never registers `s`, so the name has one owner. Counting it would
+    // report `remote`, `fileUpload` and `workspaces` on the real container, whose
+    // only other registration comes from the unloaded test runtime.
     let graph = build(
         &["a", "consumer"],
         vec![
@@ -588,11 +589,11 @@ fn an_unloaded_second_provider_is_not_a_conflict() {
             discovered("consumer", &[], &["s"]),
         ],
     );
-    assert!(graph.conflicts.is_empty());
+    assert!(graph.shared_services.is_empty());
 }
 
 #[test]
-fn a_single_provider_is_not_a_conflict() {
+fn a_single_registration_is_not_reported() {
     let graph = build(
         &["a", "consumer"],
         vec![
@@ -600,14 +601,14 @@ fn a_single_provider_is_not_a_conflict() {
             discovered("consumer", &[], &["s"]),
         ],
     );
-    assert!(graph.conflicts.is_empty());
+    assert!(graph.shared_services.is_empty());
 }
 
 #[test]
-fn a_conflict_is_reported_even_when_providing_one_side_is_also_the_consumer() {
+fn a_shared_name_is_reported_even_when_both_owners_also_consume_it() {
     // The real `sessions` pair are both self-providers: each registers the service
-    // and injects it. That idiom is why neither is resolved for the other, but it
-    // does not make two owners of one name any less of a conflict.
+    // and injects it. That idiom is why neither is resolved for the other, but the
+    // name still has two registrations to report.
     let graph = build(
         &["a", "b"],
         vec![
@@ -615,8 +616,8 @@ fn a_conflict_is_reported_even_when_providing_one_side_is_also_the_consumer() {
             discovered("b", &["s"], &["s"]),
         ],
     );
-    assert_eq!(graph.conflicts.len(), 1);
-    assert_eq!(graph.conflicts[0].service, "s");
+    assert_eq!(graph.shared_services.len(), 1);
+    assert_eq!(graph.shared_services[0].service, "s");
 }
 
 // ── end to end over a tree ────────────────────────────────────────────────
@@ -825,7 +826,7 @@ fn the_wire_shape_round_trips() {
     let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     assert!(value.get("sourceId").is_some());
     assert!(value.get("inactiveProviders").is_some());
-    assert!(value.get("conflicts").is_some());
+    assert!(value.get("sharedServices").is_some());
     assert!(value.get("scannedAt").is_some());
     assert!(value["plugins"][0].get("activated").is_some());
 }

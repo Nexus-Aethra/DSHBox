@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::extract::Scan;
-use crate::{GraphPlugin, GraphSource, PluginGraph, PluginLink, ServiceConflict, ServiceEdge};
+use crate::{GraphPlugin, GraphSource, PluginGraph, PluginLink, ServiceEdge, SharedService};
 
 /// One discovered plugin package and what its sources declared.
 #[derive(Clone, Debug)]
@@ -144,10 +144,9 @@ pub fn assemble(
     let names: Vec<String> = discovered.iter().map(|plugin| plugin.name.clone()).collect();
     let (order, cycles) = sort_plugins(&names, &links);
 
-    // Compared on the activated providers only: an installed-but-unloaded plugin
-    // registering the same name never actually registers it, so counting it would
-    // report a conflict the running tree does not have.
-    let conflicts: Vec<ServiceConflict> = providers
+    // Compared on the activated plugins only: one the profile never loads does not
+    // register anything, so counting it would describe a tree that is not running.
+    let shared_services: Vec<SharedService> = providers
         .iter()
         .filter_map(|(service, names)| {
             let loaded: Vec<String> = names
@@ -155,7 +154,7 @@ pub fn assemble(
                 .filter(|name| is_activated(name))
                 .cloned()
                 .collect();
-            (loaded.len() > 1).then(|| ServiceConflict {
+            (loaded.len() > 1).then(|| SharedService {
                 service: service.clone(),
                 providers: loaded,
             })
@@ -175,7 +174,7 @@ pub fn assemble(
         cycles,
         missing,
         inactive_providers,
-        conflicts,
+        shared_services,
         diagnostics,
         scanned_at,
     }

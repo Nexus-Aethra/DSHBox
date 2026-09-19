@@ -75,15 +75,20 @@ pub struct ServiceEdge {
     pub service: String,
 }
 
-/// A service name that more than one loaded plugin registers. cordis resolves a
-/// service name to a single provider, so the extra registrations are a wiring
-/// conflict — and the traceable cause of both the fan-out a reader sees in the
-/// diagram and most of the cycles reported for it.
+/// A service name more than one activated plugin registers.
+///
+/// Not a conflict, and deliberately not named one: cordis resolves a service name
+/// per isolation scope (`cordis/src/reflect.ts`), so a host implementation and a
+/// browser implementation of the same name are the design — `sessions` is
+/// provided by `dsh-session` in the host app and by
+/// `dsh-api-session-controller/src/client/**` in the client app, and both are
+/// correct. It is reported because this diagram merges the contexts, which turns
+/// one name into a fan-out wider than anything the running tree has.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct ServiceConflict {
+pub struct SharedService {
     pub service: String,
-    /// The activated providers of `service`, in name order.
+    /// The activated registrations of `service`, in name order.
     pub providers: Vec<String>,
 }
 
@@ -131,8 +136,8 @@ pub struct PluginGraph {
     pub inactive_providers: Vec<ServiceEdge>,
     /// Services registered by more than one activated plugin. Reported because a
     /// reader seeing a cycle or a hairball cannot tell from the drawing alone
-    /// that the same service name has several owners.
-    pub conflicts: Vec<ServiceConflict>,
+    /// that the same name is implemented once per context.
+    pub shared_services: Vec<SharedService>,
     pub diagnostics: Vec<String>,
     pub scanned_at: u64,
 }
