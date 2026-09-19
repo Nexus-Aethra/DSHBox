@@ -1,0 +1,47 @@
+# DSH Box boxfile — the dshell bundle on DSH 0.1.6-alpha.1
+#
+#   dshbox pull template github.com/deepseek-ai/deepseek-harness:dsh-v0.1.6-alpha.1
+#   dshbox build ./examples/boxfile-dshell.dsh --name dshell
+#   dshbox run dshell
+#
+# The DSH version is not free. `@nexus-aethra/dshell-bundle` pins nine exact
+# `@deepseek-ai/dsh-*` peer versions, and every release from 0.1.2 on names the
+# same pair:
+#
+#   dshell-bundle 0.1.0 / 0.1.1   ->  0.1.5-rc.2
+#   dshell-bundle 0.1.2 / 0.1.3   ->  0.1.5-rc.2 || 0.1.6-alpha.1
+#
+# 0.1.3 is not among them, so a 0.1.3 template would install this package against
+# a framework it was never built for. 0.1.6-alpha.1 is the newest release it does
+# accept, and is what the FROM line below asks for.
+#
+# Two things to know before building:
+#
+# 1. On Linux with the bundled runtime, every DSH at or above 0.1.5-alpha.1
+#    refuses to prepare. `pnpm run build` now starts with `build:native-system`,
+#    which compiles the `flock` Node-API addon and needs
+#    `<node>/include/node/node_api.h`, and `tools/runtime-packager` strips
+#    `include/` from the bundled Node as never used. Prepare then aborts with
+#    `Node-API headers missing at …`. Windows is unaffected; restoring the
+#    headers into the bundled runtime by hand is the workaround, and it also
+#    needs a host C compiler. See the note in AGENTS.md.
+#
+# 2. `npm:` specs resolve through the npm registry configured in Settings, and
+#    mirrors lag on fresh publishes — npmmirror.com still carried only 0.1.2
+#    after 0.1.3 was on registry.npmjs.org. If the install reports that 0.1.3
+#    does not exist, point the npm registry at the canonical one until the
+#    mirror catches up.
+FROM github.com/deepseek-ai/deepseek-harness:dsh-v0.1.6-alpha.1
+PROFILE web
+NAME dshell
+VERSION 1.0.0
+
+# The bundle reaches `node-pty`, whose install script compiles a native binding,
+# and pnpm blocks lifecycle scripts until they are named. This is the line the
+# build prints when it refuses: the source itself, then the transitive key pnpm
+# reported. Both are needed — node-pty does not work without its build.
+LABEL dshbox.allow-build=@nexus-aethra/dshell-bundle@0.1.3,node-pty@1.2.0-beta.15
+
+# Pinned: the package pins its peers, so an unpinned ADD could resolve to a
+# release whose peer range excludes this template.
+ADD plugin npm:@nexus-aethra/dshell-bundle@0.1.3
