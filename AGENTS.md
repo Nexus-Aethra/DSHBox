@@ -35,6 +35,7 @@ pnpm install
 pnpm runtime:prepare      # fetch bundled Node/pnpm runtime manifest
 pnpm server:prepare       # build the dshboxd sidecar
 pnpm tauri dev            # dev shell (frontend + Tauri)
+pnpm dev                  # frontend only, in a browser — see "Browser debugging" below
 pnpm build                # frontend typecheck + vite build (tsc --noEmit && vite build)
 pnpm tauri build          # desktop binary (needs `custom-protocol` feature in release)
 
@@ -107,6 +108,22 @@ they don't run them inline.
   Importing copies into a Container; later repo edits do not mutate installed
   copies.
 
+## Browser debugging
+
+`pnpm dev` serves the Box UI in a plain browser against the **running daemon**, so
+the UI can be inspected with browser devtools instead of a webview. `scripts/dev-rpc-bridge.mjs`
+adds a dev-only `/__rpc` route (`apply: 'serve'`, never in a production build) that
+forwards `box-api.ts` calls to `dshboxd` over its loopback RPC. Start the daemon
+first (`dshboxd`, or any CLI command that spawns it) and set `DSHBOX_CONFIG_DIR` if
+the runtime directory is not the default.
+
+The bridge covers the read-only surface — config, templates, containers, tasks,
+toolchains, and `plugin_dependency_graph`. Commands that the desktop layer
+orchestrates rather than the daemon (anything that enqueues a scheduler task, drives
+the process lifecycle, or opens a native dialog) answer with an explicit "not
+available in browser dev mode" error instead of a stub, so a missing capability is
+obvious. `listenTask` degrades to a no-op and task progress comes from the 3s poll.
+
 ## Known gotchas
 
 - **No system Node/pnpm/Git required (Windows); Linux uses host git with isolated
@@ -139,8 +156,21 @@ they don't run them inline.
   YAML merge producing a single bare-scalar `allowBuilds:` section).
 - **Runtime archive integrity.** Verify SHA-256 (Node) and SHA-512 (pnpm)
   before use; a failed verification aborts startup, no silent fallback.
+- **DSH ≥ `dsh-v0.1.5-alpha.1` cannot be built from source on Linux/macOS with
+  the bundled runtime.** `pnpm run build` now runs `build:native-system` first
+  (`harness/scripts/build.ts`), which compiles the `flock` Node-API addon and
+  requires `<node>/include/node/node_api.h`. `is_redundant_node_file` in
+  `tools/runtime-packager` strips `include/` as "never used", so the container
+  prepare aborts with `Node-API headers missing at …`. Windows is unaffected
+  (`native/system/scripts/build.ts` exits 0 for `--host-addon-only` there).
+  Verified 2026-09-17 against `0.1.6-alpha.1` (commit `0d1f500`): restoring the
+  headers by hand makes the same container build and start, so this is the only
+  blocker — but it also needs a host C compiler, which the runtime bundle
+  otherwise never requires.
 - **Prepared/sealed templates.** Pulling a root Harness template prepares a
-  complete source tree (`pnpm install` + `pnpm run build`). `dshbox build`
+  complete source tree (`pnpm install` only — `validate_prepared_harness`
+  checks that tree; the frontend build happens later, when a container is
+  prepared from it at `dshboxd/src/sealed.rs` "Building DSH frontend"). `dshbox build`
   copies that base and publishes a sealed physical template with locally packed
   plugin artifacts installed. Container creation copies that sealed tree;
   Container startup must never install or build DSH. `dshbox image` remains a

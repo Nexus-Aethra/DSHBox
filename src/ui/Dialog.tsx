@@ -7,9 +7,12 @@ export type DialogProps = {
   description?: string
   onClose: () => void
   children?: ReactNode
+  // `lg` widens the dialog for content that needs a canvas rather than a form.
+  // The default stays narrow so existing confirmations keep their proportions.
+  size?: 'md' | 'lg'
 }
 
-export function Dialog({ open, title, description, onClose, children }: DialogProps) {
+export function Dialog({ open, title, description, onClose, children, size = 'md' }: DialogProps) {
   const ref = useRef<HTMLDialogElement | null>(null)
 
   useEffect(() => {
@@ -43,7 +46,7 @@ export function Dialog({ open, title, description, onClose, children }: DialogPr
   }
 
   return (
-    <dialog ref={ref} className="ui-dialog" onClick={handleClick} onCancel={onClose}>
+    <dialog ref={ref} className={`ui-dialog${size === 'lg' ? ' size-lg' : ''}`} onClick={handleClick} onCancel={onClose}>
       <h2 className="ui-dialog-title">{title}</h2>
       {description !== undefined && description !== '' && <p className="ui-dialog-description">{description}</p>}
       {children}

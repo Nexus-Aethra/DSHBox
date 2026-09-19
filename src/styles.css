@@ -125,6 +125,8 @@ h1 { font-size: clamp(32px, 4vw, 44px); line-height: 1.08; letter-spacing: -.04e
 .extensions-heading label { align-items: center; color: #626973; display: flex; font-size: 12px; gap: 8px; }
 .extensions-heading select, .profile-create input { background: #fff; border: 1px solid #dce0e5; border-radius: 8px; color: #1f2329; font: inherit; padding: 8px 28px 8px 9px; }
 .extensions-heading select { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23626973' d='M6 8.825a.5.5 0 0 1-.354-.146l-4-4a.5.5 0 0 1 .708-.708L6 7.617l3.646-3.646a.5.5 0 0 1 .708.708l-4 4A.5.5 0 0 1 6 8.825z'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; background-size: 12px; }
+.extensions-heading-row { align-items: center; display: flex; gap: 16px; justify-content: space-between; margin-bottom: 12px; }
+.extensions-heading-actions { align-items: center; display: flex; gap: 12px; }
 .profile-create { display: flex; gap: 8px; margin: 0 0 12px; }
 .extension-import { display: flex; gap: 8px; margin: 0 0 12px; }
 .extension-import input { background: #fff; border: 1px solid #dce0e5; border-radius: 8px; color: #1f2329; flex: 1; font: inherit; min-width: 0; padding: 8px 9px; }
@@ -314,6 +316,8 @@ code.missing { color: #b42318; }
 .ui-dialog-title { font-size: 17px; font-weight: 650; letter-spacing: -.02em; margin: 0 0 var(--space-2); }
 .ui-dialog-description { color: var(--color-text-soft); font-size: 13px; line-height: 1.5; margin: 0 0 var(--space-5); }
 .ui-dialog-actions { display: flex; gap: var(--space-2); justify-content: flex-end; }
+/* Wide variant: the dependency diagram needs a canvas, not a form's measure. */
+.ui-dialog.size-lg { display: flex; flex-direction: column; max-height: 88vh; max-width: min(1400px, 96vw); width: 96vw; }
 
 .ui-stack { display: flex; flex-direction: column; gap: var(--space-4); }
 .ui-stack.gap-2 { gap: var(--space-2); }
@@ -329,4 +333,132 @@ code.missing { color: #b42318; }
 .ui-badge.variant-primary { background: var(--color-primary-soft); color: var(--color-primary); }
 .ui-badge.variant-danger { background: #fbeae8; color: var(--color-danger); }
 
+/* === Plugin dependency graph === */
+.plugin-graph-toolbar { align-items: center; display: flex; gap: var(--space-3); justify-content: space-between; margin: 0 0 var(--space-3); }
+.plugin-graph-views, .plugin-graph-actions { align-items: center; display: flex; gap: var(--space-1); }
+/* The shared input is `width: 100%`, which in a flex row would swallow the
+   buttons beside it. */
+.plugin-graph-actions .ui-input { flex: 0 1 200px; width: auto; }
+.plugin-graph-views .ui-button.active, .plugin-graph-actions .ui-button.active { background: var(--color-primary-soft); color: var(--color-primary); }
+.plugin-graph-legend { align-items: center; color: var(--color-text-muted); display: flex; flex-wrap: wrap; font-size: 11px; gap: var(--space-4); list-style: none; margin: 0 0 var(--space-3); padding: 0; }
+.plugin-graph-legend li { align-items: center; display: flex; gap: 6px; }
+.plugin-graph-legend .swatch { border: 1px solid var(--color-border-strong); border-radius: 3px; height: 10px; width: 14px; }
+.plugin-graph-legend .swatch.plugin { background: var(--color-bg); border-color: var(--color-text-muted); }
+.plugin-graph-legend .swatch.service { background: var(--color-primary-soft); border-color: var(--color-primary); border-radius: 999px; }
+.plugin-graph-legend .swatch.inactive { background: var(--color-bg-soft); border-style: dashed; }
+/* The three red marks are drawn differently so the legend swatches match what is
+   on the canvas: an outline for a service nobody declares, a dashed outline when
+   the provider is installed but unloaded, a filled tint for a cycle member. */
+.plugin-graph-legend .swatch.mark-missing { background: var(--color-bg); border-color: var(--color-danger); }
+.plugin-graph-legend .swatch.mark-inactive-provider { background: var(--color-bg); border-color: var(--color-danger); border-style: dashed; }
+.plugin-graph-legend .swatch.mark-cycle { background: #fbeae8; border-color: var(--color-danger); }
+.plugin-graph-legend-notes { color: var(--color-text-muted); font-size: 11px; list-style: none; margin: 0 0 var(--space-3); max-width: 76ch; padding: 0; }
+.plugin-graph-legend-notes li { margin: 0 0 2px; }
+.plugin-graph-legend-notes:empty { display: none; }
+
+/* The diagram is the point of this dialog, so diagnostics sit beside it rather
+   than beneath it: stacked, they take the height the graph needs to stay legible. */
+.plugin-graph-body { display: grid; flex: 1 1 auto; gap: var(--space-4); grid-template-columns: minmax(0, 1fr) 320px; min-height: 0; }
+.plugin-graph-main { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.plugin-graph-side { display: flex; flex-direction: column; gap: var(--space-3); min-height: 0; overflow: auto; }
+
+.plugin-graph-stage { background: var(--color-bg-subtle); border: 1px solid var(--color-border); border-radius: var(--radius-lg); cursor: grab; flex: 1 1 auto; min-height: 300px; overflow: hidden; position: relative; touch-action: none; }
+.plugin-graph-stage:active { cursor: grabbing; }
+.plugin-graph-zoom { display: inline-block; transform-origin: 0 0; }
+.plugin-graph-canvas { display: inline-block; }
+.plugin-graph-canvas svg { display: block; user-select: none; }
+.plugin-graph-empty { color: var(--color-text-muted); font-size: 13px; margin: var(--space-5) 0; text-align: center; }
+
+.plugin-graph-edge { fill: none; stroke: #b6bdc6; stroke-width: 1.4; }
+.plugin-graph-edges .edge.touched .plugin-graph-edge { stroke: var(--color-primary); stroke-width: 2; }
+.plugin-graph-edge.back { stroke: var(--color-danger); stroke-dasharray: 5 3; }
+.plugin-graph-arrow-head { fill: #97a0aa; }
+.plugin-graph-arrow-head.back { fill: var(--color-danger); }
+.plugin-graph-arrow-head.active { fill: var(--color-primary); }
+.plugin-graph-edge-label { fill: var(--color-text-muted); font-family: var(--font-mono); font-size: 10px; paint-order: stroke; stroke: var(--color-bg-subtle); stroke-width: 3px; }
+
+/* Selecting a node fades everything outside its neighbourhood, so which arrows
+   leave it and which arrive stay readable in a graph of a few hundred edges.
+   The fade goes on the whole edge group, not on its path: an arrowhead is drawn
+   by a `marker` element with its own `fill`, and `stroke-opacity` on the path
+   does not touch it — the lines dimmed while every arrowhead stayed solid, which
+   left the direction as unreadable as before. Group opacity composites both. */
+.plugin-graph-edges .edge.muted { opacity: 0.08; }
+.plugin-graph-node.muted { opacity: 0.22; }
+
+.plugin-graph-node { cursor: pointer; }
+.plugin-graph-node rect { fill: var(--color-bg); stroke: var(--color-border-strong); stroke-width: 1.2; }
+.plugin-graph-node text { fill: var(--color-text); font-family: var(--font-mono); font-size: 11px; pointer-events: none; }
+.plugin-graph-node.inactive rect { fill: var(--color-bg-soft); stroke-dasharray: 4 3; }
+.plugin-graph-node.inactive text { fill: var(--color-text-muted); }
+.plugin-graph-node.service rect { fill: var(--color-primary-soft); stroke: var(--color-primary); }
+.plugin-graph-node.service text { fill: var(--color-primary); }
+.plugin-graph-node.missing rect, .plugin-graph-node.cycle rect, .plugin-graph-node.inactive-provider rect { stroke: var(--color-danger); stroke-width: 1.8; }
+.plugin-graph-node.missing text, .plugin-graph-node.cycle text, .plugin-graph-node.inactive-provider text { fill: var(--color-danger); }
+/* Each mark looks like its legend swatch: outline / dashed outline / filled. */
+.plugin-graph-node.inactive-provider rect { stroke-dasharray: 5 3; }
+.plugin-graph-node.cycle rect { fill: #fbeae8; }
+.plugin-graph-node.selected rect { stroke: var(--color-primary); stroke-width: 2.4; }
+/* A search hit: an outline outside the box, so it reads as a find result without
+   competing with the selected node's own ring. */
+.plugin-graph-node.match rect { stroke: var(--color-primary); stroke-width: 2.6; }
+.plugin-graph-node.match text { font-weight: 700; }
+.plugin-graph-node:focus-visible { outline: none; }
+.plugin-graph-node:focus-visible rect { stroke: var(--color-primary); stroke-width: 2.4; }
+
+.plugin-graph-note { color: var(--color-text-muted); font-size: 12px; margin: 0 0 var(--space-2); }
+.plugin-graph-direction { color: var(--color-text-muted); font-size: 11px; margin: 0 0 var(--space-2); max-width: 72ch; }
+/* The how-to-read block, shown only while asked for. */
+.plugin-graph-help { background: var(--color-bg-subtle); border: 1px solid var(--color-border); border-radius: var(--radius-lg); margin: 0 0 var(--space-3); padding: var(--space-3) var(--space-4); }
+.plugin-graph-help .plugin-graph-legend-notes { margin: 0; }
+.plugin-graph-error { color: var(--color-danger); font-size: 12px; margin: 0 0 var(--space-3); }
+.plugin-graph-ok { color: var(--color-success); font-size: 12px; margin: var(--space-2) 0; }
+
+/* Overlays the stage instead of sitting below it, so opening the detail cannot
+   resize the canvas the diagram was fitted to. */
+.plugin-graph-detail { background: var(--color-bg); border: 1px solid var(--color-border); border-radius: var(--radius-lg); bottom: var(--space-3); box-shadow: 0 10px 28px rgba(15,18,22,.16); cursor: auto; left: var(--space-3); max-height: 42%; overflow: auto; padding: var(--space-3) var(--space-4); position: absolute; right: var(--space-3); touch-action: auto; z-index: 2; }
+.plugin-graph-detail-head { align-items: center; display: flex; flex-wrap: wrap; gap: var(--space-2); margin-bottom: var(--space-2); }
+.plugin-graph-detail-head strong { font-family: var(--font-mono); font-size: 12px; }
+.plugin-graph-detail-line { color: var(--color-text-soft); font-size: 12px; margin: 3px 0; word-break: break-word; }
+.plugin-graph-detail-line .label { color: var(--color-text-muted); display: inline-block; min-width: 68px; }
+.plugin-graph-detail-line code { font-family: var(--font-mono); font-size: 11px; }
+.plugin-graph-detail-line.danger, .plugin-graph-detail-line.danger code { color: var(--color-danger); }
+
+.plugin-graph-diagnostics, .plugin-graph-order { border-top: 1px solid var(--color-border); padding-top: var(--space-3); }
+.plugin-graph-side > :first-child { border-top: 0; padding-top: 0; }
+.plugin-graph-diagnostics h3, .plugin-graph-order h3 { font-size: 12px; font-weight: 650; letter-spacing: .04em; margin: 0 0 var(--space-2); text-transform: uppercase; }
+.plugin-graph-issue { margin-bottom: var(--space-3); }
+.plugin-graph-issue ul { color: var(--color-text-soft); font-size: 12px; margin: var(--space-2) 0 0; padding-left: var(--space-5); }
+.plugin-graph-issue li { font-family: var(--font-mono); font-size: 11px; margin-bottom: 3px; }
+/* A diagnostic row is a way into the diagram, so it reads as one: the whole line
+   is the target, and it underlines only on hover or focus. */
+.plugin-graph-issue li button { background: none; border: 0; color: inherit; cursor: pointer; font: inherit; padding: 0; text-align: left; }
+.plugin-graph-issue li button:hover { color: var(--color-primary); text-decoration: underline; }
+.plugin-graph-issue li button:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 1px; }
+.plugin-graph-order ol { color: var(--color-text-soft); margin: var(--space-2) 0 0; padding-left: var(--space-5); }
+.plugin-graph-order li { font-size: 12px; margin-bottom: 2px; }
+/* An order entry that never loads still explains the chain, so it stays listed
+   but recedes. */
+.plugin-graph-order li.inactive { color: var(--color-text-muted); opacity: .7; }
+/* A cycle member has no position of its own; red matches how the diagram and the
+   diagnostics already mark it, so the list does not need a legend of its own. */
+.plugin-graph-order li.pending { color: var(--color-danger); border-left: 2px solid var(--color-danger); margin-left: -8px; padding-left: 6px; }
+/* Where the node selected in the diagram sits in the order. */
+.plugin-graph-order li.current { background: var(--color-primary-soft); border-radius: 3px; font-weight: 650; }
+/* A collapsed diagnostic group: the badge is the whole control. */
+.plugin-graph-disclosure { background: none; border: 0; cursor: pointer; display: block; font: inherit; padding: 0; }
+.plugin-graph-disclosure:hover .ui-badge { background: var(--color-primary-soft); color: var(--color-primary); }
+.plugin-graph-disclosure:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
+.plugin-graph-order code { font-family: var(--font-mono); font-size: 11px; }
+
+.plugin-graph-footer { display: flex; justify-content: flex-end; margin-top: var(--space-4); }
+
+@media (max-width: 768px) {
+  .ui-dialog.size-lg { max-width: 96vw; width: 96vw; }
+  .plugin-graph-body { grid-template-columns: minmax(0, 1fr); }
+  .plugin-graph-stage { min-height: 220px; }
+  .plugin-graph-toolbar { align-items: flex-start; flex-direction: column; }
+}
+
 @media (max-width: 768px) { .app-shell { padding: 18px 20px 48px; } .topbar { align-items: flex-start; gap: 12px; flex-direction: column; } .navigation { width: 100%; overflow-x: auto; } .nav-item { padding: 8px 9px; white-space: nowrap; } .workspace, .onboarding { padding: 58px 0 34px; } .card, .toolchain-row { align-items: flex-start; flex-direction: column; } .toolchain-actions { width: 100%; justify-content: space-between; } .settings-layout { grid-template-columns: 1fr; gap: 16px; } .settings-sidebar { border-bottom: 1px solid #e6e8eb; border-right: 0; display: flex; padding: 0 0 12px; } .settings-row { align-items: flex-start; flex-direction: column; } .settings-row > :last-child { width: 100%; } .settings-input { width: 100%; } .settings-controls { justify-content: flex-start; } .extensions-heading, .extension-row, .extension-import { align-items: flex-start; flex-direction: column; } .extension-row > div:last-child { max-width: 100%; text-align: left; } .extension-import input { width: 100%; } }
+.plugin-graph-note.danger { color: var(--color-danger); }

@@ -9,8 +9,12 @@ import { Input } from '../../ui/Input'
 import { Select } from '../../ui/Select'
 import { Tabs } from '../../ui/Tabs'
 import { Toolbar } from '../../ui/Toolbar'
+import type { PluginGraphText } from '../plugin-graph/PluginGraphPanel'
+import { PluginGraphPanel } from '../plugin-graph/PluginGraphPanel'
 
-type Text = {
+// `pluginGraph*` keys come from the shared set the panel consumes, so the global
+// text can be handed to it unchanged.
+type Text = PluginGraphText & {
   pluginRepo: string; pluginRepoNote: string; noRepositoryPlugins: string; exportPlugin: string
   remove: string; extensionSource: string; browseArchive: string; addExtension: string
   pluginsTab: string; bundles: string; createBundle: string; bundleName: string
@@ -98,6 +102,8 @@ export function ResourcesPage({
   const [scriptPath, setScriptPath] = useState('')
   const [pendingDelete, setPendingDelete] = useState<{ kind: 'plugin' | 'bundle'; id: string; name: string; refs: string[] } | null>(null)
   const [pendingTemplateDelete, setPendingTemplateDelete] = useState<{ name: string } | null>(null)
+  // Name of the template whose dependency graph is open, if any.
+  const [graphTarget, setGraphTarget] = useState<string | null>(null)
 
   // Tab-scoped loading: each tab refreshes its own data the moment it is
   // shown, so a template pulled from the CLI shows up as soon as the user
@@ -329,6 +335,7 @@ export function ResourcesPage({
                       <p className="harness-ref"><span className="label">{text.templateHarness}</span> <code>{template.harnessRef ?? '-'}</code> · {template.profile}</p>
                     </div>
                     <div className="version-actions">
+                      <Button variant="secondary" size="sm" onClick={() => { setGraphTarget(template.name) }}>{text.pluginGraphOpen}</Button>
                       <Button variant="secondary" size="sm" onClick={() => { void exportTemplateArchive(template.name) }}>{text.exportTemplate}</Button>
                       <Button variant="danger" size="sm" onClick={() => { requestDeleteTemplate(template.name) }}>{text.removeTemplate}</Button>
                     </div>
@@ -378,6 +385,10 @@ export function ResourcesPage({
           <Button variant="danger" size="sm" onClick={() => { void confirmDelete() }}>{text.dialogConfirm}</Button>
         </div>
       </Dialog>
+
+      {graphTarget !== null && (
+        <PluginGraphPanel kind="template" id={graphTarget} text={text} onClose={() => { setGraphTarget(null) }} />
+      )}
     </section>
   )
 }

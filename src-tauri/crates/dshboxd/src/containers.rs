@@ -396,6 +396,7 @@ DSH Box 在 build 阶段会自动:
 	| `list_tasks` | — | `[TaskRecord]` |
 	| `list_data_entries` | — | 数据条目 |
 	| `list_repository_reference_counts` | — | 引用计数 |
+	| `plugin_dependency_graph` | `kind`(template/container), `id` | 插件依赖图（cordis requires/provides、拓扑序、缺依赖、环） |
 	| `task_status` | `id` | 单个 TaskRecord |
 	| `cancel_task` | `id` | `{"cancelled":true}` |
 	| `delete_task` | `id` | — |

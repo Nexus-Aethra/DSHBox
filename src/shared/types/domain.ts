@@ -20,6 +20,48 @@ export type RepositoryReferenceRow = { id: string; name: string; kind: Extension
 export type BundleEntry = { repositoryId: string; kind: ExtensionKind; name: string; version: string | null; source: string | null; size: number; diagnostic: string | null }
 export type ExtensionBundle = { id: string; name: string; entries: BundleEntry[]; createdAt: number }
 export type WorkspaceExtension = { kind: ExtensionKind; name: string; version: string | null; description: string | null; relativePath: string; contentDigest: string; diagnostic: string | null }
+
+// ---- plugin dependency graph (cordis requires/provides) ----
+// Mirrors `box_plugin_graph::PluginGraph`. The graph is bipartite on the wire —
+// plugins to services — because that is what cordis actually resolves; the
+// plugin-to-plugin `links` are derived from it by the daemon.
+export type GraphSourceKind = 'template' | 'container'
+export type GraphPlugin = {
+  name: string
+  version: string | null
+  // Only an activated plugin is loaded at runtime, so a service provided solely
+  // from outside this set can never be satisfied.
+  activated: boolean
+  source: string
+  provides: string[]
+  requires: string[]
+}
+export type ServiceEdge = { plugin: string; service: string }
+export type PluginLink = { from: string; to: string; service: string }
+// A service name registered by more than one activated plugin. cordis resolves a
+// name to one provider, so the extra registrations are a wiring conflict and the
+// traceable cause of the fan-out and of most reported cycles.
+export type ServiceConflict = { service: string; providers: string[] }
+export type PluginGraph = {
+  source: GraphSourceKind
+  sourceId: string
+  profile: string
+  plugins: GraphPlugin[]
+  services: string[]
+  requires: ServiceEdge[]
+  provides: ServiceEdge[]
+  links: PluginLink[]
+  // Dependencies before dependents. A cycle's members are emitted as one block at
+  // the position their dependencies put them; `cycles` names the group, and the
+  // order inside it carries no meaning.
+  order: string[]
+  cycles: string[][]
+  missing: ServiceEdge[]
+  inactiveProviders: ServiceEdge[]
+  conflicts: ServiceConflict[]
+  diagnostics: string[]
+  scannedAt: number
+}
 export type TaskStatus = 'queued' | 'running' | 'waiting_input' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
 export type TaskRecord = { id: string; kind: string; resourceKeys: string[]; status: TaskStatus; stage: string; progress: number; createdAt: number; startedAt: number | null; finishedAt: number | null; logPath: string; error: string | null; params: Record<string, unknown>; cancelRequested: boolean }
 export type BoxConfig = { runtimeDirectory: string | null; selectedDshVersion: string | null; language: Language; toolchainSources: Record<string, string>; githubMirror: string | null; npmRegistry: string | null }
