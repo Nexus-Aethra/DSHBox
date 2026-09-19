@@ -51,6 +51,11 @@ const COPY = {
     // Marks the browser half of a dual-face package next to its host node.
     pluginGraphHalfClient: 'browser',
     pluginGraphHalfHost: 'host',
+    // The depth bands. Layer 0 is the base: nothing in the view it depends on.
+    pluginGraphLayerLabel: (layer: number, count: number) =>
+      layer === 0
+        ? `base · ${count} plugin${count === 1 ? '' : 's'} depending on nothing here`
+        : `depth ${layer} · ${count}`, 
     pluginGraphHalvesBoth: 'host + browser halves',
     pluginGraphSplitHalves: 'Split halves',
     pluginGraphLegendInactive: 'Not activated',
@@ -144,6 +149,8 @@ const COPY = {
     pluginGraphLegendPlugin: '插件', pluginGraphLegendService: '服务',
     pluginGraphHalfClient: '浏览器',
     pluginGraphHalfHost: '宿主',
+    pluginGraphLayerLabel: (layer: number, count: number) =>
+      layer === 0 ? `基础层 · ${count} 个（不依赖视图内其它插件）` : `第 ${layer} 层 · ${count} 个`,
     pluginGraphHalvesBoth: '宿主 + 浏览器两个半身',
     pluginGraphSplitHalves: '分开半身',
     pluginGraphLegendInactive: '未激活',

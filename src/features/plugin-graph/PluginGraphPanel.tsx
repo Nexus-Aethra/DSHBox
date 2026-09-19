@@ -32,6 +32,7 @@ export type PluginGraphText = {
   pluginGraphLegendPlugin: string
   pluginGraphLegendService: string
   pluginGraphHalfClient: string
+  pluginGraphLayerLabel: (layer: number, count: number) => string
   pluginGraphHalfHost: string
   pluginGraphHalvesBoth: string
   pluginGraphSplitHalves: string
@@ -362,9 +363,40 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
     return view === 'services' ? [...unique, ...serviceNodes] : unique
   }, [graph, view, visible.plugins, serviceNodes])
 
+  // How many plugins depend on each node, transitively — the layout's
+  // within-layer key. A graph this wide is mostly one layer deep, and without a
+  // gradient inside it the base reads as a crowd; `dsh-invariants` is depended on
+  // by 77 plugins and `dsh-bash-local` by one, and the picture should say so.
+  const weight = useMemo(() => {
+    const dependents = new Map<string, Set<string>>()
+    for (const link of graph?.links ?? []) {
+      const consumer = displayId(link.from)
+      const provider = displayId(link.to)
+      if (consumer === provider) continue
+      const set = dependents.get(provider) ?? new Set<string>()
+      set.add(consumer)
+      dependents.set(provider, set)
+    }
+    const total = new Map<string, number>()
+    for (const id of nodes) {
+      const seen = new Set<string>([id])
+      const stack = [id]
+      while (stack.length > 0) {
+        for (const consumer of dependents.get(stack.pop()!) ?? []) {
+          if (seen.has(consumer)) continue
+          seen.add(consumer)
+          stack.push(consumer)
+        }
+      }
+      total.set(id, seen.size - 1)
+    }
+    return total
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graph, halfOf, nodes])
+
   const layout = useMemo(
-    () => layoutGraph({ nodes, edges, order: graph?.order ?? [] }),
-    [nodes, edges, graph],
+    () => layoutGraph({ nodes, edges, order: graph?.order ?? [], weight }),
+    [nodes, edges, graph, weight],
   )
 
   // Is the node actually drawn right now? Distinct from "is it in the graph":
@@ -786,6 +818,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
                   selected={selected}
                   onSelect={selectUnlessDragged}
                   showEdgeLabels={layout.edges.length <= EDGE_LABEL_LIMIT}
+                  layerLabel={text.pluginGraphLayerLabel}
                   matches={search?.matched ?? null}
                   canvasLabel={text.pluginGraphCanvas}
                   emptyLabel={text.pluginGraphEmpty}

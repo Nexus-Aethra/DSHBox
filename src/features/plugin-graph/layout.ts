@@ -31,6 +31,12 @@ export type LayoutInput = {
   // Preferred within-layer order, typically the daemon's topological order. Nodes
   // it does not mention keep their relative input order after those it does.
   order?: string[]
+  // How fundamental each node is — how many nodes depend on it, transitively.
+  // Higher sorts first within a layer, so a base layer reads as a gradient from
+  // the most depended-on to the least instead of an arbitrary crowd. It is only a
+  // within-layer key: layers are still the dependency depths, so reordering here
+  // can never point an edge backwards.
+  weight?: Map<string, number>
 }
 
 export type PlacedNode = {
@@ -47,12 +53,26 @@ export type PlacedEdge = LayoutEdge & {
   back: boolean
 }
 
+/** One dependency depth as it ended up on the canvas — its bands unioned. */
+export type LayoutGroup = {
+  layer: number
+  x: number
+  y: number
+  width: number
+  height: number
+  count: number
+}
+
 export type Layout = {
   nodes: PlacedNode[]
   edges: PlacedEdge[]
   width: number
   height: number
   layers: number
+  // A layer can be split across several bands when it is too tall to fit, so the
+  // bands are unioned back into the layer they came from: the depth is what the
+  // reader is being shown, and it is one thing however many strips it takes.
+  groups: LayoutGroup[]
 }
 
 export const NODE_WIDTH = 176
@@ -361,19 +381,26 @@ export function layoutGraph(input: LayoutInput): Layout {
   const nodes = [...input.nodes]
   const edges = uniqueEdges(input.edges)
   if (nodes.length === 0) {
-    return { nodes: [], edges: [], width: 0, height: 0, layers: 0 }
+    return { nodes: [], edges: [], width: 0, height: 0, layers: 0, groups: [] }
   }
 
   const layer = assignLayers(nodes, edges)
   const layers = groupByLayer(nodes, layer)
 
-  // Seed each layer with the caller's preferred order before the sweeps run.
-  if (input.order && input.order.length > 0) {
-    const rank = new Map(input.order.map((id, index) => [id, index]))
+  // Seed each layer with the caller's preferred order before the sweeps run: the
+  // most depended-on first, then the topological order, so a layer that has no
+  // internal edges — the base usually does not — still reads as a gradient.
+  const weight = input.weight
+  const rank = input.order && input.order.length > 0
+    ? new Map(input.order.map((id, index) => [id, index]))
+    : null
+  if (weight !== undefined || rank !== null) {
     for (const column of layers) {
       column.sort((left, right) => {
-        const leftRank = rank.get(left) ?? Number.MAX_SAFE_INTEGER
-        const rightRank = rank.get(right) ?? Number.MAX_SAFE_INTEGER
+        const delta = (weight?.get(right) ?? 0) - (weight?.get(left) ?? 0)
+        if (delta !== 0) return delta
+        const leftRank = rank?.get(left) ?? Number.MAX_SAFE_INTEGER
+        const rightRank = rank?.get(right) ?? Number.MAX_SAFE_INTEGER
         if (leftRank !== rightRank) return leftRank - rightRank
         return left.localeCompare(right)
       })
@@ -420,11 +447,29 @@ export function layoutGraph(input: LayoutInput): Layout {
     back: (layer.get(edge.to) ?? 0) <= (layer.get(edge.from) ?? 0),
   }))
 
+  // Union each layer's bands into one group rect, in depth order.
+  const groups: LayoutGroup[] = []
+  for (const node of [...placed].sort((left, right) => left.layer - right.layer)) {
+    const last = groups[groups.length - 1]
+    if (last === undefined || last.layer !== node.layer) {
+      groups.push({ layer: node.layer, x: node.x, y: node.y, width: NODE_WIDTH, height: NODE_HEIGHT, count: 1 })
+      continue
+    }
+    const right = Math.max(last.x + last.width, node.x + NODE_WIDTH)
+    const bottom = Math.max(last.y + last.height, node.y + NODE_HEIGHT)
+    last.x = Math.min(last.x, node.x)
+    last.y = Math.min(last.y, node.y)
+    last.width = right - last.x
+    last.height = bottom - last.y
+    last.count += 1
+  }
+
   return {
     nodes: placed,
     edges: placedEdges,
     width,
     height,
     layers: ordered.length,
+    groups,
   }
 }

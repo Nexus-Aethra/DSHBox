@@ -370,6 +370,10 @@ code.missing { color: #b42318; }
 .plugin-graph-empty { color: var(--color-text-muted); font-size: 13px; margin: var(--space-5) 0; text-align: center; }
 
 .plugin-graph-edge { fill: none; stroke: #b6bdc6; stroke-width: 1.4; }
+/* The depth bands. A fill this faint separates the layers without competing with
+   the node boxes, which already use colour to mean something. */
+.plugin-graph-group { fill: var(--color-bg-subtle); stroke: var(--color-border); stroke-width: 1; }
+.plugin-graph-group-label { fill: var(--color-text-muted); font-family: var(--font-mono); font-size: 10px; letter-spacing: .04em; }
 .plugin-graph-edges .edge.touched .plugin-graph-edge { stroke: var(--color-primary); stroke-width: 2; }
 .plugin-graph-edge.back { stroke: var(--color-danger); stroke-dasharray: 5 3; }
 .plugin-graph-arrow-head { fill: #97a0aa; }

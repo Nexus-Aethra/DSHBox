@@ -23,10 +23,15 @@ type Props = {
   // Nodes the search box matched, outlined rather than isolated so the hit keeps
   // the surrounding graph as context.
   matches: Set<string> | null
+  // Labels for the dependency depths, drawn beside each band.
+  layerLabel: (layer: number, count: number) => string
   // Accessible name for the diagram, and the message shown when it is empty.
   canvasLabel: string
   emptyLabel: string
 }
+
+// Room above each band for its label.
+const GROUP_LABEL_GAP = 14
 
 const PADDING = 16
 const ARROW_GAP = 7
@@ -83,7 +88,7 @@ function edgeMidpoint(edge: PlacedEdge, from: Box, to: Box): { x: number; y: num
   }
 }
 
-export function PluginGraphView({ layout, meta, selected, onSelect, showEdgeLabels, matches, canvasLabel, emptyLabel }: Props) {
+export function PluginGraphView({ layout, meta, selected, onSelect, showEdgeLabels, matches, layerLabel, canvasLabel, emptyLabel }: Props) {
   if (layout.nodes.length === 0) {
     return <p className="plugin-graph-empty">{emptyLabel}</p>
   }
@@ -130,6 +135,30 @@ export function PluginGraphView({ layout, meta, selected, onSelect, showEdgeLabe
             <path d="M 0 0 L 10 5 L 0 10 z" className="plugin-graph-arrow-head active" />
           </marker>
         </defs>
+
+        {/* The depth bands, so the layering is visible and not just implied by
+            where the boxes happen to sit. */}
+        <g className="plugin-graph-groups">
+          {layout.groups.map((group) => (
+            <g key={group.layer}>
+              <rect
+                className="plugin-graph-group"
+                x={group.x - 8}
+                y={group.y - 8}
+                width={group.width + 16}
+                height={group.height + 16}
+                rx={10}
+              />
+              <text
+                className="plugin-graph-group-label"
+                x={group.x - 8}
+                y={group.y - GROUP_LABEL_GAP}
+              >
+                {layerLabel(group.layer, group.count)}
+              </text>
+            </g>
+          ))}
+        </g>
 
         <g className="plugin-graph-edges">
           {layout.edges.map((edge) => {
