@@ -315,6 +315,16 @@ const COMMANDS = {
     return readConfig()
   },
 
+  // ── opening a container's front end ───────────────────────────────────────
+  // The desktop opens a webview window for a container (`open_dsh_front`) or
+  // hands its URL to the system browser (`open_dsh_front_browser`). A page can do
+  // neither, so both answer with the URL the daemon just minted and the frontend
+  // opens a tab — see `openContainerFront` in `src/shared/api/box-api.ts`. The URL
+  // carries a per-launch token, which is why it has to be asked for rather than
+  // built from the port.
+  open_dsh_front: async ({ id }) => (await callDaemon('container_url', { id }))?.url ?? null,
+  open_dsh_front_browser: async ({ id }) => (await callDaemon('container_url', { id }))?.url ?? null,
+
   // ── logs ──────────────────────────────────────────────────────────────────
   // The daemon keeps task logs at the path it reports and container logs under
   // the container directory, but exposes neither as an RPC — the desktop layer

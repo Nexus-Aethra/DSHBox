@@ -34,6 +34,25 @@ function nativeDialog<T>(run: () => Promise<T>): Promise<T> {
   return Promise.reject(new Error('native file dialogs are not available in browser dev mode'))
 }
 
+/**
+ * Open a container's front end. The desktop gives it a webview window of its own
+ * (`open_dsh_front`), or hands the URL to the system browser
+ * (`open_dsh_front_browser`); a page can do neither. The dev bridge therefore
+ * answers with the container's per-launch URL and this opens a tab instead — the
+ * same destination, and it lands in the browser already doing the debugging.
+ */
+async function openContainerFront(command: string, id: string): Promise<void> {
+  if (!useDevBridge) return invoke<void>(command, { id })
+  const url = await ipc<string | null>(command, { id })
+  if (!url) throw new Error('the daemon returned no URL for this container')
+  // Not opened with `noopener`: that makes window.open return null even on
+  // success, which would hide a popup-blocked tab. Cut the opener link by hand so
+  // the failure is still reportable.
+  const opened = window.open(url, '_blank')
+  if (opened === null) throw new Error(`the browser blocked the new tab — open it directly: ${url}`)
+  opened.opener = null
+}
+
 /** The sole frontend boundary to desktop IPC and native dialogs. */
 export const boxApi = {
   loadConfig: () => ipc<BoxConfig>('load_config'),
@@ -49,7 +68,7 @@ export const boxApi = {
   uninstallDshVersion: (version: string) => ipc<BoxConfig>('uninstall_dsh_version', { version }),
   listInstalledDshVersions: () => ipc<string[]>('list_installed_dsh_versions'),
   pullTemplate: (version: string) => ipc<TaskRecord>('enqueue_pull_template', { version }),
-  openDshFrontBrowser: (id: string) => ipc<void>('open_dsh_front_browser', { id }),
+  openDshFrontBrowser: (id: string) => openContainerFront('open_dsh_front_browser', id),
   upgradeLegacyResources: () => ipc<string[]>('upgrade_legacy_resources'),
   createContainer: (name: string, version: string, profile: string) => ipc<DshContainer>('create_dsh_container', { request: { name, version, profile } }),
     listTemplates: () => ipc<TemplateInfo[]>('list_templates'),
@@ -88,7 +107,7 @@ export const boxApi = {
   enqueueContainerStart: (id: string) => ipc<TaskRecord>('enqueue_container_start', { id }),
   enqueueContainerStop: (id: string) => ipc<TaskRecord>('enqueue_container_stop', { id }),
   enqueueContainerRebuild: (id: string) => ipc<TaskRecord>('enqueue_container_rebuild', { id }),
-  openContainer: (id: string) => ipc<void>('open_dsh_front', { id }),
+  openContainer: (id: string) => openContainerFront('open_dsh_front', id),
   listTasks: () => ipc<TaskRecord[]>('list_tasks'),
   cancelTask: (id: string) => ipc<void>('cancel_task', { id }),
   deleteTask: (id: string) => ipc<void>('delete_task', { id }),
