@@ -48,6 +48,8 @@ const COPY = {
     pluginGraphHiddenInactive: (n: number) => `${n} plugin${n === 1 ? '' : 's'} this profile does not load hidden.`,
     pluginGraphHiddenIsolated: (n: number) => `${n} plugin${n === 1 ? '' : 's'} with no dependencies hidden.`,
     pluginGraphLegendPlugin: 'Plugin', pluginGraphLegendService: 'Service',
+    // Marks the browser half of a dual-face package next to its host node.
+    pluginGraphHalfClient: 'browser',
     pluginGraphLegendInactive: 'Not activated',
     // Red marks three different conditions, and one swatch labelled "blocked"
     // explained none of them: a reader seeing only cycle members had no way to
@@ -137,6 +139,7 @@ const COPY = {
     pluginGraphHiddenInactive: (n: number) => `已隐藏 ${n} 个 profile 未加载的插件。`,
     pluginGraphHiddenIsolated: (n: number) => `已隐藏 ${n} 个无依赖关系的插件。`,
     pluginGraphLegendPlugin: '插件', pluginGraphLegendService: '服务',
+    pluginGraphHalfClient: '浏览器',
     pluginGraphLegendInactive: '未激活',
     pluginGraphLegendMissing: (n: number) => `缺失服务（${n}）`,
     pluginGraphLegendInactiveProvider: (n: number) => `提供者未加载（${n}）`,

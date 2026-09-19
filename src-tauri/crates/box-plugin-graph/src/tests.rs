@@ -306,16 +306,38 @@ fn the_context_augmentation_is_read_and_events_are_not() {
 
 // ── assembly ──────────────────────────────────────────────────────────────
 
+fn scan_of(provides: &[&str], requires: &[&str]) -> extract::Scan {
+    extract::Scan {
+        provides: provides.iter().map(|value| (*value).to_owned()).collect(),
+        requires: requires.iter().map(|value| (*value).to_owned()).collect(),
+        ..Default::default()
+    }
+}
+
+/// A package whose declarations all sit in one half.
 fn discovered(name: &str, provides: &[&str], requires: &[&str]) -> Discovered {
     Discovered {
         name: name.to_owned(),
         version: Some("1.0.0".to_owned()),
         source: format!("packages/{name}"),
-        scan: extract::Scan {
-            provides: provides.iter().map(|value| (*value).to_owned()).collect(),
-            requires: requires.iter().map(|value| (*value).to_owned()).collect(),
-            ..Default::default()
-        },
+        host: scan_of(provides, requires),
+        client: None,
+    }
+}
+
+/// A dual-face package: `dsh.client` in its manifest, so its browser half is a
+/// second plugin with its own registrations.
+fn dual_face(
+    name: &str,
+    host: (&[&str], &[&str]),
+    client: (&[&str], &[&str]),
+) -> Discovered {
+    Discovered {
+        name: name.to_owned(),
+        version: Some("1.0.0".to_owned()),
+        source: format!("packages/{name}"),
+        host: scan_of(host.0, host.1),
+        client: Some(scan_of(client.0, client.1)),
     }
 }
 
@@ -347,6 +369,73 @@ fn build_unknown_activation(plugins: Vec<Discovered>) -> PluginGraph {
         Vec::new(),
         1_700_000_000,
     )
+}
+
+// ── host and browser halves ───────────────────────────────────────────────
+
+#[test]
+fn a_dual_face_package_becomes_two_nodes() {
+    // The real shape: `dsh-api-session-controller` registers `sessionController`
+    // from `src/index.ts` (host) and `sessions` from `src/client/**` (browser).
+    // One node per package claimed both, which is a plugin no cordis scope has —
+    // and the cross-context edges it drew closed a load cycle nothing has.
+    let graph = build(
+        &["controller", "consumer"],
+        vec![
+            dual_face("controller", (&["sessionController"], &["sessionQuery"]), (&["sessions"], &[])),
+            discovered("consumer", &["sessionQuery"], &["sessions"]),
+        ],
+    );
+    let ids: Vec<&str> = graph.plugins.iter().map(|plugin| plugin.id.as_str()).collect();
+    assert_eq!(ids, vec!["consumer", "controller", "controller#client"]);
+    // Both nodes keep the package name, so a label and a package-level action
+    // still have one name to show.
+    assert!(graph.plugins.iter().filter(|p| p.name == "controller").count() == 2);
+    let halves: Vec<Half> = graph
+        .plugins
+        .iter()
+        .filter(|p| p.name == "controller")
+        .map(|p| p.half)
+        .collect();
+    assert!(halves.contains(&Half::Host) && halves.contains(&Half::Client));
+    // The browser half provides `sessions`; the host half does not.
+    let client = graph.plugins.iter().find(|p| p.id == "controller#client").unwrap();
+    assert_eq!(client.provides, vec!["sessions".to_owned()]);
+    let host = graph.plugins.iter().find(|p| p.id == "controller").unwrap();
+    assert!(host.provides == vec!["sessionController".to_owned()]);
+    // The package's two halves exchange requirements with the same consumer, and
+    // it stays acyclic: `controller` waits on `sessionQuery` from `consumer`, and
+    // `consumer` waits on `sessions` from the *browser* half, which waits on
+    // nothing. Resolved against one node per package the two edges meet and the
+    // graph reports a cycle — which is what the panel used to draw for the real
+    // container, four plugins wide, on a tree that starts up fine.
+    let mut edges: Vec<(&str, &str)> = graph
+        .links
+        .iter()
+        .map(|link| (link.from.as_str(), link.to.as_str()))
+        .collect();
+    edges.sort();
+    assert_eq!(edges, vec![("consumer", "controller#client"), ("controller", "consumer")]);
+    assert!(graph.cycles.is_empty());
+}
+
+#[test]
+fn a_browser_only_package_is_a_client_node_not_a_host_one() {
+    // Most `dsh-client-ui-*` packages are this: an empty host body beside a real
+    // browser half. Calling it a host node would name the wrong context for every
+    // edge it has — 45 of the real checkout's packages are in this shape.
+    let graph = build(
+        &["ui", "provider"],
+        vec![
+            dual_face("ui", (&[], &[]), (&["slots"], &["remote"])),
+            discovered("provider", &["remote"], &[]),
+        ],
+    );
+    let ids: Vec<&str> = graph.plugins.iter().map(|plugin| plugin.id.as_str()).collect();
+    assert_eq!(ids, vec!["provider", "ui"]);
+    let ui = graph.plugins.iter().find(|plugin| plugin.id == "ui").unwrap();
+    assert_eq!(ui.half, Half::Client);
+    assert_eq!(ui.provides, vec!["slots".to_owned()]);
 }
 
 #[test]
@@ -827,6 +916,9 @@ fn the_wire_shape_round_trips() {
     assert!(value.get("sourceId").is_some());
     assert!(value.get("inactiveProviders").is_some());
     assert!(value.get("sharedServices").is_some());
+    // A node is a plugin, not a package: the UI keys on `id` and shows `half`.
+    assert!(value["plugins"][0].get("id").is_some());
+    assert!(value["plugins"][0].get("half").is_some());
     assert!(value.get("scannedAt").is_some());
     assert!(value["plugins"][0].get("activated").is_some());
 }

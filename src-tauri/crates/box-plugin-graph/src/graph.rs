@@ -5,16 +5,78 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::extract::Scan;
-use crate::{GraphPlugin, GraphSource, PluginGraph, PluginLink, ServiceEdge, SharedService};
+use crate::{GraphPlugin, GraphSource, Half, PluginGraph, PluginLink, ServiceEdge, SharedService};
 
-/// One discovered plugin package and what its sources declared.
+/// One discovered plugin package and what its sources declared, split by the
+/// cordis application those sources belong to.
+///
+/// A package's browser half is a separate plugin from its host half — separate
+/// fibres, separate isolation scopes, mounted by different apps — so the two are
+/// kept apart here. A missing half is one that declared nothing: `dsh-client-ui-*`
+/// packages commonly ship an empty host body beside a real browser one.
 #[derive(Clone, Debug)]
 pub struct Discovered {
     pub name: String,
     pub version: Option<String>,
     /// Display path, relative to the scanned root where possible.
     pub source: String,
-    pub scan: Scan,
+    /// Declarations from the host half — or from the whole package when it
+    /// declares no client entry. Empty for a browser-only package, and for one
+    /// whose sources hold nothing to read; the package is a node all the same,
+    /// because the profile loading it is worth showing even when it only
+    /// aggregates other plugins.
+    pub host: Scan,
+    /// The browser half, present only when the package declares a client entry
+    /// *and* that half declares something.
+    pub client: Option<Scan>,
+}
+
+/// Whether a half declares anything worth a node of its own.
+fn declares(scan: &Scan) -> bool {
+    !scan.provides.is_empty() || !scan.requires.is_empty() || !scan.unresolved.is_empty()
+}
+
+/// A node to be assembled: the id it is keyed by, and the declarations behind it.
+/// It carries the package it came from because activation and provenance are
+/// properties of the package, while everything the graph relates is a property of
+/// the node.
+struct Node<'a> {
+    id: String,
+    half: Half,
+    scan: &'a Scan,
+    plugin: &'a Discovered,
+}
+
+/// The nodes one package contributes.
+///
+/// A package with one declaring half keeps the bare package name as its id, so
+/// splitting dual-face packages does not renumber the rest of the graph. Only when
+/// both halves are present does the client half need a suffix to stay distinct.
+fn nodes_of(plugin: &Discovered) -> Vec<Node<'_>> {
+    let Some(client) = plugin.client.as_ref() else {
+        return vec![Node { id: plugin.name.clone(), half: Half::Host, scan: &plugin.host, plugin }];
+    };
+    // A browser-only package is one node, and it is the client half: reporting it
+    // as a host node would name the wrong context for every edge it has. It keeps
+    // the bare name, because nothing else answers to it — only a package that has
+    // both halves needs the suffix to stay unambiguous.
+    if !declares(&plugin.host) {
+        return vec![Node {
+            id: plugin.name.clone(),
+            half: Half::Client,
+            scan: client,
+            plugin,
+        }];
+    }
+    vec![
+        Node { id: plugin.name.clone(), half: Half::Host, scan: &plugin.host, plugin },
+        Node {
+            id: format!("{}#client", plugin.name),
+            half: Half::Client,
+            scan: client,
+            plugin,
+        },
+    ]
 }
 
 /// Assemble the graph. `activated` is the profile's activation closure, which
@@ -33,6 +95,16 @@ pub fn assemble(
     scanned_at: u64,
 ) -> PluginGraph {
     let is_activated = |name: &str| activated.as_ref().is_none_or(|names| names.contains(name));
+    // Every node carries its package name too: activation is a property of the
+    // package, while everything the graph relates is a property of the node.
+    let mut nodes: Vec<Node<'_>> = discovered.iter().flat_map(nodes_of).collect();
+    nodes.sort_by(|left, right| left.id.cmp(&right.id));
+    // Node id back to the package it belongs to: activation and provenance are the
+    // package's, everything else the node's.
+    let package_of: BTreeMap<&str, &str> = nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node.plugin.name.as_str()))
+        .collect();
     // Providers per service, and the full service set. Everything downstream is
     // built from these two maps.
     let mut providers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -40,15 +112,15 @@ pub fn assemble(
     let mut provides_edges: Vec<ServiceEdge> = Vec::new();
     let mut requires_edges: Vec<ServiceEdge> = Vec::new();
 
-    for plugin in &discovered {
-        for service in &plugin.scan.provides {
+    for node in &nodes {
+        for service in &node.scan.provides {
             providers
                 .entry(service.clone())
                 .or_default()
-                .insert(plugin.name.clone());
+                .insert(node.id.clone());
             services.insert(service.clone());
             provides_edges.push(ServiceEdge {
-                plugin: plugin.name.clone(),
+                plugin: node.id.clone(),
                 service: service.clone(),
             });
         }
@@ -66,32 +138,32 @@ pub fn assemble(
     // the request, is what a reader needs to see in the diagnostics.
     let mut unresolved: BTreeSet<String> = BTreeSet::new();
 
-    for plugin in &discovered {
+    for node in &nodes {
         // Only what the profile loads can hang. A plugin that is installed but not
         // activated neither waits for anything nor runs, so reporting its
         // requirements describes a tree that does not exist — for the real
         // container that was 16 rows of an unloaded plugin waiting on an unloaded
         // provider, while DSH's own startup audit reported nothing pending.
-        let consumer_runs = is_activated(&plugin.name);
-        for service in &plugin.scan.requires {
+        let consumer_runs = is_activated(&node.plugin.name);
+        for service in &node.scan.requires {
             let declared = service.as_str();
             match resolve_service(&providers, declared) {
                 None => {
                     unresolved.insert(declared.to_owned());
                     requires_edges.push(ServiceEdge {
-                        plugin: plugin.name.clone(),
+                        plugin: node.id.clone(),
                         service: declared.to_owned(),
                     });
                     if consumer_runs {
                         missing.push(ServiceEdge {
-                            plugin: plugin.name.clone(),
+                            plugin: node.id.clone(),
                             service: declared.to_owned(),
                         });
                     }
                 }
                 Some((provided, names)) => {
                     requires_edges.push(ServiceEdge {
-                        plugin: plugin.name.clone(),
+                        plugin: node.id.clone(),
                         service: provided.to_owned(),
                     });
                     // A plugin that provides the service itself is waiting for its
@@ -100,23 +172,25 @@ pub fn assemble(
                     // the service's other providers anyway invented both directions
                     // between DSH's two `sessions` providers and reported a cycle
                     // the running tree does not have.
-                    let self_provided = plugin.scan.provides.contains(provided);
+                    let self_provided = node.scan.provides.contains(provided);
                     let mut satisfied_here = self_provided;
                     if !self_provided {
                         for provider in names {
                             links.push(PluginLink {
-                                from: plugin.name.clone(),
+                                from: node.id.clone(),
                                 to: provider.clone(),
                                 service: provided.to_owned(),
                             });
-                            if is_activated(provider) {
+                            let provider_package =
+                                package_of.get(provider.as_str()).copied().unwrap_or(provider);
+                            if is_activated(provider_package) {
                                 satisfied_here = true;
                             }
                         }
                     }
                     if !satisfied_here && consumer_runs {
                         inactive_providers.push(ServiceEdge {
-                            plugin: plugin.name.clone(),
+                            plugin: node.id.clone(),
                             service: provided.to_owned(),
                         });
                     }
@@ -129,19 +203,21 @@ pub fn assemble(
     // a satisfied `a.b` is not a service of its own, it is a path into `a`.
     services.extend(unresolved);
 
-    let plugins: Vec<GraphPlugin> = discovered
+    let plugins: Vec<GraphPlugin> = nodes
         .iter()
-        .map(|plugin| GraphPlugin {
-            name: plugin.name.clone(),
-            version: plugin.version.clone(),
-            activated: is_activated(&plugin.name),
-            source: plugin.source.clone(),
-            provides: plugin.scan.provides.iter().cloned().collect(),
-            requires: plugin.scan.requires.iter().cloned().collect(),
+        .map(|node| GraphPlugin {
+            id: node.id.clone(),
+            name: node.plugin.name.clone(),
+            half: node.half,
+            version: node.plugin.version.clone(),
+            activated: is_activated(&node.plugin.name),
+            source: node.plugin.source.clone(),
+            provides: node.scan.provides.iter().cloned().collect(),
+            requires: node.scan.requires.iter().cloned().collect(),
         })
         .collect();
 
-    let names: Vec<String> = discovered.iter().map(|plugin| plugin.name.clone()).collect();
+    let names: Vec<String> = nodes.iter().map(|node| node.id.clone()).collect();
     let (order, cycles) = sort_plugins(&names, &links);
 
     // Compared on the activated plugins only: one the profile never loads does not
@@ -151,7 +227,10 @@ pub fn assemble(
         .filter_map(|(service, names)| {
             let loaded: Vec<String> = names
                 .iter()
-                .filter(|name| is_activated(name))
+                .filter(|id| {
+                    let package = package_of.get(id.as_str()).copied().unwrap_or(id);
+                    is_activated(package)
+                })
                 .cloned()
                 .collect();
             (loaded.len() > 1).then(|| SharedService {

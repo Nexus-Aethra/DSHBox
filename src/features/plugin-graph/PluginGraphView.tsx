@@ -4,6 +4,8 @@ import { NODE_HEIGHT, NODE_WIDTH } from './layout'
 /** What the renderer needs to know about a node beyond its position. */
 export type GraphNodeMeta = {
   label: string
+  /** Full name for the tooltip; the box label is elided to fit. */
+  title?: string
   kind: 'plugin' | 'service'
   // A plugin outside the profile's activation closure is installed but never
   // loaded, which is why it is drawn muted rather than as a normal node.
@@ -185,7 +187,7 @@ export function PluginGraphView({ layout, meta, selected, onSelect, showEdgeLabe
                   }
                 }}
               >
-                <title>{info.label}</title>
+                <title>{info.title ?? info.label}</title>
                 <rect width={NODE_WIDTH} height={NODE_HEIGHT} rx={info.kind === 'service' ? NODE_HEIGHT / 2 : 9} />
                 <text x={NODE_WIDTH / 2} y={NODE_HEIGHT / 2 + 4} textAnchor="middle">
                   {info.label}

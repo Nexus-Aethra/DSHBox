@@ -26,8 +26,17 @@ export type WorkspaceExtension = { kind: ExtensionKind; name: string; version: s
 // plugins to services — because that is what cordis actually resolves; the
 // plugin-to-plugin `links` are derived from it by the daemon.
 export type GraphSourceKind = 'template' | 'container'
+// Which cordis application a plugin is mounted in. A package can ship both: the
+// `dsh.client` manifest field declares a browser entry, and DSH calls the two the
+// package's host half and its client half. They are separate plugins in separate
+// isolation scopes, so each is a node of its own.
+export type GraphHalf = 'host' | 'client'
 export type GraphPlugin = {
+  // Node key. The package name for a single-half package; the client half of a
+  // dual-face package carries a suffix so both nodes stay distinct.
+  id: string
   name: string
+  half: GraphHalf
   version: string | null
   // Only an activated plugin is loaded at runtime, so a service provided solely
   // from outside this set can never be satisfied.

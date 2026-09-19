@@ -52,10 +52,32 @@ pub enum GraphSource {
     Container,
 }
 
+/// Which cordis application a plugin is mounted in.
+///
+/// A package can ship both: `dsh.client` in its manifest declares a browser
+/// entry (`exports["./client"]`), and DSH's own docs call the two the package's
+/// host half and its client half. They are separate plugins in separate contexts
+/// — `sessions` is registered by `dsh-session` in the host app and by
+/// `dsh-api-session-controller/src/client/**` in the browser — so a graph node
+/// per package would weld two plugins together and draw edges across contexts
+/// that no cordis scope has.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum Half {
+    Host,
+    Client,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphPlugin {
+    /// Node key. Equal to `name` for a package with one half; the client half of
+    /// a package that also has a host half is suffixed, because both nodes then
+    /// exist and a bare package name would be ambiguous.
+    pub id: String,
+    /// Package name. Two nodes can share it — see [`Half`].
     pub name: String,
+    pub half: Half,
     pub version: Option<String>,
     /// Whether the plugin is part of the profile's activation closure. Only an
     /// activated plugin is actually loaded at runtime, which is why a service
@@ -212,7 +234,13 @@ pub fn build_graph(
     let mut discovered: Vec<Discovered> = Vec::new();
     for candidate in unique.into_values() {
         let files = source_files(&candidate.directory, &mut diagnostics);
-        let mut scan = Scan::default();
+        // Where the package's own manifest says its browser entry's sources are.
+        // `None` for a host-only package, and for one that declares a client
+        // entry whose sources cannot be located — the latter is reported rather
+        // than guessed at.
+        let client_dir = client_half_dir(&candidate, &mut diagnostics);
+        let mut host = Scan::default();
+        let mut client = Scan::default();
         for file in files {
             match fs::read_to_string(&file) {
                 Ok(text) => {
@@ -229,29 +257,32 @@ pub fn build_graph(
                             display_path(label)
                         ));
                     }
-                    scan_merge(&mut scan, next);
+                    let belongs_to_client = client_dir
+                        .as_ref()
+                        .is_some_and(|dir| file.starts_with(dir));
+                    scan_merge(if belongs_to_client { &mut client } else { &mut host }, next);
                 }
                 Err(error) => {
                     diagnostics.push(format!("cannot read {}: {error}", display_path(&file)))
                 }
             }
         }
-        let has_declarations = !scan.provides.is_empty()
-            || !scan.requires.is_empty()
-            || !scan.unresolved.is_empty();
-        // Keep packages that declare something, plus whatever the profile
-        // activates: a bundle named in the boxfile is worth showing even when it
-        // only aggregates other plugins.
-        if has_declarations
-            || activated
-                .as_ref()
-                .is_some_and(|names| names.contains(&candidate.name))
-        {
+        let has_declarations = |scan: &Scan| {
+            !scan.provides.is_empty() || !scan.requires.is_empty() || !scan.unresolved.is_empty()
+        };
+        let is_activated = activated
+            .as_ref()
+            .is_some_and(|names| names.contains(&candidate.name));
+        // A half that declares nothing is not a node: many `dsh-client-ui-*`
+        // packages ship an empty host body beside a real browser half, and giving
+        // the stub its own node would be fourteen nodes of noise.
+        if has_declarations(&host) || has_declarations(&client) || is_activated {
             discovered.push(Discovered {
                 name: candidate.name.clone(),
                 version: candidate.version.clone(),
                 source: candidate.display,
-                scan,
+                host,
+                client: has_declarations(&client).then_some(client),
             });
         }
     }
@@ -286,6 +317,50 @@ struct Candidate {
 
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// The source directory of a package's browser half, as its own manifest declares
+/// it.
+///
+/// `dsh.client` is what makes a package dual-face, and `exports["./client"]` names
+/// the browser entry. That entry is a build output (`./lib/types/client/index.d.ts`
+/// in every dual-face package of the real checkout), so the source directory is
+/// read off the built path's last segment — `client` — and then verified on disk.
+/// Nothing here hardcodes the name: a package whose entry lived elsewhere would be
+/// followed, and one whose source tree does not match its build layout is reported
+/// as a diagnostic and left whole, rather than split on a guess.
+fn client_half_dir(candidate: &Candidate, diagnostics: &mut Vec<String>) -> Option<PathBuf> {
+    let manifest = fs::read_to_string(candidate.directory.join("package.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&manifest).ok()?;
+    value.pointer("/dsh/client")?;
+    // The subpath is the literal key `./client`, and a JSON Pointer escapes `/`
+    // as `~1`.
+    let entry = value.pointer("/exports/.~1client")?;
+    let built = ["types", "default"]
+        .iter()
+        .filter_map(|key| entry.get(key).and_then(serde_json::Value::as_str))
+        .next()
+        .unwrap_or_default();
+    let segment = built
+        .rsplit('/')
+        .find(|part| !part.is_empty() && !part.contains('.'))
+        .unwrap_or_default();
+    if segment.is_empty() {
+        diagnostics.push(format!(
+            "{}: declares dsh.client with an unreadable entry {built:?}",
+            candidate.name
+        ));
+        return None;
+    }
+    let source = candidate.directory.join("src").join(segment);
+    if source.is_dir() {
+        return Some(source);
+    }
+    diagnostics.push(format!(
+        "{}: declares dsh.client but its browser half is not at src/{segment}",
+        candidate.name
+    ));
+    None
 }
 
 /// Read `name` and `version` from a `package.json`. Returns `None` for a

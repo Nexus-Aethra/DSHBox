@@ -31,6 +31,7 @@ export type PluginGraphText = {
   pluginGraphDirectionHint: string
   pluginGraphLegendPlugin: string
   pluginGraphLegendService: string
+  pluginGraphHalfClient: string
   pluginGraphLegendInactive: string
   // Red marks three conditions; each names itself and carries its own count.
   pluginGraphLegendMissing: (count: number) => string
@@ -102,9 +103,9 @@ const DRAG_THRESHOLD_PX = 3
 // roughly halves the label width, which is what makes them readable at all. What
 // is still too long for the box is elided, since SVG text does not wrap — the
 // full name stays in the node tooltip and the detail panel.
-function shortLabel(name: string): string {
+function shortLabel(name: string, max = MAX_LABEL_CHARS): string {
   const short = name.startsWith('@deepseek-ai/') ? name.slice('@deepseek-ai/'.length) : name
-  return short.length > MAX_LABEL_CHARS ? `${short.slice(0, MAX_LABEL_CHARS - 1)}…` : short
+  return short.length > max ? `${short.slice(0, max - 1)}…` : short
 }
 
 export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
@@ -136,11 +137,31 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
     return () => { cancelled = true }
   }, [kind, id])
 
-  const byName = useMemo(() => {
+  // Keyed by node id, not package name: a dual-face package is two nodes sharing
+  // one name, so a name-keyed map would lose one of them.
+  const byId = useMemo(() => {
     const map = new Map<string, PluginGraph['plugins'][number]>()
-    for (const plugin of graph?.plugins ?? []) map.set(plugin.name, plugin)
+    for (const plugin of graph?.plugins ?? []) map.set(plugin.id, plugin)
     return map
   }, [graph])
+
+  // The label a node box shows. A browser half carries a marker, because its
+  // package name is shared with the host node and the two would otherwise be
+  // indistinguishable in the drawing.
+  const nodeLabel = (id: string): string => {
+    const plugin = byId.get(id)
+    const base = plugin?.name ?? id
+    if (plugin?.half !== 'client') return shortLabel(base)
+    const marker = ` ·${text.pluginGraphHalfClient}`
+    return `${shortLabel(base, MAX_LABEL_CHARS - marker.length)}${marker}`
+  }
+
+  /** Full name for tooltips and detail, where the marker is spelled out. */
+  const fullName = (id: string): string => {
+    const plugin = byId.get(id)
+    if (plugin === undefined) return id
+    return plugin.half === 'client' ? `${plugin.name} (${text.pluginGraphHalfClient})` : plugin.name
+  }
 
   // Isolated plugins — no provides, no requires — say nothing about
   // dependencies, so they are dropped unless asked for. So are plugins the
@@ -168,17 +189,17 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
     const plugins = graph?.plugins ?? []
     const shown = plugins.filter((plugin) => {
       if (!showInactive && !plugin.activated) return false
-      if (!showIsolated && !participants.has(plugin.name)) return false
+      if (!showIsolated && !participants.has(plugin.id)) return false
       return true
     })
     // The two counts are disjoint: a hidden plugin is either outside the graph
     // entirely or in it but not loaded.
     const hiddenIsolated = showIsolated
       ? 0
-      : plugins.filter((plugin) => !participants.has(plugin.name)).length
+      : plugins.filter((plugin) => !participants.has(plugin.id)).length
     const hiddenInactive = showInactive
       ? 0
-      : plugins.filter((plugin) => participants.has(plugin.name) && !plugin.activated).length
+      : plugins.filter((plugin) => participants.has(plugin.id) && !plugin.activated).length
     return { plugins: shown, hiddenIsolated, hiddenInactive }
   }, [graph, showIsolated, showInactive, participants])
 
@@ -243,7 +264,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
   }, [graph])
 
   const shownPlugins = useMemo(
-    () => new Set(visible.plugins.map((plugin) => plugin.name)),
+    () => new Set(visible.plugins.map((plugin) => plugin.id)),
     [visible.plugins],
   )
 
@@ -300,7 +321,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
 
   const nodes = useMemo(() => {
     if (graph === null) return []
-    const names = visible.plugins.map((plugin) => plugin.name)
+    const names = visible.plugins.map((plugin) => plugin.id)
     return view === 'services' ? [...names, ...serviceNodes] : names
   }, [graph, view, visible.plugins, serviceNodes])
 
@@ -366,7 +387,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
     if (needle === '') return null
     const matched = new Set<string>()
     for (const plugin of visible.plugins) {
-      if (plugin.name.toLowerCase().includes(needle)) matched.add(plugin.name)
+      if (plugin.name.toLowerCase().includes(needle)) matched.add(plugin.id)
     }
     if (view === 'services') {
       for (const service of serviceNodes) {
@@ -374,7 +395,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
       }
     }
     const hidden = (graph?.plugins ?? [])
-      .filter((plugin) => !drawn.has(plugin.name) && plugin.name.toLowerCase().includes(needle))
+      .filter((plugin) => !drawn.has(plugin.id) && plugin.name.toLowerCase().includes(needle))
       .map((plugin) => plugin.name)
     return { matched, hidden }
   }, [query, visible.plugins, serviceNodes, graph, drawn, view])
@@ -385,7 +406,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
     const needle = query.trim().toLowerCase()
     if (needle === '') return
     const hit = visible.plugins.find((plugin) => plugin.name.toLowerCase().includes(needle))
-    if (hit !== undefined) focusNode(hit.name)
+    if (hit !== undefined) focusNode(hit.id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query])
 
@@ -397,7 +418,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
         issue: missingServices.has(nodeId) ? 'missing' : inactiveServices.has(nodeId) ? 'inactive-provider' : null,
       }
     }
-    const plugin = byName.get(nodeId)
+    const plugin = byId.get(nodeId)
     // Only an activated plugin actually loads, so only its unmet requirement is a
     // real hang. Marking every consumer would paint the whole diagram red over
     // packages that are merely absent from this tree. A cycle member is marked
@@ -413,7 +434,8 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
             ? 'inactive-provider'
             : null
     return {
-      label: shortLabel(plugin?.name ?? nodeId),
+      label: nodeLabel(nodeId),
+      title: fullName(nodeId),
       kind: 'plugin',
       activated: runs,
       issue,
@@ -529,7 +551,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
     setSelected(id)
   }
 
-  const selectedPlugin = selected !== null ? byName.get(selected) : undefined
+  const selectedPlugin = selected !== null ? byId.get(selected) : undefined
   const selectedIsService = selected !== null && (graph?.services.includes(selected) ?? false)
 
   // The path a selected cycle member sits on, walked through the links inside its
@@ -712,7 +734,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
                   onPointerDown={(event) => { event.stopPropagation() }}
                 >
                   <div className="plugin-graph-detail-head">
-                    <strong>{selected}</strong>
+                    <strong>{fullName(selected)}</strong>
                     {selectedIsService && <Badge variant="neutral">{text.pluginGraphLegendService}</Badge>}
                     {selectedPlugin !== undefined && (
                       <Badge variant={selectedPlugin.activated ? 'success' : 'neutral'}>
@@ -748,7 +770,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
                         // Why this node is red, spelled out: the path it sits on.
                         <p className="plugin-graph-detail-line danger">
                           <span className="label">{text.pluginGraphDetailCycle}</span>{' '}
-                          <code>{cyclePath.map((name) => shortLabel(name)).join(' → ')}</code>
+                          <code>{cyclePath.map((id) => fullName(id)).join(' → ')}</code>
                         </p>
                       )}
                     </>
@@ -769,7 +791,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
                     {graph.missing.map((edge) => (
                       <li key={`${edge.plugin}-${edge.service}`}>
                         <button type="button" onClick={() => { requestFocus(edge.plugin) }}>
-                          {text.pluginGraphBlocked(edge.plugin, edge.service)}
+                          {text.pluginGraphBlocked(fullName(edge.plugin), edge.service)}
                         </button>
                       </li>
                     ))}
@@ -783,7 +805,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
                   {graph.inactiveProviders.map((edge) => (
                     <li key={`${edge.plugin}-${edge.service}`}>
                       <button type="button" onClick={() => { requestFocus(edge.plugin) }}>
-                        {text.pluginGraphBlockedInactive(edge.plugin, edge.service)}
+                        {text.pluginGraphBlockedInactive(fullName(edge.plugin), edge.service)}
                       </button>
                     </li>
                   ))}
@@ -799,7 +821,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
                         {cycle.map((name, index) => (
                           <Fragment key={name}>
                             {index > 0 && ' → '}
-                            <button type="button" onClick={() => { requestFocus(name) }}>{name}</button>
+                            <button type="button" onClick={() => { requestFocus(name) }}>{fullName(name)}</button>
                           </Fragment>
                         ))}
                       </li>
@@ -826,7 +848,7 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
                           {service.service}
                         </button>
                         {' '}
-                        {text.pluginGraphSharedService(service.providers.map(shortLabel).join(', '))}
+                        {text.pluginGraphSharedService(service.providers.map((id) => fullName(id)).join(', '))}
                       </li>
                     ))}
                   </ul>
@@ -872,13 +894,13 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
                       key={name}
                       ref={name === selected ? selectedOrderRef : undefined}
                       className={[
-                        byName.get(name)?.activated === false ? 'inactive' : '',
+                        byId.get(name)?.activated === false ? 'inactive' : '',
                         cycleMembers.has(name) ? 'pending' : '',
                         name === selected ? 'current' : '',
                       ].filter(Boolean).join(' ') || undefined}
                       title={cycleMembers.has(name) ? text.pluginGraphOrderPending : undefined}
                     >
-                      <code>{name}</code>
+                      <code>{fullName(name)}</code>
                     </li>
                   ))}
                 </ol>
