@@ -87,6 +87,16 @@ pub struct GraphPlugin {
     pub source: String,
     pub provides: Vec<String>,
     pub requires: Vec<String>,
+    /// Plugin names this package's patch file inserts — the contents of an
+    /// umbrella bundle.
+    ///
+    /// A bundle package is often a shell: `@nexus-aethra/dshell-bundle` ships a
+    /// `package.json`, a `cordis.patch.yml` and a compiled `lib/` with no
+    /// declaration this scanner can read, and its eleven sibling plugins are
+    /// mounted by the patch rows. Without following that file the bundle is an
+    /// empty node with no edges, which the panel then hides as isolated — so the
+    /// one package a reader installed is the one they cannot see.
+    pub inserts: Vec<String>,
 }
 
 /// One plugin's relation to one service.
@@ -246,6 +256,7 @@ pub fn build_graph(
         // entry whose sources cannot be located — the latter is reported rather
         // than guessed at.
         let client_dir = client_half_dir(&candidate, &mut diagnostics);
+        let inserts = bundle_inserts(&candidate, &mut diagnostics);
         let mut host = Scan::default();
         let mut client = Scan::default();
         for file in files {
@@ -290,6 +301,7 @@ pub fn build_graph(
                 source: candidate.display,
                 host,
                 client: has_declarations(&client).then_some(client),
+                inserts,
             });
         }
     }
@@ -368,6 +380,58 @@ fn client_half_dir(candidate: &Candidate, diagnostics: &mut Vec<String>) -> Opti
         candidate.name
     ));
     None
+}
+
+/// The plugin names a bundle package's patch file inserts, in name order.
+///
+/// Only `name` is read: an umbrella's rows are `{ id, name }` pairs, and the `id`
+/// is a patch-row address rather than a package. A patch that cannot be read
+/// yields nothing, because a bundle with an unreadable patch is not evidence that
+/// it inserts anything in particular.
+fn bundle_inserts(candidate: &Candidate, diagnostics: &mut Vec<String>) -> Vec<String> {
+    let Ok(manifest) = fs::read_to_string(candidate.directory.join("package.json")) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&manifest) else {
+        return Vec::new();
+    };
+    let Some(patch) = value
+        .pointer("/dsh/bundle/patch")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Vec::new();
+    };
+    let path = candidate.directory.join(patch);
+    let Ok(text) = fs::read_to_string(&path) else {
+        diagnostics.push(format!(
+            "{}: cannot read its bundle patch at {patch}",
+            candidate.name
+        ));
+        return Vec::new();
+    };
+    let Ok(document) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+        diagnostics.push(format!(
+            "{}: bundle patch {patch} is not YAML",
+            candidate.name
+        ));
+        return Vec::new();
+    };
+    let Some(rows) = document.as_sequence() else {
+        return Vec::new();
+    };
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for row in rows {
+        let entries: Vec<&serde_yaml::Value> = match row.get("insert").and_then(|v| v.as_sequence()) {
+            Some(inserted) => inserted.iter().collect(),
+            None => vec![row],
+        };
+        for entry in entries {
+            if let Some(name) = entry.get("name").and_then(|value| value.as_str()) {
+                names.insert(name.to_owned());
+            }
+        }
+    }
+    names.into_iter().collect()
 }
 
 /// Read `name` and `version` from a `package.json`. Returns `None` for a

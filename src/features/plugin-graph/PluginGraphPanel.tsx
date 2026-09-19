@@ -31,6 +31,7 @@ export type PluginGraphText = {
   pluginGraphDirectionHint: string
   pluginGraphLegendPlugin: string
   pluginGraphLegendService: string
+  pluginGraphInserts: string
   pluginGraphHalfClient: string
   pluginGraphLayerLabel: (layer: number, count: number) => string
   pluginGraphHalfHost: string
@@ -212,6 +213,20 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
       set.add(edge.plugin)
     }
     for (const cycle of graph?.cycles ?? []) for (const name of cycle) set.add(name)
+    // A bundle and its contents. `@nexus-aethra/dshell-bundle` reads nothing —
+    // it is a manifest, a patch file and a compiled `lib/` — so without this the
+    // one package the reader installed is an empty node, which the default view
+    // then drops as isolated along with the eleven siblings it mounts.
+    const idsByName = new Map<string, string[]>()
+    for (const plugin of graph?.plugins ?? []) {
+      idsByName.set(plugin.name, [...(idsByName.get(plugin.name) ?? []), plugin.id])
+    }
+    for (const plugin of graph?.plugins ?? []) {
+      const inserts = plugin.inserts ?? []
+      if (inserts.length === 0) continue
+      set.add(plugin.id)
+      for (const name of inserts) for (const id of idsByName.get(name) ?? []) set.add(id)
+    }
     return set
   }, [graph])
 

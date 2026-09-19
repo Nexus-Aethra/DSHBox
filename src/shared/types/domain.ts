@@ -44,6 +44,9 @@ export type GraphPlugin = {
   source: string
   provides: string[]
   requires: string[]
+  // Plugin names this package's patch file inserts — what an umbrella bundle
+  // actually mounts. Empty for everything that is not a bundle.
+  inserts: string[]
 }
 export type ServiceEdge = { plugin: string; service: string }
 // `crossContext` links join a host node to a client one. cordis resolves a service

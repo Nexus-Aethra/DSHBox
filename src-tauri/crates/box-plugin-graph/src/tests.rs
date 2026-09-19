@@ -322,6 +322,7 @@ fn discovered(name: &str, provides: &[&str], requires: &[&str]) -> Discovered {
         source: format!("packages/{name}"),
         host: scan_of(provides, requires),
         client: None,
+        inserts: Vec::new(),
     }
 }
 
@@ -338,6 +339,22 @@ fn dual_face(
         source: format!("packages/{name}"),
         host: scan_of(host.0, host.1),
         client: Some(scan_of(client.0, client.1)),
+        inserts: Vec::new(),
+    }
+}
+
+/// A bundle package: a shell whose patch file mounts the plugins it ships. The
+/// names are sorted because `bundle_inserts` reads them into a set.
+fn bundle(name: &str, inserts: &[&str]) -> Discovered {
+    let mut names: Vec<String> = inserts.iter().map(|value| (*value).to_owned()).collect();
+    names.sort();
+    Discovered {
+        name: name.to_owned(),
+        version: Some("1.0.0".to_owned()),
+        source: format!("packages/{name}"),
+        host: scan_of(&[], &[]),
+        client: None,
+        inserts: names,
     }
 }
 
@@ -489,6 +506,29 @@ fn mutually_context_crossing_links_are_not_a_cycle() {
     assert_eq!(crossing, vec![("browser", "host"), ("host", "browser")]);
     assert!(graph.cycles.is_empty());
     assert_eq!(graph.order.len(), 2);
+}
+
+#[test]
+fn a_bundle_reports_what_its_patch_inserts() {
+    // `@nexus-aethra/dshell-bundle` is a shell: a manifest, a `cordis.patch.yml`
+    // and a compiled `lib/` this scanner reads nothing out of. Its eleven siblings
+    // are mounted by that patch, and without them the one package the reader
+    // installed is an empty node — which the panel then hides as isolated.
+    let graph = build(
+        &["stack", "tools", "shell"],
+        vec![
+            bundle("stack", &["tools", "shell"]),
+            discovered("tools", &["tools"], &[]),
+            discovered("shell", &[], &[]),
+        ],
+    );
+    let stack = graph.plugins.iter().find(|plugin| plugin.id == "stack").unwrap();
+    assert_eq!(stack.inserts, vec!["shell".to_owned(), "tools".to_owned()]);
+    // The shell itself reads nothing, so its contents are the only thing it has to
+    // say — and the inserted plugins are named, not made dependencies: a patch
+    // mounts them, it does not wait on them.
+    assert!(stack.provides.is_empty() && stack.requires.is_empty());
+    assert!(graph.links.iter().all(|link| link.from != "stack"));
 }
 
 #[test]
@@ -973,6 +1013,7 @@ fn the_wire_shape_round_trips() {
     assert!(value["plugins"][0].get("id").is_some());
     assert!(value["plugins"][0].get("half").is_some());
     assert!(value["links"][0].get("crossContext").is_some());
+    assert!(value["plugins"][0].get("inserts").is_some());
     assert!(value.get("scannedAt").is_some());
     assert!(value["plugins"][0].get("activated").is_some());
 }

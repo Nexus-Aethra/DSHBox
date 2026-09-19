@@ -49,6 +49,8 @@ const COPY = {
     pluginGraphHiddenIsolated: (n: number) => `${n} plugin${n === 1 ? '' : 's'} with no dependencies hidden.`,
     pluginGraphLegendPlugin: 'Plugin', pluginGraphLegendService: 'Service',
     // Marks the browser half of a dual-face package next to its host node.
+    // What an umbrella bundle's patch file mounts.
+    pluginGraphInserts: 'Inserts',
     pluginGraphHalfClient: 'browser',
     pluginGraphHalfHost: 'host',
     // The depth bands. Layer 0 is the base: nothing in the view it depends on.
@@ -147,6 +149,7 @@ const COPY = {
     pluginGraphHiddenInactive: (n: number) => `已隐藏 ${n} 个 profile 未加载的插件。`,
     pluginGraphHiddenIsolated: (n: number) => `已隐藏 ${n} 个无依赖关系的插件。`,
     pluginGraphLegendPlugin: '插件', pluginGraphLegendService: '服务',
+    pluginGraphInserts: '插入的插件',
     pluginGraphHalfClient: '浏览器',
     pluginGraphHalfHost: '宿主',
     pluginGraphLayerLabel: (layer: number, count: number) =>

@@ -29,6 +29,8 @@ pub struct Discovered {
     /// The browser half, present only when the package declares a client entry
     /// *and* that half declares something.
     pub client: Option<Scan>,
+    /// The plugins this package's patch file inserts, when it is a bundle.
+    pub inserts: Vec<String>,
 }
 
 /// Whether a half declares anything worth a node of its own.
@@ -246,6 +248,7 @@ pub fn assemble(
             source: node.plugin.source.clone(),
             provides: node.scan.provides.iter().cloned().collect(),
             requires: node.scan.requires.iter().cloned().collect(),
+            inserts: node.plugin.inserts.clone(),
         })
         .collect();
 
