@@ -354,8 +354,12 @@ fn is_redundant_node_file(relative: &Path) -> bool {
     if first == "node_modules" && components.get(1).map(String::as_str) == Some("corepack") {
         return true;
     }
-    // Unix archives ship C headers and man pages that the app never uses.
-    if matches!(first, "include" | "share") {
+    // Man pages are unused. Node's C headers are kept, because DSH builds a
+    // Node-API addon inside the container: `native/system/scripts/build.ts`
+    // resolves them from `dirname(process.execPath)/../include/node` and throws
+    // when `node_api.h` is missing. Stripping them made every container prepare
+    // fail at `build:native-system` on Linux and macOS.
+    if first == "share" {
         return true;
     }
     if components.len() == 1 {
