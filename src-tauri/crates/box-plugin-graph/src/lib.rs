@@ -338,45 +338,52 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// The source directory of a package's browser half, as its own manifest declares
-/// it.
+/// Where a package's browser half lives, as its own manifest declares it.
 ///
 /// `dsh.client` is what makes a package dual-face, and `exports["./client"]` names
-/// the browser entry. That entry is a build output (`./lib/types/client/index.d.ts`
-/// in every dual-face package of the real checkout), so the source directory is
-/// read off the built path's last segment — `client` — and then verified on disk.
-/// Nothing here hardcodes the name: a package whose entry lived elsewhere would be
-/// followed, and one whose source tree does not match its build layout is reported
-/// as a diagnostic and left whole, rather than split on a guess.
+/// the browser entry. Two layouts answer to that:
+///
+/// * a package with a `src/` tree names a build output — `./lib/client.js` — whose
+///   last component says which source directory holds the half, `src/client`;
+/// * a published package has no `src/` to point at, so the same declaration
+///   addresses the code itself: `lib/client.js` and anything under `lib/client/`.
+///
+/// Both reduce to one path prefix, which is what the caller partitions files by.
+/// Reading only the first layout reported every published plugin as a package whose
+/// "browser half is not at src/client" — 12 rows on one container, for packages that
+/// ship no `src/` at all.
 fn client_half_dir(candidate: &Candidate, diagnostics: &mut Vec<String>) -> Option<PathBuf> {
     let manifest = fs::read_to_string(candidate.directory.join("package.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&manifest).ok()?;
     value.pointer("/dsh/client")?;
     // The subpath is the literal key `./client`, and a JSON Pointer escapes `/`
-    // as `~1`.
+    // as `~1`. `default` over `types`: the compiled entry names the half, while the
+    // declaration file inside it is named `index`.
     let entry = value.pointer("/exports/.~1client")?;
-    let built = ["types", "default"]
+    let target = ["default", "types"]
         .iter()
         .filter_map(|key| entry.get(key).and_then(serde_json::Value::as_str))
         .next()
         .unwrap_or_default();
-    let segment = built
-        .rsplit('/')
-        .find(|part| !part.is_empty() && !part.contains('.'))
-        .unwrap_or_default();
-    if segment.is_empty() {
-        diagnostics.push(format!(
-            "{}: declares dsh.client with an unreadable entry {built:?}",
-            candidate.name
-        ));
-        return None;
-    }
-    let source = candidate.directory.join("src").join(segment);
-    if source.is_dir() {
-        return Some(source);
+    let stem = target.rsplit_once('.').map_or(target, |(head, _)| head);
+    let (prefix, expected) = if candidate.directory.join("src").is_dir() {
+        let segment = stem.rsplit('/').find(|part| !part.is_empty()).unwrap_or_default();
+        (
+            candidate.directory.join("src").join(segment),
+            format!("src/{segment}"),
+        )
+    } else {
+        (
+            candidate.directory.join(stem.trim_start_matches("./")),
+            stem.trim_start_matches("./").to_owned(),
+        )
+    };
+    // A file is a valid prefix here: `lib/client.js` is a whole half by itself.
+    if prefix.is_dir() || prefix.is_file() {
+        return Some(prefix);
     }
     diagnostics.push(format!(
-        "{}: declares dsh.client but its browser half is not at src/{segment}",
+        "{}: declares dsh.client but its browser half is not at {expected}",
         candidate.name
     ));
     None
