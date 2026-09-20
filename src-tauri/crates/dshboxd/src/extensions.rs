@@ -495,6 +495,7 @@ pub(crate) fn import_into_repository(
         diagnostic: None,
         source: Some(source.to_string_lossy().into_owned()),
         storage: box_extensions::RepositoryStorage::Owned,
+        derived: false,
     });
     write_repository_index(Path::new(&root), &entries)?;
     let created = entries
@@ -1224,6 +1225,7 @@ mod tests {
             diagnostic: None,
             source: None,
             storage: box_extensions::RepositoryStorage::Owned,
+            derived: false,
         };
         assert_eq!(
             repository_plugin_artifact(&entry).unwrap(),

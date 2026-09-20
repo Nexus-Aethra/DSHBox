@@ -77,6 +77,17 @@ pub fn run() {
             std::process::exit(1);
         }
     };
+    // The plugin index mirrors what templates and containers actually resolved;
+    // deriving it here means the plugin view is complete the first time it is
+    // opened, without the user importing anything by hand.
+    match box_foundation::read_config().ok().and_then(|config| config.runtime_directory) {
+        Some(runtime) => match plugins::reconcile_plugin_index(std::path::Path::new(&runtime)) {
+            Ok(0) => {}
+            Ok(added) => tracing::info!("plugin index: derived {added} plugin(s) from installed templates and containers"),            Err(error) => tracing::warn!("plugin index scan skipped: {error}"),
+        },
+        None => {}
+    }
+
 
     // Scan persisted host.json records and reconcile each one against
     // the live process table. A record in `starting`/`ready`/`running`

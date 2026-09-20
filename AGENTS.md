@@ -214,13 +214,20 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   a *full* bundle export materializes it with `pnpm add` — offline first, and it
   says so in the log when the store alone cannot resolve peer ranges, never
   quietly shipping a bundle with an entry missing.
-- **The plugin view is a union, not the repository.** `list_installed_plugins`
-  merges the extension repository with every sealed template's and container's
-  `profile/profiles/<p>/pnpm-lock.yaml`, classifying a package as a plugin when
-  it is a direct dependency or declares a cordis/dsh peer
-  (`box-plugin-graph/src/lockfile.rs`). A build never imports into the
-  repository — it resolves, locks and deletes the staged `node_modules` — so
-  without this union the plugin list looks empty right after installing.
+- **The plugin list is a mirror of what is installed, not a second place to
+  import into.** `list_installed_plugins` merges the extension repository with
+  every sealed template's and container's `profile/profiles/<p>/pnpm-lock.yaml`,
+  classifying a package as a plugin when it is a direct dependency or declares a
+  cordis/dsh peer (`box-plugin-graph/src/lockfile.rs`). The daemon then writes
+  that back: `reconcile_plugin_index` (`dshboxd/src/plugins.rs`) derives one
+  `reference` row per installed plugin at startup and before every list, so a
+  plugin a boxfile installed never looks missing just because nobody imported
+  it. Those rows carry `derived: true`, are dropped once nothing installs them,
+  and never shadow a row the user made; the UI marks them 自动收录 and hides
+  删除 (a scan would put the row straight back). A row's `source` is the spec
+  that installs the package again — `name@version` normally, the lock's
+  `specifier` for a `file:`/git dependency, whose lock *key* is the spec while
+  the entry's own `version:` field holds the version.
 - **Plugin cache dedup.** A second `build` of the same `name+version` should
   hit the existing hash entry (`<root>/repository/plugins/img-<id>/source/`)
   and not produce a duplicate `img-…` row (see

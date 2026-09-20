@@ -32,6 +32,12 @@ pub(crate) fn list_installed_plugins(_state: &DaemonState, _request: &Value) -> 
     let root = box_foundation::read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
+    // Refresh the index first: a template built or a container created since the
+    // last scan must show up without waiting for the next daemon start. A failed
+    // refresh is not fatal — the list below still reports what it can see.
+    if let Err(error) = reconcile_plugin_index(Path::new(&root)) {
+        tracing::warn!("plugin index refresh skipped: {error}");
+    }
     let mut rows: BTreeMap<String, Row> = BTreeMap::new();
 
     for entry in box_extensions::scan_repository(Path::new(&root)) {
@@ -120,6 +126,59 @@ pub(crate) fn list_installed_plugins(_state: &DaemonState, _request: &Value) -> 
         })
         .collect();
     Ok(json!({ "plugins": plugins }))
+}
+
+/// Make the index a mirror of what is installed: every plugin a sealed
+/// template's or a container's lock resolves gets a derived row, so the user
+/// never has to "import" something that is already on disk, and a derived row
+/// nothing installs any more goes away again. Rows the user owns are left
+/// alone. A failure here is never fatal — the scan is a convenience, not a
+/// precondition.
+pub(crate) fn reconcile_plugin_index(root: &Path) -> Result<usize, String> {
+    let wanted = installed_plugin_versions(root);
+    box_extensions::sync_derived_entries(root, ExtensionKind::Plugin, &wanted)
+}
+
+/// The plugins templates and containers actually resolved, one row per name —
+/// the newest resolution wins, since that is the one still installed.
+fn installed_plugin_versions(root: &Path) -> Vec<box_extensions::DerivedEntry> {
+    let mut seen: BTreeMap<String, box_extensions::DerivedEntry> = BTreeMap::new();
+    let mut record = |packages: Vec<box_plugin_graph::lockfile::LockedPackage>| {
+        for package in packages {
+            if package.plugin {
+                seen.insert(package.name.clone(), derived_entry(&package));
+            }
+        }
+    };
+    for template in list_sealed_templates().unwrap_or_default() {
+        if !template.built {
+            continue;
+        }
+        let Ok((profile, directory)) = template_root_by_name(root.to_string_lossy().as_ref(), &template.name) else {
+            continue;
+        };
+        record(read_lock(&directory, &profile));
+    }
+    for container in box_containers::scan_containers(root.to_string_lossy().as_ref()).unwrap_or_default().into_values() {
+        record(read_lock(Path::new(&container.directory), &container.profile));
+    }
+    seen.into_values().collect()
+}
+
+/// What `pnpm add` would take to get this package again: a plain version is
+/// better said as `name@version`, but a `file:`/git spec is the only form that
+/// can be resolved at all.
+fn derived_entry(package: &box_plugin_graph::lockfile::LockedPackage) -> box_extensions::DerivedEntry {
+    let spec = match &package.specifier {
+        Some(spec) if spec.contains(':') => spec.clone(),
+        _ if package.version.contains(':') => package.version.clone(),
+        _ => format!("{}@{}", package.name, package.version),
+    };
+    box_extensions::DerivedEntry {
+        name: package.name.clone(),
+        version: package.version.clone(),
+        spec,
+    }
 }
 
 /// A container or template keeps its pnpm resolution beside its profile.

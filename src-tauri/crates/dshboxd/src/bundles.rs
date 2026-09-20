@@ -799,6 +799,7 @@ pub(crate) fn import_extension_bundle(
             diagnostic: None,
 
             storage: box_extensions::RepositoryStorage::Owned,
+            derived: false,
             source,
         });
     }

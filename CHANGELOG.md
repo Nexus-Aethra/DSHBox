@@ -32,18 +32,25 @@ builds from ever showing it.
   first — measured at one second and zero downloads), and a full bundle export
   materializes it, logging when it had to reach the registry to resolve peer
   ranges.
-- **Plugins actually installed are visible.** The plugin view lists the union of
-  the extension repository and what every template and container resolved,
-  read from the profile's `pnpm-lock.yaml` (versions included), so a plugin a
-  boxfile installed no longer looks missing just because it was never imported
-  into the repository. `plugin_dependency_graph` uses the same lock for its
-  template preview, which now shows the plugins a bundle pulled in transitively
-  — with pnpm's resolved versions rather than the boxfile's specifier.
+- **Plugins actually installed are visible, and the repository is the index.**
+  The plugin view lists the union of the extension repository and what every
+  template and container resolved, read from the profile's `pnpm-lock.yaml`
+  (versions included), and the daemon mirrors that back into the repository: one
+  derived row per installed plugin, added at startup and refreshed whenever the
+  list is read, dropped once nothing installs it, marked 自动收录 and not
+  deletable by hand. So a plugin a boxfile installed is simply there — no
+  "import into the repository" step, no separate list of what is installed but
+  not imported. `plugin_dependency_graph` uses the same lock for its template
+  preview, which now shows the plugins a bundle pulled in transitively — with
+  pnpm's resolved versions rather than the boxfile's specifier, and with the
+  version a `file:` dependency declares rather than its tarball path.
 - **Offline readiness is visible.** Each plugin in the list carries the versions
   present in the runtime's own pnpm store (Box pins
   `PNPM_CONFIG_STORE_DIR` under the runtime directory), so it is obvious
   whether installing it needs the network. An unrecognised store layout reports
-  "unknown" instead of "not cached".
+  "unknown" instead of "not cached", and a `file:`/git dependency is left
+  unmarked rather than claimed: pnpm indexes those under the spec, not under
+  `name@version`.
 - **A document store instead of scattered JSON indexes.** Every persisted
   index now goes through `box_foundation::collection::DocumentStore` (SQLite in
   the new `box-store` crate at `<runtime>/state/dshbox.db`), with legacy files

@@ -66,14 +66,38 @@ pub fn parse_lockfile(text: &str) -> Result<Vec<LockedPackage>, String> {
 
     let mut packages: Vec<LockedPackage> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
+    // `snapshots` keys the same package the same way, so a key already resolved
+    // against `packages` must not be re-read as a version.
+    let mut resolved: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for key in ["packages", "snapshots"] {
         let Some(entries) = root.get(key).and_then(|section| section.as_mapping()) else {
             continue;
         };
         for (key, entry) in entries {
-            let Some(key) = key.as_str() else { continue };
-            let Some((name, version)) = split_key(key) else {
+            let Some(raw) = key.as_str() else { continue };
+            let Some((name, key_version)) = split_key(raw) else {
                 continue;
+            };
+            // Keyed by name and the version slot, not the raw key: `snapshots`
+            // repeats a package under a peer-suffixed key.
+            let slot = format!("{name}@{key_version}");
+            let version = match resolved.get(&slot) {
+                Some(version) => version.clone(),
+                None => {
+                    // pnpm keys a `file:`/`link:`/git dependency by its spec, and
+                    // only the entry itself carries the version it declares.
+                    let version = if is_protocol_spec(&key_version) {
+                        entry
+                            .get("version")
+                            .and_then(|value| value.as_str())
+                            .map(clean_version)
+                            .unwrap_or(key_version)
+                    } else {
+                        key_version
+                    };
+                    resolved.insert(slot, version.clone());
+                    version
+                }
             };
             let is_direct = direct.iter().find(|(direct_name, _, _)| direct_name == &name);
             let plugin = is_direct.is_some() || declares_dsh_peer(entry);
@@ -161,6 +185,12 @@ fn split_key(key: &str) -> Option<(String, String)> {
 /// Drop the peer suffix pnpm appends to a version.
 fn clean_version(version: &str) -> String {
     version.split('(').next().unwrap_or(version).to_owned()
+}
+
+/// A version slot holding something other than a version: `file:../x.tgz`,
+/// `link:../local-plugin`, `https://…`, `github:owner/repo`.
+fn is_protocol_spec(version: &str) -> bool {
+    version.contains(':')
 }
 
 /// A plugin declares the framework it plugs into: a cordis or dsh peer. Plain
@@ -306,5 +336,41 @@ packages:
         // The raw spec is kept: `link:../local-plugin` says *where* it comes
         // from, which is the useful part for something pnpm never resolved.
         assert_eq!(linked.version, "link:../local-plugin");
+    }
+
+    /// A `file:` dependency is keyed by its spec, and the entry under that key
+    /// carries the version the package declares. Reporting the spec as the
+    /// version would put a relative path where a version belongs.
+    #[test]
+    fn a_file_dependency_reports_the_version_it_declares() {
+        let lock = r#"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      '@scope/plugin':
+        specifier: file:/tmp/pack/plugin-0.1.5.tgz
+        version: file:../../../../tmp/pack/plugin-0.1.5.tgz
+packages:
+  '@scope/plugin@file:../../../../tmp/pack/plugin-0.1.5.tgz':
+    resolution: {integrity: sha512-fff, tarball: file:../../../../tmp/pack/plugin-0.1.5.tgz}
+    version: 0.1.5
+    peerDependencies:
+      '@deepseek-ai/cordis': ^4.0.2
+
+snapshots:
+  '@scope/plugin@file:../../../../tmp/pack/plugin-0.1.5.tgz(zod@4.4.3)':
+    dependencies:
+      zod: 4.4.3
+"#;
+        let packages = parse_lockfile(lock).unwrap();
+        let plugin = packages.iter().find(|package| package.name == "@scope/plugin").unwrap();
+        assert_eq!(plugin.version, "0.1.5");
+        assert!(plugin.direct && plugin.plugin);
+        assert_eq!(plugin.specifier.as_deref(), Some("file:/tmp/pack/plugin-0.1.5.tgz"));
+        // The `snapshots` entry for the same key carries the edges, not a
+        // second copy of the package.
+        assert_eq!(packages.len(), 1);
+        assert_eq!(plugin.dependencies.len(), 1);
     }
 }

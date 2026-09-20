@@ -14,6 +14,9 @@ export type ContainerExtensions = { containerId: string; profiles: ProfileExtens
 export type ExtensionKind = 'plugin' | 'skill'
 export type RepositoryExtension = { id: string; kind: ExtensionKind; name: string; version: string | null; description: string | null; contentDigest: string; sourcePath: string; importedAt: number; diagnostic: string | null; source: string | null   /** `owned` keeps a copy under the runtime; `reference` points at pnpm's store. */
   storage: 'owned' | 'reference'
+  /** Box found this row by scanning installed templates and containers rather
+   *  than being told about it, so it appears and disappears with them. */
+  derived: boolean
 }
 // Detailed per-entry owner ids surfaced by the daemon for `dshbox plugin
 // refs` and the resources-page owner popover. The on-disk file keeps the

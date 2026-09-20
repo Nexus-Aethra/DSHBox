@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import type { ReactNode } from 'react'
 import type { DshContainer, DshVersion, ExtensionBundle, InstalledPlugin, PreviewScriptResult, RepositoryExtension, ResourceView, TemplateInfo } from '../../shared/types/domain'
 import { Badge } from '../../ui/Badge'
 import { Button } from '../../ui/Button'
@@ -28,10 +29,10 @@ type Text = PluginGraphText & AddResourceTypeText & ResourceTypeText & {
   bundleRefNote: string; bundleRefDelete: string
   resources: string; harnessTab: string; templateTab: string; bundleTab: string; addResource: string
   resourceBuiltinSessions: string; resourceBuiltinCredentials: string
-  installedPluginsTitle: string; importSourceHint: string; installedPluginsNote: (n: number) => string
-  installedNotImported: string; importToRepository: string
+  importSourceHint: string
   storageReference: string; storageOwned: string
-  cachedAll: string; cachedPartial: (cached: number, total: number) => string; cachedNone: string
+  pluginDerived: string; pluginDerivedHint: string
+  cachedAll: string; cachedNone: string
   ownerTemplate: string; ownerContainer: string
   versionTitle: string; versionNote: string; noVersion: string; install: string; installed: string
   uninstall: string; loadVersions: string; installing: string
@@ -105,16 +106,41 @@ export function ResourcesPage({
   templates,
 }: Props) {
   const [tab, setTab] = useState<TabId>('harness')
+  // What templates and containers actually resolved, keyed by name. The plugin
+  // list is one list: this annotates a row with where it came from and whether
+  // its bytes are already in pnpm's store.
   const [installedPlugins, setInstalledPlugins] = useState<InstalledPlugin[]>([])
 
-  /** Plugins that exist in a template or container but not in the repository. */
   async function loadInstalledPlugins(): Promise<void> {
     try {
       const listed = await boxApi.listInstalledPlugins()
-      setInstalledPlugins(listed.plugins.filter((plugin) => !plugin.inRepository))
+      setInstalledPlugins(listed.plugins)
     } catch {
       setInstalledPlugins([])
     }
+  }
+  const installedByName = new Map(installedPlugins.map((plugin) => [plugin.name, plugin]))
+
+  function ownerLabel(plugin: InstalledPlugin | undefined): string {
+    if (plugin === undefined) return ''
+    return plugin.owners
+      .map((owner) => `${owner.kind === 'template' ? text.ownerTemplate : owner.kind === 'container' ? text.ownerContainer : ''} ${owner.name}`.trim())
+      .filter((label, index, all) => label !== '' && all.indexOf(label) === index)
+      .slice(0, 4)
+      .join('、')
+  }
+
+  /**
+   * `null` means the store layout is unrecognised — say nothing rather than lie.
+   * A `file:`/git spec is not a store question either: pnpm indexes those under
+   * the spec, not under `name@version`.
+   */
+  function cacheBadge(plugin: InstalledPlugin | undefined, version: string | null, spec: string | null): ReactNode {
+    if (plugin === undefined || plugin.cachedVersions === null || version === null) return null
+    if (spec !== null && spec.includes(':')) return null
+    return plugin.cachedVersions.includes(version)
+      ? <Badge variant="success">{text.cachedAll}</Badge>
+      : <Badge variant="neutral">{text.cachedNone}</Badge>
   }
 
   const [views, setViews] = useState<ResourceView[]>([])
@@ -308,67 +334,34 @@ export function ResourcesPage({
               <Button variant="primary" disabled={!source.trim()} onClick={() => { void addPlugin() }}>{text.addExtension}</Button>
             </Toolbar>
             <div className="extension-list plugin-repo-list">
-              {plugins.length ? plugins.map((entry) => (
-                <article key={entry.id} className="extension-row">
-                  <div>
-                    <strong>{entry.name}</strong>
-                    <p>{entry.description ?? entry.diagnostic ?? ''}</p>
-                  </div>
-                  <div className="plugin-repo-actions">
-                    <Badge variant="primary">{entry.kind}</Badge>
-                    <Badge variant={entry.storage === 'reference' ? 'neutral' : 'success'}>
-                      {entry.storage === 'reference' ? text.storageReference : text.storageOwned}
-                    </Badge>
-                    <code>{entry.version ?? '—'}</code>
-                    {isGithub(entry.source) && <Badge variant="primary">{text.githubOnly}</Badge>}
-                {(references[entry.id]?.templates ?? 0) > 0 && <Badge variant="neutral">{text.usedByTemplates(references[entry.id]?.templates ?? 0)}</Badge>}
-                    <Button variant="secondary" size="sm" onClick={() => { void onExportPlugin(entry) }}>{text.exportPlugin}</Button>
-                    <Button variant="danger" size="sm" onClick={() => { requestDeletePlugin(entry) }}>{text.remove}</Button>
-                  </div>
-                </article>
-              )) : <p className="empty-extension">{text.noRepositoryPlugins}</p>}
+              {plugins.length ? plugins.map((entry) => {
+                const info = installedByName.get(entry.name)
+                const owners = ownerLabel(info)
+                return (
+                  <article key={entry.id} className="extension-row">
+                    <div>
+                      <strong>{entry.name}</strong>
+                      <p>{[entry.description ?? entry.diagnostic ?? '', owners].filter(Boolean).join(' · ')}</p>
+                    </div>
+                    <div className="plugin-repo-actions">
+                      <Badge variant="primary">{entry.kind}</Badge>
+                      <Badge variant={entry.storage === 'reference' ? 'neutral' : 'success'}>
+                        {entry.storage === 'reference' ? text.storageReference : text.storageOwned}
+                      </Badge>
+                      <code>{entry.version ?? '—'}</code>
+                      {cacheBadge(info, entry.version, entry.source)}
+                      {entry.derived && <Badge variant="neutral" title={text.pluginDerivedHint}>{text.pluginDerived}</Badge>}
+                      {isGithub(entry.source) && <Badge variant="primary">{text.githubOnly}</Badge>}
+                  {(references[entry.id]?.templates ?? 0) > 0 && <Badge variant="neutral">{text.usedByTemplates(references[entry.id]?.templates ?? 0)}</Badge>}
+                      <Button variant="secondary" size="sm" onClick={() => { void onExportPlugin(entry) }}>{text.exportPlugin}</Button>
+                      {/* A derived row is Box's mirror of what is installed: removing it
+                          just makes the next scan put it back. */}
+                      {!entry.derived && <Button variant="danger" size="sm" onClick={() => { requestDeletePlugin(entry) }}>{text.remove}</Button>}
+                    </div>
+                  </article>
+                )
+              }) : <p className="empty-extension">{text.noRepositoryPlugins}</p>}
             </div>
-
-            {installedPlugins.length > 0 && (
-              <>
-                <h3 className="extensions-heading-title installed-plugins-title">{text.installedPluginsTitle}</h3>
-                <p className="workspace-note">{text.installedPluginsNote(installedPlugins.length)}</p>
-                <div className="extension-list plugin-repo-list">
-                  {installedPlugins.map((plugin) => (
-                    <article key={plugin.name} className="extension-row">
-                      <div>
-                        <strong>{plugin.name}</strong>
-                        <p>
-                          {plugin.versions.join(' · ')}
-                          {' — '}
-                          {plugin.owners
-                            .map((owner) => `${owner.kind === 'template' ? text.ownerTemplate : owner.kind === 'container' ? text.ownerContainer : ''} ${owner.name}`.trim())
-                            .filter((label, index, all) => label !== '' && all.indexOf(label) === index)
-                            .slice(0, 4)
-                            .join('、')}
-                        </p>
-                      </div>
-                      <div className="plugin-repo-actions">
-                        {plugin.cachedVersions !== null && (
-                          plugin.cachedVersions.length === plugin.versions.length
-                            ? <Badge variant="success">{text.cachedAll}</Badge>
-                            : plugin.cachedVersions.length > 0
-                              ? <Badge variant="neutral">{text.cachedPartial(plugin.cachedVersions.length, plugin.versions.length)}</Badge>
-                              : <Badge variant="danger">{text.cachedNone}</Badge>
-                        )}
-                        <Badge variant="neutral">{text.installedNotImported}</Badge>
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          disabled={plugin.versions.length === 0}
-                          onClick={() => { void onImportPlugin(`npm:${plugin.name}@${plugin.versions[0]}`) }}
-                        >{text.importToRepository}</Button>
-                      </div>
-                    </article>
-                  ))}
-                </div>
-              </>
-            )}
           </>
         )}
 
