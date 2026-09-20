@@ -368,13 +368,8 @@ impl TaskNotifier for DaemonNotifier {
     }
 
     fn log(&self, task_id: &str, line: &str) {
-        if let Ok(task) = self.manager.task(task_id) {
-            let entry = format!("[{}] {line}\n", box_foundation::now_seconds());
-            let _ = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&task.log_path)
-                .and_then(|mut file| std::io::Write::write_all(&mut file, entry.as_bytes()));
-        }
+        // The task context owns the log file; writing it here as well put every
+        // line in it twice.
         self.events.broadcast(crate::events::DaemonEvent::TaskLog {
             task_id: task_id.to_owned(),
             line: line.to_owned(),

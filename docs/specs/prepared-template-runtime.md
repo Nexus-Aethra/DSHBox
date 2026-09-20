@@ -6,9 +6,9 @@ Status: approved implementation plan (2026-08-20)
 
 DSH Box will use a three-stage, final-path assembly model:
 
-1. A root-template pull creates a **prepared base**: an immutable checked-out Harness source tree and a seeded local dependency cache. It is a cache for cloning source, not a distributable `node_modules` tree.
-2. A Boxfile build creates a **sealed template recipe**: a copied Harness source tree (excluding `node_modules` and VCS metadata), the Boxfile, profile selection, and the profile metadata/lockfile produced by the official `dsh plugin add` command.
-3. Container creation copies that recipe into its final instance directory, then uses the bundled package manager and the Box-owned pnpm store to materialize the locked profile offline and build the frontend. Starting an already prepared container only launches DSH.
+1. A root-template pull creates a **prepared base**: a checked-out Harness source tree, a seeded local dependency cache, and the built client artifacts (native addon, host/client libraries, web frontend). It is a cache for cloning source, not a distributable `node_modules` tree.
+2. A Boxfile build creates a **sealed template recipe**: a copied Harness source tree (excluding `node_modules` and VCS metadata, but including the base's client artifacts), the Boxfile, profile selection, and the profile metadata/lockfile produced by the official `dsh plugin add` command.
+3. Container creation copies that recipe into its final instance directory and uses the bundled package manager and the Box-owned pnpm store to materialize the locked profile offline. The client artifacts are already there, so creation is a copy plus store links; a recipe without them (built before this, or imported from another OS) is rebuilt in place. Starting an already prepared container only launches DSH.
 
 This replaces the shared `runtimes/<version>/source` model. It is deliberately a storage-schema break: old runtime directories are not supported or migrated in place.
 
@@ -88,9 +88,10 @@ Container metadata records the sealed template id and digest it was copied from,
 `template pull <harness-ref>` performs one scheduled transaction:
 
 1. Clone the exact revision into `staging/<task-id>/harness` using libgit2.
-2. Run bundled pnpm in that directory: `pnpm install`. This seeds the Box-owned store but does not build the frontend.
-3. Verify the source and dependency cache.
-4. Compute manifest/digests, rename staging atomically to `templates/base-*`, and commit state only after the rename succeeds.
+2. Run bundled pnpm in that directory: `pnpm install`. This seeds the Box-owned store.
+3. Build the client artifacts: `pnpm run build` with `DSH_CLIENT_COMMIT_HASH` set to the cloned revision, then record them in `.dsh-build/box-client-artifacts.json` (commit plus platform). The build is a function of the source, the commit and the platform only — a profile's plugins do not enter it — which is why it can happen here once instead of in every container.
+4. Verify the source, the dependency cache and the client artifacts.
+5. Compute manifest/digests, rename staging atomically to `templates/base-*`, and commit state only after the rename succeeds.
 
 Failure removes only its staging directory and leaves the previous published base untouched. Retrying begins with a clean staging directory; it does not mutate a published base or share a partially written `node_modules` tree.
 
@@ -108,7 +109,7 @@ Git/plugin lifecycle scripts remain an explicit approval boundary. If pnpm repor
 
 ### Create and start a container
 
-`container create` copies one sealed recipe to an instance staging directory, moves it to the final instance path while still unpublished, runs the Harness install and `pnpm install --offline --frozen-lockfile` in the copied profile, runs `pnpm run build`, writes `container.json`, validates that link targets are instance-local, and then commits the container record. The observable task stages are `copying template`, `installing DSH dependencies`, `materializing cached plugin recipe`, `building DSH frontend`, and `writing container state`.
+`container create` copies one sealed recipe to an instance staging directory, moves it to the final instance path while still unpublished, runs the Harness install and `pnpm install --offline --frozen-lockfile` in the copied profile, writes `container.json`, validates that link targets are instance-local, and then commits the container record. `pnpm run build` runs here only when the copied tree has no client artifacts for this commit and platform; otherwise creation reports `using the template's client artifacts` and skips it. The observable task stages are `copying template`, `installing DSH dependencies`, `materializing cached plugin recipe`, `building DSH frontend` (only when needed), and `writing container state`.
 
 `container start` allocates its loopback port immediately before spawn and runs the bundled pnpm command from `<instance>/harness`. It uses the local profile and has the normal bind/readiness retry policy, but it never alters the sealed template, prepared base, repository cache, or another container.
 
@@ -121,7 +122,7 @@ Interrupted tasks are recovered by inspecting the task record and staging direct
 ## Implementation plan
 
 1. Add schema-10 path types, manifests, resource kinds, and staging/publish helpers in `box-foundation`, `box-state`, and `box-runtime`.
-2. Replace root template pull with the prepared-base transaction in the daemon; move dependency/build/health diagnostics from container startup to this task.
+2. Replace root template pull with the prepared-base transaction in the daemon; move dependency/build/health diagnostics from container startup to this task. (Done for the build: the client artifacts are produced while the base is prepared.)
 3. Change repository import to produce and validate `artifact.tgz`; preserve approval and integrity checks.
 4. Replace metadata-only image/template build with a sealed source recipe and artifact references.
 5. Replace container creation with final-directory offline install, local artifact add, and frontend build; remove shared-runtime mutation and all work from ordinary container start.

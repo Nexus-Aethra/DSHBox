@@ -77,6 +77,24 @@ builds from ever showing it.
 
 ### Fixed
 
+- **Creating a container from a template took three minutes.** Every creation
+  re-ran the whole client build (native addon, host/client libraries, web
+  frontend) — ~180s of the ~195s it took, against 12s of dependency linking.
+  That build depends only on the source, the commit and the platform, never on
+  the profile's plugins, so it now runs once while the prepared base is
+  created and travels into every template built from that base. Container
+  creation is a copy plus store links: **195s → 10s** in a measured run. A base
+  or template that predates this is repaired or rebuilt in place, and the task
+  log says which path it took.
+- **Task logs said almost nothing, and said it twice.** A container creation
+  logged nothing at all for the ~180 seconds it spent building. Every step now
+  logs what it is doing and how long it took, a failed command appends the tail
+  of its transcript to the task log, and each line is written once — both
+  notifiers were appending to the same file the task context already wrote.
+- **Live task progress never reached the UI.** The daemon names its event
+  frames `task_stage` / `task_log` / `task_finished` with snake_case payloads,
+  while the UI switched on `TaskStage` / `TaskLog` and read a task record out of
+  them, so every live update was dropped and the panel fell back to the 3s poll.
 - **Installed builds shipped a months-old frontend.** `src-tauri/build.rs`
   mirrored the repo-root `dist/` over `src-tauri/dist` on every build,
   overwriting what Vite had just written, so the desktop binary embedded a

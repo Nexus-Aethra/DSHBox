@@ -102,16 +102,14 @@ pub(crate) fn queue_task(
 }
 
 pub(crate) fn append_task_log(manager: &TaskManager, app: &tauri::AppHandle, task_id: &str, message: &str) {
+    // The task context already wrote the line to the task's log file; this only
+    // tells the UI about it. Writing it here too duplicated every line.
     let task = manager.task(task_id).ok();
-    if let Some(task) = task {
-        let line = format!("[{}] {message}\n", now_seconds());
-        let _ = fs::OpenOptions::new()
-            .append(true)
-            .open(&task.log_path)
-            .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
+    if task.is_some() {
+        let line = format!("[{}] {message}", now_seconds());
         let _ = app.emit(
             "task://log",
-            serde_json::json!({ "taskId": task_id, "line": line.trim_end() }),
+            serde_json::json!({ "taskId": task_id, "line": line }),
         );
     }
 }

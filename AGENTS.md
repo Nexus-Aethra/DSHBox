@@ -176,14 +176,30 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   blocker — but it also needs a host C compiler, which the runtime bundle
   otherwise never requires.
 - **Prepared/sealed templates.** Pulling a root Harness template prepares a
-  complete source tree (`pnpm install` only — `validate_prepared_harness`
-  checks that tree; the frontend build happens later, when a container is
-  prepared from it at `dshboxd/src/sealed.rs` "Building DSH frontend"). `dshbox build`
-  copies that base and publishes a sealed physical template with locally packed
-  plugin artifacts installed. Container creation copies that sealed tree;
-  Container startup must never install or build DSH. `dshbox image` remains a
-  deprecated alias forwarding to `build`/`template`. The authoritative design
+  complete tree: `pnpm install` **and** the client build (native addon, host and
+  client libraries, web frontend) — `validate_prepared_harness` requires
+  `apps/web/dist/index.html` and the `.dsh-build/box-client-artifacts.json`
+  marker. The build belongs here because it depends only on the source, the
+  commit and the platform, never on a profile's plugins, so one build per
+  Harness version serves every template from that base; a base that predates
+  this is repaired in place the first time a template is built from it. `dshbox
+  build` copies that base and publishes a sealed physical template with locally
+  packed plugin artifacts installed. Container creation copies that sealed tree
+  and links dependencies from the store (~10s); it rebuilds only when the tree
+  carries no artifacts for this commit and platform — an old template, or one
+  imported from another OS, whose native addon is not this machine's.
+  **Container startup must never install or build DSH.** `dshbox image` remains
+  a deprecated alias forwarding to `build`/`template`. The authoritative design
   is `docs/specs/prepared-template-runtime.md`.
+- **Task logs are the UI's only window into a long task.** A daemon task's log
+  file is written by `TaskContext::append_log` and by nothing else — a notifier
+  that writes it too doubles every line. Stage changes (`task.update`) only move
+  the progress bar; a step the user waits minutes for needs a `task.log` line
+  saying what it is doing and how long it took. The live stream is
+  `daemon://event` frames named exactly as `DaemonEvent::event_name` spells them
+  (`task_stage`, `task_log`, `task_finished`, snake_case payloads): `useTasks`
+  switches on those names, so a renamed event is silently dropped and the panel
+  falls back to the 3s poll.
 - **Container resources are user state, not code.** `box-resources` moves chat
   history, credentials and plugin state between containers. Injection refuses an
   existing destination unless `--overwrite`/`--merge` is given and refuses a

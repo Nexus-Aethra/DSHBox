@@ -438,6 +438,12 @@ pub(crate) fn create_container_from_sealed(
         },
         20,
     );
+    task.log(if direct_root {
+        "copying the prepared Harness source into the container"
+    } else {
+        "copying the sealed template tree (Harness source plus its built client artifacts) into the container"
+    });
+    let copy_started = std::time::Instant::now();
     let copy_result = if direct_root {
         copy_source_tree(&source, &staged)
     } else {
@@ -448,6 +454,7 @@ pub(crate) fn create_container_from_sealed(
         let _ = fs::remove_dir_all(&staged);
         return Err(error);
     }
+    task.log(&format!("copied in {}s", copy_started.elapsed().as_secs()));
     if direct_root {
         create_profile_manifest(&staged, &profile)?;
     }
@@ -758,6 +765,11 @@ fn seed_profile_recipe(
             format!("Resolving plugin {}/{}", index + 1, plugin_sources.len()),
             48 + ((index * 16) / plugin_sources.len().max(1)) as u8,
         );
+        task.log(&format!(
+            "resolving plugin {}/{}: {source}",
+            index + 1,
+            plugin_sources.len()
+        ));
         let spec = ProcessSpec::new(pnpm.path.clone())
             .args(&pnpm.arguments)
             .args([
@@ -932,9 +944,18 @@ pub(crate) fn seal_template(
     let staged = layout.create_staging_dir("template_build")?;
     let staged_harness = staged.join("harness");
     let result = (|| -> Result<SealedTemplateRecord, String> {
+        // A base prepared before Box built client artifacts at base time gets
+        // them here, once: every template from it then carries a run-ready tree.
+        ensure_base_client_artifacts(&base_directory, &base.source_commit, task)?;
         task.update("Copying prepared base", 20);
+        task.log("copying the prepared Harness tree into the template");
+        let copy_started = std::time::Instant::now();
         copy_source_tree(&base_harness, &staged_harness)
             .map_err(|error| format!("cannot copy prepared base: {error}"))?;
+        task.log(&format!(
+            "copied in {}s",
+            copy_started.elapsed().as_secs()
+        ));
         fs::write(staged.join("boxfile.dsh"), boxfile_source)
             .map_err(|error| format!("cannot preserve Boxfile source: {error}"))?;
         create_profile_manifest(&staged, profile)?;
@@ -951,6 +972,12 @@ pub(crate) fn seal_template(
             || staged_harness.join("node_modules").exists()
         {
             return Err("sealed template recipe has an invalid Harness source tree".to_owned());
+        }
+        if !client_artifacts_present(&staged_harness, &base.source_commit) {
+            return Err(
+                "sealed template is missing the client artifacts the prepared base built"
+                    .to_owned(),
+            );
         }
         let created_at = now_seconds();
         let identity = format!(
@@ -1035,6 +1062,8 @@ fn prepare_container_at_final_path(
     let pnpm = resolve_toolchain("pnpm")?;
     let log_path = directory.join("logs").join("prepare.log");
     task.update("Installing DSH dependencies", 38);
+    task.log("installing DSH dependencies offline from the pnpm store");
+    let install_started = std::time::Instant::now();
     run_pnpm_command(
         &pnpm,
         &harness,
@@ -1045,10 +1074,18 @@ fn prepare_container_at_final_path(
         None,
         None,
     )?;
+    task.log(&format!(
+        "dependencies linked in {}s",
+        install_started.elapsed().as_secs()
+    ));
 
     if !plugin_sources.is_empty() {
         let profile_dir = directory.join("profile/profiles").join(profile);
         task.update("Materializing cached plugin recipe", 62);
+        task.log(&format!(
+            "installing {} profile plugin source(s) offline",
+            plugin_sources.len()
+        ));
         run_pnpm_command(
             &pnpm,
             &profile_dir,
@@ -1061,17 +1098,36 @@ fn prepare_container_at_final_path(
         )?;
     }
 
-    task.update("Building DSH frontend", 72);
-    run_pnpm_command(
-        &pnpm,
-        &harness,
-        ["run", "build"],
-        &log_path,
-        task,
-        "container frontend build",
-        Some(profile_home),
-        Some(source_commit.to_owned()),
-    )?;
+    // The client artifacts are built once, while the prepared base is created,
+    // and copied here with the rest of the tree. Only a template that predates
+    // that (or one whose tree lost them) still needs the build.
+    if client_artifacts_present(&harness, source_commit) {
+        task.update("Using the template's client artifacts", 72);
+        task.log("client artifacts came with the template; skipping the build");
+    } else {
+        task.update("Building DSH frontend", 72);
+        task.log(
+            "this template has no prebuilt client artifacts, so they are built now \
+             (native addon, libs, web frontend — a few minutes). Rebuild the template \
+             with `dshbox build` to make container creation a copy.",
+        );
+        let build_started = std::time::Instant::now();
+        run_pnpm_command(
+            &pnpm,
+            &harness,
+            ["run", "build"],
+            &log_path,
+            task,
+            "container frontend build",
+            Some(profile_home),
+            Some(source_commit.to_owned()),
+        )?;
+        task.log(&format!(
+            "client build finished in {}s",
+            build_started.elapsed().as_secs()
+        ));
+        write_client_artifact_marker(&harness, source_commit)?;
+    }
     if !harness.join("apps/web/dist/index.html").is_file()
         || !harness.join("node_modules/tsx/package.json").is_file()
     {
@@ -1080,6 +1136,94 @@ fn prepare_container_at_final_path(
     task.update("Materializing DSH Box context plugin", 82);
     materialize_bundled_context_plugin(directory, profile, Some(task))?;
     Ok(())
+}
+
+/// Where a prepared base records that its client artifacts were built, and for
+/// which commit and platform. Box writes it, so it can be trusted on a machine
+/// other than the one that built the tree — an imported template carries
+/// another platform's native addon.
+pub(crate) const CLIENT_ARTIFACT_MARKER: &str = ".dsh-build/box-client-artifacts.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ClientArtifactMarker {
+    commit: String,
+    platform: String,
+}
+
+/// The platform a built tree belongs to: the native addon and the web bundle
+/// are only valid on the machine (and OS) that produced them.
+fn build_platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Record a completed client build. Written atomically, and only after the
+/// build succeeded, so a half-written tree is never mistaken for a built one.
+pub(crate) fn write_client_artifact_marker(harness: &Path, commit: &str) -> Result<(), String> {
+    let path = harness.join(CLIENT_ARTIFACT_MARKER);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let marker = ClientArtifactMarker {
+        commit: commit.to_owned(),
+        platform: build_platform(),
+    };
+    let body = serde_json::to_vec_pretty(&marker).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, body).map_err(|error| error.to_string())?;
+    fs::rename(&temporary, &path).map_err(|error| error.to_string())
+}
+
+/// Whether this tree already carries client artifacts built for `commit` on
+/// this platform.
+pub(crate) fn client_artifacts_present(harness: &Path, commit: &str) -> bool {
+    if !harness.join("apps/web/dist/index.html").is_file() {
+        return false;
+    }
+    let Ok(body) = fs::read_to_string(harness.join(CLIENT_ARTIFACT_MARKER)) else {
+        return false;
+    };
+    match serde_json::from_str::<ClientArtifactMarker>(&body) {
+        Ok(marker) => marker.commit == commit && marker.platform == build_platform(),
+        Err(_) => false,
+    }
+}
+
+/// Make sure a prepared base carries its client artifacts, building them in
+/// place when it predates the build-at-base step. The base is the only tree
+/// with `node_modules`, so it is the only place this can run cheaply.
+fn ensure_base_client_artifacts(
+    base_directory: &Path,
+    commit: &str,
+    task: &TaskContext,
+) -> Result<(), String> {
+    let harness = base_directory.join("harness");
+    if client_artifacts_present(&harness, commit) {
+        return Ok(());
+    }
+    let pnpm = resolve_toolchain("pnpm")?;
+    let log_path = base_directory.join("prepare.log");
+    task.update("Building client artifacts for this base", 22);
+    task.log(
+        "this prepared base was created before Box built client artifacts at base \
+         time; building them once here (a few minutes) so every template from it is \
+         ready to run",
+    );
+    let started = std::time::Instant::now();
+    run_pnpm_command(
+        &pnpm,
+        &harness,
+        ["run", "build"],
+        &log_path,
+        task,
+        "prepared-base client build",
+        None,
+        Some(commit.to_owned()),
+    )?;
+    task.log(&format!(
+        "client artifacts built in {}s",
+        started.elapsed().as_secs()
+    ));
+    write_client_artifact_marker(&harness, commit)
 }
 
 fn run_pnpm_command<const N: usize>(
@@ -1156,6 +1300,7 @@ fn run_pnpm_command_once<const N: usize>(
     if status.success() {
         Ok(())
     } else {
+        log_command_tail(log_path, task, 20);
         Err(format!("{label} failed; inspect {}", log_path.display()))
     }
 }
@@ -1164,6 +1309,25 @@ fn run_pnpm_command_once<const N: usize>(
 /// signatures that warrant a transient retry: `EBUSY`, `EPERM`,
 /// `EACCES`, or pnpm's generic `[UNKNOWN] UNKNOWN` that wraps them when
 /// reading package.json files inside `node_modules/`.
+/// Append the tail of a command transcript to the task log. The full output
+/// stays in the transcript file, but a failure that only says "inspect
+/// /path/prepare.log" makes the UI log useless when the run is the thing the
+/// user is watching.
+pub(crate) fn log_command_tail(log_path: &Path, task: &TaskContext, lines: usize) {
+    let Ok(contents) = fs::read_to_string(log_path) else {
+        return;
+    };
+    let tail: Vec<&str> = contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .rev()
+        .take(lines)
+        .collect();
+    for line in tail.into_iter().rev() {
+        task.log(line);
+    }
+}
+
 fn log_indicates_transient_io(log_path: &Path) -> bool {
     let Ok(contents) = std::fs::read_to_string(log_path) else {
         return false;
