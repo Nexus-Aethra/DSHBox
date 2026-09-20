@@ -1,0 +1,144 @@
+name: Release installers
+
+# A version tag (`v0.1.7`, matching the tags already on this repository) is the
+# only release trigger: it builds the installers for all three platforms and
+# attaches them to the GitHub Release for that tag. `workflow_dispatch` runs the
+# same build without publishing, so the pipeline can be exercised before a tag
+# exists.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing must not cancel the other two — a Windows-only
+      # failure should still leave the Linux/macOS logs to read.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64 — deb + rpm
+            os: ubuntu-22.04
+            artifact: linux-x64
+            bundle: pnpm bundle:linux
+            paths: |
+              src-tauri/target/release/bundle/deb/*.deb
+              src-tauri/target/release/bundle/rpm/*.rpm
+          - name: Windows x64 — MSI
+            os: windows-latest
+            artifact: windows-x64
+            bundle: pnpm bundle:windows
+            paths: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+          - name: macOS arm64 — dmg
+            os: macos-latest
+            artifact: macos-arm64
+            bundle: pnpm bundle:macos
+            paths: src-tauri/target/release/bundle/dmg/*.dmg
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri's WebKitGTK/AppIndicator link deps, plus the tools the bundle
+      # scripts call on PATH.
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev build-essential curl wget file patchelf
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # `bundle-windows.mjs` links with MSVC. The runner image ships VS 2022
+      # Enterprise, but this action is what puts link.exe, the SDK paths and
+      # INCLUDE/LIB into the environment cargo inherits (the script's own
+      # toolset discovery only knows BuildTools/Community installs).
+      - name: Set up MSVC
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The installers are named after the version baked into the binaries, so
+      # a tag that disagrees with it would publish mislabelled artifacts.
+      # Plain POSIX-ish bash on purpose: macOS still ships bash 3.2, which has
+      # no associative arrays.
+      - name: Check the tag against the package versions
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          fail=0
+          check() {
+            if [ "$2" != "$tag" ]; then
+              echo "::error file=$1::version $2 does not match tag v$tag"
+              fail=1
+            fi
+          }
+          check package.json "$(node -p "require('./package.json').version")"
+          check src-tauri/tauri.conf.json "$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          check src-tauri/Cargo.toml "$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)"
+          exit $fail
+
+      # The three bundle scripts are the same ones a developer runs locally;
+      # they pick the runtime target, build the sidecar and the Cordis plugin,
+      # then hand off to `tauri build`.
+      - name: Build installers
+        run: ${{ matrix.bundle }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          path: ${{ matrix.paths }}
+
+  release:
+    name: Publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: installers
+          merge-multiple: true
+
+      - name: List what is about to be published
+        run: find installers -type f -printf '%p  %s bytes\n' | sort
+
+      # Re-running a tag build must not fail on an existing release: upload
+      # with --clobber in that case, otherwise create it with generated notes.
+      - name: Attach installers to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" installers/* --clobber
+          else
+            gh release create "$tag" installers/* \
+              --title "$tag" \
+              --generate-notes
+          fi
