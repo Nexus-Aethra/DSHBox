@@ -164,6 +164,7 @@ const COMMANDS = {
   plugin_dependency_graph: ({ kind, id }) => callDaemon('plugin_dependency_graph', { kind, id }),
   list_container_resources: ({ id, plugin }) => callDaemon('list_container_resources', { id, plugin }),
   list_resources: () => callDaemon('list_resources', {}),
+  list_installed_plugins: () => callDaemon('list_installed_plugins', {}),
   browse_container_paths: ({ id, path }) => callDaemon('browse_container_paths', { id, path }),
   list_resource_views: () => callDaemon('list_resource_views', {}),
   add_resource_view: (request) => callDaemon('add_resource_view', request),

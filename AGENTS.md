@@ -194,6 +194,13 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   declarations (`package.json` → `dshbox.resources`) are trusted; paths scanned
   out of a plugin's code are candidates the user confirms. Extracted records go
   through the document store; payloads stay in `<runtime>/resources/<id>/`.
+- **The plugin view is a union, not the repository.** `list_installed_plugins`
+  merges the extension repository with every sealed template's and container's
+  `profile/profiles/<p>/pnpm-lock.yaml`, classifying a package as a plugin when
+  it is a direct dependency or declares a cordis/dsh peer
+  (`box-plugin-graph/src/lockfile.rs`). A build never imports into the
+  repository — it resolves, locks and deletes the staged `node_modules` — so
+  without this union the plugin list looks empty right after installing.
 - **Plugin cache dedup.** A second `build` of the same `name+version` should
   hit the existing hash entry (`<root>/repository/plugins/img-<id>/source/`)
   and not produce a duplicate `img-…` row (see

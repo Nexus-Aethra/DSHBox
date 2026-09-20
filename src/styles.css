@@ -550,3 +550,5 @@ dialog .resource-panel { max-height: 70vh; overflow-y: auto; }
 .extensions-profile { align-items: center; display: inline-flex; gap: 6px; }
 .extensions-profile .ui-select { width: auto; min-width: 7rem; max-width: 12rem; }
 .extensions-heading-actions { align-items: center; display: flex; gap: 8px; flex: 0 0 auto; }
+
+.installed-plugins-title { margin: 20px 0 4px; }

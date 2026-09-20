@@ -24,6 +24,13 @@ builds from ever showing it.
   **+ Resource type** adds more by detected kind, by scanning a plugin, or by
   picking a path in a tree of the container's storage area), and each tab lists
   every container's copy of that type.
+- **Plugins actually installed are visible.** The plugin view lists the union of
+  the extension repository and what every template and container resolved,
+  read from the profile's `pnpm-lock.yaml` (versions included), so a plugin a
+  boxfile installed no longer looks missing just because it was never imported
+  into the repository. `plugin_dependency_graph` uses the same lock for its
+  template preview, which now shows the plugins a bundle pulled in transitively
+  — with pnpm's resolved versions rather than the boxfile's specifier.
 - **A document store instead of scattered JSON indexes.** Every persisted
   index now goes through `box_foundation::collection::DocumentStore` (SQLite in
   the new `box-store` crate at `<runtime>/state/dshbox.db`), with legacy files

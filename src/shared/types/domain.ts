@@ -290,3 +290,20 @@ export type ResourceTypeSummary = {
   containers: ResourceTypeContainer[]
   stored: StoredResource[]
 }
+
+/** Where an installed plugin came from: the repository, a template, a container. */
+export type PluginOwner = {
+  kind: 'repository' | 'template' | 'container'
+  id: string
+  name: string
+  version: string | null
+  direct: boolean
+}
+
+/** A plugin that exists on this machine, whether or not it was imported. */
+export type InstalledPlugin = {
+  name: string
+  versions: string[]
+  inRepository: boolean
+  owners: PluginOwner[]
+}

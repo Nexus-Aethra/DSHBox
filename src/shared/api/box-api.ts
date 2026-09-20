@@ -1,7 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import type { BoxConfig, ContainerExtensions, ContainerPathListing, ContainerResources, DataEntry, DshContainer, DshVersion, ExtensionBundle, GraphSourceKind, Language, PluginGraph, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, ResourceState, ResourceTypeSummary, ResourceView, ServerServiceStatus, StoredResource, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
+import type { BoxConfig, ContainerExtensions, ContainerPathListing, ContainerResources, DataEntry, DshContainer, DshVersion, ExtensionBundle, GraphSourceKind, Language, PluginGraph, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, InstalledPlugin,
+  ResourceState, ResourceTypeSummary, ResourceView, ServerServiceStatus, StoredResource, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
 
 type ToolchainPayload = { id: string; name: string; managedVersion: string | null }
 
@@ -120,6 +121,7 @@ export const boxApi = {
   removeRepositoryPlugin: (id: string, profile: string, name: string) => ipc<void>('remove_repository_plugin', { id, profile, name }),
   listResourceStates: () => ipc<ResourceSnapshot>('list_resource_states'),
   listRepositoryReferenceCounts: () => ipc<RepositoryReferenceRow[]>('list_repository_reference_counts'),
+  listInstalledPlugins: () => ipc<{ plugins: InstalledPlugin[] }>('list_installed_plugins', {}),
   pluginDependencyGraph: (kind: GraphSourceKind, id: string) => ipc<PluginGraph>('plugin_dependency_graph', { kind, id }),
   listContainerResources: (id: string, plugin?: string) => ipc<ContainerResources>('list_container_resources', { id, plugin }),
   listResources: () => ipc<{ resources: StoredResource[] }>('list_resources', {}),

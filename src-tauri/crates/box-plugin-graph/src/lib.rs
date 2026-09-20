@@ -16,9 +16,11 @@
 //! provides, a provider that is installed but not activated, and a dependency
 //! cycle.
 //!
-//! Deliberately out of scope: npm-level package dependencies. The user-facing
-//! graph is plugin-to-plugin, so a plugin's library dependencies are not nodes
-//! and the profile lockfile is not consulted.
+//! Plugin-to-plugin is the graph; npm-level packaging is [`lockfile`]. A sealed
+//! template keeps no `node_modules`, so the profile's `pnpm-lock.yaml` is the
+//! only record of what a container will install — including the plugins a bundle
+//! pulled in that no boxfile names — and it is where the resolved versions come
+//! from.
 //!
 //! The scanner is text-based, because the workspace has no TypeScript parser. The
 //! forms it recognises were derived from a real harness checkout; see
@@ -26,6 +28,7 @@
 
 pub mod extract;
 pub mod graph;
+pub mod lockfile;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

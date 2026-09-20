@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { DshContainer, DshVersion, ExtensionBundle, PreviewScriptResult, RepositoryExtension, ResourceView, TemplateInfo } from '../../shared/types/domain'
+import type { DshContainer, DshVersion, ExtensionBundle, InstalledPlugin, PreviewScriptResult, RepositoryExtension, ResourceView, TemplateInfo } from '../../shared/types/domain'
 import { Badge } from '../../ui/Badge'
 import { Button } from '../../ui/Button'
 import { Card } from '../../ui/Card'
@@ -28,6 +28,9 @@ type Text = PluginGraphText & AddResourceTypeText & ResourceTypeText & {
   bundleRefNote: string; bundleRefDelete: string
   resources: string; harnessTab: string; templateTab: string; bundleTab: string; addResource: string
   resourceBuiltinSessions: string; resourceBuiltinCredentials: string
+  installedPluginsTitle: string; installedPluginsNote: (n: number) => string
+  installedNotImported: string; importToRepository: string
+  ownerTemplate: string; ownerContainer: string
   versionTitle: string; versionNote: string; noVersion: string; install: string; installed: string
   uninstall: string; loadVersions: string; installing: string
   buildScript: string; scriptPath: string; chooseScript: string; previewScript: string
@@ -100,6 +103,18 @@ export function ResourcesPage({
   templates,
 }: Props) {
   const [tab, setTab] = useState<TabId>('harness')
+  const [installedPlugins, setInstalledPlugins] = useState<InstalledPlugin[]>([])
+
+  /** Plugins that exist in a template or container but not in the repository. */
+  async function loadInstalledPlugins(): Promise<void> {
+    try {
+      const listed = await boxApi.listInstalledPlugins()
+      setInstalledPlugins(listed.plugins.filter((plugin) => !plugin.inRepository))
+    } catch {
+      setInstalledPlugins([])
+    }
+  }
+
   const [views, setViews] = useState<ResourceView[]>([])
   const [containers, setContainers] = useState<DshContainer[]>([])
   const [addTypeOpen, setAddTypeOpen] = useState(false)
@@ -132,7 +147,7 @@ export function ResourcesPage({
   // shown, so a template pulled from the CLI shows up as soon as the user
   // opens the Template tab without any manual refresh.
   useEffect(() => {
-    if (tab === 'plugins') void onReloadPlugins()
+    if (tab === 'plugins') { void onReloadPlugins(); void loadInstalledPlugins() }
     if (tab === 'bundles') void onLoadBundles()
     if (tab === 'template') void onLoadTemplates()
     if (tab === 'harness') void onRefreshDshCatalog()
@@ -308,6 +323,40 @@ export function ResourcesPage({
                 </article>
               )) : <p className="empty-extension">{text.noRepositoryPlugins}</p>}
             </div>
+
+            {installedPlugins.length > 0 && (
+              <>
+                <h3 className="extensions-heading-title installed-plugins-title">{text.installedPluginsTitle}</h3>
+                <p className="workspace-note">{text.installedPluginsNote(installedPlugins.length)}</p>
+                <div className="extension-list plugin-repo-list">
+                  {installedPlugins.map((plugin) => (
+                    <article key={plugin.name} className="extension-row">
+                      <div>
+                        <strong>{plugin.name}</strong>
+                        <p>
+                          {plugin.versions.join(' · ')}
+                          {' — '}
+                          {plugin.owners
+                            .map((owner) => `${owner.kind === 'template' ? text.ownerTemplate : owner.kind === 'container' ? text.ownerContainer : ''} ${owner.name}`.trim())
+                            .filter((label, index, all) => label !== '' && all.indexOf(label) === index)
+                            .slice(0, 4)
+                            .join('、')}
+                        </p>
+                      </div>
+                      <div className="plugin-repo-actions">
+                        <Badge variant="neutral">{text.installedNotImported}</Badge>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          disabled={plugin.versions.length === 0}
+                          onClick={() => { void onImportPlugin(`npm:${plugin.name}@${plugin.versions[0]}`) }}
+                        >{text.importToRepository}</Button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              </>
+            )}
           </>
         )}
 

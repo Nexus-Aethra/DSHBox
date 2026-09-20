@@ -192,6 +192,9 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         }
         Some("list_resources") => crate::resources::list_resources(state, request).map(Sync),
         Some("list_resource_views") => crate::resources::list_resource_views(state, request).map(Sync),
+        Some("list_installed_plugins") => {
+            crate::plugins::list_installed_plugins(state, request).map(Sync)
+        }
         Some("add_resource_view") => crate::resources::add_resource_view(state, request).map(Sync),
         Some("delete_resource_view") => {
             crate::resources::delete_resource_view(state, request).map(Sync)
@@ -434,6 +437,17 @@ fn list_repository_reference_counts_rpc() -> Result<Value, String> {
 /// the harness tree plus the profile's installed plugins and reads the literal
 /// `inject` / service-registration declarations out of them. `kind` decides
 /// whether `id` names a sealed template or a container.
+/// `@scope/name@1.2.3` → name + version; anything else is a name (a `link:` or
+/// `file:` spec has no registry version to read).
+fn split_spec(spec: &str) -> (String, Option<String>) {
+    if let Some((name, version)) = spec.rsplit_once('@') {
+        if !name.is_empty() && version.chars().next().is_some_and(|character| character.is_ascii_digit()) {
+            return (name.to_owned(), Some(version.to_owned()));
+        }
+    }
+    (spec.to_owned(), None)
+}
+
 fn plugin_dependency_graph_rpc(request: &Value) -> Result<Value, String> {
     use box_plugin_graph::{build_graph, GraphPlugin, GraphSource, Half, ScanRoots};
 
@@ -498,18 +512,35 @@ fn plugin_dependency_graph_rpc(request: &Value) -> Result<Value, String> {
                     .collect()
             })
             .unwrap_or_default();
+        // pnpm's own resolution, from the lockfile the sealed template keeps.
+        // It is the only record of what will be installed — the tree has no
+        // `node_modules` — and it names the plugins a bundle pulled in that no
+        // boxfile ever wrote down.
+        let locked = std::fs::read_to_string(
+            directory
+                .join("profile")
+                .join("profiles")
+                .join(&profile)
+                .join("pnpm-lock.yaml"),
+        )
+        .ok()
+        .and_then(|text| box_plugin_graph::lockfile::parse_lockfile(&text).ok())
+        .unwrap_or_default();
+
         for spec in recipes {
             if spec.is_empty() {
                 continue;
             }
-            if !graph.plugins.iter().any(|plugin| plugin.name == spec) {
-                let version = spec
-                    .rsplit_once('@')
-                    .filter(|(_, tail)| !tail.contains('/'))
-                    .map(|(_, tail)| tail.to_owned());
+            let (name, spec_version) = split_spec(&spec);
+            let version = locked
+                .iter()
+                .find(|package| package.name == name)
+                .map(|package| package.version.clone())
+                .or(spec_version);
+            if !graph.plugins.iter().any(|plugin| plugin.name == name) {
                 graph.plugins.push(GraphPlugin {
-                    id: spec.clone(),
-                    name: spec.clone(),
+                    id: name.clone(),
+                    name: name.clone(),
                     half: Half::Host,
                     version,
                     activated: true,
@@ -519,11 +550,43 @@ fn plugin_dependency_graph_rpc(request: &Value) -> Result<Value, String> {
                     inserts: Vec::new(),
                 });
             }
-            graph.recipe_plugins.push(spec);
+            graph.recipe_plugins.push(name);
+        }
+
+        // Plugins the recipe pulls in without naming them: the version is the
+        // one pnpm resolved, not the one a boxfile guessed.
+        for package in locked.iter().filter(|package| package.plugin) {
+            if graph.plugins.iter().any(|plugin| plugin.name == package.name) {
+                continue;
+            }
+            graph.plugins.push(GraphPlugin {
+                id: package.name.clone(),
+                name: package.name.clone(),
+                half: Half::Host,
+                version: Some(package.version.clone()),
+                activated: true,
+                source: "pnpm lock — a recipe dependency pulled this plugin in".to_owned(),
+                provides: Vec::new(),
+                requires: Vec::new(),
+                inserts: Vec::new(),
+            });
+            graph.recipe_plugins.push(package.name.clone());
+        }
+        if !locked.is_empty() {
+            graph.diagnostics.push(box_plugin_graph::lockfile::summary(&locked));
+        }
+        let transitive = locked
+            .iter()
+            .filter(|package| package.plugin && !package.direct)
+            .count();
+        if transitive > 0 {
+            graph.diagnostics.push(format!(
+                "{transitive} plugin(s) are not named by the boxfile: the profile's pnpm lock pulls them in, and their versions above are pnpm's resolution"
+            ));
         }
         if !graph.recipe_plugins.is_empty() {
             graph.diagnostics.push(format!(
-                "{} plugin(s) come from this template's boxfile and are installed when a container is created, so their sources are not in the template tree",
+                "{} plugin(s) come from this template's recipe (the boxfile and the pnpm lock) and are installed when a container is created, so their sources are not in the template tree",
                 graph.recipe_plugins.len()
             ));
         }
