@@ -10,7 +10,8 @@
       "deb": {
         "files": {
           "/usr/bin/dshboxd": "../scripts/packaging/dshboxd"
-        }
+        },
+        "desktopTemplate": "bundler/linux/dshbox.desktop"
       },
       "rpm": {
         "files": {
