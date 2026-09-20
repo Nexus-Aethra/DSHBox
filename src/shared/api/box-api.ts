@@ -54,6 +54,27 @@ async function openContainerFront(command: string, id: string): Promise<void> {
 }
 
 /** The sole frontend boundary to desktop IPC and native dialogs. */
+/**
+ * Resolve when a queued task reaches a terminal state. Extraction and
+ * injection are background tasks: a caller that reloads its data right after
+ * `enqueue_*` reads the old state, which is why a copy "does not appear".
+ * Polls the task list, and gives up quietly on timeout so a hung task cannot
+ * spin the UI forever.
+ */
+async function waitForTask(id: string, timeoutMs: number): Promise<TaskRecord | null> {
+  const terminal = new Set(['succeeded', 'failed', 'cancelled', 'interrupted'])
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    let tasks: TaskRecord[] = []
+    try { tasks = await ipc<TaskRecord[]>('list_tasks') } catch { return null }
+    const task = tasks.find((entry) => entry.id === id)
+    // A task that is gone (retried, deleted) is finished as far as we care.
+    if (task === undefined) return null
+    if (terminal.has(task.status)) return task
+    await new Promise((resolve) => setTimeout(resolve, 700))
+  }
+  return null
+}
 export const boxApi = {
   loadConfig: () => ipc<BoxConfig>('load_config'),
   saveRuntimeDirectory: (directory: string) => ipc<BoxConfig>('save_runtime_directory', { directory }),
@@ -75,6 +96,7 @@ export const boxApi = {
     readTemplate: (name: string) => ipc<{ name: string; text: string }>('read_template', { name }),
     importTemplate: (archive: string, name: string | null) => ipc<string>('import_template', { request: { archive, name } }),
     exportTemplate: (name: string, destination: string | null) => ipc<string>('export_template', { request: { name, destination } }),
+
     removeTemplate: (name: string) => ipc<string>('remove_template', { request: { name } }),
     createContainerFromTemplate: (name: string, template: string, profile: string | null) => ipc<TaskRecord>('enqueue_template_container', { request: { name, template, profile } }),
   listContainers: () => ipc<DshContainer[]>('list_dsh_containers'),
@@ -119,6 +141,7 @@ export const boxApi = {
   enqueueContainerRebuild: (id: string) => ipc<TaskRecord>('enqueue_container_rebuild', { id }),
   openContainer: (id: string) => openContainerFront('open_dsh_front', id),
   listTasks: () => ipc<TaskRecord[]>('list_tasks'),
+  waitForTask: (id: string, timeoutMs = 120_000) => waitForTask(id, timeoutMs),
   cancelTask: (id: string) => ipc<void>('cancel_task', { id }),
   deleteTask: (id: string) => ipc<void>('delete_task', { id }),
   retryTask: (id: string) => ipc<TaskRecord>('retry_task', { id }),

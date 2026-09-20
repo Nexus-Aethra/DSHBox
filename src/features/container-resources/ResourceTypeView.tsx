@@ -69,14 +69,22 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
 
   useEffect(() => { void reload() }, [view.kind, view.path])
 
-  /** Run an action and refresh; anything returning a task id is announced. */
+  /**
+   * Run an action and refresh. Anything that returns a task id is waited for
+   * first: the work happens in the daemon, so reloading immediately would show
+   * the list without the copy that was just taken.
+   */
   async function run(work: () => Promise<unknown>): Promise<void> {
     setBusy(true)
     setError(null)
     try {
       const result = await work()
       const id = (result as { id?: unknown } | null)?.id
-      if (typeof id === 'string') setQueued(id)
+      if (typeof id === 'string') {
+        setQueued(id)
+        const task = await boxApi.waitForTask(id)
+        if (task !== null && task.status === 'failed') setError(task.error ?? task.stage)
+      }
       await reload()
     } catch (runError) {
       setError(String(runError))

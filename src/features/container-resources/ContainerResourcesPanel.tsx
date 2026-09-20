@@ -122,12 +122,15 @@ export function ContainerResourcesPanel({ id, name, text, onClose }: Props) {
   const installedPlugins = useInstalledPlugins(id)
   const others = useMemo(() => containers.filter((container) => container.id !== id), [containers, id])
 
+  /** Queue an action, wait for the daemon to finish it, then refresh. */
   async function run(work: () => Promise<{ id: string }>): Promise<void> {
     setBusy(true)
     setError(null)
     try {
       const task = await work()
       setQueued(task.id ?? '')
+      const finished = await boxApi.waitForTask(task.id)
+      if (finished !== null && finished.status === 'failed') setError(finished.error ?? finished.stage)
       await reload()
     } catch (runError) {
       setError(String(runError))
