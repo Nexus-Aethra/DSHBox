@@ -15,14 +15,14 @@ dshbox container resource list <id> [--plugin <pkg>] [--json]
         scanned candidates (kind, location, size, secret)
 dshbox container resource stored [--json]
         resources already extracted into the Box store
-dshbox container resource extract <id> <kind> [options]
+dshbox container resource extract <id> <kind> [options] [--json]
         --entry <e>     one entry only (e.g. a single session); use
                         --entry=<e> for slugs that start with `--`
         --name <n>      name for the extracted resource
         --dest <path>   explicit path for a kind Box does not know
         --plugin <pkg>  resolve the kind through this plugin's declarations
         --out <file>    also pack the payload as a .tar.gz
-dshbox container resource inject <id> <resource-id> [options]
+dshbox container resource inject <id> <resource-id> [options] [--json]
 dshbox container resource inject <id> --from <container> [options]
 dshbox container resource inject <id> --in <file.tar.gz> [options]
         --kind <k>      kind to inject as (default: where it came from)
@@ -35,7 +35,7 @@ dshbox container resource inject <id> --in <file.tar.gz> [options]
 dshbox container resource read <id> <path> [--section a.b] [--json]
         one file of a container as a YAML tree: the nodes, their key paths and
         the block at --section (empty = the whole document)
-dshbox container resource write <id> <path> [options]
+dshbox container resource write <id> <path> [options] [--json]
         --section <a.b>  key path to write at (empty = the whole file)
         --text <yaml>    the block that goes *at* that path, without the
                         path's own key (writing at `a.b` a text of `c: 1`
@@ -48,10 +48,11 @@ dshbox container resource types [--json]
         the resource types Box shows as tabs (kind, container, path, label)
 dshbox container resource type rm <view-id>
         remove one of those types (the state itself is untouched)
-dshbox container resource rm <resource-id>
+dshbox container resource rm <resource-id> [--json]
         delete an extracted resource and its payload
 
-Injection refuses an existing destination unless --overwrite or --merge is
+Every verb that reports something takes --json, so a caller never has to parse
+prose. Injection refuses an existing destination unless --overwrite or --merge is
 given, and refuses a running container unless --restart is given.";
 
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
@@ -418,7 +419,11 @@ fn inject(arguments: &[String]) -> Result<(), String> {
     let task: TaskRecord = serde_json::from_value(value)
         .map_err(|error| format!("invalid task record from daemon: {error}"))?;
     rpc::wait_task(&client, &task.id)?;
-    println!("injected into {id}");
+    if flags.has("json") {
+        println!("{}", serde_json::to_string_pretty(&json!({ "task": task.id, "container": id })).map_err(|error| error.to_string())?);
+    } else {
+        println!("injected into {id}");
+    }
     Ok(())
 }
 
@@ -427,10 +432,14 @@ fn remove(arguments: &[String]) -> Result<(), String> {
         .first()
         .filter(|id| !id.starts_with('-'))
         .ok_or("expected a resource id")?;
+    let flags = Flags::parse(&arguments[1..])?;
     let client = rpc::connect()?;
-    let value = rpc::call(&client, "delete_resource", json!({ "resourceId": id }))?;
-    let _ = value;
-    println!("deleted resource {id}");
+    rpc::call(&client, "delete_resource", json!({ "resourceId": id }))?;
+    if flags.has("json") {
+        println!("{}", serde_json::to_string_pretty(&json!({ "deleted": id })).map_err(|error| error.to_string())?);
+    } else {
+        println!("deleted resource {id}");
+    }
     Ok(())
 }
 
