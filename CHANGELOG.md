@@ -62,6 +62,13 @@ builds from ever showing it.
   (MSI) and macOS arm64 (dmg) and attaches them to the release; the tag is
   checked against the three version fields first. `workflow_dispatch` builds
   without publishing.
+- The Windows bundler finds MSVC through `vswhere` before falling back to
+  scanning install roots, and says so when it does fall back: a host whose
+  Visual Studio sits in the 64-bit `Program Files` (every GitHub runner) used
+  to be handed MinGW silently, which cannot link Tauri's MSVC-flavoured
+  dependencies.
+- Building needs Node 22.13+: the pinned `packageManager` imports
+  `node:sqlite`, which Node 20 does not ship.
 
 ## 0.1.7
 
