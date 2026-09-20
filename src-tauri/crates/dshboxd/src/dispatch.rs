@@ -187,6 +187,17 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
             prune_sealed_template_snapshots().map(|removed| Sync(json!({ "removed": removed })))
         }
         Some("plugin_dependency_graph") => plugin_dependency_graph_rpc(request).map(Sync),
+        Some("list_container_resources") => {
+            crate::resources::list_container_resources(state, request).map(Sync)
+        }
+        Some("list_resources") => crate::resources::list_resources(state, request).map(Sync),
+        Some("delete_resource") => crate::resources::delete_resource(state, request).map(Sync),
+        Some("enqueue_resource_extract") => {
+            crate::resources::enqueue_resource_extract(state, request)
+        }
+        Some("enqueue_resource_inject") => {
+            crate::resources::enqueue_resource_inject(state, request)
+        }
         Some("create_container") => create_container_rpc(request).map(Sync),
         Some("enqueue_container_start") => enqueue_container_start(state, request),
         Some("enqueue_container_stop") => enqueue_container_stop(state, request),
@@ -543,7 +554,7 @@ fn enqueue_build(state: &DaemonState, request: &Value) -> Result<HandlerResult, 
 /// Enqueue `work` as a daemon-owned task and return the task record right
 /// away; the client polls `task_status`. Every long-running RPC uses this
 /// path so the daemon is the only process that executes business logic.
-fn enqueue_task_worker(
+pub(crate) fn enqueue_task_worker(
     state: &DaemonState,
     kind: &str,
     resource_keys: Vec<String>,

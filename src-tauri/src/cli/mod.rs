@@ -12,6 +12,7 @@ pub mod image;
 pub mod init;
 pub mod plugin;
 pub mod pull;
+mod resource;
 pub mod rpc;
 pub mod run;
 pub mod setup_path;

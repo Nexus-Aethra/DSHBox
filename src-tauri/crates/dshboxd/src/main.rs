@@ -14,6 +14,7 @@ mod events;
 mod extensions;
 mod host;
 mod lifecycle;
+mod resources;
 mod sealed;
 mod state;
 #[cfg(test)]

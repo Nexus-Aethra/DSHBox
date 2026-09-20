@@ -50,6 +50,7 @@ pub enum Scope {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Discovered {
     pub kind: ResolvedKind,
     pub scope: Scope,
@@ -130,7 +131,6 @@ pub fn scanned_candidates(source: &str) -> Vec<String> {
     let mut index = 0usize;
     while let Some(offset) = source[index..].find("join(") {
         let start = index + offset + "join(".len();
-        index = start;
         let (parts, next) = read_join_arguments(source, bytes, start);
         index = next;
         if parts.len() < 2 {

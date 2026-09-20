@@ -4,12 +4,14 @@
 //! the only writer; payloads are content directories under
 //! `<runtime>/resources/<id>/payload/`.
 
+use crate::kinds::Shape;
 use box_foundation::collection::{Collection, DocumentStore};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ResourceRecord {
     /// `<kind>-<name>`, sanitized.
     pub id: String,
@@ -24,10 +26,25 @@ pub struct ResourceRecord {
     pub bytes: u64,
     pub files: u64,
     pub secret: bool,
+    /// Payload shape at extraction time, so an injection knows whether it may
+    /// merge entry by entry.
+    #[serde(default = "default_shape")]
+    pub shape: Shape,
+    /// Entry depth at extraction time.
+    #[serde(default = "default_depth")]
+    pub entry_depth: u8,
     /// The package it belongs to, when a plugin owned the resource.
     #[serde(default)]
     pub plugin: Option<String>,
     pub created_at: u64,
+}
+
+fn default_shape() -> Shape {
+    Shape::Opaque
+}
+
+fn default_depth() -> u8 {
+    1
 }
 
 pub fn record_key(record: &ResourceRecord) -> &str {

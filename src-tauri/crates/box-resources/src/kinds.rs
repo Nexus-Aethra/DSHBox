@@ -105,6 +105,7 @@ pub fn builtin(id: &str) -> Option<&'static Kind> {
 /// A kind resolved for one container: a built-in, a plugin declaration, or a
 /// caller-supplied kind with an explicit destination.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResolvedKind {
     pub id: String,
     pub label: String,

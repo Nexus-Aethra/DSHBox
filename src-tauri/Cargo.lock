@@ -1003,6 +1003,7 @@ dependencies = [
  "box-image",
  "box-logger",
  "box-plugin-graph",
+ "box-resources",
  "box-runtime",
  "box-scheduler",
  "box-server-core",
