@@ -77,6 +77,14 @@ builds from ever showing it.
 
 ### Fixed
 
+- **A resource copy had no name, and the second one replaced the first.** Every
+  copy was keyed `<kind>-<kind>` (`sessions-sessions`,
+  `credentials-credentials`), so a type could only ever hold one row and taking
+  another copy silently overwrote it — including from a different container.
+  Taking a copy is now a button that opens a card asking which container the
+  state comes out of and what to call the copy; the name defaults to the source
+  container, and taking another copy adds `<name>-2` rather than replacing what
+  is there.
 - **Creating a container from a template took three minutes.** Every creation
   re-ran the whole client build (native addon, host/client libraries, web
   frontend) — ~180s of the ~195s it took, against 12s of dependency linking.

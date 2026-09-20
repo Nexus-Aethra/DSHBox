@@ -209,7 +209,12 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   symlink pointing outside the source is refused, not followed). Plugin
   declarations (`package.json` → `dshbox.resources`) are trusted; paths scanned
   out of a plugin's code are candidates the user confirms. Extracted records go
-  through the document store; payloads stay in `<runtime>/resources/<id>/`.
+  through the document store; payloads stay in `<runtime>/resources/<id>/`. A
+  copy's id is `<kind>-<name>`, where the name is the user's, the selected
+  entry's, or the source container's (`build_id` + `free_record_id` in
+  `dshboxd/src/resources.rs`): taking a copy again adds `<name>-2` instead of
+  replacing the one the user already has, since taking a copy is an explicit act
+  — the same kind from two containers must not land on one row.
 - **Cache state comes from the pnpm store, the list from the lockfiles.** Box
   gives pnpm a private store (`PNPM_CONFIG_STORE_DIR` → `<runtime>/pnpm/store`,
   see `box-runtime/src/process/env.rs`), so "can this install offline" is a

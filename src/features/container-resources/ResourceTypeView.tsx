@@ -4,12 +4,16 @@ import type { DshContainer, ResourceTypeSummary, ResourceView } from '../../shar
 import { Badge } from '../../ui/Badge'
 import { Button } from '../../ui/Button'
 import { Select } from '../../ui/Select'
+import type { AddResourceCopyText } from './AddResourceCopyDialog'
+import { AddResourceCopyDialog } from './AddResourceCopyDialog'
 
-export type ResourceTypeText = {
+export type ResourceTypeText = AddResourceCopyText & {
   resourceTypeLoading: string
   resourceTypeCopies: string
   resourceTypeCopiesEmpty: string
   resourceTypeAddCopy: string
+  resourceTypeCopyName: string
+  resourceTypeCopyNameHint: string
   resourceTypeAddFrom: string
   resourceTypeAddFromPlaceholder: string
   resourceTypeFrom: string
@@ -50,7 +54,7 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [queued, setQueued] = useState<string | null>(null)
-  const [source, setSource] = useState('')
+  const [addOpen, setAddOpen] = useState(false)
   const [targets, setTargets] = useState<Record<string, string>>({})
   const [conflict, setConflict] = useState('merge')
   const [restart, setRestart] = useState(true)
@@ -93,15 +97,17 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
     }
   }
 
-  /** Take a fresh copy out of the chosen container. */
-  async function addCopy(): Promise<void> {
+  /** Take a fresh copy out of a container, named by the user. */
+  async function addCopy(source: string, name: string): Promise<void> {
     if (!source) return
     await run(() => boxApi.enqueueResourceExtract({
       id: source,
       kind: view.kind,
+      name: name || undefined,
       // A type pinned to a path takes exactly that path.
       ...(view.kind === 'path' && view.path !== null && view.path !== undefined ? { dest: view.path } : {}),
     }))
+    setAddOpen(false)
   }
 
   /** Put one copy into the container chosen on its row. */
@@ -131,22 +137,15 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
         <h2>{view.label}</h2>
         <code className="resource-path">{view.path ?? view.kind}</code>
         {view.secret && <Badge variant="danger">{text.resourceTypeSecret}</Badge>}
+        <Button variant="primary" size="sm" disabled={busy || containers.length === 0} onClick={() => { setAddOpen(true) }}>{text.resourceTypeAddCopy}</Button>
         {removable && <Button variant="ghost" size="sm" disabled={busy} onClick={() => { void onRemove() }}>{text.resourceTypeRemove}</Button>}
       </div>
 
       {error !== null && <p className="resource-error">{text.resourceTypeError(error)}</p>}
       {queued !== null && <p className="resource-note">{text.resourceTypeQueued(queued)}</p>}
 
-      <div className="resource-add">
-        <span className="resource-section">{text.resourceTypeAddFrom}</span>
-        <Select
-          value={source}
-          placeholder={text.resourceTypeAddFromPlaceholder}
-          aria-label={text.resourceTypeAddFrom}
-          options={containers.map((entry) => ({ value: entry.id, label: entry.name }))}
-          onChange={(event) => { setSource(event.target.value) }}
-        />
-        <Button variant="primary" size="sm" disabled={busy || !source} onClick={() => { void addCopy() }}>{text.resourceTypeAddCopy}</Button>
+      <div className="resource-copies-head">
+        <h3 className="resource-section">{text.resourceTypeCopies}</h3>
         <details className="resource-options">
           <summary>{text.resourceTypeOptions}</summary>
           <div className="resource-controls">
@@ -167,8 +166,6 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
           </div>
         </details>
       </div>
-
-      <h3 className="resource-section">{text.resourceTypeCopies}</h3>
       {loading && <p className="resource-note">{text.resourceTypeLoading}</p>}
       {!loading && copies.length === 0 && <p className="resource-note">{text.resourceTypeCopiesEmpty}</p>}
       <ul className="resource-copies">
@@ -202,6 +199,15 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
           </li>
         ))}
       </ul>
+
+      {addOpen && (
+        <AddResourceCopyDialog
+          containers={containers}
+          text={text}
+          onClose={() => { setAddOpen(false) }}
+          onAdd={addCopy}
+        />
+      )}
     </div>
   )
 }

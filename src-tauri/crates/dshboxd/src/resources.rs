@@ -10,6 +10,7 @@ use box_resources::kinds::Conflict;
 use box_resources::record::{self, ResourceRecord};
 use box_resources::{discover, transfer, ResolvedKind, Shape};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::dispatch::{enqueue_task_worker, HandlerResult};
@@ -39,6 +40,39 @@ fn container_dir(root: &Path, id: &str) -> Result<PathBuf, String> {
 
 /// A container records its profile in `container.json`; `web` is what the
 /// daemon falls back to when the file predates that field.
+/// The name a copy falls back to when the user gave none: the container's own
+/// name, so `sessions` from `hello` and from `dshell` are two rows rather than
+/// one that keeps being replaced.
+fn container_name(root: &Path, id: &str) -> String {
+    registered_containers(root)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(container_id, _, _)| container_id == id)
+        .map(|(_, name, _)| name)
+        .unwrap_or_else(|| id.to_owned())
+}
+
+/// Taking a copy is an explicit act, so it adds one: the first free
+/// `<base>`, `<base>-2`, `<base>-3`, … A user who wants to replace a copy
+/// names the new one after it and removes the old one.
+fn free_record_id(
+    collection: &Collection<ResourceRecord>,
+    base: &str,
+) -> Result<String, String> {
+    let taken: BTreeSet<String> = collection
+        .load_all()?
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    if !taken.contains(base) {
+        return Ok(base.to_owned());
+    }
+    Ok((2u32..)
+        .map(|nth| format!("{base}-{nth}"))
+        .find(|id| !taken.contains(id))
+        .unwrap_or_else(|| base.to_owned()))
+}
+
 fn profile_name(container: &Path) -> String {
     std::fs::read_to_string(container.join("container.json"))
         .ok()
@@ -415,12 +449,14 @@ pub(crate) fn enqueue_resource_extract(
                 None,
             )?;
             // Naming the extraction after the entry keeps two sessions from
-            // overwriting each other in the store.
+            // overwriting each other in the store; with neither a name nor an
+            // entry it is named after the container it came out of, so the same
+            // kind taken from two containers does not land on one row.
             let label = name
                 .clone()
                 .or_else(|| entry.clone().map(|entry| entry.replace('/', "-")))
-                .unwrap_or_else(|| kind.id.clone());
-            let record_id = record::build_id(&kind.id, &label);
+                .unwrap_or_else(|| container_name(&root, &id));
+            let record_id = free_record_id(&collection, &record::build_id(&kind.id, &label))?;
             let payload = record::payload_dir(&root, &record_id);
 
             task.update("Copying the payload", 40);
@@ -659,4 +695,68 @@ fn staging_dir(root: &Path, purpose: &str) -> PathBuf {
         .join(format!("{purpose}-{}-{stamp}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     directory
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use box_resources::kinds::Shape;
+
+    fn record(id: &str) -> ResourceRecord {
+        ResourceRecord {
+            id: id.to_owned(),
+            kind: "sessions".to_owned(),
+            name: id.to_owned(),
+            source_container: "container-1".to_owned(),
+            source_path: "profile/sessions".to_owned(),
+            digest: "d".to_owned(),
+            bytes: 1,
+            files: 1,
+            secret: false,
+            shape: Shape::Entries,
+            entry_depth: 2,
+            plugin: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn taking_a_copy_again_adds_one_instead_of_replacing_it() {
+        let collection = Collection::memory("resources", record::record_key);
+        assert_eq!(
+            free_record_id(&collection, "sessions-hello").unwrap(),
+            "sessions-hello"
+        );
+        collection.upsert(&[record("sessions-hello")]).unwrap();
+        assert_eq!(
+            free_record_id(&collection, "sessions-hello").unwrap(),
+            "sessions-hello-2"
+        );
+        collection.upsert(&[record("sessions-hello-2")]).unwrap();
+        assert_eq!(
+            free_record_id(&collection, "sessions-hello").unwrap(),
+            "sessions-hello-3"
+        );
+        // A different name is unaffected.
+        assert_eq!(
+            free_record_id(&collection, "credentials-hello").unwrap(),
+            "credentials-hello"
+        );
+    }
+
+    #[test]
+    fn a_copy_without_a_name_is_named_after_its_container() {
+        let root = std::env::temp_dir().join(format!("dshbox-resource-name-{}", std::process::id()));
+        let container = root.join("instances").join("container-1");
+        std::fs::create_dir_all(&container).unwrap();
+        std::fs::write(
+            container.join("container.json"),
+            r#"{"id":"container-1","name":"hello"}"#,
+        )
+        .unwrap();
+        assert_eq!(container_name(&root, "container-1"), "hello");
+        // A container that is not registered yet still names the copy.
+        assert_eq!(container_name(&root, "container-2"), "container-2");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
