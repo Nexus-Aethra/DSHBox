@@ -36,7 +36,9 @@ jobs:
           - name: Windows x64 — MSI
             os: windows-latest
             artifact: windows-x64
-            bundle: pnpm bundle:windows
+            # `--msvc` on purpose: a missing VS toolset must fail here, not
+            # after a long MinGW link that cannot succeed.
+            bundle: node scripts/bundle-windows.mjs --msvc
             paths: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
           - name: macOS arm64 — dmg
             os: macos-latest

@@ -16,10 +16,10 @@
 //   - Non-Windows hosts are rejected up front.
 //   - pnpm is resolved robustly: PATH → corepack → known install dirs.
 //   - The linker is resolved per toolchain (link.exe for MSVC,
-//     x86_64-w64-mingw32-gcc for GNU). For MSVC we also honour the
-//     standard vcvars* environment via vswhere + vcvars setup so that
-//     cargo can find link.exe and the Windows SDK libs without the
-//     user having to start a "Developer Command Prompt".
+//     x86_64-w64-mingw32-gcc for GNU). MSVC discovery asks vswhere first and
+//     only then scans the known install roots, so cargo finds link.exe without
+//     the user having to start a "Developer Command Prompt" (INCLUDE and LIB
+//     still come from the environment — the MSVC setup action in CI sets them).
 //   - Forwarded args after `--` are appended to the final `tauri build`.
 //     `--no-bundle` skips step 5.
 //   - We never silently override CARGO_TARGET_*_LINKER if the user
@@ -202,23 +202,60 @@ function findPnpm() {
 
 // ---- MSVC / GNU linker discovery ------------------------------------------
 
-// Try to locate a link.exe under any installed VS 2022 instance. We avoid
-// spawning vswhere because it's an extra dependency; instead we walk the
-// usual install roots directly.
-function findMsvcLinker() {
+// The VS installer's own locator. Asking it is the only reliable way to find a
+// toolset: the path scan below only knows the layouts this project has seen,
+// and it missed the one GitHub's Windows runners use (VS 2022 Enterprise under
+// the 64-bit Program Files), which silently turned the build into a MinGW one
+// that cannot link the MSVC-flavoured dependencies.
+function findVswhere() {
+  const sysdrive = process.env.SystemDrive || 'C:'
+  const programFiles = process.env['ProgramFiles'] || join(sysdrive, 'Program Files')
+  const programFiles86 = process.env['ProgramFiles(x86)'] || join(sysdrive, 'Program Files (x86)')
+  for (const root of [programFiles86, programFiles]) {
+    const candidate = join(root, 'Microsoft Visual Studio', 'Installer', 'vswhere.exe')
+    if (isFile(candidate)) return candidate
+  }
+  return resolveAbs('vswhere')
+}
+
+function findMsvcLinkerViaVswhere() {
+  const vswhere = findVswhere()
+  if (!vswhere) return null
+  const result = spawnSync(
+    vswhere,
+    [
+      '-latest',
+      '-products', '*',
+      '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+      '-find', 'VC\\Tools\\MSVC\\**\\bin\\Hostx64\\x64\\link.exe',
+    ],
+    { encoding: 'utf8' },
+  )
+  if (result.status !== 0 || !result.stdout) return null
+  const found = result.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  // Several toolsets can be installed; the last one sorts highest.
+  return found.length > 0 ? found[found.length - 1] : null
+}
+
+// Fallback for hosts without vswhere: walk the usual install roots directly.
+// Both Program Files roots are checked for every edition — VS 2022 defaults to
+// the 64-bit one, while older/BuildTools installs may sit in the x86 one.
+function findMsvcLinkerOnDisk() {
   const sysdrive = process.env.SystemDrive || 'C:'
   const programFiles = process.env['ProgramFiles'] || join(sysdrive, 'Program Files')
   const programFiles86 = process.env['ProgramFiles(x86)'] || join(sysdrive, 'Program Files (x86)')
 
-  const roots = [
-    join(programFiles86, 'Microsoft Visual Studio', '2022', 'BuildTools', 'VC', 'Tools', 'MSVC'),
-    join(programFiles86, 'Microsoft Visual Studio', '2022', 'Community', 'VC', 'Tools', 'MSVC'),
-    join(programFiles86, 'Microsoft Visual Studio', '2022', 'Enterprise', 'VC', 'Tools', 'MSVC'),
-    join(programFiles86, 'Microsoft Visual Studio', '2022', 'Professional', 'VC', 'Tools', 'MSVC'),
-    join(programFiles, 'Microsoft Visual Studio', '2022', 'BuildTools', 'VC', 'Tools', 'MSVC'),
-    join(programFiles, 'Microsoft Visual Studio', '2022', 'Community', 'VC', 'Tools', 'MSVC'),
-    join(programFiles, 'Microsoft Visual Studio', '17.0', 'BuildTools', 'VC', 'Tools', 'MSVC'),
-  ]
+  const roots = []
+  for (const base of [programFiles, programFiles86]) {
+    for (const edition of ['BuildTools', 'Community', 'Professional', 'Enterprise']) {
+      roots.push(join(base, 'Microsoft Visual Studio', '2022', edition, 'VC', 'Tools', 'MSVC'))
+    }
+  }
+  roots.push(join(programFiles, 'Microsoft Visual Studio', '17.0', 'BuildTools', 'VC', 'Tools', 'MSVC'))
+  roots.push(join(programFiles86, 'Microsoft Visual Studio', '17.0', 'BuildTools', 'VC', 'Tools', 'MSVC'))
 
   for (const root of roots) {
     if (!isFile(root)) continue
@@ -236,32 +273,16 @@ function findMsvcLinker() {
   return null
 }
 
+function findMsvcLinker() {
+  return findMsvcLinkerViaVswhere() ?? findMsvcLinkerOnDisk()
+}
+
 function findMsvcToolset() {
-  // Returns the MSVC root dir (the dir that contains the version dirs)
-  // and the version subdir, so we can wire up PATH and INCLUDE/LIB.
-  const sysdrive = process.env.SystemDrive || 'C:'
-  const programFiles = process.env['ProgramFiles'] || join(sysdrive, 'Program Files')
-  const programFiles86 = process.env['ProgramFiles(x86)'] || join(sysdrive, 'Program Files (x86)')
-
-  const roots = [
-    join(programFiles86, 'Microsoft Visual Studio', '2022', 'BuildTools', 'VC', 'Tools', 'MSVC'),
-    join(programFiles86, 'Microsoft Visual Studio', '2022', 'Community', 'VC', 'Tools', 'MSVC'),
-    join(programFiles, 'Microsoft Visual Studio', '2022', 'BuildTools', 'VC', 'Tools', 'MSVC'),
-  ]
-
-  for (const root of roots) {
-    if (!isFile(root)) continue
-    let versions
-    try {
-      versions = readdirSync(root).sort().reverse()
-    } catch {
-      continue
-    }
-    if (versions.length > 0) {
-      return { root, version: versions[0], bin: join(root, versions[0], 'bin', 'Hostx64', 'x64') }
-    }
-  }
-  return null
+  // The bin directory of the discovered toolset, wired into PATH for the
+  // tauri build so cargo can find link.exe (INCLUDE/LIB still come from the
+  // caller's environment, e.g. the MSVC setup action in CI).
+  const linker = findMsvcLinker()
+  return linker ? { bin: dirname(linker) } : null
 }
 
 function findGnuLinker() {
@@ -417,6 +438,16 @@ console.log(`pnpm=${tools.pnpm}${tools.pnpmPrefixArgs.length ? ` (via ${tools.pn
 console.log(`cargo=${tools.cargo}`)
 console.log(`toolchain=${tools.toolchain.kind} target=${tools.toolchain.target}`)
 console.log(`linker=${tools.toolchain.linker}`)
+
+// A silent MinGW fallback is what turns a missing VS toolset into a confusing
+// link error twenty minutes later, so say it out loud.
+if (tools.toolchain.kind === 'gnu' && flags.toolchain === 'auto') {
+  console.warn('')
+  console.warn('! no MSVC toolset found — falling back to MinGW (x86_64-pc-windows-gnu).')
+  console.warn('  Tauri\'s Windows dependencies are MSVC-flavoured; if the link step')
+  console.warn('  fails, install Visual Studio Build Tools with the')
+  console.warn('  "Desktop development with C++" workload, or pass --msvc.')
+}
 
 // 1. plugin:build
 runStep('plugin:build', tools.pnpm, [...tools.pnpmPrefixArgs, 'plugin:build'])
