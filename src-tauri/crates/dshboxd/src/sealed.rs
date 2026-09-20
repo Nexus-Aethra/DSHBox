@@ -1046,6 +1046,10 @@ pub(crate) fn seal_template(
     }
     index.insert(record.name.clone(), record.clone());
     write_index(&layout, &index)?;
+    task.log(&format!(
+        "sealed template `{}` published at {}",
+        record.name, record.directory
+    ));
     task.update("Sealed template ready", 100);
     Ok(record)
 }
