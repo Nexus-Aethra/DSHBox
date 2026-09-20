@@ -7,17 +7,18 @@ import { Select } from '../../ui/Select'
 
 export type ResourceTypeText = {
   resourceTypeLoading: string
-  resourceTypeContainers: string
-  resourceTypeExtract: string
-  resourceTypeStored: string
-  resourceTypeEmpty: string
+  resourceTypeCopies: string
+  resourceTypeCopiesEmpty: string
+  resourceTypeAddCopy: string
+  resourceTypeAddFrom: string
+  resourceTypeAddFromPlaceholder: string
+  resourceTypeFrom: string
   resourceTypeSecret: string
-  resourceTypeAbsent: string
-  resourceTypeInjectTo: string
-  resourceTypeInjectPlaceholder: string
-  resourceTypeInject: string
+  resourceTypeAttach: string
+  resourceTypeAttachPlaceholder: string
   resourceTypeDelete: string
   resourceTypeRemove: string
+  resourceTypeOptions: string
   resourceTypeQueued: (id: string) => string
   resourceTypeError: (message: string) => string
   resourceTypeFiles: (count: number) => string
@@ -38,9 +39,10 @@ type Props = {
 }
 
 /**
- * Everything of one resource type: where each container stands, and what has
- * been extracted. Extract pulls a container's copy into the Box store; inject
- * pushes a stored copy into whichever container you pick.
+ * A resource type is its list of extracted copies — nothing else. Above the
+ * list you pick the container a fresh copy comes out of; on a copy you pick
+ * the container it gets attached to. The conflict policy and the restart
+ * switch are defaults, kept under 高级选项 so the list stays the page.
  */
 export function ResourceTypeView({ view, containers, text, removable = true, onRemove }: Props) {
   const [summary, setSummary] = useState<ResourceTypeSummary | null>(null)
@@ -48,7 +50,8 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [queued, setQueued] = useState<string | null>(null)
-  const [target, setTarget] = useState('')
+  const [source, setSource] = useState('')
+  const [targets, setTargets] = useState<Record<string, string>>({})
   const [conflict, setConflict] = useState('merge')
   const [restart, setRestart] = useState(true)
 
@@ -66,7 +69,7 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
 
   useEffect(() => { void reload() }, [view.kind, view.path])
 
-  /** Run an action and refresh; anything that returns a task id is announced. */
+  /** Run an action and refresh; anything returning a task id is announced. */
   async function run(work: () => Promise<unknown>): Promise<void> {
     setBusy(true)
     setError(null)
@@ -82,6 +85,24 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
     }
   }
 
+  /** Take a fresh copy out of the chosen container. */
+  async function addCopy(): Promise<void> {
+    if (!source) return
+    await run(() => boxApi.enqueueResourceExtract({
+      id: source,
+      kind: view.kind,
+      // A type pinned to a path takes exactly that path.
+      ...(view.kind === 'path' && view.path !== null && view.path !== undefined ? { dest: view.path } : {}),
+    }))
+  }
+
+  /** Put one copy into the container chosen on its row. */
+  async function attach(copyId: string): Promise<void> {
+    const target = targets[copyId]
+    if (!target) return
+    await run(() => boxApi.enqueueResourceInject({ id: target, resource: copyId, conflict, restart }))
+  }
+
   function human(bytes: number): string {
     const units = ['B', 'KB', 'MB', 'GB']
     let value = bytes
@@ -89,6 +110,12 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
     while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1 }
     return unit === 0 ? `${bytes} B` : `${value.toFixed(1)} ${units[unit]}`
   }
+
+  function containerName(id: string): string {
+    return containers.find((entry) => entry.id === id)?.name ?? id
+  }
+
+  const copies = summary?.stored ?? []
 
   return (
     <div className="resource-panel">
@@ -98,96 +125,75 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
         {view.secret && <Badge variant="danger">{text.resourceTypeSecret}</Badge>}
         {removable && <Button variant="ghost" size="sm" disabled={busy} onClick={() => { void onRemove() }}>{text.resourceTypeRemove}</Button>}
       </div>
+
       {error !== null && <p className="resource-error">{text.resourceTypeError(error)}</p>}
       {queued !== null && <p className="resource-note">{text.resourceTypeQueued(queued)}</p>}
-      {loading && <p className="resource-note">{text.resourceTypeLoading}</p>}
 
-      <div className="resource-controls">
+      <div className="resource-add">
+        <span className="resource-section">{text.resourceTypeAddFrom}</span>
         <Select
-          value={conflict}
-          aria-label={text.resourceTypeConflict}
-          options={[
-            { value: 'merge', label: text.resourceTypeMerge },
-            { value: 'overwrite', label: text.resourceTypeOverwrite },
-            { value: 'refuse', label: text.resourceTypeRefuse },
-          ]}
-          onChange={(event) => { setConflict(event.target.value) }}
+          value={source}
+          placeholder={text.resourceTypeAddFromPlaceholder}
+          aria-label={text.resourceTypeAddFrom}
+          options={containers.map((entry) => ({ value: entry.id, label: entry.name }))}
+          onChange={(event) => { setSource(event.target.value) }}
         />
-        <label className="resource-restart">
-          <input type="checkbox" checked={restart} onChange={(event) => { setRestart(event.target.checked) }} />
-          <span>{text.resourceTypeRestart}</span>
-        </label>
+        <Button variant="primary" size="sm" disabled={busy || !source} onClick={() => { void addCopy() }}>{text.resourceTypeAddCopy}</Button>
+        <details className="resource-options">
+          <summary>{text.resourceTypeOptions}</summary>
+          <div className="resource-controls">
+            <Select
+              value={conflict}
+              aria-label={text.resourceTypeConflict}
+              options={[
+                { value: 'merge', label: text.resourceTypeMerge },
+                { value: 'overwrite', label: text.resourceTypeOverwrite },
+                { value: 'refuse', label: text.resourceTypeRefuse },
+              ]}
+              onChange={(event) => { setConflict(event.target.value) }}
+            />
+            <label className="resource-restart">
+              <input type="checkbox" checked={restart} onChange={(event) => { setRestart(event.target.checked) }} />
+              <span>{text.resourceTypeRestart}</span>
+            </label>
+          </div>
+        </details>
       </div>
 
-      <h3 className="resource-section">{text.resourceTypeContainers}</h3>
-      <table className="resource-table">
-        <tbody>
-          {(summary?.containers ?? []).map((entry) => (
-            <tr key={entry.id}>
-              <td>{entry.name}</td>
-              <td className="resource-path">{entry.path}</td>
-              <td>{entry.exists ? `${human(entry.bytes)} · ${text.resourceTypeFiles(entry.files)}` : text.resourceTypeAbsent}</td>
-              <td>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  disabled={busy || !entry.exists}
-                  onClick={() => { void run(() => boxApi.enqueueResourceExtract({ id: entry.id, kind: view.kind, ...(view.path !== null && view.path !== undefined && view.kind === 'path' ? { dest: view.path } : {}) })) }}
-                >{text.resourceTypeExtract}</Button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-
-      <h3 className="resource-section">{text.resourceTypeStored}</h3>
-      {(summary?.stored.length ?? 0) > 0 && (
-        <div className="resource-from">
-          <Select
-            value={target}
-            placeholder={text.resourceTypeInjectPlaceholder}
-            aria-label={text.resourceTypeInjectTo}
-            options={containers.map((entry) => ({ value: entry.id, label: entry.name }))}
-            onChange={(event) => { setTarget(event.target.value) }}
-          />
-        </div>
-      )}
-      {(summary?.stored.length ?? 0) === 0 && <p className="resource-note">{text.resourceTypeEmpty}</p>}
-      {(summary?.stored.length ?? 0) > 0 && (
-        <>
-          <table className="resource-table">
-            <tbody>
-              {summary?.stored.map((resource) => (
-                <tr key={resource.id}>
-                  <td>
-                    {resource.id}
-                    <div className="resource-browser-meta">{resource.sourcePath}</div>
-                  </td>
-                  <td>{human(resource.bytes)} · {text.resourceTypeFiles(resource.files)}</td>
-                  <td>
-                    {/* One inject per stored copy, into the container chosen
-                        above: a type usually holds several. */}
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      disabled={busy || !target}
-                      onClick={() => { void run(() => boxApi.enqueueResourceInject({ id: target, resource: resource.id, conflict, restart })) }}
-                    >{text.resourceTypeInject}</Button>
-                  </td>
-                  <td>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      disabled={busy}
-                      onClick={() => { void run(() => boxApi.deleteResource(resource.id)) }}
-                    >{text.resourceTypeDelete}</Button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </>
-      )}
+      <h3 className="resource-section">{text.resourceTypeCopies}</h3>
+      {loading && <p className="resource-note">{text.resourceTypeLoading}</p>}
+      {!loading && copies.length === 0 && <p className="resource-note">{text.resourceTypeCopiesEmpty}</p>}
+      <ul className="resource-copies">
+        {copies.map((copy) => (
+          <li key={copy.id}>
+            <div className="resource-copy-text">
+              <div className="resource-copy-name">{copy.id}</div>
+              <div className="resource-copy-meta">
+                {human(copy.bytes)} · {text.resourceTypeFiles(copy.files)} · {text.resourceTypeFrom} {containerName(copy.sourceContainer)}
+              </div>
+            </div>
+            <Select
+              value={targets[copy.id] ?? ''}
+              placeholder={text.resourceTypeAttachPlaceholder}
+              aria-label={text.resourceTypeAttach}
+              options={containers.map((entry) => ({ value: entry.id, label: entry.name }))}
+              onChange={(event) => { setTargets((current) => ({ ...current, [copy.id]: event.target.value })) }}
+            />
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={busy || !targets[copy.id]}
+              onClick={() => { void attach(copy.id) }}
+            >{text.resourceTypeAttach}</Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={busy}
+              onClick={() => { void run(() => boxApi.deleteResource(copy.id)) }}
+            >{text.resourceTypeDelete}</Button>
+          </li>
+        ))}
+      </ul>
     </div>
   )
 }
