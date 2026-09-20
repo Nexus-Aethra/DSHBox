@@ -12,10 +12,12 @@ import { Toolbar } from '../../ui/Toolbar'
 import { Stack } from '../../ui/Stack'
 import type { PluginGraphText } from '../plugin-graph/PluginGraphPanel'
 import { PluginGraphPanel } from '../plugin-graph/PluginGraphPanel'
+import type { ResourceText } from '../container-resources/ContainerResourcesPanel'
+import { ContainerResourcesPanel } from '../container-resources/ContainerResourcesPanel'
 
 // Includes the shared `pluginGraph*` keys so the global text can be handed to the
 // dependency-graph panel unchanged.
-export type ContainerDetailsText = PluginGraphText & {
+export type ContainerDetailsText = PluginGraphText & ResourceText & {
   back: string; activeProfile: string; profiles: string; addProfile: string; profilePlaceholder: string
   plugins: string; pluginRepo: string; skills: string; logs: string
   hostLog: string; rebuildLog: string; webviewLog: string; logRefresh: string
@@ -45,6 +47,7 @@ export function ContainerDetails({ container, details, repository, bundles, work
   const [conflict, setConflict] = useState('keep')
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   const [graphOpen, setGraphOpen] = useState(false)
+  const [resourcesOpen, setResourcesOpen] = useState(false)
   useEffect(() => { setProfile(container.profile) }, [container.id, container.profile])
   const selected = details?.profiles.find((item) => item.name === profile) ?? details?.profiles[0]
   const repositoryPlugins = repository.filter((entry) => entry.kind === 'plugin' && !entry.diagnostic)
@@ -104,6 +107,7 @@ export function ContainerDetails({ container, details, repository, bundles, work
                 {tab === 'plugins' && (
                   <div className="extensions-heading-actions">
                     <Button variant="secondary" size="sm" onClick={() => { setGraphOpen(true) }}>{text.pluginGraphOpen}</Button>
+                    <Button variant="secondary" size="sm" onClick={() => { setResourcesOpen(true) }}>{text.resourceOpen}</Button>
                     <Field label={text.profiles}>
                       {(id) => <Select id={id} value={selected?.name ?? ''} disabled={saving || !selected} onChange={(event) => { void selectProfile(event.target.value, false) }} options={(details?.profiles ?? []).map((item) => ({ value: item.name, label: item.name }))} />}
                     </Field>
@@ -211,6 +215,9 @@ export function ContainerDetails({ container, details, repository, bundles, work
         </div>
       </Dialog>
 
+      {resourcesOpen && (
+        <ContainerResourcesPanel id={container.id} name={container.name} text={text} onClose={() => { setResourcesOpen(false) }} />
+      )}
       {graphOpen && (
         <PluginGraphPanel kind="container" id={container.id} text={text} onClose={() => { setGraphOpen(false) }} />
       )}

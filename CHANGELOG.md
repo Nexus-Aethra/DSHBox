@@ -12,6 +12,14 @@ builds from ever showing it.
 
 ### Added
 
+- **Container resources: extract and inject.** Chat history, provider
+  credentials and plugin state are modelled as kinds — location, secrecy, entry
+  depth — and can be extracted into the Box store, injected back (refusing by
+  default, merging per entry when asked), carried between containers, or packed
+  as a tarball. Plugins can declare their own kinds; when they do not, the paths
+  their code composes are offered as candidates. `dshbox container resource
+  list|stored|extract|inject|rm`, a Resources panel in the container view, and
+  `list_container_resources` / `enqueue_resource_*` over RPC.
 - **A document store instead of scattered JSON indexes.** Every persisted
   index now goes through `box_foundation::collection::DocumentStore` (SQLite in
   the new `box-store` crate at `<runtime>/state/dshbox.db`), with legacy files

@@ -12,6 +12,7 @@ DSH Box is a lightweight desktop shell built with [Tauri 2](https://tauri.app) t
 - **Isolated DSH Containers** — install multiple DSH versions side by side and create independent Containers per project. Every Container gets its own profile (`web` / `headless` / custom), workspace, plugin set, and host process, so experiments never cross-contaminate.
 - **Embedded WebView, no browser needed** — the DSH frontend opens in a native WebView window managed by DSH Box. No port-forwarding, no copy-pasting URLs, no tab clutter.
 - **Plugin dependency graph** — see what a template, a container, or a running host actually loads. Every plugin is a node, host and browser halves are drawn apart, and the nodes are grouped into depth bands with the `inject`/`provide` links that put them there, plus shared services, load order, and the parse notes that explain what could not be resolved. Search it, click a node to focus it, and read why a plugin is present in the detail panel. See [Architecture → Plugin dependency graph](#plugin-dependency-graph).
+- **Container resources, extract and inject** — chat history, provider credentials and plugin state are modelled as *kinds* with a location, and they can be extracted from a container into the Box store, injected back (refusing to overwrite by default, merging entry by entry when asked), carried between containers, or packed as a tarball. A plugin that declares its own `dshbox.resources` — or merely builds a path under the profile — shows up as a candidate. `dshbox container resource list <id>` answers "what does this container persist, and where". See [Architecture → Container resources](#container-resources).
 - **Zero-dependency install** — a private Node, npm, pnpm, and Git (Windows) runtime is bundled with every release. No system Node, no manual toolchain setup, no PATH hacking. Git-backed Boxfile sources (`github.com/owner/repo:tag`) resolve through the managed binary in DSH Box's clean-room environment — host `~/.gitconfig` never leaks into builds. On Linux, DSH Box uses your system Git (`apt install git`) while still isolating its configuration under the runtime directory.
 - **Version manager built in** — browse DSH releases from `deepseek-ai/deepseek-harness`, install or uninstall any tag with one click, and pin a version per Container.
 - **Boxfile / sealed-template pipeline** — describe a Container with a small declarative `.dsh` script (`FROM` + `PROFILE` + `ADD plugin|skill|data`); `dshbox build` produces a reusable source recipe and `dshbox run <template>` prepares it once in the final Container directory. See [Architecture → Boxfile](#boxfile-and-the-built-template-pipeline).
@@ -155,6 +156,24 @@ What it computes:
 
 The scan is text-based on purpose — a small scanner over comment-blanked sources, not a TypeScript AST: the graph has to describe a container's `node_modules` without loading DSH, and a wrong node must be cheap to spot and correct.
 
+### Container resources
+
+A container persists state that is not code: conversations under `profile/sessions/<workspace>/session-<id>/`, provider keys in `profile/.credentials.yaml`, and whatever a plugin writes under its own directory. Box models each of those as a **kind** — a location, whether it holds secrets, and how deep its independent entries sit — and two verbs move it.
+
+- **Extract** copies a kind (or one entry, so a single conversation can travel) into `<runtime>/resources/<id>/payload/`, digests it, and records it in the shared document store. `--out file.tar.gz` also packs it for another machine.
+- **Inject** writes it back from the store, straight from another container, or from a tarball. `Refuse` is the default and checks every clash before writing anything; `Merge` replaces only the entries the payload carries — sessions compare per conversation, credentials merge as YAML maps with the incoming value winning — and `Overwrite` empties the kind first. A file a secret kind writes is tightened to `0600` on the way in and out, and a running container is refused unless `--restart` asks for stop → inject → start.
+
+Kinds come from three places: Box ships `sessions` and `credentials`; a plugin package can declare its own in `dshbox.resources`; and when a plugin declares nothing, Box reads the `join(root, 'a', 'b')` chains in its shipped code and offers those paths as candidates — never as trusted paths. That is what the Resources panel shows: pick a plugin, see whether it persists anything, where, and how much.
+
+```bash
+dshbox container resource list <id> [--plugin @scope/name]      # kinds, locations, sizes
+dshbox container resource extract <id> sessions [--entry=<slug>/session-<id>]
+dshbox container resource stored                                # what the Box store holds
+dshbox container resource inject <id> sessions-sessions --merge --restart
+dshbox container resource inject <id> --from <other-container> --kind sessions
+dshbox container resource inject <id> --in backup.tar.gz --merge
+```
+
 ### Persistence and reference counts
 
 Long-lived indexes are stored as documents instead of scattered files: the task queue goes through `box_foundation::collection::DocumentStore` — SQLite, via the `box-store` crate, at `<runtime>/state/dshbox.db` — so the daemon and the desktop app share one queue without either owning a file. Legacy task JSON is imported on first open and archived as `*.pre-sqlite`, and schema changes are forward-only migrations gated by `PRAGMA user_version`. Content-addressed directories (`templates/<hash>/`, `data/<digest>/`, `runtimes/`) stay on disk, and `config.json` stays machine-local in `~/.dsh-box/` — it never enters the store.
@@ -239,6 +258,7 @@ src-tauri/                 Rust workspace + Tauri shell
     box-extensions         repository plugin/skill scan + transfer
     box-image              .dsh parser, manifest v6, gzip tar I/O
     box-plugin-graph       plugin dependency scan + graph assembly
+    box-resources          resource kinds, extraction and injection
     box-template-core      root/common template install/uninstall core
     box-data-scheduler     soft-delete + dual-queue async hard-delete
     box-logger             tracing init + daily-rolled log files

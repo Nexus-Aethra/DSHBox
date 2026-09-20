@@ -68,6 +68,7 @@ frontend. Manual `cargo build` for release needs it explicitly.
 | `box-containers`           | Container metadata + active Host registry |
 | `box-extensions`           | Repository plugin/skill scan, copy, export |
 | `box-image`                | `.dsh` parser, manifest v6, gzip tar I/O |
+| `box-resources`            | Container resource kinds, extraction, injection |
 | `box-dsh-context`          | Patch YAML / context snapshot rendering |
 | `box-server-core`          | `dshboxd` helpers, service install |
 | `box-api`, `box-client`    | IPC + client adapter layer |
@@ -183,6 +184,16 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   Container startup must never install or build DSH. `dshbox image` remains a
   deprecated alias forwarding to `build`/`template`. The authoritative design
   is `docs/specs/prepared-template-runtime.md`.
+- **Container resources are user state, not code.** `box-resources` moves chat
+  history, credentials and plugin state between containers. Injection refuses an
+  existing destination unless `--overwrite`/`--merge` is given and refuses a
+  running container unless `--restart` is; a secret kind's payload is `0600` in
+  the store and at the destination; a path never leaves the container
+  (`safe_join` rejects `..` and absolute paths before normalization, and a
+  symlink pointing outside the source is refused, not followed). Plugin
+  declarations (`package.json` → `dshbox.resources`) are trusted; paths scanned
+  out of a plugin's code are candidates the user confirms. Extracted records go
+  through the document store; payloads stay in `<runtime>/resources/<id>/`.
 - **Plugin cache dedup.** A second `build` of the same `name+version` should
   hit the existing hash entry (`<root>/repository/plugins/img-<id>/source/`)
   and not produce a duplicate `img-…` row (see

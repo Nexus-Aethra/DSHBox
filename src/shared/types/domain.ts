@@ -191,3 +191,52 @@ export type ImageManifest = {
   labels: Record<string, string>
   entries: ImageEntry[]
 }
+
+/** How a resource kind reaches the container: Box ships it, a plugin declares
+ * it, or Box read the path out of the plugin's code (a candidate). */
+export type ResourceScope = 'builtin' | 'declared' | 'inferred'
+export type ResourceShape = 'entries' | 'opaque'
+
+export type ResolvedResourceKind = {
+  id: string
+  label: string
+  path: string
+  secret: boolean
+  shape: ResourceShape
+  /** Independent entries sit this deep under the path (chat history: 2). */
+  entryDepth: number
+  inferred: boolean
+}
+
+export type DiscoveredResource = {
+  kind: ResolvedResourceKind
+  scope: ResourceScope
+  plugin: string | null
+  description: string | null
+  exists: boolean
+  bytes: number
+  files: number
+}
+
+export type StoredResource = {
+  id: string
+  kind: string
+  name: string
+  sourceContainer: string
+  sourcePath: string
+  digest: string
+  bytes: number
+  files: number
+  secret: boolean
+  shape: ResourceShape
+  entryDepth: number
+  plugin: string | null
+  createdAt: number
+}
+
+export type ContainerResources = {
+  container: string
+  profile: string
+  resources: DiscoveredResource[]
+  stored: StoredResource[]
+}

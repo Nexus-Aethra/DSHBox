@@ -466,3 +466,21 @@ code.missing { color: #b42318; }
 
 @media (max-width: 768px) { .app-shell { padding: 18px 20px 48px; } .topbar { align-items: flex-start; gap: 12px; flex-direction: column; } .navigation { width: 100%; overflow-x: auto; } .nav-item { padding: 8px 9px; white-space: nowrap; } .workspace, .onboarding { padding: 58px 0 34px; } .card, .toolchain-row { align-items: flex-start; flex-direction: column; } .toolchain-actions { width: 100%; justify-content: space-between; } .settings-layout { grid-template-columns: 1fr; gap: 16px; } .settings-sidebar { border-bottom: 1px solid #e6e8eb; border-right: 0; display: flex; padding: 0 0 12px; } .settings-row { align-items: flex-start; flex-direction: column; } .settings-row > :last-child { width: 100%; } .settings-input { width: 100%; } .settings-controls { justify-content: flex-start; } .extensions-heading, .extension-row, .extension-import { align-items: flex-start; flex-direction: column; } .extension-row > div:last-child { max-width: 100%; text-align: left; } .extension-import input { width: 100%; } }
 .plugin-graph-note.danger { color: var(--color-danger); }
+
+/* Container resources panel: a table of what the container persists, with the
+   extract/inject actions on each row. */
+.resource-panel { display: flex; flex-direction: column; gap: 16px; max-height: 70vh; overflow-y: auto; }
+.resource-section { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-strong, #111827); }
+.resource-note { margin: 0; font-size: 13px; color: #6b7280; }
+.resource-error { margin: 0; font-size: 13px; color: #b91c1c; }
+.resource-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.resource-restart { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #374151; }
+.resource-detect { display: flex; gap: 8px; align-items: center; }
+.resource-detect .ui-input { flex: 1; }
+.resource-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.resource-table th { text-align: left; font-weight: 500; color: #6b7280; padding: 4px 8px 4px 0; border-bottom: 1px solid #f3f4f6; }
+.resource-table td { padding: 6px 8px 6px 0; border-bottom: 1px solid #f9fafb; vertical-align: middle; }
+.resource-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #4b5563; }
+.resource-table .ui-badge { margin-left: 6px; }
+.resource-from { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; }
+.resource-footer { display: flex; justify-content: flex-end; }
