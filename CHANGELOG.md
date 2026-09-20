@@ -31,6 +31,11 @@ builds from ever showing it.
   into the repository. `plugin_dependency_graph` uses the same lock for its
   template preview, which now shows the plugins a bundle pulled in transitively
   — with pnpm's resolved versions rather than the boxfile's specifier.
+- **Offline readiness is visible.** Each plugin in the list carries the versions
+  present in the runtime's own pnpm store (Box pins
+  `PNPM_CONFIG_STORE_DIR` under the runtime directory), so it is obvious
+  whether installing it needs the network. An unrecognised store layout reports
+  "unknown" instead of "not cached".
 - **A document store instead of scattered JSON indexes.** Every persisted
   index now goes through `box_foundation::collection::DocumentStore` (SQLite in
   the new `box-store` crate at `<runtime>/state/dshbox.db`), with legacy files

@@ -306,4 +306,7 @@ export type InstalledPlugin = {
   versions: string[]
   inRepository: boolean
   owners: PluginOwner[]
+  /** Versions present in the runtime's pnpm store; null when the store layout
+   *  is unrecognised, so "unknown" is never shown as "not cached". */
+  cachedVersions: string[] | null
 }

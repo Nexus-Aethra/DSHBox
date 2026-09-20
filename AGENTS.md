@@ -194,6 +194,14 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   declarations (`package.json` → `dshbox.resources`) are trusted; paths scanned
   out of a plugin's code are candidates the user confirms. Extracted records go
   through the document store; payloads stay in `<runtime>/resources/<id>/`.
+- **Cache state comes from the pnpm store, the list from the lockfiles.** Box
+  gives pnpm a private store (`PNPM_CONFIG_STORE_DIR` → `<runtime>/pnpm/store`,
+  see `box-runtime/src/process/env.rs`), so "can this install offline" is a
+  lookup in its index — `package_index` keys are `<integrity>\t<name>@<version>`
+  (`box-toolchains/src/pnpm_store.rs`). The *list* of plugins stays lockfile-
+  driven: a store is a cache keyed by content (it holds plain libraries and
+  packages nothing uses any more, and has no owner relation), while a lockfile
+  records what one template or container actually installed.
 - **The plugin view is a union, not the repository.** `list_installed_plugins`
   merges the extension repository with every sealed template's and container's
   `profile/profiles/<p>/pnpm-lock.yaml`, classifying a package as a plugin when

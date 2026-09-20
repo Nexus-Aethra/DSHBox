@@ -368,6 +368,7 @@ version = "0.1.0"
 dependencies = [
  "box-foundation",
  "box-runtime",
+ "rusqlite",
  "serde",
 ]
 

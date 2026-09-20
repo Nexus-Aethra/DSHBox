@@ -95,14 +95,27 @@ pub(crate) fn list_installed_plugins(_state: &DaemonState, _request: &Value) -> 
         }
     }
 
+    // Box gives pnpm a private store, so this answers "can this install
+    // offline?". An unrecognised store is reported as unknown rather than as
+    // "nothing cached".
+    let cached = box_toolchains::cached_packages(Path::new(&root)).ok();
     let plugins: Vec<Value> = rows
         .into_iter()
         .map(|(name, row)| {
+            let versions: Vec<String> = row.versions.into_iter().collect();
+            let cached_versions: Option<Vec<String>> = cached.as_ref().map(|cached| {
+                versions
+                    .iter()
+                    .filter(|version| cached.contains(&format!("{name}@{version}")))
+                    .cloned()
+                    .collect()
+            });
             json!({
                 "name": name,
-                "versions": row.versions.into_iter().collect::<Vec<_>>(),
+                "versions": versions,
                 "inRepository": row.in_repository,
                 "owners": row.owners,
+                "cachedVersions": cached_versions,
             })
         })
         .collect();

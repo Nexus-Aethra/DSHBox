@@ -30,6 +30,7 @@ type Text = PluginGraphText & AddResourceTypeText & ResourceTypeText & {
   resourceBuiltinSessions: string; resourceBuiltinCredentials: string
   installedPluginsTitle: string; installedPluginsNote: (n: number) => string
   installedNotImported: string; importToRepository: string
+  cachedAll: string; cachedPartial: (cached: number, total: number) => string; cachedNone: string
   ownerTemplate: string; ownerContainer: string
   versionTitle: string; versionNote: string; noVersion: string; install: string; installed: string
   uninstall: string; loadVersions: string; installing: string
@@ -344,6 +345,13 @@ export function ResourcesPage({
                         </p>
                       </div>
                       <div className="plugin-repo-actions">
+                        {plugin.cachedVersions !== null && (
+                          plugin.cachedVersions.length === plugin.versions.length
+                            ? <Badge variant="success">{text.cachedAll}</Badge>
+                            : plugin.cachedVersions.length > 0
+                              ? <Badge variant="neutral">{text.cachedPartial(plugin.cachedVersions.length, plugin.versions.length)}</Badge>
+                              : <Badge variant="danger">{text.cachedNone}</Badge>
+                        )}
                         <Badge variant="neutral">{text.installedNotImported}</Badge>
                         <Button
                           variant="secondary"

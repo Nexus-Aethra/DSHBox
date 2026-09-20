@@ -42,7 +42,9 @@ LABEL maintainer=alice@example.com
 ADD plugin github.com/team/cordis-plugin-foo@v1.2.3
 # — npm registry (any spec pnpm accepts)
 ADD plugin npm:@linxin666/dsh-web-ui-all
-# — Local repository entry already imported with `dshbox plugin import`
+# — Bare name: forwarded to pnpm as `cordis-plugin-bar@<version>` and resolved
+#   from the registry configured in Settings (the Box extension repository is
+#   addressed by its own ids, not by name)
 ADD plugin cordis-plugin-bar
 
 # Skills: installed into profile/skills

@@ -7,3 +7,4 @@ edition = "2021"
 box-foundation = { path = "../box-foundation" }
 box-runtime = { path = "../box-runtime" }
 serde = { version = "1.0", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
