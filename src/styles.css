@@ -469,7 +469,9 @@ code.missing { color: #b42318; }
 
 /* Container resources panel: a table of what the container persists, with the
    extract/inject actions on each row. */
-.resource-panel { display: flex; flex-direction: column; gap: 16px; max-height: 70vh; overflow-y: auto; }
+.resource-panel { display: flex; flex-direction: column; gap: 16px; }
+/* A dialog needs its own scroll box; the page does not. */
+dialog .resource-panel { max-height: 70vh; overflow-y: auto; }
 .resource-section { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-strong, #111827); }
 .resource-note { margin: 0; font-size: 13px; color: #6b7280; }
 .resource-error { margin: 0; font-size: 13px; color: #b91c1c; }
@@ -531,3 +533,12 @@ code.missing { color: #b42318; }
 .resource-copy-meta { font-size: 11px; color: #9ca3af; }
 .resource-options { margin-left: auto; font-size: 12px; color: #6b7280; }
 .resource-options summary { cursor: pointer; }
+
+/* Selects inside a row size to their content: a full-width select next to a
+   text column squeezes the column to nothing. */
+.resource-add .ui-select,
+.resource-copies .ui-select { flex: 0 0 auto; width: auto; min-width: 11rem; max-width: 15rem; }
+.resource-copy-text { flex: 1 1 14rem; min-width: 12rem; }
+.resource-copies li { flex-wrap: wrap; }
+.resource-add { align-items: center; }
+.resource-add .resource-section { white-space: nowrap; }
