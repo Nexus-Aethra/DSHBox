@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import type { BoxConfig, ContainerExtensions, ContainerPathListing, ContainerResources, DataEntry, DshContainer, DshVersion, ExtensionBundle, GraphSourceKind, Language, PluginGraph, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, InstalledPlugin,
-  ResourceState, ResourceTypeSummary, ResourceView, ServerServiceStatus, StoredResource, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
+  ResourceState, ResourceTree, ResourceTypeSummary, ResourceView, ServerServiceStatus, StoredResource, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
 
 type ToolchainPayload = { id: string; name: string; managedVersion: string | null }
 
@@ -133,6 +133,9 @@ export const boxApi = {
   enqueueResourceExtract: (request: { id: string; kind: string; entry?: string; name?: string; plugin?: string; dest?: string; out?: string }) => ipc<TaskRecord>('enqueue_resource_extract', request),
   enqueueResourceInject: (request: { id: string; resource?: string; from?: string; input?: string; kind?: string; dest?: string; entry?: string; conflict?: string; restart?: boolean }) => ipc<TaskRecord>('enqueue_resource_inject', request),
   deleteResource: (resourceId: string) => ipc<void>('delete_resource', { resourceId }),
+  /** One file of a container as a YAML tree, so a block can be edited by path. */
+  readResourceTree: (request: { id: string; path: string; section?: string[] }) => ipc<ResourceTree>('read_resource_tree', request),
+  enqueueResourceWrite: (request: { id: string; path: string; section: string[]; text: string; conflict?: string; restart?: boolean }) => ipc<TaskRecord>('enqueue_resource_write', request),
   getResourceState: (key: string) => ipc<ResourceState | null>('get_resource_state', { key }),
   refreshResourceState: () => ipc<ResourceSnapshot>('refresh_resource_state'),
   listDataEntries: () => ipc<DataEntry[]>('list_data_entries'),

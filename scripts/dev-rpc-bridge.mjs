@@ -165,6 +165,9 @@ const COMMANDS = {
   list_container_resources: ({ id, plugin }) => callDaemon('list_container_resources', { id, plugin }),
   list_resources: () => callDaemon('list_resources', {}),
   list_installed_plugins: () => callDaemon('list_installed_plugins', {}),
+  read_resource_tree: ({ id, path, section }) => callDaemon('read_resource_tree', { id, path, section }),
+  enqueue_resource_write: ({ id, path, section, text, conflict, restart }) =>
+    callDaemon('enqueue_resource_write', { id, path, section, text, conflict, restart }),
   browse_container_paths: ({ id, path }) => callDaemon('browse_container_paths', { id, path }),
   list_resource_views: () => callDaemon('list_resource_views', {}),
   add_resource_view: (request) => callDaemon('add_resource_view', request),

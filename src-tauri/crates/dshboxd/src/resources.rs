@@ -40,6 +40,233 @@ fn container_dir(root: &Path, id: &str) -> Result<PathBuf, String> {
 
 /// A container records its profile in `container.json`; `web` is what the
 /// daemon falls back to when the file predates that field.
+/// Read one file out of a container as a YAML tree, so the UI can show what is
+/// in it and let the user edit one block by its key path. A file that is not
+/// YAML still answers, with a single node: the user may be looking at a JSON
+/// file, and "this is not a YAML document" is the honest answer.
+pub(crate) fn read_resource_tree(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    let id = request["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or("expected a container id")?;
+    let rel = request["path"]
+        .as_str()
+        .filter(|path| !path.is_empty())
+        .ok_or("expected a container-relative path")?;
+    let section: Vec<String> = request["section"]
+        .as_array()
+        .map(|keys| keys.iter().filter_map(|key| key.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default();
+    let root = runtime_root(state)?;
+    let container = container_dir(&root, id)?;
+    let file = transfer::safe_join(&container, rel)?;
+    let text = std::fs::read_to_string(&file)
+        .map_err(|error| format!("cannot read {rel}: {error}"))?;
+    let document: serde_yaml::Value = serde_yaml::from_str(&text)
+        .map_err(|error| format!("{rel} is not a YAML document: {error}"))?;
+    let mut nodes = Vec::new();
+    collect_yaml_nodes(&document, &mut Vec::new(), 0, &mut nodes);
+    // The editor starts at the section the caller asked for, or the whole file.
+    let selected = if section.is_empty() {
+        serde_yaml::to_string(&document).map_err(|error| error.to_string())?
+    } else {
+        match yaml_at(&document, &section) {
+            Some(value) => serde_yaml::to_string(value).map_err(|error| error.to_string())?,
+            None => String::new(),
+        }
+    };
+    Ok(json!({
+        "path": rel,
+        "section": section,
+        "text": selected,
+        "document": text,
+        "nodes": nodes,
+    }))
+}
+
+/// A flattened pre-order view of a YAML document: `path` is the key path to the
+/// node, which is exactly what a write has to name.
+fn collect_yaml_nodes(
+    value: &serde_yaml::Value,
+    path: &mut Vec<String>,
+    depth: usize,
+    out: &mut Vec<Value>,
+) {
+    let (kind, preview, children): (&str, String, Vec<(String, serde_yaml::Value)>) = match value {
+        serde_yaml::Value::Mapping(mapping) => (
+            "map",
+            format!("{} keys", mapping.len()),
+            mapping
+                .iter()
+                .filter_map(|(key, value)| key.as_str().map(|key| (key.to_owned(), value.clone())))
+                .collect(),
+        ),
+        serde_yaml::Value::Sequence(items) => (
+            "list",
+            format!("{} items", items.len()),
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (index.to_string(), value.clone()))
+                .collect(),
+        ),
+        serde_yaml::Value::String(text) => ("string", one_line(text), Vec::new()),
+        serde_yaml::Value::Bool(flag) => ("bool", flag.to_string(), Vec::new()),
+        serde_yaml::Value::Number(number) => ("number", number.to_string(), Vec::new()),
+        serde_yaml::Value::Null => ("null", "null".to_owned(), Vec::new()),
+        other => ("other", format!("{other:?}"), Vec::new()),
+    };
+    out.push(json!({
+        "path": path.clone(),
+        "key": path.last().cloned().unwrap_or_default(),
+        "depth": depth,
+        "kind": kind,
+        "preview": preview,
+        "expandable": !children.is_empty(),
+    }));
+    for (key, child) in children {
+        path.push(key);
+        collect_yaml_nodes(&child, path, depth + 1, out);
+        path.pop();
+    }
+}
+
+fn one_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default();
+    if line.chars().count() > 60 {
+        format!("{}…", line.chars().take(60).collect::<String>())
+    } else {
+        line.to_owned()
+    }
+}
+
+fn yaml_at<'a>(document: &'a serde_yaml::Value, section: &[String]) -> Option<&'a serde_yaml::Value> {
+    let mut current = document;
+    for key in section {
+        current = current.get(key.as_str())?;
+    }
+    Some(current)
+}
+
+/// Write one YAML block into a container file, at the key path the user picked.
+/// The container is stopped and started again when it is running, because a
+/// plugin that cached its settings would otherwise keep serving the old ones.
+pub(crate) fn enqueue_resource_write(
+    state: &DaemonState,
+    request: &Value,
+) -> Result<HandlerResult, String> {
+    let id = request["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or("expected a container id")?
+        .to_owned();
+    let rel = request["path"]
+        .as_str()
+        .filter(|path| !path.is_empty())
+        .ok_or("expected a container-relative path")?
+        .to_owned();
+    let section: Vec<String> = request["section"]
+        .as_array()
+        .map(|keys| keys.iter().filter_map(|key| key.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default();
+    let text = request["text"].as_str().unwrap_or("").to_owned();
+    let conflict = Conflict::parse(request["conflict"].as_str().unwrap_or("merge"))
+        .ok_or("expected a conflict policy: refuse, merge or overwrite")?;
+    let restart = request["restart"].as_bool().unwrap_or(true);
+    if text.trim().is_empty() {
+        return Err("expected the YAML to write".to_owned());
+    }
+    let paths = state
+        .paths
+        .read()
+        .map_err(|_| "daemon paths lock failed".to_owned())?
+        .clone();
+    let containers = state.containers.clone();
+    let params = json!({
+        "id": id,
+        "path": rel,
+        "section": section,
+        "text": text,
+        "conflict": request["conflict"].clone(),
+    });
+    enqueue_task_worker(
+        state,
+        "resource-write",
+        vec![format!("container:{id}")],
+        params,
+        move |task| {
+            let root = paths
+                .runtime
+                .clone()
+                .ok_or("DSH Box storage is not configured")?;
+            let container = container_dir(&root, &id)?;
+            let is_running = containers
+                .running
+                .lock()
+                .map_err(|_| "container registry lock failed".to_owned())?
+                .contains_key(&id);
+            if is_running && !restart {
+                return Err(format!(
+                    "container {id} is running; stop it first or allow a restart"
+                ));
+            }
+            if is_running {
+                task.update("Stopping the container", 30);
+                stop_dsh_container(&id, &containers)?;
+            }
+            task.update("Writing the YAML block", 60);
+            let written = transfer::write_section(&container, &rel, &section, &text, conflict)?;
+            let label = if section.is_empty() {
+                rel.clone()
+            } else {
+                format!("{rel}({})", section.join("."))
+            };
+            task.log(&format!(
+                "{label}: {} bytes, {}",
+                written.bytes,
+                if written.replaced.is_empty() {
+                    "added".to_owned()
+                } else {
+                    format!("replaced {}", written.replaced.join(", "))
+                }
+            ));
+            task.check_cancelled()?;
+            if is_running {
+                task.update("Restarting the container", 90);
+                start_dsh_container_inner(&id, &containers.running, Some(task))?;
+            }
+            Ok(())
+        },
+    )
+    .map(HandlerResult::Async)
+}
+
+/// Every place a kind's state lives, in the form the transfer layer walks.
+fn payload_parts_of(kind: &ResolvedKind) -> Vec<transfer::PayloadPart> {
+    kind.payload_parts()
+        .into_iter()
+        .map(|part| transfer::PayloadPart {
+            path: part.path,
+            section: part.section,
+        })
+        .collect()
+}
+
+/// How a part list reads in a task log: `profile/settings.yaml(llm-pi-ai)`.
+fn describe_parts(parts: &[transfer::PayloadPart]) -> String {
+    parts
+        .iter()
+        .map(|part| {
+            if part.section.is_empty() {
+                part.path.clone()
+            } else {
+                format!("{}({})", part.path, part.section.join("."))
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(", ")
+}
+
 /// The name a copy falls back to when the user gave none: the container's own
 /// name, so `sessions` from `hello` and from `dshell` are two rows rather than
 /// one that keeps being replaced.
@@ -460,16 +687,21 @@ pub(crate) fn enqueue_resource_extract(
             let payload = record::payload_dir(&root, &record_id);
 
             task.update("Copying the payload", 40);
-            let extracted = transfer::extract(
+            // A kind can live in more than one place: a provider route is a
+            // section of `settings.yaml` and its key is a ref in
+            // `.credentials.yaml`, and neither half authenticates anything on
+            // its own.
+            let parts = payload_parts_of(&kind);
+            let extracted = transfer::extract_parts(
                 &container,
-                &kind.path,
+                &parts,
                 entry.as_deref(),
                 &payload,
                 kind.secret,
             )?;
             task.log(&format!(
                 "{} → {} ({} files, {} bytes)",
-                kind.path,
+                describe_parts(&parts),
                 payload.display(),
                 extracted.files,
                 extracted.bytes
@@ -657,9 +889,13 @@ pub(crate) fn enqueue_resource_inject(
             }
 
             task.update("Writing the payload", 70);
-            let injected = transfer::inject(&payload, &container, &path, conflict, shape, depth, secret)?;
+            // The payload says what it holds when it holds more than one part;
+            // otherwise it is the single path this injection was told to use.
+            let parts = transfer::payload_parts(&payload, &path);
+            let injected = transfer::inject_parts(&payload, &container, &parts, conflict, shape, depth, secret)?;
             task.log(&format!(
-                "{path}: +{} files, replaced {}",
+                "{}: +{} files, replaced {}",
+                describe_parts(&parts),
                 injected.files,
                 if injected.replaced.is_empty() {
                     "nothing".to_owned()

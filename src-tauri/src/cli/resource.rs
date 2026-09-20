@@ -32,6 +32,18 @@ dshbox container resource inject <id> --in <file.tar.gz> [options]
         --overwrite     replace the kind's path first
         --restart       a running container is stopped, injected, then started
                         again (a stopped container stays stopped)
+dshbox container resource read <id> <path> [--section a.b] [--json]
+        one file of a container as a YAML tree: the nodes, their key paths and
+        the block at --section (empty = the whole document)
+dshbox container resource write <id> <path> [options]
+        --section <a.b>  key path to write at (empty = the whole file)
+        --text <yaml>    the block that goes *at* that path, without the
+                        path's own key (writing at `a.b` a text of `c: 1`
+                        produces `a: {b: {c: 1}}`)
+        --file <f>       read the block from a file instead
+        --merge          merge into that block (default)
+        --overwrite      replace that block
+        --restart        a running container is stopped, written, then started
 dshbox container resource rm <resource-id>
         delete an extracted resource and its payload
 
@@ -40,7 +52,7 @@ given, and refuses a running container unless --restart is given.";
 
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     let Some(action) = arguments.first().map(String::as_str) else {
-        return Err("expected resource list|stored|extract|inject|rm".to_owned());
+        return Err("expected resource list|stored|extract|inject|read|write|rm".to_owned());
     };
     if matches!(action, "help" | "--help" | "-h") {
         println!("{HELP}");
@@ -52,6 +64,8 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         "stored" => stored(rest),
         "extract" => extract(rest),
         "inject" => inject(rest),
+        "read" => read(rest),
+        "write" => write(rest),
         "rm" | "remove" => remove(rest),
         other => Err(format!("unknown resource action: {other}")),
     }
@@ -226,6 +240,92 @@ fn extract(arguments: &[String]) -> Result<(), String> {
         .map_err(|error| format!("invalid task record from daemon: {error}"))?;
     rpc::wait_task(&client, &task.id)?;
     println!("extracted {kind} from {id}");
+    Ok(())
+}
+
+/// Read a file as a YAML tree, so a block can be named by its key path.
+fn read(arguments: &[String]) -> Result<(), String> {
+    let id = id_argument("read", arguments)?;
+    let path = arguments
+        .get(1)
+        .filter(|path| !path.starts_with('-'))
+        .ok_or("expected a container-relative path after the container id")?
+        .clone();
+    let flags = Flags::parse(&arguments[2..])?;
+    let client = rpc::connect()?;
+    let mut request = json!({ "id": id, "path": path });
+    if let Some(section) = flags.get("section") {
+        request["section"] = json!(section.split('.').filter(|key| !key.is_empty()).collect::<Vec<&str>>());
+    }
+    let value = rpc::call(&client, "read_resource_tree", request)?;
+    if flags.has("json") {
+        println!("{}", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?);
+        return Ok(());
+    }
+    let nodes = value["nodes"].as_array().cloned().unwrap_or_default();
+    for node in &nodes {
+        let depth = node["depth"].as_u64().unwrap_or(0) as usize;
+        let key_path = node["path"]
+            .as_array()
+            .map(|keys| keys.iter().filter_map(|key| key.as_str()).collect::<Vec<&str>>().join("."))
+            .unwrap_or_default();
+        println!(
+            "{}{} [{}] {}",
+            "  ".repeat(depth),
+            if key_path.is_empty() { "/" } else { &key_path },
+            node["kind"].as_str().unwrap_or("?"),
+            node["preview"].as_str().unwrap_or("")
+        );
+    }
+    println!("---");
+    print!("{}", value["text"].as_str().unwrap_or(""));
+    Ok(())
+}
+
+/// Write one YAML block back into a container file, at a key path.
+fn write(arguments: &[String]) -> Result<(), String> {
+    let id = id_argument("write", arguments)?;
+    let path = arguments
+        .get(1)
+        .filter(|path| !path.starts_with('-'))
+        .ok_or("expected a container-relative path after the container id")?
+        .clone();
+    let flags = Flags::parse(&arguments[2..])?;
+    let text = match (flags.get("text"), flags.get("file")) {
+        (Some(text), _) => text.to_owned(),
+        (None, Some(file)) => std::fs::read_to_string(file)
+            .map_err(|error| format!("cannot read {file}: {error}"))?,
+        (None, None) => return Err("expected --text <yaml> or --file <path>".to_owned()),
+    };
+    let section: Vec<String> = flags
+        .get("section")
+        .map(|section| section.split('.').filter(|key| !key.is_empty()).map(str::to_owned).collect())
+        .unwrap_or_default();
+    let conflict = if flags.has("overwrite") {
+        "overwrite"
+    } else if flags.has("refuse") {
+        "refuse"
+    } else {
+        "merge"
+    };
+    let client = rpc::connect()?;
+    let request = json!({
+        "id": id,
+        "path": path,
+        "section": section,
+        "text": text,
+        "conflict": conflict,
+        "restart": flags.has("restart"),
+    });
+    let value = rpc::call(&client, "enqueue_resource_write", request)?;
+    let task: TaskRecord = serde_json::from_value(value)
+        .map_err(|error| format!("invalid task record from daemon: {error}"))?;
+    rpc::wait_task(&client, &task.id)?;
+    println!(
+        "wrote {}{}",
+        path,
+        if section.is_empty() { String::new() } else { format!("({})", section.join(".")) }
+    );
     Ok(())
 }
 

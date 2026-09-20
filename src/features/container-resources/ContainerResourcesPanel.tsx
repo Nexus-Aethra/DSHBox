@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { boxApi } from '../../shared/api/box-api'
+import type { EditYamlText } from './EditYamlDialog'
+import { EditYamlDialog } from './EditYamlDialog'
 import { ContainerTree, PluginChips, useInstalledPlugins } from './pickers'
 import type { PickerText } from './pickers'
 import type { ContainerResources, DiscoveredResource, DshContainer, StoredResource } from '../../shared/types/domain'
@@ -10,7 +12,7 @@ import { Field } from '../../ui/Field'
 import { Input } from '../../ui/Input'
 import { Select } from '../../ui/Select'
 
-export type ResourceText = PickerText & {
+export type ResourceText = PickerText & EditYamlText & {
   resourceOpen: string
   resourceTitle: (name: string) => string
   resourceSubtitle: string
@@ -44,6 +46,7 @@ export type ResourceText = PickerText & {
   resourceBrowseSelected: (path: string) => string
   resourceBrowseExtract: string
   resourceBrowseInject: string
+  resourceEdit: string
   resourceBrowseInjectPick: string
   resourceFrom: string
   resourceFromPlaceholder: string
@@ -76,6 +79,7 @@ export function ContainerResourcesPanel({ id, name, text, onClose }: Props) {
   const [browseOpen, setBrowseOpen] = useState(false)
   const [pluginQuery, setPluginQuery] = useState('')
   const [picked, setPicked] = useState<string | null>(null)
+  const [editOpen, setEditOpen] = useState(false)
   const [injectPick, setInjectPick] = useState('')
   const [entry, setEntry] = useState('')
   const [conflict, setConflict] = useState('merge')
@@ -253,6 +257,7 @@ export function ContainerResourcesPanel({ id, name, text, onClose }: Props) {
               onChange={(event) => { setInjectPick(event.target.value) }}
             />
             <Button variant="secondary" size="sm" disabled={busy || !injectPick} onClick={() => { void injectIntoPickedPath() }}>{text.resourceBrowseInject}</Button>
+            <Button variant="secondary" size="sm" disabled={busy} onClick={() => { setEditOpen(true) }}>{text.resourceEdit}</Button>
           </div>
         )}
 
@@ -346,6 +351,14 @@ export function ContainerResourcesPanel({ id, name, text, onClose }: Props) {
           <Button variant="ghost" size="sm" onClick={onClose}>{text.resourceClose}</Button>
         </div>
       </div>
+      {editOpen && picked !== null && (
+        <EditYamlDialog
+          containerId={id}
+          path={picked}
+          text={text}
+          onClose={() => { setEditOpen(false); void reload(plugin) }}
+        />
+      )}
     </Dialog>
   )
 }

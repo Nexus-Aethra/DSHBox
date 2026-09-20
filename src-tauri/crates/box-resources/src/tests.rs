@@ -28,13 +28,19 @@ fn fixture_container(name: &str) -> PathBuf {
 #[test]
 fn builtin_kinds_cover_the_two_v1_resources() {
     let sessions = crate::builtin("sessions").expect("sessions kind");
-    assert_eq!(sessions.path, "profile/sessions");
+    assert_eq!(sessions.path(), "profile/sessions");
     assert_eq!(sessions.shape, Shape::Entries);
     assert!(!sessions.secret);
+    assert_eq!(sessions.parts.len(), 1);
 
     let credentials = crate::builtin("credentials").expect("credentials kind");
-    assert_eq!(credentials.path, "profile/.credentials.yaml");
+    assert_eq!(credentials.path(), "profile/.credentials.yaml");
     assert!(credentials.secret, "credentials are a secret kind");
+    // A key is only half of it: the provider route that names its environment
+    // variable lives in settings.yaml.
+    assert_eq!(credentials.parts.len(), 2);
+    assert_eq!(credentials.parts[1].path, "profile/settings.yaml");
+    assert_eq!(credentials.parts[1].section, ["llm-pi-ai"]);
     assert!(crate::builtin("sshkey").is_none());
 }
 
@@ -280,4 +286,117 @@ fn a_single_session_can_be_extracted_and_injected_on_its_own() {
     .unwrap();
     assert!(target.join("profile/sessions/--home-wpp--/session-1/session.v3.jsonl.zstd").is_file());
     assert!(!target.join("profile/sessions/--home-wpp--/session-2").exists());
+}
+
+/// The provider credentials kind is two files, because a key authenticates
+/// nothing until a route names the environment variable that holds it.
+fn credentials_parts() -> Vec<transfer::PayloadPart> {
+    vec![
+        transfer::PayloadPart {
+            path: "profile/.credentials.yaml".to_owned(),
+            section: Vec::new(),
+        },
+        transfer::PayloadPart {
+            path: "profile/settings.yaml".to_owned(),
+            section: vec!["llm-pi-ai".to_owned()],
+        },
+    ]
+}
+
+fn credentials_fixture(name: &str) -> PathBuf {
+    let root = temp_dir(name);
+    write(
+        &root.join("profile/.credentials.yaml"),
+        "version: 1\nrefs:\n  MINIMAX_CN_API_KEY: sk-one\n",
+    );
+    write(
+        &root.join("profile/settings.yaml"),
+        "ui-onboarding:\n  welcomeNoticeVersion: 2026-08-13.1\nllm-pi-ai:\n  providers:\n    minimax-cn:\n      apiKeyEnv: MINIMAX_CN_API_KEY\n",
+    );
+    root
+}
+
+#[test]
+fn provider_credentials_travel_as_a_key_and_the_route_that_names_it() {
+    let source = credentials_fixture("provider-source");
+    let payload = temp_dir("provider-payload");
+    let extracted = transfer::extract_parts(&source, &credentials_parts(), None, &payload, true).unwrap();
+    assert_eq!(extracted.files, 2, "the key file and the section");
+    // The section travels as its subtree alone: the rest of settings.yaml is
+    // another plugin's business.
+    let section = fs::read_to_string(payload.join("part-1/section.yaml")).unwrap();
+    assert!(section.contains("apiKeyEnv"), "the route is in the payload: {section}");
+    assert!(!section.contains("ui-onboarding"), "and nothing else is: {section}");
+    // The payload describes itself, so an injection does not have to guess.
+    let parts = transfer::payload_parts(&payload, "profile/.credentials.yaml");
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[1].section, vec!["llm-pi-ai".to_owned()]);
+
+    // Into a container that has settings of its own and no provider yet.
+    let target = temp_dir("provider-target");
+    write(&target.join("profile/settings.yaml"), "ui-onboarding:\n  welcomeNoticeVersion: keep\n");
+    let injected = transfer::inject_parts(&payload, &target, &parts, Conflict::Merge, Shape::Opaque, 1, true).unwrap();
+    assert_eq!(injected.files, 2);
+    assert!(injected.added.iter().any(|entry| entry == "llm-pi-ai"), "the route section is what was added: {:?}", injected.added);
+
+    let settings: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(target.join("profile/settings.yaml")).unwrap()).unwrap();
+    assert_eq!(settings["ui-onboarding"]["welcomeNoticeVersion"].as_str(), Some("keep"));
+    assert_eq!(
+        settings["llm-pi-ai"]["providers"]["minimax-cn"]["apiKeyEnv"].as_str(),
+        Some("MINIMAX_CN_API_KEY")
+    );
+    let keys: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(target.join("profile/.credentials.yaml")).unwrap()).unwrap();
+    assert_eq!(keys["refs"]["MINIMAX_CN_API_KEY"].as_str(), Some("sk-one"));
+}
+
+#[test]
+fn a_section_refuses_overwrites_and_merges_by_policy() {
+    let source = credentials_fixture("section-source");
+    let payload = temp_dir("section-payload");
+    transfer::extract_parts(&source, &credentials_parts(), None, &payload, false).unwrap();
+    let parts = credentials_parts();
+
+    // The target already has the section: refusing is the default.
+    let target = credentials_fixture("section-target");
+    write(
+        &target.join("profile/settings.yaml"),
+        "llm-pi-ai:\n  providers:\n    other:\n      apiKeyEnv: OTHER_KEY\n",
+    );
+    let refused = transfer::inject_parts(&payload, &target, &parts, Conflict::Refuse, Shape::Opaque, 1, false);
+    assert!(refused.is_err(), "refusing is the default");
+    let untouched = fs::read_to_string(target.join("profile/settings.yaml")).unwrap();
+    assert!(untouched.contains("OTHER_KEY"), "a refused injection writes nothing");
+
+    // Merging keeps the route that was there and adds the payload's.
+    transfer::inject_parts(&payload, &target, &parts, Conflict::Merge, Shape::Opaque, 1, false).unwrap();
+    let merged: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(target.join("profile/settings.yaml")).unwrap()).unwrap();
+    assert_eq!(merged["llm-pi-ai"]["providers"]["other"]["apiKeyEnv"].as_str(), Some("OTHER_KEY"));
+    assert_eq!(
+        merged["llm-pi-ai"]["providers"]["minimax-cn"]["apiKeyEnv"].as_str(),
+        Some("MINIMAX_CN_API_KEY")
+    );
+
+    // Overwriting replaces the section wholesale.
+    transfer::inject_parts(&payload, &target, &parts, Conflict::Overwrite, Shape::Opaque, 1, false).unwrap();
+    let replaced: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(target.join("profile/settings.yaml")).unwrap()).unwrap();
+    assert!(replaced["llm-pi-ai"]["providers"]["other"].is_null());
+}
+
+#[test]
+fn a_single_part_payload_still_injects_as_the_path_it_names() {
+    // Copies taken before kinds had parts have no manifest: the path the
+    // caller names is the whole story.
+    let payload = temp_dir("legacy-payload");
+    write(&payload.join(".credentials.yaml"), "version: 1\n");
+    let parts = transfer::payload_parts(&payload, "profile/.credentials.yaml");
+    assert_eq!(parts.len(), 1);
+    assert!(parts[0].section.is_empty());
+
+    let target = temp_dir("legacy-target");
+    transfer::inject_parts(&payload, &target, &parts, Conflict::Merge, Shape::Opaque, 1, false).unwrap();
+    assert!(target.join("profile/.credentials.yaml").is_file());
 }

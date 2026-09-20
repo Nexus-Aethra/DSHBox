@@ -215,6 +215,20 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   `dshboxd/src/resources.rs`): taking a copy again adds `<name>-2` instead of
   replacing the one the user already has, since taking a copy is an explicit act
   — the same kind from two containers must not land on one row.
+- **A resource is one or more parts, and a part may be a YAML section.** A kind
+  declares `parts` (`KindPart`): a container-relative path, optionally with a
+  `section` key path. `credentials` is two parts — `.credentials.yaml` plus
+  `settings.yaml#llm-pi-ai` — because a key authenticates nothing until a
+  provider route names the environment variable that holds it
+  (`apiKeyEnv` is a credential-ref in `llm-pi-ai`), while the rest of
+  `settings.yaml` belongs to other plugins. Extraction writes part 0 at the
+  payload root (unchanged layout, so copies taken before parts still inject) and
+  later parts under `part-<i>/`, plus a `parts.json` the injection reads — a
+  payload describes itself rather than trusting the kind installed now. Section
+  parts merge deep (`merge_yaml`) and refuse/overwrite the section as one value.
+  `transfer::write_section` is the same operation the UI's YAML editor uses:
+  read a block by key path, write it back, merge or replace — copy and edit are
+  one mechanism, so a new YAML-shaped resource needs no new code.
 - **Cache state comes from the pnpm store, the list from the lockfiles.** Box
   gives pnpm a private store (`PNPM_CONFIG_STORE_DIR` → `<runtime>/pnpm/store`,
   see `box-runtime/src/process/env.rs`), so "can this install offline" is a

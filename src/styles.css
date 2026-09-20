@@ -528,6 +528,18 @@ dialog .resource-panel { max-height: 70vh; overflow-y: auto; }
 /* The copies list owns the attach options: a copy is what gets attached, so
    the conflict policy and the restart switch belong beside that list. */
 .resource-copies-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+/* Editing a YAML block: the document as a tree, the block in a textarea. */
+.resource-yaml-tree { list-style: none; margin: 0; padding: 0; max-height: 220px; overflow-y: auto; border: 1px solid #f3f4f6; border-radius: 8px; background: #fafafa; }
+.resource-yaml-tree button { width: 100%; display: flex; align-items: center; gap: 8px; border: 0; background: transparent; font-size: 12px; text-align: left; padding: 4px 8px; cursor: pointer; }
+.resource-yaml-tree button:hover { background: #eef2ff; }
+.resource-yaml-tree button.active { background: #e0e7ff; }
+.resource-yaml-key { color: #111827; font-weight: 600; }
+.resource-yaml-kind { color: #9ca3af; font-size: 11px; }
+.resource-yaml-preview { color: #6b7280; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.resource-yaml-path { display: flex; align-items: center; gap: 8px; }
+.resource-yaml-path .ui-field-label, .resource-yaml-path .resource-section { white-space: nowrap; }
+.resource-yaml-body { width: 100%; min-height: 140px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 8px; resize: vertical; }
+.resource-footer { gap: 8px; align-items: center; }
 .resource-copies { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .resource-copies li { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid #f3f4f6; border-radius: 10px; background: #fff; }
 .resource-copy-text { flex: 1; min-width: 0; }

@@ -264,6 +264,7 @@ pub fn discover(container_root: &Path, profile_name: &str, plugin: Option<&str>)
                                     .unwrap_or(Shape::Opaque),
                                 entry_depth: entry.depth.unwrap_or(1).max(1),
                                 inferred: false,
+                                parts: Vec::new(),
                             };
                             found.push(measured(
                                 container_root,
@@ -286,6 +287,7 @@ pub fn discover(container_root: &Path, profile_name: &str, plugin: Option<&str>)
                                 shape: Shape::Entries,
                                 entry_depth: 2,
                                 inferred: true,
+                                parts: Vec::new(),
                             };
                             found.push(measured(
                                 container_root,
@@ -318,6 +320,7 @@ pub fn discover(container_root: &Path, profile_name: &str, plugin: Option<&str>)
                             .unwrap_or(Shape::Opaque),
                         entry_depth: entry.depth.unwrap_or(1).max(1),
                         inferred: false,
+                        parts: Vec::new(),
                     };
                     found.push(measured(
                         container_root,
@@ -488,5 +491,6 @@ pub fn resolve(kind_id: &str, declared: &[DeclaredResource]) -> Option<ResolvedK
                 .unwrap_or(Shape::Opaque),
             entry_depth: entry.depth.unwrap_or(1).max(1),
             inferred: false,
+            parts: Vec::new(),
         })
 }

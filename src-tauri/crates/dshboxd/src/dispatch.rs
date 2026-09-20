@@ -207,6 +207,12 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("enqueue_resource_extract") => {
             crate::resources::enqueue_resource_extract(state, request)
         }
+        Some("read_resource_tree") => {
+            crate::resources::read_resource_tree(state, request).map(Sync)
+        }
+        Some("enqueue_resource_write") => {
+            crate::resources::enqueue_resource_write(state, request)
+        }
         Some("enqueue_resource_inject") => {
             crate::resources::enqueue_resource_inject(state, request)
         }

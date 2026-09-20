@@ -77,6 +77,23 @@ builds from ever showing it.
 
 ### Fixed
 
+- **A provider key arrived without the provider.** `credentials` was one file
+  (`.credentials.yaml`), but DSH keeps a key and the route that uses it in two
+  places: the route is `llm-pi-ai.providers.<route>.apiKeyEnv` in
+  `settings.yaml`, and `apiKeyEnv` is a credential-ref, so injecting the key
+  alone left the target with a secret nothing referenced — the model list stayed
+  at one entry. A resource is now one or more *parts*, and a part may be a YAML
+  section: `credentials` carries the key file and the `llm-pi-ai` section
+  together, merging into `settings.yaml` without touching what other plugins
+  keep there. A copy taken before this still injects (its payload has no part
+  manifest, so it is the single path it names).
+- **The CLI and the UI can edit a resource, not just copy it.** `dshbox
+  container resource read <id> <path> [--section a.b]` prints a container file's
+  YAML as a tree of key paths; `... write <id> <path> --section a.b --text|--file
+  [--overwrite] [--restart]` writes one block back. In the Box UI the container's
+  storage browser gained **编辑 YAML**: the document is a tree, picking a node
+  loads that block, and a path that does not exist yet is how a block is added.
+  Both go through the same merge-or-replace policy as an injected copy.
 - **A resource copy had no name, and the second one replaced the first.** Every
   copy was keyed `<kind>-<kind>` (`sessions-sessions`,
   `credentials-credentials`), so a type could only ever hold one row and taking

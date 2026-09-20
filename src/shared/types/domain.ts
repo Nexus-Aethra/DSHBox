@@ -223,6 +223,27 @@ export type DiscoveredResource = {
   files: number
 }
 
+// ---- container resources: reading and editing a YAML block by path ----
+/** One node of a container file's YAML document, flattened in pre-order. */
+export type ResourceTreeNode = {
+  /** Key path to this node, which is what a write names. */
+  path: string[]
+  key: string
+  depth: number
+  kind: string
+  preview: string
+  expandable: boolean
+}
+
+export type ResourceTree = {
+  path: string
+  section: string[]
+  /** The YAML at `section` (or the whole document when it is empty). */
+  text: string
+  document: string
+  nodes: ResourceTreeNode[]
+}
+
 export type StoredResource = {
   id: string
   kind: string

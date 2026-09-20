@@ -186,6 +186,121 @@ pub fn extract(
     payload_dir: &Path,
     secret: bool,
 ) -> Result<Extracted, String> {
+    extract_parts(
+        container_root,
+        &[PayloadPart {
+            path: rel.to_owned(),
+            section: Vec::new(),
+        }],
+        selection,
+        payload_dir,
+        secret,
+    )
+}
+
+/// One part of a payload: where it goes back, and whether it is a whole path or
+/// one key path inside a YAML document there.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayloadPart {
+    pub path: String,
+    #[serde(default)]
+    pub section: Vec<String>,
+}
+
+/// What the payload says about itself. It is written whenever a payload has
+/// more than one part, so an injection never has to guess from the kind that
+/// happens to be installed now.
+const PARTS_FILE: &str = "parts.json";
+
+/// A payload with no manifest is the one path the caller named: a copy taken
+/// before kinds had parts.
+pub fn payload_parts(payload_dir: &Path, fallback_path: &str) -> Vec<PayloadPart> {
+    read_parts_manifest(payload_dir).unwrap_or_else(|| {
+        vec![PayloadPart {
+            path: fallback_path.to_owned(),
+            section: Vec::new(),
+        }]
+    })
+}
+
+pub fn read_parts_manifest(payload_dir: &Path) -> Option<Vec<PayloadPart>> {
+    let text = fs::read_to_string(payload_dir.join(PARTS_FILE)).ok()?;
+    serde_json::from_str::<Vec<PayloadPart>>(&text)
+        .ok()
+        .filter(|parts| !parts.is_empty())
+}
+
+fn write_parts_manifest(payload_dir: &Path, parts: &[PayloadPart]) -> Result<(), String> {
+    let body = serde_json::to_string_pretty(parts).map_err(|error| error.to_string())?;
+    fs::write(payload_dir.join(PARTS_FILE), body).map_err(|error| error.to_string())
+}
+
+/// Where one part lives inside the payload. A single-part payload keeps the
+/// layout every copy has always had (the path itself at the root); once there
+/// is more than one, each part gets a directory of its own so a whole-file part
+/// is still one file to the code that reads it.
+fn part_dir(payload_dir: &Path, index: usize, many: bool) -> PathBuf {
+    if many || index > 0 {
+        payload_dir.join(format!("part-{index}"))
+    } else {
+        payload_dir.to_path_buf()
+    }
+}
+
+/// Extract every part of a kind into one payload directory. A part that is a
+/// section of a YAML document travels as that subtree alone, so the rest of the
+/// file (another plugin's settings) stays where it is.
+pub fn extract_parts(
+    container_root: &Path,
+    parts: &[PayloadPart],
+    selection: Option<&str>,
+    payload_dir: &Path,
+    secret: bool,
+) -> Result<Extracted, String> {
+    if parts.is_empty() {
+        return Err("this resource has nothing to extract".to_owned());
+    }
+    if payload_dir.exists() {
+        fs::remove_dir_all(payload_dir).map_err(|error| error.to_string())?;
+    }
+    fs::create_dir_all(payload_dir).map_err(|error| error.to_string())?;
+
+    let many = parts.len() > 1;
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    for (index, part) in parts.iter().enumerate() {
+        // A selection is one entry of the primary part (a single session out of
+        // a history), so it only ever applies to the first.
+        let selection = if index == 0 { selection } else { None };
+        let target = part_dir(payload_dir, index, many);
+        let (part_bytes, part_files) = if part.section.is_empty() {
+            extract_path(container_root, &part.path, selection, &target)?
+        } else {
+            extract_section(container_root, part, &target)?
+        };
+        bytes += part_bytes;
+        files += part_files;
+    }
+    if many {
+        write_parts_manifest(payload_dir, parts)?;
+    }
+    if secret {
+        restrict_permissions(payload_dir);
+    }
+    Ok(Extracted {
+        bytes,
+        files,
+        digest: tree_digest(payload_dir)?,
+    })
+}
+
+fn extract_path(
+    container_root: &Path,
+    rel: &str,
+    selection: Option<&str>,
+    target: &Path,
+) -> Result<(u64, u64), String> {
     let source = safe_join(container_root, rel)?;
     let selected = match selection {
         Some(entry) => Some(safe_join(&source, entry)?),
@@ -198,39 +313,86 @@ pub fn extract(
     } else if !source.exists() {
         return Err(format!("nothing to extract: {} does not exist", source.display()));
     }
-
-    if payload_dir.exists() {
-        fs::remove_dir_all(payload_dir).map_err(|error| error.to_string())?;
-    }
-    fs::create_dir_all(payload_dir).map_err(|error| error.to_string())?;
-
-    let (bytes, files) = match (&selected, selection) {
+    fs::create_dir_all(target).map_err(|error| error.to_string())?;
+    match (&selected, selection) {
         (Some(node), Some(entry)) => {
-            let target = safe_join(payload_dir, entry)?;
-            if let Some(parent) = target.parent() {
+            let destination = safe_join(target, entry)?;
+            if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent).map_err(|error| error.to_string())?;
             }
-            copy_tree(node, &target, container_root)?
+            copy_tree(node, &destination, container_root)
         }
         _ => {
             if source.is_dir() {
-                copy_tree(&source, payload_dir, container_root)?
+                copy_tree(&source, target, container_root)
             } else {
                 let name = source
                     .file_name()
                     .ok_or_else(|| format!("{} has no file name", source.display()))?;
-                copy_tree(&source, &payload_dir.join(name), container_root)?
+                copy_tree(&source, &target.join(name), container_root)
             }
         }
-    };
-    if secret {
-        restrict_permissions(payload_dir);
     }
-    Ok(Extracted {
-        bytes,
-        files,
-        digest: tree_digest(payload_dir)?,
-    })
+}
+
+fn extract_section(
+    container_root: &Path,
+    part: &PayloadPart,
+    target: &Path,
+) -> Result<(u64, u64), String> {
+    let source = safe_join(container_root, &part.path)?;
+    let label = part.section.join(".");
+    let text = fs::read_to_string(&source)
+        .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+    let document: serde_yaml::Value = serde_yaml::from_str(&text)
+        .map_err(|error| format!("{} is not valid YAML: {error}", source.display()))?;
+    let value = section_value(&document, &part.section)
+        .ok_or_else(|| format!("{} has no `{label}` section", source.display()))?;
+    let body = serde_yaml::to_string(value).map_err(|error| error.to_string())?;
+    fs::create_dir_all(target).map_err(|error| error.to_string())?;
+    fs::write(target.join(SECTION_FILE), &body).map_err(|error| error.to_string())?;
+    Ok((body.len() as u64, 1))
+}
+
+/// The file a section part travels as, inside its part directory.
+const SECTION_FILE: &str = "section.yaml";
+
+/// The value at a YAML key path, when the document has one.
+fn section_value<'a>(document: &'a serde_yaml::Value, section: &[String]) -> Option<&'a serde_yaml::Value> {
+    let mut current = document;
+    for key in section {
+        current = current.get(key.as_str())?;
+    }
+    Some(current)
+}
+
+/// Wrap a value back up in its section keys, so merging it into the destination
+/// document is one deep merge.
+fn nest(section: &[String], value: serde_yaml::Value) -> serde_yaml::Value {
+    let mut current = value;
+    for key in section.iter().rev() {
+        let mut mapping = serde_yaml::Mapping::new();
+        mapping.insert(serde_yaml::Value::String(key.clone()), current);
+        current = serde_yaml::Value::Mapping(mapping);
+    }
+    current
+}
+
+fn remove_section(document: &mut serde_yaml::Value, section: &[String]) -> bool {
+    let Some((last, parents)) = section.split_last() else {
+        return false;
+    };
+    let mut current = document;
+    for key in parents {
+        match current.get_mut(key.as_str()) {
+            Some(next) => current = next,
+            None => return false,
+        }
+    }
+    match current {
+        serde_yaml::Value::Mapping(mapping) => mapping.remove(serde_yaml::Value::String(last.clone())).is_some(),
+        _ => false,
+    }
 }
 
 /// The independent entries of a tree at the kind's depth, as `(relative, path)`
@@ -280,6 +442,70 @@ pub fn inject(
     entry_depth: u8,
     secret: bool,
 ) -> Result<Injected, String> {
+    inject_parts(
+        payload_dir,
+        container_root,
+        &[PayloadPart {
+            path: rel.to_owned(),
+            section: Vec::new(),
+        }],
+        conflict,
+        shape,
+        entry_depth,
+        secret,
+    )
+}
+
+/// Inject every part of a payload. A part that is a section of a YAML document
+/// is merged back into that document at the same key path, so the rest of the
+/// file keeps whatever it had.
+pub fn inject_parts(
+    payload_dir: &Path,
+    container_root: &Path,
+    parts: &[PayloadPart],
+    conflict: Conflict,
+    shape: Shape,
+    entry_depth: u8,
+    secret: bool,
+) -> Result<Injected, String> {
+    let mut result = Injected {
+        bytes: 0,
+        files: 0,
+        replaced: Vec::new(),
+        added: Vec::new(),
+    };
+    let many = parts.len() > 1;
+    for (index, part) in parts.iter().enumerate() {
+        let source = part_dir(payload_dir, index, many);
+        if !source.exists() {
+            return Err(format!(
+                "payload is missing part {index} ({})",
+                part.path
+            ));
+        }
+        let injected = if part.section.is_empty() {
+            inject_one(&source, container_root, part, conflict, shape, entry_depth, secret)?
+        } else {
+            inject_section(&source.join(SECTION_FILE), container_root, part, conflict)?
+        };
+        result.bytes += injected.bytes;
+        result.files += injected.files;
+        result.replaced.extend(injected.replaced);
+        result.added.extend(injected.added);
+    }
+    Ok(result)
+}
+
+fn inject_one(
+    payload_dir: &Path,
+    container_root: &Path,
+    part: &PayloadPart,
+    conflict: Conflict,
+    shape: Shape,
+    entry_depth: u8,
+    secret: bool,
+) -> Result<Injected, String> {
+    let rel = part.path.as_str();
     let dest = safe_join(container_root, rel)?;
     let mut replaced = Vec::new();
     let mut added = Vec::new();
@@ -367,6 +593,103 @@ pub fn inject(
     Ok(Injected {
         bytes,
         files,
+        replaced,
+        added,
+    })
+}
+
+/// Merge one YAML section of a payload back into the document at `part.path`.
+///
+/// `Refuse` refuses when the destination already has that key path (the section
+/// exists or not, nothing finer: it is one value), `Overwrite` drops the
+/// destination's section first, and `Merge` deep-merges into it — which is what
+/// adding a provider route to a `settings.yaml` that other plugins also write to
+/// has to be.
+fn inject_section(
+    payload_file: &Path,
+    container_root: &Path,
+    part: &PayloadPart,
+    conflict: Conflict,
+) -> Result<Injected, String> {
+    let text = fs::read_to_string(payload_file)
+        .map_err(|error| format!("cannot read {}: {error}", payload_file.display()))?;
+    write_section(container_root, &part.path, &part.section, &text, conflict)
+}
+
+/// Write one YAML block into a container file, at the key path `section`
+/// (empty = the whole file).
+///
+/// This is the same operation as injecting a section part, which is the point:
+/// a provider route the user edits by hand and one that arrives inside a copy
+/// are written by the same code, with the same conflict policy.
+pub fn write_section(
+    container_root: &Path,
+    rel: &str,
+    section: &[String],
+    text: &str,
+    conflict: Conflict,
+) -> Result<Injected, String> {
+    let dest = safe_join(container_root, rel)?;
+    let label = if section.is_empty() {
+        rel.to_owned()
+    } else {
+        section.join(".")
+    };
+    let incoming: serde_yaml::Value = serde_yaml::from_str(text)
+        .map_err(|error| format!("the YAML to write is not valid: {error}"))?;
+
+    let existing = fs::read_to_string(&dest).unwrap_or_default();
+    let mut document: serde_yaml::Value = if existing.trim().is_empty() {
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+    } else {
+        serde_yaml::from_str(&existing)
+            .map_err(|error| format!("{} is not valid YAML: {error}", dest.display()))?
+    };
+
+    let present = if section.is_empty() {
+        !existing.trim().is_empty()
+    } else {
+        section_value(&document, section).is_some()
+    };
+    if conflict == Conflict::Refuse && present {
+        return Err(format!(
+            "{} already has `{label}`; pass --overwrite to replace that section or --merge to add \
+             to it",
+            dest.display()
+        ));
+    }
+    let merged = if section.is_empty() {
+        // The whole file: an overlay of the file itself is just the file.
+        if conflict == Conflict::Overwrite || !present {
+            incoming
+        } else {
+            merge_value(document, incoming)
+        }
+    } else {
+        if conflict == Conflict::Overwrite {
+            remove_section(&mut document, section);
+        }
+        merge_value(document, nest(section, incoming))
+    };
+    let body = serde_yaml::to_string(&merged).map_err(|error| error.to_string())?;
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let temporary = dest.with_extension("yaml.tmp");
+    fs::write(&temporary, &body).map_err(|error| error.to_string())?;
+    fs::rename(&temporary, &dest).map_err(|error| error.to_string())?;
+
+    let entry = label.clone();
+    let mut replaced = Vec::new();
+    let mut added = Vec::new();
+    if present {
+        replaced.push(entry);
+    } else {
+        added.push(entry);
+    }
+    Ok(Injected {
+        bytes: body.len() as u64,
+        files: 1,
         replaced,
         added,
     })
