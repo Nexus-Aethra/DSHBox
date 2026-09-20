@@ -34,17 +34,17 @@ fn parses_example_boxfile() {
     assert_eq!(script.ops.len(), 4);
 }
 
-/// The shipped dshell boxfile: a pinned harness tag and a pinned npm spec, the
-/// two tokens that decide whether the build is reproducible at all.
+/// The shipped dshell boxfile: a pinned harness tag, a pinned bundle spec, and
+/// the provider rows that must ride that same DSH build.
 #[test]
 fn parses_the_dshell_boxfile() {
     let (script, _) = example("boxfile-dshell.dsh");
 
     assert_eq!(script.name, "dshell");
     assert_eq!(script.profile, "web");
-    // A version tag, not a branch: the plugin's peer dependencies name exact DSH
+    // A version tag, not a branch: the bundle's peer dependencies name exact DSH
     // releases, so `latest` would resolve to whatever shipped most recently.
-    assert_eq!(script.harness_ref.as_deref(), Some("dsh-v0.1.6-alpha.1"));
+    assert_eq!(script.harness_ref.as_deref(), Some("dsh-v0.1.6-alpha.2"));
     assert_eq!(
         script.harness_url,
         "https://github.com/deepseek-ai/deepseek-harness"
@@ -53,21 +53,38 @@ fn parses_the_dshell_boxfile() {
     // bundle reaches `node-pty`, which compiles a native binding on install.
     assert_eq!(
         script.labels.get("dshbox.allow-build").map(String::as_str),
-        Some("@nexus-aethra/dshell-bundle@0.1.3,node-pty@1.2.0-beta.15")
+        Some("@nexus-aethra/dshell-bundle@0.1.5,node-pty@1.2.0-beta.15")
     );
-    assert_eq!(script.ops.len(), 1);
-    match script.ops.first() {
-        Some(ImageOp::Add { kind, source, .. }) => {
-            assert_eq!(*kind, AddKind::Plugin);
-            // `@scope/name@version` carries two `@`, and the alias form
-            // (`alias@npm:real@version`) is why the split is worth asserting.
-            assert_eq!(
-                source,
-                &ParsedSource::NpmPrefix {
-                    spec: "@nexus-aethra/dshell-bundle@0.1.3".to_owned()
+
+    let specs: Vec<String> = script
+        .ops
+        .iter()
+        .map(|op| match op {
+            ImageOp::Add { kind, source, .. } => {
+                assert_eq!(*kind, AddKind::Plugin);
+                // `@scope/name@version` carries two `@`, and the alias form
+                // (`alias@npm:real@version`) is why the split is worth asserting.
+                match source {
+                    ParsedSource::NpmPrefix { spec } => spec.clone(),
+                    other => panic!("expected an npm: spec, got {other:?}"),
                 }
-            );
-        }
-        other => panic!("expected one ADD plugin op, got {other:?}"),
+            }
+            other => panic!("expected only ADD plugin ops, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(specs.len(), 8);
+    assert_eq!(specs[0], "@nexus-aethra/dshell-bundle@0.1.5");
+    // Every other row is a dsh provider pinned to the FROM line's exact version:
+    // an unpinned one would drag a second DSH build into the same tree.
+    let harness_version = script
+        .harness_ref
+        .as_deref()
+        .expect("harness ref")
+        .trim_start_matches("dsh-v");
+    for spec in &specs[1..] {
+        assert!(
+            spec.starts_with("@deepseek-ai/dsh-") && spec.ends_with(&format!("@{harness_version}")),
+            "{spec} is not a dsh provider pinned to {harness_version}"
+        );
     }
 }
