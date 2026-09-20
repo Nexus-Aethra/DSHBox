@@ -158,6 +158,16 @@ pub(crate) fn list_repository_reference_counts() -> Result<Vec<box_extensions::R
     serde_json::from_value(value).map_err(|error| format!("invalid reference counts response: {error}"))
 }
 
+/// Read the cordis service graph for one template or container. `kind` is
+/// `template` or `container`, and `id` is a sealed-template name or a container
+/// id. Answered inline by the daemon: it only reads sources and manifests.
+#[tauri::command]
+pub(crate) fn plugin_dependency_graph(kind: String, id: String) -> Result<box_plugin_graph::PluginGraph, String> {
+    let client = connect()?;
+    let value = call(&client, "plugin_dependency_graph", serde_json::json!({ "kind": kind, "id": id }))?;
+    serde_json::from_value(value).map_err(|error| format!("invalid plugin graph response: {error}"))
+}
+
 #[tauri::command]
 pub(crate) fn remove_repository_plugin(
     id: String,

@@ -30,6 +30,106 @@ pub struct DshVersion {
     pub installed: bool,
 }
 
+/// Order a catalogue the way a reader looks for a release: `latest` first, then
+/// newest to oldest.
+///
+/// The list used to come out in the byte order of its names, because it was
+/// collected into a `BTreeMap<String, _>`. That put the oldest release at the top
+/// and the newest at the bottom, and it would have put `dsh-v0.1.10` *above*
+/// `dsh-v0.1.2` the first time DSH shipped a two-digit number — a string compare
+/// reads the `1` of `10` against the `2` and stops there.
+pub fn sort_catalog(versions: &mut [DshVersion]) {
+    versions.sort_by(|left, right| {
+        order_of(&left.name)
+            .cmp(&order_of(&right.name))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+}
+
+/// A sort key that puts `latest` first, then descends by release value, and
+/// leaves anything unrecognisable at the end in name order.
+fn order_of(name: &str) -> (u8, std::cmp::Reverse<Release>, String) {
+    if name == "latest" {
+        return (0, std::cmp::Reverse(Release::default()), String::new());
+    }
+    match parse_release(name) {
+        Some(release) => (1, std::cmp::Reverse(release), String::new()),
+        None => (2, std::cmp::Reverse(Release::default()), name.to_owned()),
+    }
+}
+
+/// The value of a release name: its numeric components and its pre-release
+/// identifiers, in the shape semver orders them.
+#[derive(Default, PartialEq, Eq, Debug)]
+struct Release {
+    numbers: Vec<u64>,
+    /// Empty for a final release.
+    pre: Vec<Identifier>,
+}
+
+impl Ord for Release {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.numbers.cmp(&other.numbers).then_with(|| {
+            // Deriving this would get it backwards: an empty `Vec` compares less
+            // than a non-empty one, which would make `0.1.6` older than
+            // `0.1.6-alpha.2`. The release with no pre-release is the newer one.
+            match (self.pre.is_empty(), other.pre.is_empty()) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                (false, false) => self.pre.cmp(&other.pre),
+            }
+        })
+    }
+}
+
+impl PartialOrd for Release {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Identifier {
+    /// A numeric identifier outranks a textual one, per semver.
+    Numeric(u64),
+    Text(String),
+}
+
+/// Read `dsh-v0.1.6-alpha.2`, `v0.1.6`, `0.1.6` — the shapes DSH tags use.
+fn parse_release(name: &str) -> Option<Release> {
+    let rest = name.trim_start_matches(|byte: char| !byte.is_ascii_digit());
+    if rest.is_empty() {
+        return None;
+    }
+    let (numbers, pre) = match rest.split_once('-') {
+        Some((numbers, pre)) => (numbers, pre),
+        None => (rest, ""),
+    };
+    let numbers: Option<Vec<u64>> = numbers
+        .split('.')
+        .map(|part| part.parse::<u64>().ok())
+        .collect();
+    let mut numbers = numbers?;
+    if numbers.is_empty() {
+        return None;
+    }
+    // `0.1` and `0.1.0` are the same release; padding makes them compare equal
+    // rather than one running out of components first.
+    while numbers.len() < 3 {
+        numbers.push(0);
+    }
+    let pre = pre
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<u64>()
+                .map_or_else(|_| Identifier::Text(part.to_owned()), Identifier::Numeric)
+        })
+        .collect();
+    Some(Release { numbers, pre })
+}
+
 /// A `pull template <ref>` request broken into its constituent pieces. The
 /// `version` is what gets used as the install directory name and the local
 /// template file name (`<root>/templates/<version>.dsh`).
@@ -662,6 +762,58 @@ mod tests {
         )
         .unwrap();
         dir
+    }
+
+    fn catalog(names: &[&str]) -> Vec<String> {
+        let mut versions: Vec<DshVersion> = names
+            .iter()
+            .map(|name| DshVersion { name: (*name).to_owned(), installed: false })
+            .collect();
+        sort_catalog(&mut versions);
+        versions.into_iter().map(|version| version.name).collect()
+    }
+
+    #[test]
+    fn the_catalog_reads_newest_first_with_latest_on_top() {
+        // The Harness tab listed `dsh-v0.1.0-rc.7` first and `latest` last, because
+        // the entries were collected into a `BTreeMap` and handed out in the byte
+        // order of their names — the oldest release at the top, the moving
+        // reference the others are cut from at the bottom.
+        assert_eq!(
+            catalog(&["dsh-v0.1.0-rc.7", "latest", "dsh-v0.1.6-alpha.2", "dsh-v0.1.5-rc.2"]),
+            vec!["latest", "dsh-v0.1.6-alpha.2", "dsh-v0.1.5-rc.2", "dsh-v0.1.0-rc.7"]
+        );
+    }
+
+    #[test]
+    fn a_two_digit_number_is_not_read_as_a_string() {
+        // Byte order compares the `1` of `10` against the `2` of `2` and stops, so
+        // 0.1.10 was going to sort above 0.1.2 the first time DSH shipped one.
+        assert_eq!(
+            catalog(&["dsh-v0.1.2-rc.1", "dsh-v0.1.10-alpha.1", "dsh-v0.1.9"]),
+            vec!["dsh-v0.1.10-alpha.1", "dsh-v0.1.9", "dsh-v0.1.2-rc.1"]
+        );
+    }
+
+    #[test]
+    fn a_release_outranks_its_own_pre_releases() {
+        // `0.1.6` is the release `0.1.6-alpha.2` was cut from. Deriving the order
+        // would have said the opposite: an empty identifier list compares less than
+        // a non-empty one.
+        assert_eq!(
+            catalog(&["dsh-v0.1.6-alpha.2", "dsh-v0.1.6", "dsh-v0.1.6-rc.1"]),
+            vec!["dsh-v0.1.6", "dsh-v0.1.6-rc.1", "dsh-v0.1.6-alpha.2"]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_name_is_still_listed() {
+        // A tag that is neither `latest` nor a version keeps a place, at the end
+        // and in name order, rather than being dropped from the list.
+        assert_eq!(
+            catalog(&["zzz-custom", "dsh-v0.1.0", "aaa-custom", "latest"]),
+            vec!["latest", "dsh-v0.1.0", "aaa-custom", "zzz-custom"]
+        );
     }
 
     #[test]

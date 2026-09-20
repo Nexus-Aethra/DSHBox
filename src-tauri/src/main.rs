@@ -32,6 +32,22 @@ fn main() {
             );
         }
     }
+    // WebKitGTK resolves proxies through GIO. With a system proxy configured,
+    // GIO's GNOME resolver hands the DSH host's loopback URL to that proxy
+    // (its `ignore-hosts` entry `127.*` is not matched by the resolver, only a
+    // literal `localhost` is), so the DSH window navigates into the proxy,
+    // gets nothing back and stays blank while the main window is unaffected —
+    // same failure the Windows branch above fixes with --no-proxy-server.
+    // Every webview here loads embedded assets or the loopback DSH host, so
+    // GIO's proxy resolution is switched off for good. Toolchain children
+    // (pnpm, git) do not go through GIO and keep their HTTP_PROXY environment.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("GIO_USE_PROXY_RESOLVER").is_none() {
+        // SAFETY: runs before any thread or webview exists.
+        unsafe {
+            std::env::set_var("GIO_USE_PROXY_RESOLVER", "dummy");
+        }
+    }
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         desktop::write_startup_log(&format!("panic: {info}"));

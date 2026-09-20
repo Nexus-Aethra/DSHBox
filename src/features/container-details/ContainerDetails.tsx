@@ -10,8 +10,12 @@ import { Select } from '../../ui/Select'
 import { Tabs } from '../../ui/Tabs'
 import { Toolbar } from '../../ui/Toolbar'
 import { Stack } from '../../ui/Stack'
+import type { PluginGraphText } from '../plugin-graph/PluginGraphPanel'
+import { PluginGraphPanel } from '../plugin-graph/PluginGraphPanel'
 
-export type ContainerDetailsText = {
+// Includes the shared `pluginGraph*` keys so the global text can be handed to the
+// dependency-graph panel unchanged.
+export type ContainerDetailsText = PluginGraphText & {
   back: string; activeProfile: string; profiles: string; addProfile: string; profilePlaceholder: string
   plugins: string; pluginRepo: string; skills: string; logs: string
   hostLog: string; rebuildLog: string; webviewLog: string; logRefresh: string
@@ -40,6 +44,7 @@ export function ContainerDetails({ container, details, repository, bundles, work
   const [bundleId, setBundleId] = useState('')
   const [conflict, setConflict] = useState('keep')
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
+  const [graphOpen, setGraphOpen] = useState(false)
   useEffect(() => { setProfile(container.profile) }, [container.id, container.profile])
   const selected = details?.profiles.find((item) => item.name === profile) ?? details?.profiles[0]
   const repositoryPlugins = repository.filter((entry) => entry.kind === 'plugin' && !entry.diagnostic)
@@ -97,9 +102,12 @@ export function ContainerDetails({ container, details, repository, bundles, work
               <div className="extensions-heading-row">
                 <h2 className="extensions-heading-title">{text[tab]}</h2>
                 {tab === 'plugins' && (
-                  <Field label={text.profiles}>
-                    {(id) => <Select id={id} value={selected?.name ?? ''} disabled={saving || !selected} onChange={(event) => { void selectProfile(event.target.value, false) }} options={(details?.profiles ?? []).map((item) => ({ value: item.name, label: item.name }))} />}
-                  </Field>
+                  <div className="extensions-heading-actions">
+                    <Button variant="secondary" size="sm" onClick={() => { setGraphOpen(true) }}>{text.pluginGraphOpen}</Button>
+                    <Field label={text.profiles}>
+                      {(id) => <Select id={id} value={selected?.name ?? ''} disabled={saving || !selected} onChange={(event) => { void selectProfile(event.target.value, false) }} options={(details?.profiles ?? []).map((item) => ({ value: item.name, label: item.name }))} />}
+                    </Field>
+                  </div>
                 )}
               </div>
               <Toolbar>
@@ -202,6 +210,10 @@ export function ContainerDetails({ container, details, repository, bundles, work
           <Button variant="danger" size="sm" onClick={() => { void confirmDelete() }}>{text.dialogConfirm}</Button>
         </div>
       </Dialog>
+
+      {graphOpen && (
+        <PluginGraphPanel kind="container" id={container.id} text={text} onClose={() => { setGraphOpen(false) }} />
+      )}
 
       {details?.diagnostics.length ? <section className="extension-diagnostics"><strong>{text.diagnostics}</strong>{details.diagnostics.map((item) => <p key={item}>{item}</p>)}</section> : null}
     </section>

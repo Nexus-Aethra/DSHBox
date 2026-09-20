@@ -35,6 +35,7 @@ pnpm install
 pnpm runtime:prepare      # fetch bundled Node/pnpm runtime manifest
 pnpm server:prepare       # build the dshboxd sidecar
 pnpm tauri dev            # dev shell (frontend + Tauri)
+pnpm dev                  # frontend only, in a browser — see "Browser debugging" below
 pnpm build                # frontend typecheck + vite build (tsc --noEmit && vite build)
 pnpm tauri build          # desktop binary (needs `custom-protocol` feature in release)
 
@@ -107,6 +108,22 @@ they don't run them inline.
   Importing copies into a Container; later repo edits do not mutate installed
   copies.
 
+## Browser debugging
+
+`pnpm dev` serves the Box UI in a plain browser against the **running daemon**, so
+the UI can be inspected with browser devtools instead of a webview. `scripts/dev-rpc-bridge.mjs`
+adds a dev-only `/__rpc` route (`apply: 'serve'`, never in a production build) that
+forwards `box-api.ts` calls to `dshboxd` over its loopback RPC. Start the daemon
+first (`dshboxd`, or any CLI command that spawns it) and set `DSHBOX_CONFIG_DIR` if
+the runtime directory is not the default.
+
+The bridge covers the read-only surface — config, templates, containers, tasks,
+toolchains, and `plugin_dependency_graph`. Commands that the desktop layer
+orchestrates rather than the daemon (anything that enqueues a scheduler task, drives
+the process lifecycle, or opens a native dialog) answer with an explicit "not
+available in browser dev mode" error instead of a stub, so a missing capability is
+obvious. `listenTask` degrades to a no-op and task progress comes from the 3s poll.
+
 ## Known gotchas
 
 - **No system Node/pnpm/Git required (Windows); Linux uses host git with isolated
@@ -129,6 +146,13 @@ they don't run them inline.
   host process — `dsh_host_policy` (`box-runtime/src/process/env.rs`) strips
   all 8 proxy aliases. A host that inherits a proxy self-terminates with an
   "opening the default browser" error.
+  (c) the DSH front webview: WebKitGTK resolves proxies through GIO, and a
+  system proxy hands the host's `127.0.0.1:<port>` URL to the proxy (GNOME's
+  resolver matches a literal `localhost` in `ignore-hosts`, but not `127.*` or
+  `127.0.0.1`), leaving the window blank. `main.rs` pins
+  `GIO_USE_PROXY_RESOLVER=dummy` on Linux for that reason; env vars such as
+  `no_proxy` do **not** affect this path. Windows uses `--no-proxy-server` in
+  `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` for the same failure.
 - **Plugin lifecycle scripts are user-approved code execution.** Do not relax
   pnpm supply-chain checks (lifecycle-script approval, minimum-release-age).
   The `dshbox.allow-build` LABEL in a boxfile authorizes the **top-level
@@ -139,8 +163,21 @@ they don't run them inline.
   YAML merge producing a single bare-scalar `allowBuilds:` section).
 - **Runtime archive integrity.** Verify SHA-256 (Node) and SHA-512 (pnpm)
   before use; a failed verification aborts startup, no silent fallback.
+- **DSH ≥ `dsh-v0.1.5-alpha.1` cannot be built from source on Linux/macOS with
+  the bundled runtime.** `pnpm run build` now runs `build:native-system` first
+  (`harness/scripts/build.ts`), which compiles the `flock` Node-API addon and
+  requires `<node>/include/node/node_api.h`. `is_redundant_node_file` in
+  `tools/runtime-packager` strips `include/` as "never used", so the container
+  prepare aborts with `Node-API headers missing at …`. Windows is unaffected
+  (`native/system/scripts/build.ts` exits 0 for `--host-addon-only` there).
+  Verified 2026-09-17 against `0.1.6-alpha.1` (commit `0d1f500`): restoring the
+  headers by hand makes the same container build and start, so this is the only
+  blocker — but it also needs a host C compiler, which the runtime bundle
+  otherwise never requires.
 - **Prepared/sealed templates.** Pulling a root Harness template prepares a
-  complete source tree (`pnpm install` + `pnpm run build`). `dshbox build`
+  complete source tree (`pnpm install` only — `validate_prepared_harness`
+  checks that tree; the frontend build happens later, when a container is
+  prepared from it at `dshboxd/src/sealed.rs` "Building DSH frontend"). `dshbox build`
   copies that base and publishes a sealed physical template with locally packed
   plugin artifacts installed. Container creation copies that sealed tree;
   Container startup must never install or build DSH. `dshbox image` remains a
@@ -164,7 +201,12 @@ they don't run them inline.
   break if this regresses. Tracked children spawn with `setsid` pre_exec so
   kill_tree can't take down unrelated process groups.
 - **`src-tauri/dist/` is generated** by Vite before the Tauri build and
-  bundled into the desktop binary — never edit files under it.
+  bundled into the desktop binary — never edit files under it. It must stay the
+  only frontend output: `vite.config.ts`'s `outDir` and `build.frontendDist`
+  (which Tauri resolves against `src-tauri/`) have to agree, and no build step
+  may copy a second `dist/` over it. `build.rs` used to mirror the repo-root
+  `dist/` in, which silently shipped a months-old frontend — a stale bundle
+  looks exactly like "the feature was never implemented".
 
 ## Docs to read before touching sensitive areas
 

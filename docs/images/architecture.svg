@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 430" width="960" height="430" role="img" aria-label="DSH Box architecture: the React UI talks to the Tauri shell over IPC, the shell and the CLI both drive the dshboxd daemon over loopback RPC, and the daemon supervises one DSH host process per container using the bundled runtime.">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="430" rx="14" fill="#ffffff"/>
+  <g font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif">
+
+    <!-- UI -->
+    <rect x="40" y="36" width="420" height="70" rx="10" fill="#eef2ff" stroke="#c7d2fe"/>
+    <text x="60" y="62" font-size="14" font-weight="600" fill="#111827">Box UI — React 18 + Vite</text>
+    <text x="60" y="82" font-size="12" fill="#4b5563">src/ · pages, hooks, i18n — no business logic</text>
+
+    <!-- desktop shell -->
+    <rect x="40" y="122" width="420" height="70" rx="10" fill="#eef2ff" stroke="#c7d2fe"/>
+    <text x="60" y="148" font-size="14" font-weight="600" fill="#111827">Desktop shell — Tauri 2</text>
+    <text x="60" y="168" font-size="12" fill="#4b5563">src-tauri/src/desktop · window, tray, IPC adapters</text>
+
+    <!-- daemon -->
+    <rect x="40" y="208" width="420" height="86" rx="10" fill="#ecfdf5" stroke="#a7f3d0"/>
+    <text x="60" y="234" font-size="14" font-weight="600" fill="#111827">dshboxd — background daemon</text>
+    <text x="60" y="254" font-size="12" fill="#4b5563">POST /rpc · GET /events (SSE)</text>
+    <text x="60" y="272" font-size="12" fill="#4b5563">task queue · document store · template + container registry</text>
+    <text x="60" y="288" font-size="12" fill="#6b7280">one source of truth for every client</text>
+
+    <!-- crates -->
+    <rect x="40" y="310" width="420" height="86" rx="10" fill="#f7f8fa" stroke="#e5e7eb"/>
+    <text x="60" y="336" font-size="14" font-weight="600" fill="#111827">Crate workspace — framework-free</text>
+    <text x="60" y="356" font-size="12" fill="#4b5563">box-plugin-graph · box-image · box-runtime · box-state</text>
+    <text x="60" y="374" font-size="12" fill="#4b5563">box-toolchains · box-dsh-versions · box-store · box-extensions …</text>
+    <text x="60" y="390" font-size="12" fill="#6b7280">pure functions + unit tests; no Tauri, no HTTP</text>
+
+    <!-- CLI -->
+    <rect x="700" y="36" width="220" height="70" rx="10" fill="#ffffff" stroke="#e5e7eb"/>
+    <text x="720" y="62" font-size="14" font-weight="600" fill="#111827">dshbox CLI</text>
+    <text x="720" y="82" font-size="12" fill="#4b5563">the same RPC surface</text>
+
+    <!-- DSH host -->
+    <rect x="700" y="208" width="220" height="86" rx="10" fill="#f5f3ff" stroke="#ddd6fe"/>
+    <text x="720" y="234" font-size="14" font-weight="600" fill="#111827">DSH host</text>
+    <text x="720" y="254" font-size="12" fill="#4b5563">one per container</text>
+    <text x="720" y="272" font-size="12" fill="#4b5563">own loopback port</text>
+    <text x="720" y="288" font-size="12" fill="#6b7280">opened in the webview</text>
+
+    <!-- runtime -->
+    <rect x="700" y="310" width="220" height="86" rx="10" fill="#ffffff" stroke="#e5e7eb"/>
+    <text x="720" y="336" font-size="14" font-weight="600" fill="#111827">Bundled runtime</text>
+    <text x="720" y="356" font-size="12" fill="#4b5563">Node · pnpm · Git (Windows)</text>
+    <text x="720" y="374" font-size="12" fill="#4b5563">pinned in runtime-lock.json</text>
+    <text x="720" y="390" font-size="12" fill="#6b7280">SHA-256 verified at build time</text>
+
+    <!-- arrows -->
+    <g fill="none" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#a)">
+      <path d="M 250 106 L 250 122"/>
+      <path d="M 250 192 L 250 208"/>
+      <path d="M 320 294 L 320 310"/>
+      <path d="M 700 71 C 620 71, 560 150, 468 220"/>
+      <path d="M 460 286 C 560 300, 620 320, 692 342"/>
+    </g>
+    <g fill="none" stroke="#94a3b8" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#a)">
+      <path d="M 700 251 L 468 251"/>
+    </g>
+
+    <g font-size="11" fill="#6b7280">
+      <text x="262" y="118">Tauri IPC</text>
+      <text x="262" y="204">HTTP RPC + SSE · 127.0.0.1</text>
+      <text x="332" y="306">calls into</text>
+      <text x="596" y="146" text-anchor="middle">drives</text>
+      <text x="566" y="240" text-anchor="middle">supervises</text>
+      <text x="588" y="330" text-anchor="middle">spawns with</text>
+    </g>
+  </g>
+</svg>

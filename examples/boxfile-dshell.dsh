@@ -1,0 +1,81 @@
+# DSH Box boxfile — the dshell bundle on DSH 0.1.6-alpha.2
+#
+#   dshbox pull template github.com/deepseek-ai/deepseek-harness:dsh-v0.1.6-alpha.2
+#   dshbox build ./examples/boxfile-dshell.dsh --name dshell
+#   dshbox run dshell
+#
+# The DSH version is not free. `@nexus-aethra/dshell-bundle` pins its
+# `@deepseek-ai/dsh-*` peers as an exact union, and each release names the lines
+# it was built for:
+#
+#   dshell-bundle 0.1.0 / 0.1.1   ->  0.1.5-rc.2
+#   dshell-bundle 0.1.2 / 0.1.3   ->  0.1.5-rc.2 || 0.1.6-alpha.1
+#   dshell-bundle 0.1.5           ->  0.1.5-rc.2 || 0.1.6-alpha.2
+#
+# Each channel's own range excludes the other — `^0.1.5-rc.2` does not satisfy
+# `0.1.6-alpha.2`, because semver refuses a prerelease whose `major.minor.patch`
+# differs — so a template on a line the bundle does not name installs it against a
+# framework it was never built for. 0.1.6-alpha.2 is the newest line 0.1.5
+# accepts, and is what the FROM line below asks for. alpha.1 is deliberately not
+# an option here: it is outside that union.
+#
+# (0.1.4 is on the registry only as a deprecated stub. It was published with
+# `npm publish`, which does not rewrite the `workspace:` protocol, so every
+# install of it failed with EUNSUPPORTEDPROTOCOL. Install 0.1.5.)
+#
+# The lines below the bundle are not optional. A plugin installed from npm into
+# the profile resolves its imports through THE PROFILE, where dsh's optional
+# providers are absent — dsh's own packages come from the harness checkout, not
+# from the profile. Two dshell plugins import one of those providers directly:
+#
+#   @nexus-aethra/dshell-ssh         -> @deepseek-ai/dsh-ssh
+#   @nexus-aethra/dshell-host-tools  -> @deepseek-ai/dsh-browser-use
+#
+# So the bundle alone leaves three rows unable to import, which takes the whole
+# client down: dshell-workspace provides `uiWorkspace`, and everything that wants
+# a Session on screen waits on it. The remaining five are rows the bundle's patch
+# names that the base seed omits. All are pinned to the FROM line's version so the
+# tree stays one DSH build.
+#
+# Two things to know before building:
+#
+# 1. On Linux with the bundled runtime, every DSH at or above 0.1.5-alpha.1
+#    refuses to prepare. `pnpm run build` now starts with `build:native-system`,
+#    which compiles the `flock` Node-API addon and needs
+#    `<node>/include/node/node_api.h`, and `tools/runtime-packager` strips
+#    `include/` from the bundled Node as never used. Prepare then aborts with
+#    `Node-API headers missing at …`. Windows is unaffected; restoring the
+#    headers into the bundled runtime by hand is the workaround, and it also
+#    needs a host C compiler. See the note in AGENTS.md.
+#
+# 2. `npm:` specs resolve through the npm registry configured in Settings, and
+#    mirrors lag on fresh publishes — npmmirror.com still carried only 0.1.2
+#    after 0.1.3 was on registry.npmjs.org. If the install reports that a version
+#    does not exist, point the npm registry at the canonical one until the mirror
+#    catches up.
+FROM github.com/deepseek-ai/deepseek-harness:dsh-v0.1.6-alpha.2
+PROFILE web
+NAME dshell
+VERSION 1.0.0
+
+# The bundle reaches `node-pty`, whose install script compiles a native binding,
+# and pnpm blocks lifecycle scripts until they are named. This is the line the
+# build prints when it refuses: the source itself, then the transitive key pnpm
+# reported. Both are needed — node-pty does not work without its build.
+LABEL dshbox.allow-build=@nexus-aethra/dshell-bundle@0.1.5,node-pty@1.2.0-beta.15
+
+# ── dshell itself ────────────────────────────────────────────────────────
+# Pinned: the package pins its peers, so an unpinned ADD could resolve to a
+# release whose peer range excludes this template.
+ADD plugin npm:@nexus-aethra/dshell-bundle@0.1.5
+
+# ── the optional dsh providers dshell's rows import ──────────────────────
+ADD plugin npm:@deepseek-ai/dsh-ssh@0.1.6-alpha.2
+ADD plugin npm:@deepseek-ai/dsh-browser-use@0.1.6-alpha.2
+
+# ── the rows dshell's bundle patch names that the base seed omits ────────
+ADD plugin npm:@deepseek-ai/dsh-tool-terminal@0.1.6-alpha.2
+ADD plugin npm:@deepseek-ai/dsh-client-store@0.1.6-alpha.2
+ADD plugin npm:@deepseek-ai/dsh-client-ui-slots@0.1.6-alpha.2
+ADD plugin npm:@deepseek-ai/dsh-client-ui-primitives@0.1.6-alpha.2
+ADD plugin npm:@deepseek-ai/dsh-client-ui-dockkit@0.1.6-alpha.2

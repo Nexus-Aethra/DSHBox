@@ -271,6 +271,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "box-plugin-graph"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
 name = "box-runtime"
 version = "0.1.0"
 dependencies = [
@@ -930,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "dshbox"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "box-api",
  "box-client",
@@ -942,6 +951,7 @@ dependencies = [
  "box-foundation",
  "box-image",
  "box-logger",
+ "box-plugin-graph",
  "box-runtime",
  "box-scheduler",
  "box-server-core",
@@ -979,6 +989,7 @@ dependencies = [
  "box-foundation",
  "box-image",
  "box-logger",
+ "box-plugin-graph",
  "box-runtime",
  "box-scheduler",
  "box-server-core",

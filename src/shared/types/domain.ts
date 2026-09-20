@@ -20,6 +20,69 @@ export type RepositoryReferenceRow = { id: string; name: string; kind: Extension
 export type BundleEntry = { repositoryId: string; kind: ExtensionKind; name: string; version: string | null; source: string | null; size: number; diagnostic: string | null }
 export type ExtensionBundle = { id: string; name: string; entries: BundleEntry[]; createdAt: number }
 export type WorkspaceExtension = { kind: ExtensionKind; name: string; version: string | null; description: string | null; relativePath: string; contentDigest: string; diagnostic: string | null }
+
+// ---- plugin dependency graph (cordis requires/provides) ----
+// Mirrors `box_plugin_graph::PluginGraph`. The graph is bipartite on the wire —
+// plugins to services — because that is what cordis actually resolves; the
+// plugin-to-plugin `links` are derived from it by the daemon.
+export type GraphSourceKind = 'template' | 'container'
+// Which cordis application a plugin is mounted in. A package can ship both: the
+// `dsh.client` manifest field declares a browser entry, and DSH calls the two the
+// package's host half and its client half. They are separate plugins in separate
+// isolation scopes, so each is a node of its own.
+export type GraphHalf = 'host' | 'client'
+export type GraphPlugin = {
+  // Node key. The package name for a single-half package; the client half of a
+  // dual-face package carries a suffix so both nodes stay distinct.
+  id: string
+  name: string
+  half: GraphHalf
+  version: string | null
+  // Only an activated plugin is loaded at runtime, so a service provided solely
+  // from outside this set can never be satisfied.
+  activated: boolean
+  source: string
+  provides: string[]
+  requires: string[]
+  // Plugin names this package's patch file inserts — what an umbrella bundle
+  // actually mounts. Empty for everything that is not a bundle.
+  inserts: string[]
+}
+export type ServiceEdge = { plugin: string; service: string }
+// `crossContext` links join a host node to a client one. cordis resolves a service
+// name inside an isolation scope, so such a link is a real requirement but not a
+// load-order dependency — the other application's own mount satisfies it, and for
+// a framework builtin that mount is not in this graph at all.
+export type PluginLink = { from: string; to: string; service: string; crossContext: boolean }
+// A service name more than one activated plugin registers. Not a conflict: cordis
+// resolves a name per isolation scope, so a host implementation and a browser one
+// are the design. It is reported because this graph merges the contexts, which
+// draws the name as a fan-out wider than the running tree has.
+export type SharedService = { service: string; providers: string[] }
+export type PluginGraph = {
+  source: GraphSourceKind
+  sourceId: string
+  profile: string
+  plugins: GraphPlugin[]
+  services: string[]
+  requires: ServiceEdge[]
+  provides: ServiceEdge[]
+  links: PluginLink[]
+  // Dependencies before dependents. A cycle's members are emitted as one block at
+  // the position their dependencies put them; `cycles` names the group, and the
+  // order inside it carries no meaning.
+  order: string[]
+  cycles: string[][]
+  missing: ServiceEdge[]
+  inactiveProviders: ServiceEdge[]
+  sharedServices: SharedService[]
+  // Plugins a template's boxfile added. Their sources are not in the template
+  // tree — they are installed when a container is created — so they are listed and
+  // drawn as nodes rather than being absent from the preview.
+  recipePlugins: string[]
+  diagnostics: string[]
+  scannedAt: number
+}
 export type TaskStatus = 'queued' | 'running' | 'waiting_input' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
 export type TaskRecord = { id: string; kind: string; resourceKeys: string[]; status: TaskStatus; stage: string; progress: number; createdAt: number; startedAt: number | null; finishedAt: number | null; logPath: string; error: string | null; params: Record<string, unknown>; cancelRequested: boolean }
 export type BoxConfig = { runtimeDirectory: string | null; selectedDshVersion: string | null; language: Language; toolchainSources: Record<string, string>; githubMirror: string | null; npmRegistry: string | null }

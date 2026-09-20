@@ -11,6 +11,7 @@ DSH Box is a lightweight desktop shell built with [Tauri 2](https://tauri.app) t
 
 - **Isolated DSH Containers** — install multiple DSH versions side by side and create independent Containers per project. Every Container gets its own profile (`web` / `headless` / custom), workspace, plugin set, and host process, so experiments never cross-contaminate.
 - **Embedded WebView, no browser needed** — the DSH frontend opens in a native WebView window managed by DSH Box. No port-forwarding, no copy-pasting URLs, no tab clutter.
+- **Plugin dependency graph** — see what a template, a container, or a running host actually loads. Every plugin is a node, host and browser halves are drawn apart, and the nodes are grouped into depth bands with the `inject`/`provide` links that put them there, plus shared services, load order, and the parse notes that explain what could not be resolved. Search it, click a node to focus it, and read why a plugin is present in the detail panel. See [Architecture → Plugin dependency graph](#plugin-dependency-graph).
 - **Zero-dependency install** — a private Node, npm, pnpm, and Git (Windows) runtime is bundled with every release. No system Node, no manual toolchain setup, no PATH hacking. Git-backed Boxfile sources (`github.com/owner/repo:tag`) resolve through the managed binary in DSH Box's clean-room environment — host `~/.gitconfig` never leaks into builds. On Linux, DSH Box uses your system Git (`apt install git`) while still isolating its configuration under the runtime directory.
 - **Version manager built in** — browse DSH releases from `deepseek-ai/deepseek-harness`, install or uninstall any tag with one click, and pin a version per Container.
 - **Boxfile / sealed-template pipeline** — describe a Container with a small declarative `.dsh` script (`FROM` + `PROFILE` + `ADD plugin|skill|data`); `dshbox build` produces a reusable source recipe and `dshbox run <template>` prepares it once in the final Container directory. See [Architecture → Boxfile](#boxfile-and-the-built-template-pipeline).
@@ -41,7 +42,7 @@ Download the installer for your platform from the **Releases** page of this repo
 | Linux (x64) | `dshbox-<version>-amd64.deb` | Debian/Ubuntu package |
 | macOS (arm64) | `dshbox-<version>-arm64.dmg` | Apple Silicon |
 
-> Grab the latest version from the [Releases page](https://github.com/Nexus-Aethra/DSHBox/releases) — artifact names follow the `<product>-<version>-<arch>` convention and may differ per release. Other formats (`.msi`, `.rpm`, `.AppImage`) are produced per release where supported.
+> Grab the latest version from the [Releases page](https://github.com/Nexus-Aethra/DSHBox/releases) — artifact names follow the `<product>-<version>-<arch>` convention. Every tagged release carries all three platforms, built by the [release workflow](.github/workflows/release.yml).
 
 No runtime prerequisites on Windows — the bundled Node/npm/pnpm/Git runtime travels inside the installer. Linux needs a system Git (`apt install git` or your distro equivalent); its configuration is isolated per-runtime-directory, so your host `~/.gitconfig` is never read by DSH Box builds.
 
@@ -65,6 +66,8 @@ The app minimizes to the system tray on close. Use the tray menu to open the win
 ## Architecture
 
 DSH Box separates a Tauri **desktop shell**, a framework-free Rust workspace, a background **daemon** (`dshboxd`), and a small React frontend. The split exists so all business logic — plugin fetching, container lifecycle, template resolution, background tasks — is testable without a UI, and so a CLI or external agent can drive the same flows the UI does.
+
+![DSH Box architecture: the React UI talks to the Tauri shell over IPC, the shell and the CLI both drive the dshboxd daemon over loopback RPC, and the daemon supervises one DSH host per container from the bundled runtime](docs/images/architecture.svg)
 
 ### Layered components
 
@@ -135,9 +138,28 @@ How each `ADD` is stored matters:
 
 The full storage, transaction, and migration contract is in [`docs/specs/prepared-template-runtime.md`](docs/specs/prepared-template-runtime.md). This is a schema break: legacy shared `runtimes/<version>/source` layouts are not used by new builds.
 
-### Data scheduler and reference counts
+### Plugin dependency graph
 
-Containers, templates, plugins, and skill packs all share a single `resource-map.json` indexed by id. Deletion is `soft-delete → fast queue → permanent delete`; references between Container ↔ template ↔ plugin are kept in lockstep so an entity still in use is never garbage-collected. Full design in [`docs/specs/data-scheduler.md`](docs/specs/data-scheduler.md).
+`plugin_dependency_graph` answers "what loads, in what order, and why" for a sealed template, a container directory, or a running host. The daemon walks the package tree, scans each package's sources, and returns nodes, links, layer depths, load order, shared services, and diagnostics. The **Dependency graph** button on a template (Resources → Templates) and on a container's detail view renders it.
+
+![The plugin dependency view: nodes grouped into depth bands, host and browser halves drawn apart, a bundle's inserts and a cross-context injection dashed](docs/images/plugin-graph.svg)
+
+What it computes:
+
+- **A node per mounted plugin, not per package.** A package that ships both a host and a browser half (`dsh.client` + `exports["./client"]`) becomes two nodes, so `inject`/`provide` resolve inside one context. A name provided once per context is a shared service, not a conflict — which also means a cycle is either inside one context or it is real.
+- **Only registered declarations count.** An `inject` is read where a plugin registers it: an `Object.assign(target, { inject })` carrier, or a factory's returned `{ inject, apply }`. A plain object property is not a plugin declaration; treating one as such invented 26 requirements on a real profile.
+- **Depth bands and load order.** A node's depth is one more than the deepest dependency it injects (0 = has nothing to wait for), and within a band nodes are ordered by how many plugins depend on them, so the page reads top to bottom in load order. A cycle does not hide that order: the nodes still inside it are marked pending.
+- **Bundles are followed.** A bundle's `cordis.patch.yml` `insert` rows are read, so the plugins a bundle mounts appear as the nodes they are — including the ones a Boxfile `ADD`s, which is what makes a template preview show its own plugins before any container exists.
+- **Diagnostics name their file.** Anything the scanner cannot resolve is reported with the package and the file it came from, in a collapsible panel, instead of being dropped without a trace.
+- **Published packages are read where their code is.** The client entry from the manifest's `dsh.client`/`exports` subpath, `lib/` when there is no `src/`, and never a build output directory.
+
+The scan is text-based on purpose — a small scanner over comment-blanked sources, not a TypeScript AST: the graph has to describe a container's `node_modules` without loading DSH, and a wrong node must be cheap to spot and correct.
+
+### Persistence and reference counts
+
+Long-lived indexes are stored as documents instead of scattered files: the task queue goes through `box_foundation::collection::DocumentStore` — SQLite, via the `box-store` crate, at `<runtime>/state/dshbox.db` — so the daemon and the desktop app share one queue without either owning a file. Legacy task JSON is imported on first open and archived as `*.pre-sqlite`, and schema changes are forward-only migrations gated by `PRAGMA user_version`. Content-addressed directories (`templates/<hash>/`, `data/<digest>/`, `runtimes/`) stay on disk, and `config.json` stays machine-local in `~/.dsh-box/` — it never enters the store.
+
+Containers, templates, plugins and skills are referenced by id, and deletion is `soft-delete → fast queue → permanent delete`, so an entity still in use is never garbage-collected. Full design in [`docs/specs/data-scheduler.md`](docs/specs/data-scheduler.md).
 
 ### Logging
 
@@ -153,7 +175,7 @@ Containers, templates, plugins, and skill packs all share a single `resource-map
 | UI | React 18, TypeScript, Vite |
 | Background service | `dshboxd` sidecar (single HTTP entry: `POST /rpc` + `GET /events`) |
 | Bundled runtime | Node / npm / pnpm / Git-Windows-only (per-platform archive, SHA-256-pinned in `runtime-lock.json`) |
-| Targets | Windows x64/arm64, Linux x64/arm64, macOS x64/arm64 |
+| Targets | Windows x64 (MSI), Linux x64 (deb, rpm), macOS arm64 (dmg) — all built by the release workflow |
 
 ---
 
@@ -186,13 +208,28 @@ cd src-tauri && cargo test --workspace
 
 ---
 
+## Releasing
+
+The version lives in three files and they must agree — `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`. Bump all three, record what changed in [`CHANGELOG.md`](CHANGELOG.md), then tag:
+
+```bash
+git tag v0.1.8 && git push origin v0.1.8
+```
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) takes it from there: it builds the Linux `.deb` + `.rpm`, the Windows MSI, and the macOS arm64 `.dmg` through the same `bundle:*` scripts a developer runs locally, and attaches all of them to the GitHub Release for that tag. The tag is compared against the three version fields first, so a mismatched tag fails instead of publishing mislabelled installers; if a release for the tag already exists, the artifacts are re-uploaded over it. Running the workflow manually (`workflow_dispatch`) builds everything without publishing, which is the way to test a pipeline change.
+
+Installers are **unsigned**: macOS needs the usual Gatekeeper bypass on first launch and Windows shows a SmartScreen prompt. Signing and notarization identities can be added to the workflow when certificates are available.
+
+---
+
 ## Repository layout
 
 ```
 src/                       React/TypeScript management UI
 src-tauri/                 Rust workspace + Tauri shell
   crates/                  focused, framework-free crates
-    box-foundation         config, paths, JSON persistence
+    box-foundation         config, paths, document collections
+    box-store              SQLite document store + legacy import
     box-runtime            absolute-path process exec
     box-scheduler          persisted task queue + locks
     box-state              ResourceStateManager (read model)
@@ -201,14 +238,19 @@ src-tauri/                 Rust workspace + Tauri shell
     box-containers         Container metadata + active Host registry
     box-extensions         repository plugin/skill scan + transfer
     box-image              .dsh parser, manifest v6, gzip tar I/O
+    box-plugin-graph       plugin dependency scan + graph assembly
     box-template-core      root/common template install/uninstall core
     box-data-scheduler     soft-delete + dual-queue async hard-delete
     box-logger             tracing init + daily-rolled log files
     box-dsh-context        dsh-box-context plugin (paths.dshboxHome/dshboxCli)
+    box-server-core        dshboxd helpers + service install
+    box-api, box-client    RPC surface + client adapter
   src/desktop/app/         domain modules (containers, extensions, tasks, …)
+  tools/runtime-packager   bundled Node/pnpm/Git runtime packager
 examples/                  boxfile.dsh + plugin-chains example
-docs/                      HANDOFF.md, architecture.md, template-system.md,
-                           specs/, design/, notes/
+docs/                      HANDOFF.md, template-system.md, specs/, design/,
+                           notes/, images/
+.github/workflows/         release.yml — a v* tag builds the three installers
 ```
 
 The canonical reference for the boxfile grammar is **`docs/template-system.md`**; image/built-template design lives in **`docs/specs/image-build.md`**; the full RPC + event-stream surface in **`docs/design/rpc-and-events.md`**.

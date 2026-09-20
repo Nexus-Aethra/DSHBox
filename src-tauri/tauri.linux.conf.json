@@ -1,7 +1,7 @@
 {
   "bundle": {
     "resources": {
-      "../dist/": "dist/",
+      "dist/": "dist/",
       "resources/runtime/linux-x64/": "runtime/linux-x64/",
       "resources/server/linux-x64/": "server/linux-x64/",
       "resources/plugins/linux-x64/": "plugins/linux-x64/"
@@ -10,7 +10,8 @@
       "deb": {
         "files": {
           "/usr/bin/dshboxd": "../scripts/packaging/dshboxd"
-        }
+        },
+        "desktopTemplate": "bundler/linux/dshbox.desktop"
       },
       "rpm": {
         "files": {

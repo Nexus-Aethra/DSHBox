@@ -123,6 +123,10 @@ pub(crate) fn list_sealed_templates() -> Result<Vec<TemplateInfo>, String> {
     Ok(templates.into_values().collect())
 }
 
+/// A pulled Harness root carries no profile tree of its own; it is always the
+/// web profile. Sealed templates built from it record their own.
+const PREPARED_BASE_PROFILE: &str = "web";
+
 fn prepared_base_template_info(base: PreparedBaseRecord) -> Option<TemplateInfo> {
     let directory = Path::new(&base.directory);
     if !directory.join("manifest.json").is_file()
@@ -134,9 +138,31 @@ fn prepared_base_template_info(base: PreparedBaseRecord) -> Option<TemplateInfo>
         name: base.source_ref.clone(),
         id: base.id,
         harness_ref: Some(base.source_ref),
-        profile: "web".to_owned(),
+        profile: PREPARED_BASE_PROFILE.to_owned(),
         built: false,
     })
+}
+
+/// Resolve a template *name* to its root directory and profile.
+///
+/// A prepared Harness base is listed as a runnable template before anything is
+/// built from it, so a name has to resolve against both indices: sealed-only
+/// resolution rejects the very root `dshbox pull` just produced, which is the
+/// template a user is most likely to inspect first.
+pub(crate) fn template_root_by_name(root: &str, name: &str) -> Result<(String, PathBuf), String> {
+    match sealed_template_by_name(root, name) {
+        Ok(record) => Ok((record.profile, PathBuf::from(record.directory))),
+        Err(sealed_error) => {
+            let base = list_prepared_bases(root)?
+                .into_iter()
+                .find(|base| base.source_ref == name)
+                .ok_or(sealed_error)?;
+            Ok((
+                PREPARED_BASE_PROFILE.to_owned(),
+                PathBuf::from(base.directory),
+            ))
+        }
+    }
 }
 
 pub(crate) fn read_sealed_template(name: &str) -> Result<String, String> {
