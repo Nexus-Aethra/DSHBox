@@ -181,7 +181,7 @@ Containers, templates, plugins and skills are referenced by id, and deletion is 
 
 ## Building from source
 
-Prerequisites: [Node.js](https://nodejs.org) 20+ with pnpm, the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform, and **7-Zip** (needed once by `runtime:prepare` to unpack the Windows PortableGit archive — install from [7-zip.org](https://www.7-zip.org/) or `apt install p7zip-full`, and make sure `7z` is on `PATH`). 7-Zip is a build-time-only tool; it never ships in the installer.
+Prerequisites: [Node.js](https://nodejs.org) 22.13+ with pnpm (the pinned `packageManager` needs `node:sqlite`), the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform, and **7-Zip** (needed once by `runtime:prepare` to unpack the Windows PortableGit archive — install from [7-zip.org](https://www.7-zip.org/) or `apt install p7zip-full`, and make sure `7z` is on `PATH`). 7-Zip is a build-time-only tool; it never ships in the installer.
 
 ```bash
 pnpm install

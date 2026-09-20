@@ -28,7 +28,7 @@ runtime-lock.json          Pinned Node + pnpm integrity for bundled runtime
 
 ## Build, lint, test
 
-Prereqs: Node 20+ with pnpm, Tauri 2 prereqs for your platform, Rust toolchain.
+Prereqs: Node 22.13+ with pnpm (the pinned `packageManager` needs `node:sqlite`), Tauri 2 prereqs for your platform, Rust toolchain.
 
 ```bash
 pnpm install
