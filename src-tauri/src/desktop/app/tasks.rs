@@ -179,10 +179,10 @@ pub(crate) fn run_queued_task(
     });
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn list_tasks(
-    manager: tauri::State<TaskManager>,
-    resources: tauri::State<ResourceStateManager>,
+    manager: tauri::State<'_, TaskManager>,
+    resources: tauri::State<'_, ResourceStateManager>,
 ) -> Result<Vec<TaskRecord>, String> {
     // Daemon-owned tasks come from the daemon (it persists them as it goes);
     // local tasks (toolchain installs) come from the local manager. The
@@ -202,10 +202,10 @@ pub(crate) fn list_tasks(
     Ok(tasks)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn cancel_task(
     id: String,
-    manager: tauri::State<TaskManager>,
+    manager: tauri::State<'_, TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     // Local tasks (toolchain installs) cancel locally; daemon tasks cancel
@@ -224,10 +224,10 @@ pub(crate) fn cancel_task(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn delete_task(
     id: String,
-    manager: tauri::State<TaskManager>,
+    manager: tauri::State<'_, TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     if manager
@@ -244,10 +244,10 @@ pub(crate) fn delete_task(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn read_task_log(
     id: String,
-    resources: tauri::State<ResourceStateManager>,
+    resources: tauri::State<'_, ResourceStateManager>,
 ) -> Result<String, String> {
     let task = resources
         .snapshot()?
@@ -258,10 +258,10 @@ pub(crate) fn read_task_log(
     fs::read_to_string(task.log_path).map_err(|error| format!("cannot read task log: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn retry_task(
     id: String,
-    manager: tauri::State<TaskManager>,
+    manager: tauri::State<'_, TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     // Local tasks live in the local manager; daemon tasks (including ones

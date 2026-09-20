@@ -8,10 +8,10 @@ pub(crate) fn is_safe_workspace_relative_path(value: &str) -> bool {
     !value.is_empty() && !Path::new(value).is_absolute() && !Path::new(value).components().any(|part| matches!(part, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_)))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_container_extension_add(
     request: AddContainerExtensionRequest,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     if !is_safe_identifier(&request.id) || !is_safe_identifier(&request.profile) {
@@ -35,10 +35,10 @@ pub(crate) fn enqueue_container_extension_add(
         .map_err(|error| format!("invalid task record: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_repository_extension_import(
     request: ImportRepositoryExtensionRequest,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     if request.source.trim().is_empty() { return Err("extension source is required".to_owned()); }
@@ -52,10 +52,10 @@ pub(crate) fn enqueue_repository_extension_import(
         .map_err(|error| format!("invalid task record: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_repository_extension_export(
     request: ExportRepositoryExtensionRequest,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     if !is_safe_identifier(&request.repository_id) || request.destination.trim().is_empty() { return Err("invalid extension export request".to_owned()); }
@@ -72,10 +72,10 @@ pub(crate) fn enqueue_repository_extension_export(
         .map_err(|error| format!("invalid task record: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_plugin_export(
     request: ExportContainerPluginRequest,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     if !is_safe_identifier(&request.source_container_id)
@@ -98,7 +98,7 @@ pub(crate) fn enqueue_plugin_export(
         .map_err(|error| format!("invalid task record: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn scan_container_workspace_extensions(id: String) -> Result<Vec<box_extensions::WorkspaceExtension>, String> {
     if !is_safe_identifier(&id) { return Err("invalid container id".to_owned()); }
     let root = read_config()?.runtime_directory.ok_or("DSH Box storage is not configured")?;
@@ -106,10 +106,10 @@ pub(crate) fn scan_container_workspace_extensions(id: String) -> Result<Vec<box_
     Ok(scan_workspace_extensions(&PathBuf::from(container.directory).join("workspace")))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_workspace_extension_import(
     request: ImportWorkspaceExtensionRequest,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     if !is_safe_identifier(&request.id) || !is_safe_workspace_relative_path(&request.relative_path) { return Err("invalid workspace extension path".to_owned()); }
@@ -123,10 +123,10 @@ pub(crate) fn enqueue_workspace_extension_import(
         .map_err(|error| format!("invalid task record: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_container_extension_copy(
     request: CopyRepositoryExtensionRequest,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     if !is_safe_identifier(&request.id) || !is_safe_identifier(&request.repository_id) || request.profile.as_deref().is_some_and(|value| !is_safe_identifier(value)) { return Err("invalid extension copy request".to_owned()); }
@@ -140,8 +140,8 @@ pub(crate) fn enqueue_container_extension_copy(
         .map_err(|error| format!("invalid task record: {error}"))
 }
 
-#[tauri::command]
-pub(crate) fn remove_repository_extension(id: String, _tasks: tauri::State<TaskManager>, app: tauri::AppHandle) -> Result<(), String> {
+#[tauri::command(async)]
+pub(crate) fn remove_repository_extension(id: String, _tasks: tauri::State<'_, TaskManager>, app: tauri::AppHandle) -> Result<(), String> {
     if !is_safe_identifier(&id) { return Err("invalid repository extension id".to_owned()); }
     let client = connect()?;
     call(&client, "remove_repository_extension", serde_json::json!({ "id": id }))?;
@@ -151,7 +151,7 @@ pub(crate) fn remove_repository_extension(id: String, _tasks: tauri::State<TaskM
 
 /// Debugging aid exposed as a tauri command so the resources page can
 /// show a popover of owner ids alongside the snapshot counts.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn list_repository_reference_counts() -> Result<Vec<box_extensions::RepositoryReferenceRow>, String> {
     let client = connect()?;
     let value = call(&client, "list_repository_reference_counts", serde_json::json!({}))?;
@@ -161,19 +161,19 @@ pub(crate) fn list_repository_reference_counts() -> Result<Vec<box_extensions::R
 /// Read the cordis service graph for one template or container. `kind` is
 /// `template` or `container`, and `id` is a sealed-template name or a container
 /// id. Answered inline by the daemon: it only reads sources and manifests.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn plugin_dependency_graph(kind: String, id: String) -> Result<box_plugin_graph::PluginGraph, String> {
     let client = connect()?;
     let value = call(&client, "plugin_dependency_graph", serde_json::json!({ "kind": kind, "id": id }))?;
     serde_json::from_value(value).map_err(|error| format!("invalid plugin graph response: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn remove_repository_plugin(
     id: String,
     profile: String,
     name: String,
-    _tasks: tauri::State<TaskManager>,
+    _tasks: tauri::State<'_, TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     if !is_safe_identifier(&id) || !is_safe_identifier(&profile) || !is_safe_package_name(&name) {

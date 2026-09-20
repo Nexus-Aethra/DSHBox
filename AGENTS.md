@@ -191,6 +191,16 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   **Container startup must never install or build DSH.** `dshbox image` remains
   a deprecated alias forwarding to `build`/`template`. The authoritative design
   is `docs/specs/prepared-template-runtime.md`.
+- **The desktop must never block its own main thread on the daemon.** A plain
+  `#[tauri::command]` runs on the main thread — the same one that renders the
+  window — so a slow daemon call freezes the UI. Every command that talks to the
+  daemon, the filesystem, or another process is `#[tauri::command(async)]`,
+  which Tauri runs on its `sync_threadpool`; only in-memory reads
+  (`get_resource_state`, `get_container_details`) stay sync. `box-client` bounds
+  each RPC with a read timeout (60s) and a write timeout, and the liveness probe
+  (`ping_quickly`, 3s) is what the startup gate polls, so a stuck daemon answers
+  "not yet" instead of holding a thread. The frontend polls one request at a
+  time for the same reason: overlapping polls against a busy daemon pile up.
 - **The CLI is the agent surface; the UI is the human one.** `dshbox apply -f
   <file>` takes a document (`container:`, `types:`, `copies:`) and makes the
   resource layer match it, so an agent configures resources by writing one file

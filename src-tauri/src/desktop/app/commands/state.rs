@@ -8,9 +8,9 @@ use super::super::*;
 /// `<runtime>/repository/index.json` but the desktop has no event telling it
 /// to refresh its cached snapshot. Reading from disk here (a single JSON read)
 /// keeps the UI in sync with whatever the daemon and the CLI have done.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn list_resource_states(
-    resources: tauri::State<ResourceStateManager>,
+    resources: tauri::State<'_, ResourceStateManager>,
 ) -> Result<ResourceSnapshot, String> {
     let mut snapshot = resources.snapshot()?;
     if let Some(runtime) = &snapshot.runtime_directory {
@@ -40,7 +40,7 @@ pub(crate) fn get_container_details(
 }
 
 /// Re-scans real resources and updates the process-local read model.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn refresh_resource_state(app: tauri::AppHandle) -> Result<ResourceSnapshot, String> {
     refresh_global_state(&app);
     app.state::<ResourceStateManager>().snapshot()
@@ -51,7 +51,7 @@ pub(crate) fn refresh_resource_state(app: tauri::AppHandle) -> Result<ResourceSn
 pub(crate) use box_api::DataEntry;
 
 /// Lists data-store entries via the daemon.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn list_data_entries() -> Result<Vec<DataEntry>, String> {
     let client = connect()?;
     let value = call(&client, "list_data_entries", serde_json::json!({}))?;
@@ -61,7 +61,7 @@ pub(crate) fn list_data_entries() -> Result<Vec<DataEntry>, String> {
 
 /// Garbage-collects orphaned data-store blobs via the daemon. Returns the
 /// removed content digests.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn prune_orphaned_data() -> Result<Vec<String>, String> {
     let client = connect()?;
     let value = call(&client, "prune_orphaned_data", serde_json::json!({}))?;

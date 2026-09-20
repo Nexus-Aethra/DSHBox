@@ -1,9 +1,9 @@
 use super::super::*;
 use box_dsh_versions::DshVersion;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn list_dsh_versions(
-    resources: tauri::State<ResourceStateManager>,
+    resources: tauri::State<'_, ResourceStateManager>,
 ) -> Result<Vec<DshVersion>, String> {
     let client = connect()?;
     // The daemon derives the Harness tab list directly from the template
@@ -22,9 +22,9 @@ pub(crate) fn list_dsh_versions(
     Ok(versions)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn upgrade_legacy_resources(
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: tauri::AppHandle,
 ) -> Result<Vec<String>, String> {
     // One-shot migration: mirror every `<runtime>/runtimes/<tag>/source/`
@@ -45,9 +45,9 @@ pub(crate) fn upgrade_legacy_resources(
     Ok(registered)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn list_installed_dsh_versions(
-    _resources: tauri::State<ResourceStateManager>,
+    _resources: tauri::State<'_, ResourceStateManager>,
 ) -> Result<Vec<String>, String> {
     let client = connect()?;
     let value = call(&client, "list_installed_dsh_versions", serde_json::json!({}))?;
@@ -55,10 +55,10 @@ pub(crate) fn list_installed_dsh_versions(
         .map_err(|error| format!("invalid installed versions: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn uninstall_dsh_version(
     version: String,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<BoxConfig, String> {
     if !is_safe_version_name(&version) {

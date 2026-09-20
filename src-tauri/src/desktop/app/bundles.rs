@@ -1,6 +1,6 @@
 use super::*;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn list_extension_bundles() -> Result<Vec<ExtensionBundle>, String> {
     let client = connect()?;
     let value = call(&client, "list_bundles", serde_json::json!({}))?;
@@ -8,7 +8,7 @@ pub(crate) fn list_extension_bundles() -> Result<Vec<ExtensionBundle>, String> {
         .map_err(|error| format!("invalid bundle list: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn create_extension_bundle(
     name: String,
     repository_ids: Vec<String>,
@@ -30,19 +30,19 @@ pub(crate) fn create_extension_bundle(
         .map_err(|error| format!("invalid bundle record: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn delete_extension_bundle(id: String) -> Result<(), String> {
     let client = connect()?;
     call(&client, "delete_extension_bundle", serde_json::json!({ "id": id }))?;
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_bundle_export(
     id: String,
     destination: String,
     mode: String,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     if !is_safe_identifier(&id)
@@ -76,10 +76,10 @@ pub(crate) struct ImportBundleRequest {
     pub(crate) conflict: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_bundle_import(
     request: ImportBundleRequest,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     if request.archive.trim().is_empty()
@@ -117,10 +117,10 @@ pub(crate) struct InstallBundleRequest {
     conflict: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_container_bundle_install(
     request: InstallBundleRequest,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     if !is_safe_identifier(&request.id)

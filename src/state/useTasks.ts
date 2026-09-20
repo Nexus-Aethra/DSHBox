@@ -122,8 +122,18 @@ export function useTasks(refreshers: TaskRefreshers, onError: (message: string |
     // Poll for tasks enqueued by the CLI process (which cannot emit Tauri
     // events into this process). The backend merges the shared state file on
     // every call, so the next poll picks up progress and completion too.
+    //
+    // One poll at a time: a daemon that is slow (or busy with a long task) would
+    // otherwise collect a queue of overlapping requests, each holding a thread
+    // until it answers. Skipping a tick costs nothing — the next one is 3s away.
+    let polling = false
     const pollInterval = setInterval(() => {
-      void boxApi.listTasks().then(absorb).catch(() => undefined)
+      if (polling) return
+      polling = true
+      void boxApi.listTasks()
+        .then(absorb)
+        .catch(() => undefined)
+        .finally(() => { polling = false })
     }, 3000)
     return () => {
       clearInterval(pollInterval)

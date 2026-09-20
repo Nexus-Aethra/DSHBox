@@ -1,6 +1,6 @@
 use super::*;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn create_dsh_container(
     request: CreateDshContainerRequest,
     app: tauri::AppHandle,
@@ -176,11 +176,11 @@ fn read_credentials_env_names(profile_home: &Path) -> Vec<String> {
 }
 
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn add_dsh_container_profile(
     id: String,
     profile: String,
-    tasks: tauri::State<TaskManager>,
+    tasks: tauri::State<'_, TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<DshContainer, String> {
     if !is_safe_identifier(&id) || !is_safe_identifier(&profile) {
@@ -204,11 +204,11 @@ pub(crate) fn add_dsh_container_profile(
         .ok_or("container disappeared after profile creation".to_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn set_dsh_container_profile(
     id: String,
     profile: String,
-    tasks: tauri::State<TaskManager>,
+    tasks: tauri::State<'_, TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<DshContainer, String> {
     if !is_safe_identifier(&id) || !is_safe_identifier(&profile) {
@@ -248,11 +248,11 @@ pub(crate) fn set_dsh_container_profile(
         .ok_or("container disappeared after profile update".to_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn delete_dsh_container(
     id: String,
-    _manager: tauri::State<ContainerManager>,
-    _tasks: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, ContainerManager>,
+    _tasks: tauri::State<'_, TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     if !is_safe_version_name(&id) {
@@ -269,7 +269,7 @@ pub(crate) fn delete_dsh_container(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn read_container_log(id: String, log: String) -> Result<String, String> {
     if !is_safe_identifier(&id) {
         return Err("invalid container id".to_owned());
@@ -292,7 +292,7 @@ pub(crate) fn read_container_log(id: String, log: String) -> Result<String, Stri
     fs::read_to_string(path).map_err(|error| format!("cannot read container log: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn append_container_webview_log(
     window: tauri::WebviewWindow,
     id: String,

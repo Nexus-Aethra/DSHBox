@@ -10,6 +10,24 @@ use box_server_core::{read_discovery, ServerDiscovery};
 use serde_json::Value;
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
+use std::time::Duration;
+
+/// How long one RPC may take before the client gives up.
+///
+/// The daemon is a local process and its synchronous methods answer in
+/// milliseconds; a call that outlives this is a daemon that is stuck, and
+/// waiting forever would hang whoever asked — a Tauri command thread, the CLI,
+/// or the desktop's liveness probe. The desktop runs its commands off the main
+/// thread, so this is a bound on how long an action can stay pending, not a
+/// freeze.
+const RPC_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Writing a loopback request is instant unless the socket is half-open.
+const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The liveness probe is polled (the desktop's startup gate every 800ms), so it
+/// answers "not yet" rather than blocking the poll for a minute.
+const PING_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Response frame every daemon method returns. The daemon now produces
 /// either a `result` (sync) or a `task` (async) field, plus an
@@ -104,9 +122,20 @@ impl RpcClient {
 
     /// Send one JSON request via HTTP POST /rpc; returns the parsed response frame.
     fn exchange(&self, request: Value) -> Result<RpcResponse, String> {
+        self.exchange_within(request, RPC_READ_TIMEOUT)
+    }
+
+    /// `exchange` with an explicit read timeout, for callers that must not wait.
+    fn exchange_within(&self, request: Value, timeout: Duration) -> Result<RpcResponse, String> {
         let addr = format!("127.0.0.1:{}", self.port);
         let mut stream = TcpStream::connect(&addr)
             .map_err(|error| format!("cannot connect to dshboxd at {}: {error}", addr))?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| format!("cannot set a read timeout on {addr}: {error}"))?;
+        stream
+            .set_write_timeout(Some(RPC_WRITE_TIMEOUT))
+            .map_err(|error| format!("cannot set a write timeout on {addr}: {error}"))?;
 
         let body = serde_json::to_string(&request).map_err(|error| error.to_string())?;
         let request_line = format!(
@@ -122,9 +151,19 @@ impl RpcClient {
 
         let mut reader = BufReader::new(stream);
         let mut response_str = String::new();
-        reader
-            .read_to_string(&mut response_str)
-            .map_err(|error| format!("dshboxd read error: {error}"))?;
+        reader.read_to_string(&mut response_str).map_err(|error| {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) {
+                format!(
+                    "dshboxd did not answer within {}s (it may be busy); retry, or check the daemon",
+                    timeout.as_secs()
+                )
+            } else {
+                format!("dshboxd read error: {error}")
+            }
+        })?;
 
         let mut boundary = None;
         for (i, _) in response_str.match_indices("\r\n\r\n") {
@@ -195,5 +234,86 @@ impl RpcClient {
     /// Health probe: the daemon answers without a token check failure.
     pub fn ping(&self) -> Result<Value, String> {
         self.call("ping", serde_json::json!({}))
+    }
+
+    /// A liveness probe that gives up quickly: callers poll it, so "not yet" has
+    /// to come back in time to poll again.
+    pub fn ping_quickly(&self) -> Result<Value, String> {
+        let request = serde_json::json!({ "token": self.token, "method": "ping" });
+        let response = self.exchange_within(request, PING_TIMEOUT)?;
+        if response.ok {
+            Ok(response.result.or(response.task).unwrap_or(Value::Null))
+        } else {
+            Err(response
+                .error
+                .unwrap_or_else(|| "unknown daemon error".to_owned()))
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read as _;
+    use std::net::TcpListener;
+
+    /// A daemon that accepts the connection and then says nothing must not hold
+    /// the caller forever: a Tauri command thread would stay pending, and the
+    /// CLI would look hung.
+    #[test]
+    fn a_silent_daemon_times_out_instead_of_hanging() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept and read the request, never reply.
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer);
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+        let client = RpcClient {
+            port,
+            token: "test".to_owned(),
+        };
+        let started = std::time::Instant::now();
+        let error = client
+            .exchange_within(
+                serde_json::json!({ "token": "test", "method": "ping" }),
+                Duration::from_millis(300),
+            )
+            .expect_err("a silent daemon is an error, not a value");
+        assert!(
+            error.contains("did not answer within"),
+            "the error says what happened: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "it gives up on time, not when the daemon finally speaks"
+        );
+    }
+
+    /// The same guard on the polling probe: a hung daemon answers "not yet" fast
+    /// enough for the next poll.
+    #[test]
+    fn the_quick_probe_does_not_wait_for_a_stalled_daemon() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer);
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+        let client = RpcClient {
+            port,
+            token: "test".to_owned(),
+        };
+        let started = std::time::Instant::now();
+        assert!(client.ping_quickly().is_err());
+        assert!(
+            started.elapsed() < PING_TIMEOUT + Duration::from_secs(1),
+            "a poll returns inside its own budget"
+        );
     }
 }

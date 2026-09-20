@@ -77,6 +77,16 @@ builds from ever showing it.
 
 ### Fixed
 
+- **A slow daemon froze the desktop.** Every Tauri command was synchronous, and
+  Tauri runs those on the main thread — the one that renders the window — so a
+  single slow daemon call stopped the UI from drawing or responding. The 66
+  commands that reach the daemon, the filesystem or another process are now
+  `#[tauri::command(async)]` (Tauri's threadpool); only two in-memory reads stay
+  synchronous. `box-client` also bounds every RPC with a read timeout and a 3s
+  liveness probe, so a daemon that accepts a connection and never answers
+  surfaces as "did not answer within 60s" instead of a thread waiting forever,
+  and the task poll no longer starts a second request while the previous one is
+  still out.
 - **A provider key arrived without the provider.** `credentials` was one file
   (`.credentials.yaml`), but DSH keeps a key and the route that uses it in two
   places: the route is `llm-pi-ai.providers.<route>.apiKeyEnv` in

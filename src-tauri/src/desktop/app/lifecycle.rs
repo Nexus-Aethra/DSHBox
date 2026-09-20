@@ -1,10 +1,10 @@
 use super::*;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_container_start(
     id: String,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     let client = connect()?;
@@ -17,10 +17,10 @@ pub(crate) fn enqueue_container_start(
         .map_err(|error| format!("invalid task record: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_container_stop(
     id: String,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     // The daemon owns the host process; close the local front window as soon
@@ -38,10 +38,10 @@ pub(crate) fn enqueue_container_stop(
         .map_err(|error| format!("invalid task record: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_container_rebuild(
     id: String,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     let client = connect()?;
@@ -213,10 +213,10 @@ pub(crate) async fn open_dsh_front_for_client(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn open_dsh_front_browser(
     id: String,
-    _manager: tauri::State<ContainerManager>,
+    _manager: tauri::State<'_, ContainerManager>,
 ) -> Result<(), String> {
     if !is_safe_identifier(&id) {
         return Err("invalid container id".to_owned());

@@ -24,7 +24,7 @@ pub(crate) fn scan_toolchains(_: &BoxConfig) -> Vec<ToolchainStatus> {
     .into()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn start_toolchain_install(id: String) -> Result<ToolchainInstallStatus, String> {
     if !is_known_toolchain(&id) {
         return Err(format!("unsupported toolchain: {id}"));
@@ -32,10 +32,10 @@ pub(crate) fn start_toolchain_install(id: String) -> Result<ToolchainInstallStat
     Err("Node, npm, and pnpm are bundled with DSH Box; reinstall the application to repair the runtime".to_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_toolchain_install(
     id: String,
-    manager: tauri::State<TaskManager>,
+    manager: tauri::State<'_, TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     let task = queue_task(

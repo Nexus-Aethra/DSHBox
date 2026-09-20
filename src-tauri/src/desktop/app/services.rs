@@ -54,7 +54,9 @@ fn daemon_alive() -> bool {
     box_server_core::read_discovery()
         .ok()
         .flatten()
-        .map(|discovery| box_client::RpcClient::from_discovery(&discovery).ping().is_ok())
+        // A quick probe: this is polled by the startup gate, so a daemon that is
+        // busy has to answer "not yet" fast rather than hold the poll open.
+        .map(|discovery| box_client::RpcClient::from_discovery(&discovery).ping_quickly().is_ok())
         .unwrap_or(false)
 }
 
@@ -288,29 +290,29 @@ pub(crate) fn initialize_bundled_runtime(resource_directory: PathBuf) -> Result<
         .map_err(|_| "bundled runtime was initialized twice".to_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn get_server_service_status() -> ServiceStatus {
     service_status()
 }
 
 /// Health probe for the frontend startup gate: true once the daemon's
 /// discovery record is reachable and it answers `ping`.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn get_daemon_status() -> bool {
     daemon_alive()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn restart_server_service() -> Result<(), String> {
     restart_user_service()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn start_server_service() -> Result<(), String> {
     start_user_service()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn stop_server_service() -> Result<(), String> {
     stop_user_service()
 }
