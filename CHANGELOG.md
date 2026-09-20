@@ -19,7 +19,11 @@ builds from ever showing it.
   as a tarball. Plugins can declare their own kinds; when they do not, the paths
   their code composes are offered as candidates. `dshbox container resource
   list|stored|extract|inject|rm`, a Resources panel in the container view, and
-  `list_container_resources` / `enqueue_resource_*` over RPC.
+  `list_container_resources` / `enqueue_resource_*` over RPC. Resource types are
+  tabs in the Resources navigation (`Chat history` and `API keys` ship with it;
+  **+ Resource type** adds more by detected kind, by scanning a plugin, or by
+  picking a path in a tree of the container's storage area), and each tab lists
+  every container's copy of that type.
 - **A document store instead of scattered JSON indexes.** Every persisted
   index now goes through `box_foundation::collection::DocumentStore` (SQLite in
   the new `box-store` crate at `<runtime>/state/dshbox.db`), with legacy files

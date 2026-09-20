@@ -191,6 +191,15 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
             crate::resources::list_container_resources(state, request).map(Sync)
         }
         Some("list_resources") => crate::resources::list_resources(state, request).map(Sync),
+        Some("list_resource_views") => crate::resources::list_resource_views(state, request).map(Sync),
+        Some("add_resource_view") => crate::resources::add_resource_view(state, request).map(Sync),
+        Some("delete_resource_view") => {
+            crate::resources::delete_resource_view(state, request).map(Sync)
+        }
+        Some("list_resource_type") => crate::resources::list_resource_type(state, request).map(Sync),
+        Some("browse_container_paths") => {
+            crate::resources::browse_container_paths(state, request).map(Sync)
+        }
         Some("delete_resource") => crate::resources::delete_resource(state, request).map(Sync),
         Some("enqueue_resource_extract") => {
             crate::resources::enqueue_resource_extract(state, request)

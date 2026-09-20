@@ -8,9 +8,11 @@ export type TabsProps<T extends string> = {
   onChange: (next: T) => void
   children: ReactNode
   ariaLabel?: string
+  /** Rendered after the tabs — a trailing affordance such as "add a type". */
+  action?: ReactNode
 }
 
-export function Tabs<T extends string>({ items, value, onChange, children, ariaLabel }: TabsProps<T>) {
+export function Tabs<T extends string>({ items, value, onChange, children, ariaLabel, action }: TabsProps<T>) {
   function focusTab(index: number) {
     const buttons = document.querySelectorAll<HTMLButtonElement>(`[data-tabs-list="${ariaLabel ?? 'default'}"] button`)
     buttons[index]?.focus()
@@ -50,6 +52,7 @@ export function Tabs<T extends string>({ items, value, onChange, children, ariaL
             {item.label}
           </button>
         ))}
+        {action}
       </div>
       <div className="ui-tab-panel" role="tabpanel" id={`tab-panel-${value}`}>{children}</div>
     </div>

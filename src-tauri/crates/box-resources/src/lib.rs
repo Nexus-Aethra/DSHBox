@@ -23,5 +23,5 @@ mod tests;
 
 pub use discover::{discover, Discovered, Scope};
 pub use kinds::{builtin, builtins, Conflict, Kind, ResolvedKind, Shape};
-pub use record::{build_id, collection, payload_dir, resources_root, ResourceRecord};
+pub use record::{build_id, collection, payload_dir, resources_root, view_collection, ResourceRecord, ResourceView};
 pub use transfer::{entries_at, extract, inject, Extracted, Injected};

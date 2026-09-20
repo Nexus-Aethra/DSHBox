@@ -85,3 +85,31 @@ pub fn build_id(kind: &str, name: &str) -> String {
     };
     format!("{}-{}", clean(kind), clean(name))
 }
+
+/// A resource *type* the user pinned to the Resources navigation: a container
+/// plus the kind (or explicit path) they picked there. The label is theirs.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceView {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    /// Container the type was picked from; its declared kinds are what the id
+    /// resolves against.
+    pub container: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    pub secret: bool,
+    pub shape: crate::kinds::Shape,
+    #[serde(default = "default_depth")]
+    pub entry_depth: u8,
+    pub created_at: u64,
+}
+
+pub fn view_key(view: &ResourceView) -> &str {
+    &view.id
+}
+
+pub fn view_collection(store: Arc<dyn DocumentStore>) -> Collection<ResourceView> {
+    Collection::new(store, "resource_views", view_key)
+}

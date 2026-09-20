@@ -165,6 +165,8 @@ A container persists state that is not code: conversations under `profile/sessio
 
 Kinds come from three places: Box ships `sessions` and `credentials`; a plugin package can declare its own in `dshbox.resources`; and when a plugin declares nothing, Box reads the `join(root, 'a', 'b')` chains in its shipped code and offers those paths as candidates — never as trusted paths. That is what the Resources panel shows: pick a plugin, see whether it persists anything, where, and how much.
 
+In the UI, a resource type is a **tab in the Resources navigation**. `会话历史` and `API Key` ship as tabs, and the **+ Resource type** button adds one more: pick a container, then either a kind Box detected there, a **plugin to scan** (every package installed in the profile is offered, filtered as you type), or a path you pick in a **tree of the container's storage area**. The tab then shows every container's copy of that type — size, file count, `提取` — plus what has been extracted, with inject/merge controls. A tab you added can be removed again; the two built-in ones cannot.
+
 ```bash
 dshbox container resource list <id> [--plugin @scope/name]      # kinds, locations, sizes
 dshbox container resource extract <id> sessions [--entry=<slug>/session-<id>]

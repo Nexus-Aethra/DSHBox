@@ -74,6 +74,9 @@ pub(crate) fn list_container_resources(state: &DaemonState, request: &Value) -> 
         "container": id,
         "profile": profile,
         "resources": resources,
+        // Every installed package, so the picker offers what a bundle pulled
+        // in as well as what the profile declares.
+        "plugins": discover::installed_plugins(&container, &profile),
         "stored": records(state)?.load_all()?,
     }))
 }
@@ -103,6 +106,232 @@ pub(crate) fn delete_resource(state: &DaemonState, request: &Value) -> Result<Va
     }
     collection.remove(&id)?;
     Ok(json!({ "removed": id, "kind": existing.kind }))
+}
+
+/// The resource types the user pinned to the navigation.
+pub(crate) fn list_resource_views(state: &DaemonState, _request: &Value) -> Result<Value, String> {
+    let paths = state
+        .paths
+        .read()
+        .map_err(|_| "daemon paths lock failed".to_owned())?;
+    let collection = record::view_collection(box_store::open_document_store_for_paths(&paths)?);
+    let mut views = collection.load_all()?;
+    views.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    Ok(json!({ "views": views }))
+}
+
+/// Pin a resource type: the container is what the kind resolves against, and
+/// the label is what the navigation shows.
+pub(crate) fn add_resource_view(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    let kind = request["kind"]
+        .as_str()
+        .filter(|kind| !kind.is_empty())
+        .ok_or("expected a resource kind")?
+        .to_owned();
+    let container = request["container"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or("expected a container id")?
+        .to_owned();
+    let root = runtime_root(state)?;
+    let directory = container_dir(&root, &container)?;
+    let profile = profile_name(&directory);
+    let dest = request["path"].as_str().filter(|path| !path.is_empty());
+    let kind_info = resolve_kind(&directory, &profile, None, &kind, dest, None)?;
+    let label = request["label"]
+        .as_str()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .unwrap_or(&kind_info.label)
+        .to_owned();
+
+    let paths = state
+        .paths
+        .read()
+        .map_err(|_| "daemon paths lock failed".to_owned())?;
+    let collection = record::view_collection(box_store::open_document_store_for_paths(&paths)?);
+    // One view per (kind, container, path): adding the same type twice edits it.
+    let id = record::build_id(&kind_info.id, &format!("{container}{}", dest.unwrap_or("")));
+    let existing = collection
+        .load_all()?
+        .into_iter()
+        .find(|view| view.id == id)
+        .map(|view| view.created_at)
+        .unwrap_or_else(now_seconds);
+    let view = box_resources::ResourceView {
+        id,
+        label,
+        kind: kind_info.id.clone(),
+        container: container.clone(),
+        path: dest.map(str::to_owned).or_else(|| Some(kind_info.path.clone())),
+        secret: kind_info.secret,
+        shape: kind_info.shape,
+        entry_depth: kind_info.entry_depth,
+        created_at: existing,
+    };
+    collection.upsert(&[view.clone()])?;
+    Ok(json!({ "view": view }))
+}
+
+pub(crate) fn delete_resource_view(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    let id = request["viewId"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or("expected a view id")?
+        .to_owned();
+    let paths = state
+        .paths
+        .read()
+        .map_err(|_| "daemon paths lock failed".to_owned())?;
+    let collection = record::view_collection(box_store::open_document_store_for_paths(&paths)?);
+    collection.remove(&id)?;
+    Ok(json!({ "removed": id }))
+}
+
+/// Everything of one resource type: where every container stands, and what has
+/// been extracted. One call, so the type tab is a single round trip.
+pub(crate) fn list_resource_type(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    let kind = request["kind"]
+        .as_str()
+        .filter(|kind| !kind.is_empty())
+        .ok_or("expected a resource kind")?
+        .to_owned();
+    let path = request["path"].as_str().filter(|path| !path.is_empty()).map(str::to_owned);
+    let root = runtime_root(state)?;
+    let mut containers = Vec::new();
+    for (id, name, profile) in registered_containers(&root)? {
+        let directory = root.join("instances").join(&id);
+        let resolved = resolve_kind(&directory, &profile, None, &kind, path.as_deref(), None);
+        let Ok(resolved) = resolved else {
+            continue;
+        };
+        // A kind Box knows is measured through discovery; a path the user
+        // pinned themselves is measured directly, or it would always read as
+        // absent.
+        let measured = discover::discover(&directory, &profile, None)
+            .into_iter()
+            .find(|entry| entry.kind.id == kind)
+            .map(|entry| (entry.exists, entry.bytes, entry.files))
+            .or_else(|| {
+                let target = transfer::safe_join(&directory, &resolved.path).ok()?;
+                let exists = target.exists();
+                let (bytes, files) = if exists {
+                    transfer::tree_stats(&target).unwrap_or((0, 0))
+                } else {
+                    (0, 0)
+                };
+                Some((exists, bytes, files))
+            })
+            .unwrap_or((false, 0, 0));
+        containers.push(json!({
+            "id": id,
+            "name": name,
+            "path": resolved.path,
+            "secret": resolved.secret,
+            "exists": measured.0,
+            "bytes": measured.1,
+            "files": measured.2,
+        }));
+    }
+    let paths = state
+        .paths
+        .read()
+        .map_err(|_| "daemon paths lock failed".to_owned())?;
+    let collection = record::collection(box_store::open_document_store_for_paths(&paths)?);
+    let stored: Vec<ResourceRecord> = collection
+        .load_all()?
+        .into_iter()
+        .filter(|record| record.kind == kind)
+        .collect();
+    Ok(json!({ "kind": kind, "containers": containers, "stored": stored }))
+}
+
+/// Every container on disk, as `(id, name, profile)` — read from the registry
+/// rather than the running set, so a type view also covers stopped containers.
+fn registered_containers(root: &Path) -> Result<Vec<(String, String, String)>, String> {
+    let instances = root.join("instances");
+    let mut containers = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&instances) else {
+        return Ok(containers);
+    };
+    for entry in entries.flatten() {
+        let id = entry.file_name().to_string_lossy().to_string();
+        if !entry.path().is_dir() || id.starts_with('.') {
+            continue;
+        }
+        let container = entry.path();
+        let name = std::fs::read_to_string(container.join("container.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|value| value["name"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| id.clone());
+        let profile = profile_name(&container);
+        containers.push((id, name, profile));
+    }
+    containers.sort();
+    Ok(containers)
+}
+
+/// List one directory of a container's storage area, so the UI can offer a
+/// file tree instead of asking for a path. Read-only, and confined to the
+/// container root — `safe_join` rejects anything that would leave it.
+pub(crate) fn browse_container_paths(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    let id = request["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or("expected a container id")?
+        .to_owned();
+    // Default to the profile, which is where resource state lives.
+    let relative = request["path"].as_str().unwrap_or("profile").to_owned();
+    let root = runtime_root(state)?;
+    let container = container_dir(&root, &id)?;
+    let directory = transfer::safe_join(&container, &relative)?;
+    if !directory.is_dir() {
+        return Err(format!("{relative} is not a directory in container {id}"));
+    }
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&directory).map_err(|error| format!("{}: {error}", directory.display()))? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        let is_dir = meta.is_dir() && !meta.is_symlink();
+        // Only files report a size here: a container holds trees big enough
+        // that walking every directory would stall the panel.
+        let bytes = if meta.is_file() { meta.len() } else { 0 };
+        let children = if is_dir {
+            std::fs::read_dir(&path).map(|dir| dir.count() as u64).unwrap_or(0)
+        } else {
+            0
+        };
+        entries.push(json!({
+            "name": name,
+            "path": format!("{relative}/{name}").replace("//", "/"),
+            "directory": is_dir,
+            "symlink": meta.is_symlink(),
+            "bytes": bytes,
+            "children": children,
+            "secret": name.starts_with('.')
+                || name.contains("credential")
+                || matches!(path.extension().and_then(|ext| ext.to_str()), Some("key" | "pem" | "p12")),
+        }));
+    }
+    entries.sort_by(|left, right| {
+        let left_dir = left["directory"].as_bool().unwrap_or(false);
+        let right_dir = right["directory"].as_bool().unwrap_or(false);
+        right_dir
+            .cmp(&left_dir)
+            .then_with(|| left["name"].as_str().unwrap_or("").cmp(right["name"].as_str().unwrap_or("")))
+    });
+    let parent = Path::new(&relative)
+        .parent()
+        .map(|parent| parent.to_string_lossy().to_string())
+        .filter(|parent| !parent.is_empty() && parent != ".")
+        .unwrap_or_else(|| ".".to_owned());
+    Ok(json!({ "container": id, "path": relative, "parent": parent, "entries": entries }))
 }
 
 /// Resolve a kind by id, preferring what this container knows about it, and

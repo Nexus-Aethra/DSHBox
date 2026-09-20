@@ -391,6 +391,24 @@ fn package_dir(modules: &Path, name: &str) -> Option<PathBuf> {
     scoped.is_dir().then_some(scoped)
 }
 
+/// Every package installed in one profile, `@scope/name` form, sorted — what
+/// the plugin picker offers. Declared plugins alone would hide the packages a
+/// bundle pulled in transitively.
+pub fn installed_plugins(container_root: &Path, profile_name: &str) -> Vec<String> {
+    let modules = container_root
+        .join("profile")
+        .join("profiles")
+        .join(profile_name)
+        .join("node_modules");
+    let mut names: Vec<String> = installed_packages(&modules)
+        .iter()
+        .filter_map(|dir| package_name(&modules, dir))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn installed_packages(modules: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let Ok(entries) = std::fs::read_dir(modules) else {

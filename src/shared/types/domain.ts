@@ -238,6 +238,8 @@ export type ContainerResources = {
   container: string
   profile: string
   resources: DiscoveredResource[]
+  /** Every package installed in the profile, `@scope/name` form. */
+  plugins: string[]
   stored: StoredResource[]
 }
 
@@ -257,4 +259,34 @@ export type ContainerPathListing = {
   path: string
   parent: string
   entries: ContainerPathEntry[]
+}
+
+/** A resource type the user pinned to the Resources navigation. */
+export type ResourceView = {
+  id: string
+  label: string
+  kind: string
+  container: string
+  path: string | null
+  secret: boolean
+  shape: ResourceShape
+  entryDepth: number
+  createdAt: number
+}
+
+/** One container's standing for a resource type. */
+export type ResourceTypeContainer = {
+  id: string
+  name: string
+  path: string
+  secret: boolean
+  exists: boolean
+  bytes: number
+  files: number
+}
+
+export type ResourceTypeSummary = {
+  kind: string
+  containers: ResourceTypeContainer[]
+  stored: StoredResource[]
 }

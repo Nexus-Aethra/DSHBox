@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { DshVersion, ExtensionBundle, PreviewScriptResult, RepositoryExtension, TemplateInfo } from '../../shared/types/domain'
+import type { DshContainer, DshVersion, ExtensionBundle, PreviewScriptResult, RepositoryExtension, ResourceView, TemplateInfo } from '../../shared/types/domain'
 import { Badge } from '../../ui/Badge'
 import { Button } from '../../ui/Button'
 import { Card } from '../../ui/Card'
@@ -11,10 +11,15 @@ import { Tabs } from '../../ui/Tabs'
 import { Toolbar } from '../../ui/Toolbar'
 import type { PluginGraphText } from '../plugin-graph/PluginGraphPanel'
 import { PluginGraphPanel } from '../plugin-graph/PluginGraphPanel'
+import type { AddResourceTypeText } from '../container-resources/AddResourceTypeDialog'
+import { AddResourceTypeDialog } from '../container-resources/AddResourceTypeDialog'
+import type { ResourceTypeText } from '../container-resources/ResourceTypeView'
+import { ResourceTypeView } from '../container-resources/ResourceTypeView'
+import { boxApi } from '../../shared/api/box-api'
 
 // `pluginGraph*` keys come from the shared set the panel consumes, so the global
 // text can be handed to it unchanged.
-type Text = PluginGraphText & {
+type Text = PluginGraphText & AddResourceTypeText & ResourceTypeText & {
   pluginRepo: string; pluginRepoNote: string; noRepositoryPlugins: string; exportPlugin: string
   remove: string; extensionSource: string; browseArchive: string; addExtension: string
   pluginsTab: string; bundles: string; createBundle: string; bundleName: string
@@ -22,6 +27,7 @@ type Text = PluginGraphText & {
   githubOnly: string; importBundle: string; conflictOverwrite: string; conflictKeep: string
   bundleRefNote: string; bundleRefDelete: string
   resources: string; harnessTab: string; templateTab: string; bundleTab: string; addResource: string
+  resourceBuiltinSessions: string; resourceBuiltinCredentials: string
   versionTitle: string; versionNote: string; noVersion: string; install: string; installed: string
   uninstall: string; loadVersions: string; installing: string
   buildScript: string; scriptPath: string; chooseScript: string; previewScript: string
@@ -78,7 +84,7 @@ type Props = {
 
 const isGithub = (source: string | null) => !!source && source.startsWith('https://github.com/')
 
-type TabId = 'harness' | 'plugins' | 'bundles' | 'template'
+type TabId = string
 
 export function ResourcesPage({
   plugins, bundles, references, dshVersions, installedDshVersions, installingVersion, loadingVersions,
@@ -94,6 +100,23 @@ export function ResourcesPage({
   templates,
 }: Props) {
   const [tab, setTab] = useState<TabId>('harness')
+  const [views, setViews] = useState<ResourceView[]>([])
+  const [containers, setContainers] = useState<DshContainer[]>([])
+  const [addTypeOpen, setAddTypeOpen] = useState(false)
+
+  async function reloadViews(): Promise<void> {
+    try {
+      const listed = await boxApi.listResourceViews()
+      setViews(listed.views)
+    } catch {
+      setViews([])
+    }
+  }
+
+  useEffect(() => {
+    void reloadViews()
+    boxApi.listContainers().then(setContainers).catch(() => { setContainers([]) })
+  }, [])
   const [source, setSource] = useState('')
   const [bundleName, setBundleName] = useState('')
   const [selected, setSelected] = useState<string[]>([])
@@ -167,13 +190,52 @@ export function ResourcesPage({
     { id: 'plugins', label: text.pluginsTab },
     { id: 'bundles', label: text.bundleTab },
     { id: 'template', label: text.templateTab },
+    // The two built-in types ship as tabs so the feature is usable without
+    // configuring anything; they cannot be removed.
+    { id: 'view:builtin-sessions', label: text.resourceBuiltinSessions },
+    { id: 'view:builtin-credentials', label: text.resourceBuiltinCredentials },
+    // Resource types the user pinned: one tab each, its content is every
+    // container's copy of that type plus what has been extracted.
+    ...views.map((view) => ({ id: `view:${view.id}`, label: view.label })),
   ]
+  const builtinViews: ResourceView[] = [
+    { id: 'builtin-sessions', label: text.resourceBuiltinSessions, kind: 'sessions', container: '', path: 'profile/sessions', secret: false, shape: 'entries', entryDepth: 2, createdAt: 0 },
+    { id: 'builtin-credentials', label: text.resourceBuiltinCredentials, kind: 'credentials', container: '', path: 'profile/.credentials.yaml', secret: true, shape: 'opaque', entryDepth: 1, createdAt: 0 },
+  ]
+  const activeView = tab.startsWith('view:')
+    ? [...builtinViews, ...views].find((view) => `view:${view.id}` === tab) ?? null
+    : null
+  const activeIsBuiltin = activeView !== null && builtinViews.some((view) => view.id === activeView.id)
 
   return (
     <section className="workspace">
       <p className="eyebrow">RESOURCES</p>
       <h1>{text.resources}</h1>
-      <Tabs items={tabItems} value={tab} onChange={setTab} ariaLabel={text.resources}>
+      <Tabs
+        items={tabItems}
+        value={tab}
+        onChange={setTab}
+        ariaLabel={text.resources}
+        action={(
+          <span className="ui-tab-action">
+            <Button variant="ghost" size="sm" onClick={() => { setAddTypeOpen(true) }}>{text.resourceAddType}</Button>
+          </span>
+        )}
+      >
+        {activeView !== null && (
+          <ResourceTypeView
+            view={activeView}
+            containers={containers}
+            text={text}
+            removable={!activeIsBuiltin}
+            onRemove={async () => {
+              await boxApi.deleteResourceView(activeView.id)
+              await reloadViews()
+              setTab('harness')
+            }}
+          />
+        )}
+
 
         {tab === 'harness' && (
           <>
@@ -386,6 +448,14 @@ export function ResourcesPage({
         </div>
       </Dialog>
 
+      {addTypeOpen && (
+        <AddResourceTypeDialog
+          containers={containers}
+          text={text}
+          onClose={() => { setAddTypeOpen(false) }}
+          onAdded={reloadViews}
+        />
+      )}
       {graphTarget !== null && (
         <PluginGraphPanel kind="template" id={graphTarget} text={text} onClose={() => { setGraphTarget(null) }} />
       )}
