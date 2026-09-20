@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import type { BoxConfig, ContainerExtensions, ContainerResources, DataEntry, DshContainer, DshVersion, ExtensionBundle, GraphSourceKind, Language, PluginGraph, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, ResourceState, ServerServiceStatus, StoredResource, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
+import type { BoxConfig, ContainerExtensions, ContainerPathListing, ContainerResources, DataEntry, DshContainer, DshVersion, ExtensionBundle, GraphSourceKind, Language, PluginGraph, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, ResourceState, ServerServiceStatus, StoredResource, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
 
 type ToolchainPayload = { id: string; name: string; managedVersion: string | null }
 
@@ -101,6 +101,7 @@ export const boxApi = {
   pluginDependencyGraph: (kind: GraphSourceKind, id: string) => ipc<PluginGraph>('plugin_dependency_graph', { kind, id }),
   listContainerResources: (id: string, plugin?: string) => ipc<ContainerResources>('list_container_resources', { id, plugin }),
   listResources: () => ipc<{ resources: StoredResource[] }>('list_resources', {}),
+  browseContainerPaths: (id: string, path: string) => ipc<ContainerPathListing>('browse_container_paths', { id, path }),
   enqueueResourceExtract: (request: { id: string; kind: string; entry?: string; name?: string; plugin?: string; dest?: string; out?: string }) => ipc<TaskRecord>('enqueue_resource_extract', request),
   enqueueResourceInject: (request: { id: string; resource?: string; from?: string; input?: string; kind?: string; dest?: string; entry?: string; conflict?: string; restart?: boolean }) => ipc<TaskRecord>('enqueue_resource_inject', request),
   deleteResource: (resourceId: string) => ipc<void>('delete_resource', { resourceId }),

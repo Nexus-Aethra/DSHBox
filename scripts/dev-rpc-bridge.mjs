@@ -164,6 +164,7 @@ const COMMANDS = {
   plugin_dependency_graph: ({ kind, id }) => callDaemon('plugin_dependency_graph', { kind, id }),
   list_container_resources: ({ id, plugin }) => callDaemon('list_container_resources', { id, plugin }),
   list_resources: () => callDaemon('list_resources', {}),
+  browse_container_paths: ({ id, path }) => callDaemon('browse_container_paths', { id, path }),
   enqueue_resource_extract: (request) => callDaemon('enqueue_resource_extract', request),
   enqueue_resource_inject: (request) => callDaemon('enqueue_resource_inject', request),
   delete_resource: ({ resourceId }) => callDaemon('delete_resource', { resourceId }),

@@ -240,3 +240,21 @@ export type ContainerResources = {
   resources: DiscoveredResource[]
   stored: StoredResource[]
 }
+
+/** One entry of a container's storage area, as the file tree shows it. */
+export type ContainerPathEntry = {
+  name: string
+  path: string
+  directory: boolean
+  symlink: boolean
+  bytes: number
+  children: number
+  secret: boolean
+}
+
+export type ContainerPathListing = {
+  container: string
+  path: string
+  parent: string
+  entries: ContainerPathEntry[]
+}
