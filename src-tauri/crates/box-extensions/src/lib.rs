@@ -35,7 +35,20 @@ pub struct ExtensionRecord {
     pub content_digest: Option<String>,
 }
 
-/// One immutable extension source owned by the DSH Box repository.
+/// How a repository entry holds its content. A registry/git package is already
+/// in pnpm's content-addressed store, so Box keeps only a row for it; anything
+/// pnpm cannot re-create (a local directory, a hand-made archive) keeps a copy.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RepositoryStorage {
+    /// Box owns the bytes: `<source_path>` is a copy under the repository root.
+    #[default]
+    Owned,
+    /// pnpm owns the bytes: the entry is a pointer at a store-cached spec.
+    Reference,
+}
+
+/// One extension source the DSH Box repository knows about.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryExtension {
@@ -48,11 +61,14 @@ pub struct RepositoryExtension {
     pub source_path: String,
     pub imported_at: u64,
     pub diagnostic: Option<String>,
-    /// Original import source (GitHub URL, directory, or archive path). Quick
-    /// bundle exports use this to keep GitHub entries as URLs instead of
-    /// embedding their content.
+    /// Original import source (GitHub URL, directory, archive path, or pnpm
+    /// spec). Quick bundle exports use this to keep GitHub entries as URLs
+    /// instead of embedding their content; a reference entry uses it to
+    /// re-install the package.
     #[serde(default)]
     pub source: Option<String>,
+    #[serde(default)]
+    pub storage: RepositoryStorage,
 }
 
 /// A valid extension candidate found inside one Container workspace.
@@ -116,6 +132,54 @@ pub fn repository_index_path(runtime: &Path) -> PathBuf {
     repository_root(runtime).join("index.json")
 }
 
+/// A reference entry's identity is the spec it points at: there is no local
+/// content to digest.
+/// fnv1a64, hex — the same identity hash `extension_digest` finishes with.
+fn fnv1a64_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+pub fn reference_digest(spec: Option<&str>) -> String {
+    format!("reference:{}", spec.unwrap_or("unknown"))
+}
+
+/// Record a package Box does not own: the spec is all that is kept, and pnpm's
+/// store holds the bytes. Importing the same spec twice updates one row.
+pub fn upsert_reference_entry(
+    runtime: &Path,
+    kind: ExtensionKind,
+    name: &str,
+    version: Option<&str>,
+    spec: &str,
+) -> Result<RepositoryExtension, String> {
+    let mut entries = scan_repository(runtime);
+    // Deterministic, so importing the same spec twice updates one row.
+    let id = format!("ref-{}", fnv1a64_hex(spec.as_bytes()));
+    let entry = RepositoryExtension {
+        id: id.clone(),
+        kind,
+        name: name.to_owned(),
+        version: version.map(str::to_owned),
+        description: None,
+        content_digest: reference_digest(Some(spec)),
+        source_path: String::new(),
+        imported_at: now_seconds(),
+        diagnostic: None,
+        source: Some(spec.to_owned()),
+        storage: RepositoryStorage::Reference,
+    };
+    match entries.iter_mut().find(|existing| existing.id == id) {
+        Some(existing) => *existing = entry.clone(),
+        None => entries.push(entry.clone()),
+    }
+    write_repository_index(runtime, &entries)?;
+    Ok(entry)
+}
+
 /// Reads the index and verifies every source still exists. Invalid entries remain visible as diagnostics.
 pub fn scan_repository(runtime: &Path) -> Vec<RepositoryExtension> {
     let path = repository_index_path(runtime);
@@ -124,6 +188,13 @@ pub fn scan_repository(runtime: &Path) -> Vec<RepositoryExtension> {
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
     for entry in &mut entries {
+        if entry.storage == RepositoryStorage::Reference {
+            // The bytes live in pnpm's store; there is no directory to check.
+            // Whether the store still holds it is the daemon's question (it
+            // reads the store index), not this one's.
+            entry.content_digest = reference_digest(entry.source.as_deref());
+            continue;
+        }
         let source = Path::new(&entry.source_path);
         if !source.is_dir() {
             entry.diagnostic = Some("repository source directory is missing".to_owned());
@@ -941,6 +1012,7 @@ mod tests {
                 imported_at: 0,
                 diagnostic: None,
                 source: None,
+                storage: RepositoryStorage::Owned,
             }],
         )
         .unwrap();

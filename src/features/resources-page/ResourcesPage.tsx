@@ -28,8 +28,9 @@ type Text = PluginGraphText & AddResourceTypeText & ResourceTypeText & {
   bundleRefNote: string; bundleRefDelete: string
   resources: string; harnessTab: string; templateTab: string; bundleTab: string; addResource: string
   resourceBuiltinSessions: string; resourceBuiltinCredentials: string
-  installedPluginsTitle: string; installedPluginsNote: (n: number) => string
+  installedPluginsTitle: string; importSourceHint: string; installedPluginsNote: (n: number) => string
   installedNotImported: string; importToRepository: string
+  storageReference: string; storageOwned: string
   cachedAll: string; cachedPartial: (cached: number, total: number) => string; cachedNone: string
   ownerTemplate: string; ownerContainer: string
   versionTitle: string; versionNote: string; noVersion: string; install: string; installed: string
@@ -302,7 +303,7 @@ export function ResourcesPage({
         {tab === 'plugins' && (
           <>
             <Toolbar>
-              <Input value={source} placeholder={text.extensionSource} onChange={(event) => { setSource(event.target.value) }} />
+              <Input value={source} placeholder={text.importSourceHint} onChange={(event) => { setSource(event.target.value) }} />
               <Button variant="secondary" onClick={() => { void browse() }}>{text.browseArchive}</Button>
               <Button variant="primary" disabled={!source.trim()} onClick={() => { void addPlugin() }}>{text.addExtension}</Button>
             </Toolbar>
@@ -315,6 +316,9 @@ export function ResourcesPage({
                   </div>
                   <div className="plugin-repo-actions">
                     <Badge variant="primary">{entry.kind}</Badge>
+                    <Badge variant={entry.storage === 'reference' ? 'neutral' : 'success'}>
+                      {entry.storage === 'reference' ? text.storageReference : text.storageOwned}
+                    </Badge>
                     <code>{entry.version ?? '—'}</code>
                     {isGithub(entry.source) && <Badge variant="primary">{text.githubOnly}</Badge>}
                 {(references[entry.id]?.templates ?? 0) > 0 && <Badge variant="neutral">{text.usedByTemplates(references[entry.id]?.templates ?? 0)}</Badge>}

@@ -12,7 +12,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     };
     if matches!(action, "help" | "--help" | "-h") {
         println!("dshbox plugin ls [container] [--profile <name>]");
-        println!("dshbox plugin import <source>");
+        println!("dshbox plugin import <source>   a package (name or npm:name@version) is\n                                       recorded as a pointer into the pnpm store; a local\n                                       directory is copied in");
         println!("dshbox plugin export <id> <dest.tar.gz>");
         println!("dshbox plugin rm <id>");
         println!("dshbox plugin prune");
@@ -26,7 +26,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         "import" => repository_import(
             arguments
                 .get(1)
-                .ok_or("expected a source: GitHub URL, local directory, or tarball")?,
+                .ok_or("expected a source: a package name, npm:name@version, or a local directory")?,
         ),
         "export" => repository_export(
             arguments.get(1).ok_or("expected a repository entry id")?,
@@ -45,14 +45,18 @@ fn repository_list() -> Result<(), String> {
     let value = rpc::call(&client, "list_repository_extensions", json!({}))?;
     let entries: Vec<box_extensions::RepositoryExtension> = serde_json::from_value(value)
         .map_err(|error| format!("invalid repository list from daemon: {error}"))?;
-    println!("ID\tKIND\tNAME\tVERSION");
+    println!("ID\tKIND\tNAME\tVERSION\tSTORAGE");
     for entry in entries {
         println!(
-            "{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}",
             entry.id,
             kind_name(&entry.kind),
             entry.name,
-            entry.version.as_deref().unwrap_or("-")
+            entry.version.as_deref().unwrap_or("-"),
+            match entry.storage {
+                box_extensions::RepositoryStorage::Owned => "copy",
+                box_extensions::RepositoryStorage::Reference => "reference",
+            }
         );
     }
     Ok(())

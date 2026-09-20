@@ -10,7 +10,7 @@ use crate::containers::create_dsh_container_sync;
 use crate::data::{list_data_entries, prune_orphaned_data};
 use crate::extensions::{
     container_list_plugins, container_plugin_add, export_repository_extension,
-    export_repository_plugin, import_into_repository, import_workspace_extension,
+    export_repository_plugin, import_source, import_workspace_extension,
     install_container_extension, link_repository_extension, prune_unused_repository_extensions,
     remove_repository_extension, remove_repository_plugin,
 };
@@ -735,7 +735,7 @@ fn enqueue_repository_import(
         "repository-extension-import",
         vec!["repository:extensions".to_owned()],
         params,
-        move |task| import_into_repository(task, Path::new(&source)).map(|_| ()),
+        move |task| import_source(task, &source),
     )
     .map(HandlerResult::Async)
 }

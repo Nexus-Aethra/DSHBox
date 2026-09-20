@@ -202,6 +202,18 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   driven: a store is a cache keyed by content (it holds plain libraries and
   packages nothing uses any more, and has no owner relation), while a lockfile
   records what one template or container actually installed.
+- **A repository entry either owns its bytes or points at pnpm's store.**
+  `RepositoryStorage::Owned` is a copy under `<runtime>/repository/…` (local
+  directories, hand-made archives — things pnpm cannot recreate);
+  `RepositoryStorage::Reference` is a row naming a spec whose bytes live in the
+  pnpm store (`source_path` empty). Import classification lives in
+  `dshboxd/src/extensions.rs::classify_import_source` and reuses the boxfile
+  source grammar, so the two accept the same strings. Consequences: installing a
+  reference into a container goes through `container_plugin_add` (spec, store
+  first) instead of copying a directory; removing one deletes only the row; and
+  a *full* bundle export materializes it with `pnpm add` — offline first, and it
+  says so in the log when the store alone cannot resolve peer ranges, never
+  quietly shipping a bundle with an entry missing.
 - **The plugin view is a union, not the repository.** `list_installed_plugins`
   merges the extension repository with every sealed template's and container's
   `profile/profiles/<p>/pnpm-lock.yaml`, classifying a package as a plugin when

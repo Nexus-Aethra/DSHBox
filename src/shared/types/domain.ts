@@ -12,7 +12,9 @@ export type ProfileExtensions = { name: string; plugins: ExtensionPlugin[]; diag
 export type ContainerSkill = { name: string; description: string | null; path: string; diagnostic: string | null }
 export type ContainerExtensions = { containerId: string; profiles: ProfileExtensions[]; skills: ContainerSkill[]; diagnostics: string[]; scannedAt: number }
 export type ExtensionKind = 'plugin' | 'skill'
-export type RepositoryExtension = { id: string; kind: ExtensionKind; name: string; version: string | null; description: string | null; contentDigest: string; sourcePath: string; importedAt: number; diagnostic: string | null; source: string | null }
+export type RepositoryExtension = { id: string; kind: ExtensionKind; name: string; version: string | null; description: string | null; contentDigest: string; sourcePath: string; importedAt: number; diagnostic: string | null; source: string | null   /** `owned` keeps a copy under the runtime; `reference` points at pnpm's store. */
+  storage: 'owned' | 'reference'
+}
 // Detailed per-entry owner ids surfaced by the daemon for `dshbox plugin
 // refs` and the resources-page owner popover. The on-disk file keeps the
 // raw sets; the snapshot view above projects them to counts.

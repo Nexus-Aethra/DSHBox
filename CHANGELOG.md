@@ -24,6 +24,14 @@ builds from ever showing it.
   **+ Resource type** adds more by detected kind, by scanning a plugin, or by
   picking a path in a tree of the container's storage area), and each tab lists
   every container's copy of that type.
+- **The repository stopped duplicating packages.** An import of a package
+  (`name`, `npm:name@version`, or a bare name) now records a pointer: the bytes
+  stay in pnpm's store and the repository keeps one row, marked `reference` in
+  the UI vs `copy` for local directories and archives that pnpm cannot
+  recreate. Installing a reference into a container installs its spec (store
+  first — measured at one second and zero downloads), and a full bundle export
+  materializes it, logging when it had to reach the registry to resolve peer
+  ranges.
 - **Plugins actually installed are visible.** The plugin view lists the union of
   the extension repository and what every template and container resolved,
   read from the profile's `pnpm-lock.yaml` (versions included), so a plugin a

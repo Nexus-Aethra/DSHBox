@@ -16,7 +16,10 @@ use box_foundation::{is_safe_identifier, mirror_url, now_seconds, read_config};
 use box_runtime::shallow_clone_with_cancel;
 use box_scheduler::TaskContext;
 use flate2::{write::GzEncoder, Compression};
+use crate::toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel};
+use box_runtime::process::{ExecutionKind, ProcessSpec};
 use std::{
+    time::Duration,
     fs,
     path::{Path, PathBuf},
 };
@@ -423,6 +426,84 @@ pub(crate) fn delete_extension_bundle(id: &str) -> Result<(), String> {
 /// describing every member. Quick exports keep GitHub-sourced entries as
 /// URLs in the manifest instead of embedding their content; full exports
 /// embed everything.
+/// Materialize a reference entry's package so a "full" bundle really is
+/// self-contained. pnpm does the store→directory work (no store internals, no
+/// CBOR here); install scripts are skipped because only sources are packed, and
+/// an offline miss is an error — a bundle that silently lacked an entry would
+/// look complete.
+fn materialize_reference(
+    spec: &str,
+    name: &str,
+    staging: &Path,
+    task: &TaskContext,
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(staging).map_err(|error| error.to_string())?;
+    // A throwaway project: the package we want becomes its dependency.
+    fs::write(
+        staging.join("package.json"),
+        "{\"name\":\"dsh-bundle-export\",\"private\":true}\n",
+    )
+    .map_err(|error| error.to_string())?;
+    fs::write(
+        staging.join("pnpm-workspace.yaml"),
+        "packages:\n  - .\n\nnodeLinker: hoisted\n",
+    )
+    .map_err(|error| error.to_string())?;
+    let pnpm = resolve_toolchain("pnpm")?;
+    let task_record = task.manager.task(&task.task_id)?;
+    // Store first, network only if the store alone cannot answer. A peer range
+    // (dshell-ssh asks for `0.1.5-rc.2||0.1.6-alpha.2`) is not resolvable from
+    // cached metadata even when the package itself is cached, so the offline
+    // attempt is a fast path, not a guarantee — and the retry says so in the
+    // log rather than quietly reaching out.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut arguments = vec![
+            "--dir".to_owned(),
+            staging.to_string_lossy().into_owned(),
+            "add".to_owned(),
+            spec.to_owned(),
+            "--ignore-scripts".to_owned(),
+        ];
+        if attempt == 1 {
+            arguments.push("--offline".to_owned());
+        }
+        let command = ProcessSpec::new(pnpm.path.clone())
+            .args(&pnpm.arguments)
+            .args(arguments.iter().map(String::as_str))
+            .policy(pnpm_policy(&pnpm)?)
+            .kind(ExecutionKind::Logged)
+            .log_path(&task_record.log_path);
+        let mut process = run_logged(&command, "materialize bundle entry")
+            .map_err(|error| format!("cannot start pnpm: {error}"))?;
+        let status = process
+            .wait_or_kill(
+                &TaskCancel(Some(task)),
+                Duration::from_secs(900),
+                "materializing a bundle entry",
+            )
+            .map_err(|error| error.to_string())?;
+        if status.success() {
+            break;
+        }
+        if attempt == 1 {
+            task.log(&format!(
+                "the store alone cannot resolve {name} (its peers are ranges); resolving it from the registry instead"
+            ));
+            continue;
+        }
+        return Err(format!(
+            "cannot materialize {name} for a full bundle: pnpm could not install {spec} even with the registry reachable. Export this bundle in quick mode, which keeps the spec instead of the content"
+        ));
+    }
+    let installed = staging.join("node_modules").join(name);
+    if !installed.is_dir() {
+        return Err(format!("pnpm did not produce {name} under the staging directory"));
+    }
+    Ok(installed)
+}
+
 pub(crate) fn export_extension_bundle(
     id: &str,
     destination: &str,
@@ -452,12 +533,12 @@ pub(crate) fn export_extension_bundle(
         destination.display()
     ));
     let repository = scan_repository(Path::new(&root));
-    let source_path = |repository_id: &str| {
-        repository
-            .iter()
-            .find(|entry| entry.id == repository_id)
-            .map(|entry| entry.source_path.clone())
+    let repository_entry = |repository_id: &str| {
+        repository.iter().find(|entry| entry.id == repository_id)
     };
+    let staging_root = repository_root(Path::new(&root))
+        .join("staging")
+        .join(&task.task_id);
     let manifest_entries = bundle
         .entries
         .iter()
@@ -467,6 +548,7 @@ pub(crate) fn export_extension_bundle(
                 .as_deref()
                 .map(is_github_source)
                 .unwrap_or(false);
+            let reference = repository_entry(&entry.repository_id).map(|found| &found.storage);
             serde_json::json!({
                 "type": match entry.kind {
                     ExtensionKind::Plugin => "plugin",
@@ -476,7 +558,11 @@ pub(crate) fn export_extension_bundle(
                 "version": entry.version,
                 "size": entry.size,
                 "source": entry.source,
-                "embedded": !(quick && github),
+                // A reference entry is a spec; in quick mode the spec is the
+                // whole entry, so nothing is embedded for it.
+                "embedded": !(quick
+                    && (github
+                        || reference == Some(&box_extensions::RepositoryStorage::Reference))),
             })
         })
         .collect::<Vec<_>>();
@@ -502,26 +588,48 @@ pub(crate) fn export_extension_bundle(
         .map_err(|error| format!("cannot append bundle manifest: {error}"))?;
     for entry in &bundle.entries {
         task.check_cancelled()?;
-        let Some(source_path) = source_path(&entry.repository_id) else {
+        let found = repository_entry(&entry.repository_id);
+        let Some(found) = found else {
             task.log(&format!(
                 "skipping {}: repository source is gone",
                 entry.name
             ));
             continue;
         };
-        let source = Path::new(&source_path);
-        if !source.is_dir() {
-            task.log(&format!(
-                "skipping {}: source directory is missing",
-                entry.name
-            ));
-            continue;
-        }
         let github = entry
             .source
             .as_deref()
             .map(is_github_source)
             .unwrap_or(false);
+        let materialized;
+        let source: &Path = if found.storage == box_extensions::RepositoryStorage::Reference {
+            if quick {
+                task.log(&format!("quick: {} kept as its spec only", entry.name));
+                continue;
+            }
+            let spec = found
+                .source
+                .as_deref()
+                .ok_or_else(|| format!("{} has no spec to materialize", entry.name))?;
+            task.log(&format!("materializing {} from the pnpm store", entry.name));
+            materialized = materialize_reference(
+                spec,
+                &entry.name,
+                &staging_root.join(&entry.name),
+                task,
+            )?;
+            materialized.as_path()
+        } else {
+            let source = Path::new(&found.source_path);
+            if !source.is_dir() {
+                task.log(&format!(
+                    "skipping {}: source directory is missing",
+                    entry.name
+                ));
+                continue;
+            }
+            source
+        };
         let target = Path::new(match entry.kind {
             ExtensionKind::Plugin => "plugins",
             ExtensionKind::Skill => "skills",
@@ -538,6 +646,7 @@ pub(crate) fn export_extension_bundle(
         append_plugin_archive(&mut archive, source, &target)?;
     }
     archive.finish().map_err(|error| error.to_string())?;
+    let _ = fs::remove_dir_all(&staging_root);
     task.check_cancelled()?;
     task.update("Bundle exported", 95);
     Ok(())
@@ -688,6 +797,8 @@ pub(crate) fn import_extension_bundle(
             source_path: repo_dir.to_string_lossy().into_owned(),
             imported_at: now_seconds(),
             diagnostic: None,
+
+            storage: box_extensions::RepositoryStorage::Owned,
             source,
         });
     }
