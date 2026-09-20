@@ -1,0 +1,79 @@
+# Changelog
+
+Notable changes per release. A version tag builds the installers for all three
+platforms and publishes them on the
+[Releases page](https://github.com/Nexus-Aethra/DSHBox/releases) — see
+[Releasing](README.md#releasing).
+
+## 0.1.8
+
+The plugin dependency graph, plus the two packaging faults that kept earlier
+builds from ever showing it.
+
+### Added
+
+- **A document store instead of scattered JSON indexes.** Every persisted
+  index now goes through `box_foundation::collection::DocumentStore` (SQLite in
+  the new `box-store` crate at `<runtime>/state/dshbox.db`), with legacy files
+  migrated on first open and schema changes gated by `PRAGMA user_version`.
+- **Plugin dependency graph.** The daemon resolves what a template, a container
+  or a running host actually loads — nodes, links, layer depths, load order,
+  shared services and parse diagnostics — and the Box UI draws it as labelled
+  layer bands with search, click-to-focus and a detail panel. New
+  `box-plugin-graph` crate and a `plugin_dependency_graph` RPC; the browser dev
+  bridge carries it too.
+- **A node per mounted plugin, not per package.** A package that ships both a
+  host and a browser half (`dsh.client` + `exports["./client"]`) is drawn as two
+  nodes, so `inject`/`provide` resolve inside one context instead of inventing a
+  cross-context cycle. A bundle's `cordis.patch.yml` inserts are followed to the
+  plugins it mounts.
+- **Only real declarations count.** An `inject` is read when a plugin registers
+  it — an `Object.assign(target, { inject })` carrier or a factory's returned
+  `{ inject, apply }`. On a real profile this removed 26 phantom requirements
+  and recovered one genuine one.
+- **Templates preview their boxfile plugins.** A template's `ADD plugin`
+  entries appear as nodes before any container exists.
+- `examples/boxfile-dshell.dsh`: a reference boxfile for a third-party bundle,
+  pinned by the parser test suite.
+
+### Fixed
+
+- **Installed builds shipped a months-old frontend.** `src-tauri/build.rs`
+  mirrored the repo-root `dist/` over `src-tauri/dist` on every build,
+  overwriting what Vite had just written, so the desktop binary embedded a
+  stale bundle. The mirror is gone; the deb's `dist` resource now points at the
+  directory Tauri embeds.
+- **The DSH window stayed blank behind a system proxy.** WebKitGTK resolves
+  proxies through GIO, whose GNOME resolver sends `127.0.0.1` to the configured
+  proxy (its `ignore-hosts` matches a literal `localhost`, not `127.*`). Linux
+  now pins `GIO_USE_PROXY_RESOLVER=dummy` before any webview exists.
+- **The Linux launcher** now runs `dshbox ui` instead of the bare binary, which
+  only printed help.
+- **The bundled runtime keeps Node's C headers**, so a container can build DSH's
+  `flock` addon on Linux and macOS.
+- **Harness version list** is ordered newest first with `latest` on top, and
+  no longer sorts `0.1.10` before `0.1.9`.
+- **Reading a published package** falls back to `lib/` when it has no sources,
+  and looks for a client entry where the manifest says it is.
+
+### Infrastructure
+
+- `.github/workflows/release.yml`: a `v*` tag builds Linux (deb + rpm), Windows
+  (MSI) and macOS arm64 (dmg) and attaches them to the release; the tag is
+  checked against the three version fields first. `workflow_dispatch` builds
+  without publishing.
+
+## 0.1.7
+
+- Built-template pivot: a sealed physical template carries the profile,
+  plugins, skills and data, and containers copy it — startup never installs or
+  builds DSH. Design of record: `docs/specs/prepared-template-runtime.md`.
+- Bundled Git (Windows) inside the installer, with host-Git passthrough and
+  config isolation on Linux.
+- Windows compatibility pass: lifecycle fixes for stuck container windows and
+  orphaned host processes.
+
+## 0.1.0
+
+First packaged release: Tauri shell, `dshboxd` sidecar, DSH version manager,
+containers, extension repository and bundles.

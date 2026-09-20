@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 470" width="960" height="470" role="img" aria-label="The plugin dependency view: plugins grouped into depth bands, host and browser halves drawn as separate nodes, a bundle's inserts and a cross-context injection dashed.">
+  <defs>
+    <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="arwCross" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#a78bfa"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="470" rx="14" fill="#ffffff"/>
+
+  <g font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif">
+    <!-- depth bands -->
+    <g>
+      <rect x="28" y="54"  width="700" height="84" rx="10" fill="#f7f8fa"/>
+      <rect x="28" y="150" width="700" height="84" rx="10" fill="#f7f8fa"/>
+      <rect x="28" y="246" width="700" height="84" rx="10" fill="#f7f8fa"/>
+      <rect x="28" y="342" width="700" height="84" rx="10" fill="#f7f8fa"/>
+      <g font-size="12" fill="#6b7280">
+        <text x="44" y="72">depth 0 · 入口 / entries</text>
+        <text x="44" y="168">depth 1</text>
+        <text x="44" y="264">depth 2</text>
+        <text x="44" y="360">depth 3</text>
+      </g>
+    </g>
+
+    <!-- edges: same context -->
+    <g fill="none" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#arw)">
+      <path d="M 198 114 L 198 174"/>
+      <path d="M 198 210 L 198 270"/>
+      <path d="M 198 306 L 198 366"/>
+      <path d="M 536 306 L 536 366"/>
+    </g>
+
+    <!-- edges: bundle insert, and a cross-context injection routed up the gutter -->
+    <g fill="none" stroke="#a78bfa" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arwCross)">
+      <path d="M 536 210 L 536 270"/>
+      <path d="M 372 291 L 356 291 L 356 99 L 366 99"/>
+    </g>
+
+    <!-- edge labels -->
+    <g font-size="10" fill="#6b7280">
+      <text x="206" y="172">inject ui.layout</text>
+      <text x="206" y="268">inject ui.sidebar</text>
+      <text x="206" y="364">inject settings</text>
+      <text x="544" y="268">inserts the plugin</text>
+      <text x="544" y="364">inject terminal</text>
+      <text x="362" y="143">remote</text>
+    </g>
+
+    <!-- nodes -->
+    <g font-size="13">
+      <!-- depth 0 -->
+      <g>
+        <rect x="48" y="84" width="300" height="30" rx="8" fill="#f5f3ff" stroke="#ddd6fe"/>
+        <text x="64" y="104" fill="#1f2937">…/dsh-client-ui-layout</text>
+        <rect x="278" y="90" width="60" height="18" rx="9" fill="#ede9fe"/>
+        <text x="308" y="103" font-size="11" fill="#5b21b6" text-anchor="middle">client</text>
+      </g>
+      <g>
+        <rect x="372" y="84" width="328" height="30" rx="8" fill="#eef2ff" stroke="#c7d2fe"/>
+        <text x="388" y="104" fill="#1f2937">@deepseek-ai/dsh-api-gateway</text>
+        <rect x="630" y="90" width="56" height="18" rx="9" fill="#e0e7ff"/>
+        <text x="658" y="103" font-size="11" fill="#3730a3" text-anchor="middle">host</text>
+      </g>
+
+      <!-- depth 1 -->
+      <g>
+        <rect x="48" y="180" width="300" height="30" rx="8" fill="#f5f3ff" stroke="#ddd6fe"/>
+        <text x="64" y="200" fill="#1f2937">…/dsh-client-ui-sidebar</text>
+        <rect x="278" y="186" width="60" height="18" rx="9" fill="#ede9fe"/>
+        <text x="308" y="199" font-size="11" fill="#5b21b6" text-anchor="middle">client</text>
+      </g>
+      <g>
+        <rect x="372" y="180" width="328" height="30" rx="8" fill="#fffbeb" stroke="#fcd34d" stroke-dasharray="5 4"/>
+        <text x="388" y="200" fill="#1f2937">@nexus-aethra/dshell-bundle</text>
+        <rect x="626" y="186" width="60" height="18" rx="9" fill="#fef3c7"/>
+        <text x="656" y="199" font-size="11" fill="#92400e" text-anchor="middle">bundle</text>
+      </g>
+
+      <!-- depth 2 -->
+      <g>
+        <rect x="48" y="276" width="300" height="30" rx="8" fill="#f5f3ff" stroke="#ddd6fe"/>
+        <text x="64" y="296" fill="#1f2937">…/dsh-client-ui-settings</text>
+        <rect x="278" y="282" width="60" height="18" rx="9" fill="#ede9fe"/>
+        <text x="308" y="295" font-size="11" fill="#5b21b6" text-anchor="middle">client</text>
+      </g>
+      <g>
+        <rect x="372" y="276" width="328" height="30" rx="8" fill="#f5f3ff" stroke="#ddd6fe"/>
+        <text x="388" y="296" fill="#1f2937">@nexus-aethra/dshell-conversation</text>
+        <rect x="626" y="282" width="60" height="18" rx="9" fill="#ede9fe"/>
+        <text x="656" y="295" font-size="11" fill="#5b21b6" text-anchor="middle">client</text>
+      </g>
+
+      <!-- depth 3 -->
+      <g>
+        <rect x="48" y="372" width="300" height="30" rx="8" fill="#f5f3ff" stroke="#ddd6fe"/>
+        <text x="64" y="392" fill="#1f2937">…/dsh-client-ui-settings-general</text>
+      </g>
+      <g>
+        <rect x="372" y="372" width="328" height="30" rx="8" fill="#f5f3ff" stroke="#ddd6fe"/>
+        <text x="388" y="392" fill="#1f2937">@nexus-aethra/dshell-terminal-bridge</text>
+      </g>
+    </g>
+
+    <!-- legend -->
+    <g font-size="12" fill="#4b5563">
+      <line x1="28" y1="452" x2="62" y2="452" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#arw)"/>
+      <text x="70" y="456">same context</text>
+      <line x1="176" y1="452" x2="210" y2="452" stroke="#a78bfa" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arwCross)"/>
+      <text x="218" y="456">across host / client halves, or a bundle's insert</text>
+      <rect x="540" y="443" width="16" height="16" rx="4" fill="#fffbeb" stroke="#fcd34d" stroke-dasharray="4 3"/>
+      <text x="564" y="456">bundle — mounts plugins it does not declare</text>
+    </g>
+
+    <!-- detail panel -->
+    <g>
+      <rect x="748" y="84" width="184" height="216" rx="10" fill="#ffffff" stroke="#e5e7eb"/>
+      <text x="766" y="110" font-size="13" font-weight="600" fill="#111827">dshell-conversation</text>
+      <text x="766" y="130" font-size="11" fill="#6b7280">depth 2 · client half · 1.4.0</text>
+      <line x1="764" y1="142" x2="916" y2="142" stroke="#f3f4f6"/>
+      <text x="766" y="164" font-size="11" fill="#374151">requires</text>
+      <text x="766" y="182" font-size="11" fill="#111827">  remote  →  host service</text>
+      <text x="766" y="202" font-size="11" fill="#374151">provides</text>
+      <text x="766" y="220" font-size="11" fill="#111827">  conversation</text>
+      <line x1="764" y1="238" x2="916" y2="238" stroke="#f3f4f6"/>
+      <text x="766" y="260" font-size="11" fill="#6b7280">load order #7</text>
+      <text x="766" y="278" font-size="11" fill="#6b7280">no cycles in this context</text>
+    </g>
+  </g>
+</svg>
