@@ -141,6 +141,17 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
       </table>
 
       <h3 className="resource-section">{text.resourceTypeStored}</h3>
+      {(summary?.stored.length ?? 0) > 0 && (
+        <div className="resource-from">
+          <Select
+            value={target}
+            placeholder={text.resourceTypeInjectPlaceholder}
+            aria-label={text.resourceTypeInjectTo}
+            options={containers.map((entry) => ({ value: entry.id, label: entry.name }))}
+            onChange={(event) => { setTarget(event.target.value) }}
+          />
+        </div>
+      )}
       {(summary?.stored.length ?? 0) === 0 && <p className="resource-note">{text.resourceTypeEmpty}</p>}
       {(summary?.stored.length ?? 0) > 0 && (
         <>
@@ -154,6 +165,16 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
                   </td>
                   <td>{human(resource.bytes)} · {text.resourceTypeFiles(resource.files)}</td>
                   <td>
+                    {/* One inject per stored copy, into the container chosen
+                        above: a type usually holds several. */}
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={busy || !target}
+                      onClick={() => { void run(() => boxApi.enqueueResourceInject({ id: target, resource: resource.id, conflict, restart })) }}
+                    >{text.resourceTypeInject}</Button>
+                  </td>
+                  <td>
                     <Button
                       variant="ghost"
                       size="sm"
@@ -165,25 +186,6 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
               ))}
             </tbody>
           </table>
-          <div className="resource-from">
-            <Select
-              value={target}
-              placeholder={text.resourceTypeInjectPlaceholder}
-              aria-label={text.resourceTypeInjectTo}
-              options={containers.map((entry) => ({ value: entry.id, label: entry.name }))}
-              onChange={(event) => { setTarget(event.target.value) }}
-            />
-            <Button
-              variant="primary"
-              size="sm"
-              disabled={busy || !target || (summary?.stored.length ?? 0) === 0}
-              onClick={() => {
-                const resource = summary?.stored[0]
-                if (resource === undefined || !target) return
-                void run(() => boxApi.enqueueResourceInject({ id: target, resource: resource.id, conflict, restart }))
-              }}
-            >{text.resourceTypeInject}</Button>
-          </div>
         </>
       )}
     </div>
