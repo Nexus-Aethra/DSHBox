@@ -87,6 +87,13 @@ builds from ever showing it.
   together, merging into `settings.yaml` without touching what other plugins
   keep there. A copy taken before this still injects (its payload has no part
   manifest, so it is the single path it names).
+- **The CLI is the agent surface.** `dshbox apply -f <file>` takes one document
+  (`container:`, `types:` for the resource types the UI shows as tabs, `copies:`
+  for state to extract) and makes the resource layer match it — idempotent, with
+  `--dry-run` and `--json` per-entry results, and unknown keys are an error
+  rather than a silent no-op. `dshbox container resource types [--json]` lists
+  the registered types, `... type rm <view-id>` drops one, and the mutating verbs
+  take `--json` too, so an agent can look and act without parsing prose.
 - **The CLI and the UI can edit a resource, not just copy it.** `dshbox
   container resource read <id> <path> [--section a.b]` prints a container file's
   YAML as a tree of key paths; `... write <id> <path> --section a.b --text|--file

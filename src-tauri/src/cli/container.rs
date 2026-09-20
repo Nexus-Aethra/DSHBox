@@ -33,7 +33,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         println!("dshbox container restart <id>          restart a stopped/crashed host (no rebuild)");
         println!("dshbox container rebuild <id>          re-materialise extensions and restart");
         println!("dshbox container rm <id>               stop and delete the container");
-        println!("dshbox container resource <verb>       list|stored|extract|inject|rm (see `resource help`)");
+        println!("dshbox container resource <verb>       list|stored|types|extract|inject|read|write|rm (see `resource help`)");
         return Ok(());
     }
     let id = arguments

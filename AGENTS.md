@@ -191,6 +191,17 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   **Container startup must never install or build DSH.** `dshbox image` remains
   a deprecated alias forwarding to `build`/`template`. The authoritative design
   is `docs/specs/prepared-template-runtime.md`.
+- **The CLI is the agent surface; the UI is the human one.** `dshbox apply -f
+  <file>` takes a document (`container:`, `types:`, `copies:`) and makes the
+  resource layer match it, so an agent configures resources by writing one file
+  instead of driving verbs in order; applying is idempotent (a type is keyed by
+  kind+container+path, a copy whose name is already stored reports `exists`),
+  `--dry-run` changes nothing and `--json` reports per-entry results. The verbs
+  an agent needs are non-interactive and machine-readable: `dshbox container
+  resource list|stored|types [--json]` to look, `extract|inject|read|write|rm`
+  to act, `dshbox container resource read <id> <path> [--section a.b]` to see a
+  container file as a tree of key paths. Unknown keys in an apply document are
+  an error, not a silent no-op.
 - **Task logs are the UI's only window into a long task.** A daemon task's log
   file is written by `TaskContext::append_log` and by nothing else — a notifier
   that writes it too doubles every line. Stage changes (`task.update`) only move

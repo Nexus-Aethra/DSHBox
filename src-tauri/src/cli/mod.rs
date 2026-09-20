@@ -12,7 +12,8 @@ pub mod image;
 pub mod init;
 pub mod plugin;
 pub mod pull;
-mod resource;
+pub mod apply;
+pub mod resource;
 pub mod rpc;
 pub mod run;
 pub mod setup_path;
@@ -85,6 +86,7 @@ pub fn run() -> Option<i32> {
         "run" => run::command(&arguments[1..]),
         "config" => config::command(&arguments[1..]),
         "container" => container::command(&arguments[1..]),
+        "apply" => apply::command(&arguments[1..]),
         "image" => image::command(&arguments[1..]),
         "rpc" => raw_rpc(&arguments[1..]),
         "setup-path" => setup_path::command(&arguments[1..]),
@@ -199,6 +201,8 @@ fn print_help() {
     println!("  dshbox info                show storage and resource summary");
     println!("  dshbox ps                  list running and stopped containers");
     println!("  dshbox help                print this help");
+    println!("  dshbox apply -f <file>      make the resource layer match a document");
+    println!("                              (resource types + copies; --dry-run, --json)");
     println!("  dshbox rpc <method> [json] raw daemon RPC call, pretty-printed (debug)");
     println!("  dshbox ui                  launch the desktop GUI");
     println!();

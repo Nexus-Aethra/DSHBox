@@ -44,6 +44,10 @@ dshbox container resource write <id> <path> [options]
         --merge          merge into that block (default)
         --overwrite      replace that block
         --restart        a running container is stopped, written, then started
+dshbox container resource types [--json]
+        the resource types Box shows as tabs (kind, container, path, label)
+dshbox container resource type rm <view-id>
+        remove one of those types (the state itself is untouched)
 dshbox container resource rm <resource-id>
         delete an extracted resource and its payload
 
@@ -52,7 +56,7 @@ given, and refuses a running container unless --restart is given.";
 
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     let Some(action) = arguments.first().map(String::as_str) else {
-        return Err("expected resource list|stored|extract|inject|read|write|rm".to_owned());
+        return Err("expected resource list|stored|types|type|extract|inject|read|write|rm".to_owned());
     };
     if matches!(action, "help" | "--help" | "-h") {
         println!("{HELP}");
@@ -64,6 +68,11 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         "stored" => stored(rest),
         "extract" => extract(rest),
         "inject" => inject(rest),
+        "types" => types(rest),
+        "type" => match rest.first().map(String::as_str) {
+            Some("rm" | "remove") => type_remove(&rest[1..]),
+            _ => Err("expected resource type rm <view-id>".to_owned()),
+        },
         "read" => read(rest),
         "write" => write(rest),
         "rm" | "remove" => remove(rest),
@@ -239,7 +248,54 @@ fn extract(arguments: &[String]) -> Result<(), String> {
     let task: TaskRecord = serde_json::from_value(value)
         .map_err(|error| format!("invalid task record from daemon: {error}"))?;
     rpc::wait_task(&client, &task.id)?;
-    println!("extracted {kind} from {id}");
+    if flags.has("json") {
+        println!("{}", serde_json::to_string_pretty(&json!({ "task": task.id, "kind": kind, "container": id })).map_err(|error| error.to_string())?);
+    } else {
+        println!("extracted {kind} from {id}");
+    }
+    Ok(())
+}
+
+/// The resource types Box shows as tabs, which is what `dshbox apply` registers.
+fn types(arguments: &[String]) -> Result<(), String> {
+    let flags = Flags::parse(arguments)?;
+    let client = rpc::connect()?;
+    let value = rpc::call(&client, "list_resource_views", json!({}))?;
+    if flags.has("json") {
+        println!("{}", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?);
+        return Ok(());
+    }
+    let views = value["views"].as_array().cloned().unwrap_or_default();
+    if views.is_empty() {
+        println!("no resource types; add one with `dshbox apply` or the Box UI");
+        return Ok(());
+    }
+    for view in views {
+        println!(
+            "{:<24} {:<14} {:<28} {}",
+            view["id"].as_str().unwrap_or("?"),
+            view["kind"].as_str().unwrap_or("?"),
+            view["path"].as_str().unwrap_or("—"),
+            view["label"].as_str().unwrap_or("?"),
+        );
+    }
+    Ok(())
+}
+
+fn type_remove(arguments: &[String]) -> Result<(), String> {
+    let id = arguments
+        .first()
+        .filter(|id| !id.starts_with('-'))
+        .ok_or("expected a resource type id")?
+        .clone();
+    let flags = Flags::parse(&arguments[1..])?;
+    let client = rpc::connect()?;
+    let value = rpc::call(&client, "delete_resource_view", json!({ "viewId": id }))?;
+    if flags.has("json") {
+        println!("{}", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?);
+    } else {
+        println!("removed resource type {id}");
+    }
     Ok(())
 }
 
