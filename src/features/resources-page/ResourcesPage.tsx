@@ -68,7 +68,7 @@ type Props = {
   onImportBundle: (archive: string, conflict: string) => Promise<void>
   onInstallDshVersion: (version: string) => Promise<void>
   onUninstallDshVersion: (version: string) => Promise<void>
-  onRefreshDshCatalog: () => Promise<void>
+  onRefreshDshCatalog: (options?: { force?: boolean }) => Promise<void>
   onUpgradeResources: () => Promise<void>
   onReloadPlugins: () => Promise<void>
   onLoadTemplates: () => Promise<void>
@@ -241,7 +241,7 @@ export function ResourcesPage({
           <>
             <p className="workspace-note">{text.versionNote}</p>
             <Toolbar>
-              <Button variant="secondary" size="sm" disabled={loadingVersions || upgradingResources} onClick={() => { void onRefreshDshCatalog() }}>{loadingVersions ? '…' : text.loadVersions}</Button>
+              <Button variant="secondary" size="sm" disabled={loadingVersions || upgradingResources} onClick={() => { void onRefreshDshCatalog({ force: true }) }}>{loadingVersions ? '…' : text.loadVersions}</Button>
               <Button variant="secondary" size="sm" disabled={loadingVersions || upgradingResources} onClick={() => { void onUpgradeResources() }}>{upgradingResources ? text.upgradeRun : text.checkUpdates}</Button>
             </Toolbar>
             {upgradeReport !== null && (upgradeReport.length > 0
@@ -277,7 +277,7 @@ export function ResourcesPage({
             ) : !loadingVersions ? (
               <Card>
                 <span>{text.noVersion}</span>
-                <Button variant="primary" size="sm" onClick={() => { void onRefreshDshCatalog() }}>{text.loadVersions}</Button>
+                <Button variant="primary" size="sm" onClick={() => { void onRefreshDshCatalog({ force: true }) }}>{text.loadVersions}</Button>
               </Card>
             ) : null}
           </>

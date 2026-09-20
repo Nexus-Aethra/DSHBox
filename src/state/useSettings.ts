@@ -14,6 +14,21 @@ export const NPM_REGISTRY_PRESETS = [
   { value: '__custom__', label: 'Custom…' },
 ]
 
+/** The catalog is a remote tag listing; automatic checks inside this window are skipped. */
+const CATALOG_QUIET_MS = 10 * 60 * 1000
+const CATALOG_CHECK_KEY = 'dshbox.dshCatalogCheckedAt'
+
+function readCatalogCheckAt(): number {
+  try {
+    const raw = window.localStorage.getItem(CATALOG_CHECK_KEY)
+    return raw === null ? 0 : Number(raw) || 0
+  } catch { return 0 }
+}
+
+function writeCatalogCheckAt(at: number): void {
+  try { window.localStorage.setItem(CATALOG_CHECK_KEY, String(at)) } catch { /* storage unavailable */ }
+}
+
 export function useSettings(onError: (message: string | null) => void) {
   const [config, setConfig] = useState<BoxConfig>(INITIAL_CONFIG)
   const [loading, setLoading] = useState(true)
@@ -68,8 +83,27 @@ export function useSettings(onError: (message: string | null) => void) {
     try { await boxApi.pullTemplate(version); onError(null) } catch (reason) { onError(String(reason)) } finally { setInstallingVersion(null) }
   }
 
-  async function refreshDshCatalog(): Promise<void> {
-    try { await boxApi.enqueueDshCatalogRefresh(); onError(null) } catch (reason) { onError(String(reason)) }
+  /**
+   * Re-read the harness version list. Entering the Resources section (and its
+   * Harness tab) calls this on every visit, and the catalog is a remote tag
+   * listing, so an automatic call inside the quiet window is skipped. A manual
+   * "load versions" click passes `force` and always runs. The timestamp is
+   * kept per machine so a page reload inside the window is quiet too.
+   */
+  async function refreshDshCatalog(options?: { force?: boolean }): Promise<void> {
+    const now = Date.now()
+    if (options?.force !== true && now - readCatalogCheckAt() < CATALOG_QUIET_MS) return
+    // Claim the window before awaiting: two callers in the same tick (entering
+    // the section and selecting its tab, or a double-invoked effect in dev)
+    // would otherwise both pass the check and both hit the network.
+    writeCatalogCheckAt(now)
+    try {
+      await boxApi.enqueueDshCatalogRefresh()
+      onError(null)
+    } catch (reason) {
+      if (readCatalogCheckAt() === now) writeCatalogCheckAt(0)
+      onError(String(reason))
+    }
   }
 
   async function uninstallDshVersion(version: string): Promise<void> {
