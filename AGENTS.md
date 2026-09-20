@@ -146,6 +146,13 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   host process — `dsh_host_policy` (`box-runtime/src/process/env.rs`) strips
   all 8 proxy aliases. A host that inherits a proxy self-terminates with an
   "opening the default browser" error.
+  (c) the DSH front webview: WebKitGTK resolves proxies through GIO, and a
+  system proxy hands the host's `127.0.0.1:<port>` URL to the proxy (GNOME's
+  resolver matches a literal `localhost` in `ignore-hosts`, but not `127.*` or
+  `127.0.0.1`), leaving the window blank. `main.rs` pins
+  `GIO_USE_PROXY_RESOLVER=dummy` on Linux for that reason; env vars such as
+  `no_proxy` do **not** affect this path. Windows uses `--no-proxy-server` in
+  `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` for the same failure.
 - **Plugin lifecycle scripts are user-approved code execution.** Do not relax
   pnpm supply-chain checks (lifecycle-script approval, minimum-release-age).
   The `dshbox.allow-build` LABEL in a boxfile authorizes the **top-level
@@ -194,7 +201,12 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   break if this regresses. Tracked children spawn with `setsid` pre_exec so
   kill_tree can't take down unrelated process groups.
 - **`src-tauri/dist/` is generated** by Vite before the Tauri build and
-  bundled into the desktop binary — never edit files under it.
+  bundled into the desktop binary — never edit files under it. It must stay the
+  only frontend output: `vite.config.ts`'s `outDir` and `build.frontendDist`
+  (which Tauri resolves against `src-tauri/`) have to agree, and no build step
+  may copy a second `dist/` over it. `build.rs` used to mirror the repo-root
+  `dist/` in, which silently shipped a months-old frontend — a stale bundle
+  looks exactly like "the feature was never implemented".
 
 ## Docs to read before touching sensitive areas
 
