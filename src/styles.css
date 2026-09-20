@@ -542,3 +542,11 @@ dialog .resource-panel { max-height: 70vh; overflow-y: auto; }
 .resource-copies li { flex-wrap: wrap; }
 .resource-add { align-items: center; }
 .resource-add .resource-section { white-space: nowrap; }
+
+/* The extensions heading: one row, scope left, actions right, everything on the
+   same baseline (the old layout stacked a field label over the select). */
+.extensions-heading-left { align-items: center; display: flex; gap: 12px; min-width: 0; }
+.extensions-heading-left h2 { margin: 0; }
+.extensions-profile { align-items: center; display: inline-flex; gap: 6px; }
+.extensions-profile .ui-select { width: auto; min-width: 7rem; max-width: 12rem; }
+.extensions-heading-actions { align-items: center; display: flex; gap: 8px; flex: 0 0 auto; }

@@ -103,14 +103,28 @@ export function ContainerDetails({ container, details, repository, bundles, work
           <>
             <Card>
               <div className="extensions-heading-row">
-                <h2 className="extensions-heading-title">{text[tab]}</h2>
+                {/* Scope on the left, actions on the right: the profile picker
+                    belongs with the list it filters, not with the buttons. */}
+                <div className="extensions-heading-left">
+                  <h2 className="extensions-heading-title">{text[tab]}</h2>
+                  {tab === 'plugins' && (
+                    <label className="extensions-profile">
+                      <span>{text.profiles}</span>
+                      <Select
+                        size="sm"
+                        value={selected?.name ?? ''}
+                        disabled={saving || !selected}
+                        aria-label={text.profiles}
+                        onChange={(event) => { void selectProfile(event.target.value, false) }}
+                        options={(details?.profiles ?? []).map((item) => ({ value: item.name, label: item.name }))}
+                      />
+                    </label>
+                  )}
+                </div>
                 {tab === 'plugins' && (
                   <div className="extensions-heading-actions">
                     <Button variant="secondary" size="sm" onClick={() => { setGraphOpen(true) }}>{text.pluginGraphOpen}</Button>
                     <Button variant="secondary" size="sm" onClick={() => { setResourcesOpen(true) }}>{text.resourceOpen}</Button>
-                    <Field label={text.profiles}>
-                      {(id) => <Select id={id} value={selected?.name ?? ''} disabled={saving || !selected} onChange={(event) => { void selectProfile(event.target.value, false) }} options={(details?.profiles ?? []).map((item) => ({ value: item.name, label: item.name }))} />}
-                    </Field>
                   </div>
                 )}
               </div>
