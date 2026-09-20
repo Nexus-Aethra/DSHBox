@@ -55,6 +55,7 @@ export type PluginGraphText = {
   pluginGraphInactive: (count: number) => string
   pluginGraphCycles: (count: number) => string
   pluginGraphSharedServices: (count: number) => string
+  pluginGraphSharedServicesExpected: (count: number) => string
   pluginGraphSharedService: (providers: string) => string
   pluginGraphSharedServiceHint: string
   pluginGraphParseNotes: (count: number) => string
@@ -299,6 +300,8 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
   // so the two halves can be different builds; `sharedServices` is absent from a
   // daemon that predates it and reading it unguarded would blank the panel.
   const sharedServices = graph?.sharedServices ?? []
+  const perContextShared = sharedServices.filter((service) => service.perContext)
+  const conflictingShared = sharedServices.filter((service) => !service.perContext)
 
   // Providers per service, and which (plugin, service) pairs a plugin provides
   // for itself. Real DSH packages do require a service they also provide
@@ -975,17 +978,24 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
                   </ul>
                 </div>
               )}
-              {/* Not an error, and not a conflict: cordis scopes a service name to
-                  one context, so a host implementation and a browser one coexist
-                  by design. It is worth saying because this diagram merges those
-                  contexts, and that is where the extra lines come from — and often
-                  where a cycle comes from too. */}
-              {sharedServices.length > 0 && (
+              {/* Two shapes hide behind "more than one registration", and only one
+                  of them is a conflict. A name registered once per context is the
+                  dual-face pattern — cordis resolves it inside each isolation
+                  scope, so nothing arbitrates — and it is worth *saying* only
+                  because this diagram merges the two contexts. A name with two
+                  registrations in the same context is the one the runtime has to
+                  arbitrate, so that list stays a list. */}
+              {perContextShared.length > 0 && (
                 <div className="plugin-graph-issue">
-                  <Badge variant="neutral">{text.pluginGraphSharedServices(sharedServices.length)}</Badge>
+                  <Badge variant="neutral">{text.pluginGraphSharedServicesExpected(perContextShared.length)}</Badge>
                   <p className="plugin-graph-note">{text.pluginGraphSharedServiceHint}</p>
+                </div>
+              )}
+              {conflictingShared.length > 0 && (
+                <div className="plugin-graph-issue">
+                  <Badge variant="danger">{text.pluginGraphSharedServices(conflictingShared.length)}</Badge>
                   <ul>
-                    {sharedServices.map((service) => (
+                    {conflictingShared.map((service) => (
                       <li key={service.service}>
                         {/* The service name is the way in: its owners are separate
                             plugins and either one is arbitrary, so the jump goes

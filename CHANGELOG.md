@@ -77,6 +77,21 @@ builds from ever showing it.
 
 ### Fixed
 
+- **The dependency graph cried wolf on a container that runs.** Three findings
+  were wrong at once. `profileContext` was reported missing because the launcher
+  (`apps/cli`) provides it and the launcher was not a node — it is now scanned
+  like a package and drawn as `dsh (launcher)`. `dshell-workspace` was reported
+  as waiting on `remote`/`workspaces` whose providers were "installed but not
+  active", because a published package that ships `lib/client.js` *and* a
+  `lib/client/` directory had its entry file attributed to the **host** half
+  (`lib/client.js` does not start with `lib/client`), so the browser half's
+  `inject` list landed on the host — the entry file is now a prefix in its own
+  right, and the source layout `src/client/index.ts` resolves too. And the
+  eight "service names with more than one registration" were all the dual-face
+  pattern (one implementation per context), which cordis resolves per isolation
+  scope: those are now reported as expected, and only two registrations *in one
+  context* stay a conflict. On the real container: 1 missing → 0, 3 inactive
+  providers → 0, 8 shared names → 5 expected + 0 conflicts.
 - **A slow daemon froze the desktop.** Every Tauri command was synchronous, and
   Tauri runs those on the main thread — the one that renders the window — so a
   single slow daemon call stopped the UI from drawing or responding. The 66

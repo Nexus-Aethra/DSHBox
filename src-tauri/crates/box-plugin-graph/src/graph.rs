@@ -264,6 +264,7 @@ pub fn assemble(
 
     // Compared on the activated plugins only: one the profile never loads does not
     // register anything, so counting it would describe a tree that is not running.
+    let half_of: BTreeMap<&str, Half> = nodes.iter().map(|node| (node.id.as_str(), node.half)).collect();
     let shared_services: Vec<SharedService> = providers
         .iter()
         .filter_map(|(service, names)| {
@@ -275,9 +276,21 @@ pub fn assemble(
                 })
                 .cloned()
                 .collect();
-            (loaded.len() > 1).then(|| SharedService {
+            if loaded.len() < 2 {
+                return None;
+            }
+            // One registration per context is the dual-face pattern, not a
+            // conflict: each side resolves the name inside its own isolation
+            // scope. Two in one context is what the runtime has to arbitrate.
+            let clients = loaded
+                .iter()
+                .filter(|id| half_of.get(id.as_str()) == Some(&Half::Client))
+                .count();
+            let per_context = clients <= 1 && loaded.len() - clients <= 1;
+            Some(SharedService {
                 service: service.clone(),
                 providers: loaded,
+                per_context,
             })
         })
         .collect();

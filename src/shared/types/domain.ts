@@ -63,7 +63,13 @@ export type PluginLink = { from: string; to: string; service: string; crossConte
 // resolves a name per isolation scope, so a host implementation and a browser one
 // are the design. It is reported because this graph merges the contexts, which
 // draws the name as a fan-out wider than the running tree has.
-export type SharedService = { service: string; providers: string[] }
+export type SharedService = {
+  service: string
+  providers: string[]
+  /** One registration per context (a host half and a browser half): the dual-face
+   *  pattern, not a conflict. False means two registrations share a context. */
+  perContext: boolean
+}
 export type PluginGraph = {
   source: GraphSourceKind
   sourceId: string

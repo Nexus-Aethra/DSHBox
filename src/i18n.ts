@@ -194,6 +194,9 @@ const COPY = {
     // conflict — but it is why one name carries N×M lines and why a cycle is
     // reported at all, so it is named rather than left to be inferred.
     pluginGraphSharedServices: (n: number) => `${n} service name${n === 1 ? '' : 's'} with more than one registration`,
+    pluginGraphSharedServicesExpected: (n: number) => `${n} name${n === 1 ? '' : 's'} registered once per context (expected)`,
+    pluginGraphSharedServiceContext: 'one per context',
+    pluginGraphSharedServiceConflict: 'same context',
     pluginGraphSharedService: (providers: string) => `is also registered by ${providers}`,
     pluginGraphSharedServiceHint: 'cordis resolves a service name per isolation scope, so a host implementation and a browser implementation of the same name coexist by design — usually the same package shipping both halves. This diagram merges those contexts, so such a name and the lines reaching it are drawn wider than the running tree has them.',
     pluginGraphParseNotes: (n: number) => `${n} unresolved declaration${n === 1 ? '' : 's'}`,
@@ -395,6 +398,9 @@ const COPY = {
     pluginGraphInactive: (n: number) => `${n} 个未激活提供者`,
     pluginGraphCycles: (n: number) => `${n} 个依赖环`,
     pluginGraphSharedServices: (n: number) => `${n} 个服务名有多个注册者`,
+    pluginGraphSharedServicesExpected: (n: number) => `${n} 个名字在宿主/浏览器各注册一次（设计如此）`,
+    pluginGraphSharedServiceContext: '每上下文一个',
+    pluginGraphSharedServiceConflict: '同一上下文',
     pluginGraphSharedService: (providers: string) => `另由 ${providers} 注册`,
     pluginGraphSharedServiceHint: 'cordis 按 isolation scope 解析服务名，所以同一个名字在宿主与浏览器各有一个实现是设计如此——通常就是同一个包的两半身。本图把这两个上下文合并绘制，因此这类服务名以及连到它的边比运行时更宽。',
     pluginGraphParseNotes: (n: number) => `${n} 处无法解析的声明`,

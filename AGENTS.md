@@ -191,6 +191,17 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   **Container startup must never install or build DSH.** `dshbox image` remains
   a deprecated alias forwarding to `build`/`template`. The authoritative design
   is `docs/specs/prepared-template-runtime.md`.
+- **The graph reads source, so it must not claim more than source can show.**
+  Three false alarms came from the same mistake — treating an incomplete static
+  view as complete. The launcher (`apps/cli`) provides services to the plugins it
+  mounts and is not a package, so it is scanned and drawn as `dsh (launcher)`;
+  without it `profileContext` reads as missing for a container that starts fine.
+  A dual-face package's half is decided by *prefixes*, plural: a published
+  package ships `lib/client.js` beside `lib/client/`, and the entry file must be
+  a prefix in its own right or its `inject` list lands on the host half. And a
+  service name registered once per context is the dual-face pattern, not a
+  conflict — `SharedService::per_context` says which is which, because cordis
+  resolves a name per isolation scope and this diagram merges the contexts.
 - **The desktop must never block its own main thread on the daemon.** A plain
   `#[tauri::command]` runs on the main thread — the same one that renders the
   window — so a slow daemon call freezes the UI. Every command that talks to the
