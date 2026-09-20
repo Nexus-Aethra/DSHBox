@@ -60,7 +60,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Not 20: the `packageManager` pin (pnpm 11.22) imports `node:sqlite`
+          # and refuses to start below Node 22.13.
+          node-version: 22
           cache: pnpm
 
       - uses: dtolnay/rust-toolchain@stable
