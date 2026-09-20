@@ -17,6 +17,7 @@ members = [
   "crates/box-containers",
   "crates/box-extensions",
   "crates/box-plugin-graph",
+  "crates/box-resources",
   "crates/box-image",
   "crates/box-state",
   "crates/box-server-core",
@@ -76,6 +77,7 @@ box-containers = { path = "crates/box-containers" }
 box-extensions = { path = "crates/box-extensions" }
 box-image = { path = "crates/box-image" }
 box-plugin-graph = { path = "crates/box-plugin-graph" }
+box-resources = { path = "crates/box-resources" }
 box-state = { path = "crates/box-state" }
 box-server-core = { path = "crates/box-server-core" }
 box-client = { path = "crates/box-client" }
