@@ -157,17 +157,23 @@ jobs:
           NOTES_FILE: ${{ steps.notes.outputs.file }}
         run: |
           tag="${GITHUB_REF_NAME}"
+          # Files, not `installers/*`: the Linux artifact carries `deb/` and
+          # `rpm/` as directories of its own, and a glob hands those to `gh`
+          # as uploads — "read installers/deb: is a directory" — which is how
+          # the v0.1.8 run reached the release step and failed there.
+          mapfile -t files < <(find installers -type f | sort)
+          printf '%s\n' "${files[@]}"
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" installers/* --clobber
+            gh release upload "$tag" "${files[@]}" --clobber
             if [ -n "$NOTES_FILE" ]; then
               gh release edit "$tag" --notes-file "$NOTES_FILE"
             fi
           elif [ -n "$NOTES_FILE" ]; then
-            gh release create "$tag" installers/* \
+            gh release create "$tag" "${files[@]}" \
               --title "$tag" \
               --notes-file "$NOTES_FILE"
           else
-            gh release create "$tag" installers/* \
+            gh release create "$tag" "${files[@]}" \
               --title "$tag" \
               --generate-notes
           fi
