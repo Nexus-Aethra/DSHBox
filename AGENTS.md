@@ -353,6 +353,7 @@ command as done only once the installed app has run it.
 |------|------|
 | Architecture, runtime model, crate map | `docs/development.md`, `handoff.md` (repo root) |
 | Prepared base / sealed template design | `docs/specs/prepared-template-runtime.md` |
+| Document store and storage layers | `docs/specs/storage-abstraction.md` |
 | Template system behavior | `docs/template-system.md` |
 | Plugin pnpm install flow | `docs/design/pnpm-managed-plugin-install.md` |
 | Past incidents, kept as history | `docs/notes/` — a fixed bug is context, not a live warning |
