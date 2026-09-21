@@ -123,6 +123,11 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-22.04
     steps:
+      # The notes live in the repository (`docs/releases/<tag>.md`), and this job
+      # starts from an empty workspace — without the checkout the notes file is
+      # never found and every release silently falls back to generated notes.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: installers

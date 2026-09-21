@@ -211,6 +211,11 @@ builds from ever showing it.
   (MSI) and macOS arm64 (dmg) and attaches them to the release; the tag is
   checked against the three version fields first. `workflow_dispatch` builds
   without publishing.
+- Release notes written in the repo actually reach the release page. The publish
+  job never checked the repository out, so `docs/releases/<tag>.md` — the file
+  the workflow reads the notes from — was never found and every release fell
+  back to generated notes: a list of merged pull requests instead of what
+  changed for a user.
 - The Windows bundler finds MSVC through `vswhere` before falling back to
   scanning install roots, and says so when it does fall back: a host whose
   Visual Studio sits in the 64-bit `Program Files` (every GitHub runner) used
