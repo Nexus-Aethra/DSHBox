@@ -6,7 +6,7 @@ import { Button } from '../../ui/Button'
 import { Dialog } from '../../ui/Dialog'
 import { Input } from '../../ui/Input'
 import type { LayoutEdge } from './layout'
-import { cyclicEdges, foldLayers, foldedNodeId, isFoldedNodeId, layoutGraph, MAX_LABEL_CHARS, NODE_HEIGHT, NODE_WIDTH } from './layout'
+import { cyclicEdges, foldLayers, foldedNodeId, isFoldedNodeId, layersWorthFolding, layoutGraph, MAX_LABEL_CHARS, NODE_HEIGHT, NODE_WIDTH } from './layout'
 import type { GraphNodeMeta } from './PluginGraphView'
 import { PluginGraphView } from './PluginGraphView'
 
@@ -127,9 +127,9 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
   const [showIsolated, setShowIsolated] = useState(false)
   const [showInactive, setShowInactive] = useState(false)
   const [selected, setSelected] = useState<string | null>(null)
-  // Dependency depths the reader folded away. Layers are read one at a time,
-  // and the depth nobody is asking about is exactly the one worth hiding.
-  const [foldedLayers, setFoldedLayers] = useState<Set<number>>(() => new Set())
+  // The depths the reader folded. `null` means nobody has folded anything yet, so
+  // the default stands — see `foldedLayers` below for what that is.
+  const [ownFolds, setOwnFolds] = useState<Set<number> | null>(null)
   const [transform, setTransform] = useState({ scale: 1, x: 0, y: 0 })
   const [query, setQuery] = useState('')
   const [showHelp, setShowHelp] = useState(false)
@@ -451,6 +451,21 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
     () => layoutGraph({ nodes, edges, order: graph?.order ?? [], weight, cyclic: cyclicKeys }),
     [nodes, edges, graph, weight, cyclicKeys],
   )
+  // A depth that cannot be drawn as one band is a depth worth summarising, so
+  // that is the default: the graph opens as an overview of the profile's levels
+  // instead of as a hairball. The moment the reader folds or unfolds anything,
+  // their choice is what stands.
+  const autoFolded = useMemo(() => new Set(layersWorthFolding(base)), [base])
+  const foldedLayers = ownFolds ?? autoFolded
+  const toggleLayer = (layer: number): void => {
+    setOwnFolds(() => {
+      const next = new Set(foldedLayers)
+      if (next.has(layer)) next.delete(layer)
+      else next.add(layer)
+      return next
+    })
+  }
+
   const layout = useMemo(() => {
     if (foldedLayers.size === 0) return base
     const layerOf = new Map(base.nodes.map((node) => [node.id, node.layer]))
@@ -465,15 +480,6 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
       if (base.nodes.some((node) => node.id === id && node.layer === layer)) count += 1
     }
     return count
-  }
-
-  const toggleLayer = (layer: number): void => {
-    setFoldedLayers((current) => {
-      const next = new Set(current)
-      if (next.has(layer)) next.delete(layer)
-      else next.add(layer)
-      return next
-    })
   }
 
   /** How many boxes a folded layer is standing in for. */
@@ -938,11 +944,12 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
                   selected={selected}
                   onSelect={selectUnlessDragged}
                   showEdgeLabels={layout.edges.length <= EDGE_LABEL_LIMIT}
-                  layerLabel={text.pluginGraphLayerLabel}
-                  foldedLayers={foldedLayers}
+                  /* A folded depth's band holds one summary box, so the count
+                     has to come from the depth itself — `41 个`, not the one box
+                     standing in for it — and the label has to offer the way
+                     back. */
+                  layerLabel={(layer, count) => (foldedLayers.has(layer) ? text.pluginGraphUnfold : text.pluginGraphFold)(layer, foldedCounts.get(layer) ?? count)}
                   onToggleLayer={toggleLayer}
-                  foldLabel={text.pluginGraphFold}
-                  unfoldLabel={text.pluginGraphUnfold}
                   matches={search?.matched ?? null}
                   canvasLabel={text.pluginGraphCanvas}
                   emptyLabel={text.pluginGraphEmpty}

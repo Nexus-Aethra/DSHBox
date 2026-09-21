@@ -23,14 +23,12 @@ type Props = {
   // Nodes the search box matched, outlined rather than isolated so the hit keeps
   // the surrounding graph as context.
   matches: Set<string> | null
-  // Labels for the dependency depths, drawn beside each band.
+  // Labels for the dependency depths, drawn beside each band. The caller words
+  // them — a band's label is also the control that folds its depth away.
   layerLabel: (layer: number, count: number) => string
-  // Folding: a band's label folds that layer away, and a folded summary node
-  // unfolds it again. Both are one action on one layer, so they share a callback.
-  foldedLayers: Set<number>
+  // Folding a depth is one action on one layer, from the band label and from the
+  // summary box it leaves behind.
   onToggleLayer: (layer: number) => void
-  foldLabel: (layer: number, count: number) => string
-  unfoldLabel: (layer: number, count: number) => string
   // Accessible name for the diagram, and the message shown when it is empty.
   canvasLabel: string
   emptyLabel: string
@@ -94,7 +92,7 @@ function edgeMidpoint(edge: PlacedEdge, from: Box, to: Box): { x: number; y: num
   }
 }
 
-export function PluginGraphView({ layout, meta, selected, onSelect, showEdgeLabels, matches, layerLabel, foldedLayers, onToggleLayer, foldLabel, unfoldLabel, canvasLabel, emptyLabel }: Props) {
+export function PluginGraphView({ layout, meta, selected, onSelect, showEdgeLabels, matches, layerLabel, onToggleLayer, canvasLabel, emptyLabel }: Props) {
   if (layout.nodes.length === 0) {
     return <p className="plugin-graph-empty">{emptyLabel}</p>
   }
@@ -171,7 +169,7 @@ export function PluginGraphView({ layout, meta, selected, onSelect, showEdgeLabe
                   }
                 }}
               >
-                {foldLabel(group.layer, group.count)}
+                {layerLabel(group.layer, group.count)}
               </text>
             </g>
           ))}

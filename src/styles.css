@@ -398,8 +398,11 @@ code.missing { color: #b42318; }
 /* A folded depth: one box standing for a whole layer. Dashed, because it is a
    summary and not a plugin, and clickable, because that is how it comes back. */
 /* An edge the drawing cannot lay out forwards — two halves merged onto one node
-   put two dependency chains there. Not a cycle, so not red: dashed and quiet. */
-.plugin-graph-edge.crosses { stroke-dasharray: 6 5; stroke: #94a3b8; }
+   put two dependency chains there. Not a cycle, so not red, and not darker than a
+   normal edge either: once a depth or two is folded these are most of the lines,
+   so they have to read as the quiet background a normal edge stands out from. */
+.plugin-graph-edge.crosses { stroke: #ccd2d9; stroke-width: 1.2; stroke-dasharray: 5 5; }
+.plugin-graph-edges .edge.touched .plugin-graph-edge.crosses { stroke: var(--color-primary); stroke-width: 2; }
 .swatch.mark-crosses { background: repeating-linear-gradient(90deg, #94a3b8 0 4px, transparent 4px 8px); }
 .plugin-graph-node.layer rect { fill: #f8fafc; stroke: #94a3b8; stroke-dasharray: 5 4; }
 .plugin-graph-node.layer text { fill: #334155; font-weight: 600; }

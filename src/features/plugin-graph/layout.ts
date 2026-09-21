@@ -493,6 +493,22 @@ export function layoutGraph(input: LayoutInput): Layout {
   }
 }
 
+/**
+ * The depths a reader sees as a crowd: more nodes than one band can hold, so the
+ * drawing already has to break them into strips. The panel folds these on open,
+ * so the first thing seen is a summary — a depth at a time is how a profile this
+ * size is read — and one click on the summary brings a depth back.
+ */
+export function layersWorthFolding(layout: Layout): Set<number> {
+  const counts = new Map<number, number>()
+  for (const node of layout.nodes) counts.set(node.layer, (counts.get(node.layer) ?? 0) + 1)
+  const folded = new Set<number>()
+  for (const [layer, count] of counts) {
+    if (count > MAX_ROWS) folded.add(layer)
+  }
+  return folded
+}
+
 // ── folding a layer away ──────────────────────────────────────────────────
 //
 // A profile this size is read one dependency depth at a time, and the depth a

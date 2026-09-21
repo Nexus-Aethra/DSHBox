@@ -77,6 +77,11 @@ builds from ever showing it.
 
 ### Added
 
+- **The dependency graph opens folded.** A depth bigger than one band is a depth
+  the drawing already has to break into strips, so those are folded on open: a
+  175-node container shows as 31 boxes with five of them summaries (`第 3 层 · 28
+  个`), and one click on a summary or a band label brings a depth back. A folded
+  depth's band label counts the depth itself, not the one box standing in for it.
 - **Fold a dependency depth away.** A band's label folds that layer into one
   summary box (`第 3 层 · 28 个`), the layer's edges re-point at it, and the rest
   of the diagram reflows — so a 175-node graph is read one depth at a time. The
