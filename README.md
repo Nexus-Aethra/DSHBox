@@ -10,30 +10,24 @@ DSH Box is a lightweight desktop shell built with [Tauri 2](https://tauri.app) t
 
 ## Highlights
 
-- **Isolated DSH Containers** — install multiple DSH versions side by side and create independent Containers per project. Every Container gets its own profile (`web` / `headless` / custom), workspace, plugin set, and host process, so experiments never cross-contaminate.
-- **Embedded WebView, no browser needed** — the DSH frontend opens in a native WebView window managed by DSH Box. No port-forwarding, no copy-pasting URLs, no tab clutter.
-- **A container is ready in seconds** — pulling a Harness version prepares a base that already carries the built client artifacts (native addon, host and client libraries, web frontend). Creating a container is a copy plus store links: measured at **~10s**, where building the frontend at container creation took ~195s. Container startup never installs or builds anything.
-- **Plugin dependency graph** — see what a template, a container, or a running host actually loads. Every plugin is a node, host and browser halves are drawn apart, and the nodes are grouped into depth bands with the `inject`/`provide` links that put them there, plus shared services, load order, and the parse notes that explain what could not be resolved. Search it, click a node to focus it, **fold a depth** you are not reading, and read why a plugin is present in the detail panel. See [Architecture → Plugin dependency graph](#plugin-dependency-graph).
-- **Container resources, extract inject and edit** — chat history, provider credentials and plugin state are modelled as *kinds* with a location, and they can be extracted from a container into the Box store, injected back (refusing to overwrite by default, merging entry by entry when asked), carried between containers, or packed as a tarball. A copy is **named**, and a second one is added rather than replacing the first; a kind can live in several places at once (a provider key is a ref in `.credentials.yaml` *and* the route that names it in `settings.yaml`); and any YAML block can be **edited by key path** in the UI or the CLI. A plugin that declares its own `dshbox.resources` — or merely builds a path under the profile — shows up as a candidate.
-- **An agent surface, not just a GUI** — `dshbox apply -f <file>` takes one document (`container:`, `types:`, `copies:`) and makes the resource layer match it; every reporting verb answers with `--json`; and `dshbox container resource read <id> <path> --section a.b` hands an agent a container file as a tree of key paths. See [Driving it from an agent](#driving-it-from-an-agent).
-- **Zero-dependency install** — a private Node, npm, pnpm, and Git (Windows) runtime is bundled with every release. No system Node, no manual toolchain setup, no PATH hacking. Git-backed Boxfile sources (`github.com/owner/repo:tag`) resolve through the managed binary in DSH Box's clean-room environment — host `~/.gitconfig` never leaks into builds. On Linux, DSH Box uses your system Git (`apt install git`) while still isolating its configuration under the runtime directory.
-- **Version manager built in** — browse DSH releases from `deepseek-ai/deepseek-harness`, install or uninstall any tag with one click, and pin a version per Container.
-- **Boxfile / sealed-template pipeline** — describe a Container with a small declarative `.dsh` script (`FROM` + `PROFILE` + `ADD plugin|skill|data`); `dshbox build` produces a reusable source recipe and `dshbox run <template>` prepares it once in the final Container directory. See [Architecture → Boxfile](#boxfile-and-the-built-template-pipeline).
-- **Portable built templates** — building a Boxfile materialises its plugin, skill, and data payloads into the template. Containers receive their own copied payloads, so they do not depend on workspace paths, pnpm links, or a mutable extension repository.
-- **Windows-first runtime recovery** — on Windows, DSH Box recovers from a first-run pnpm junction-validation failure after dependencies were materialised, and allocates a fresh loopback port immediately before Host launch. Transient loopback bind failures are retried without rebuilding the frontend.
-- **In-container agent awareness** — DSH Box injects a `dsh-box-context` plugin into every Container so the in-session agent sees `paths.dshboxHome` and `paths.dshboxCli` and can manage DSH Boxes (containers, templates, plugins) even when it does not inherit a sane `PATH`.
-- **The plugin list mirrors what is installed** — the repository is an index over pnpm's store and every profile's lockfile, not a second place to import into. A plugin a boxfile installed appears on its own, marked *auto-indexed*; importing a package records a pointer (`reference`) while a local directory or archive is kept as a *copy*; a full bundle export materialises pointers so the archive stays self-contained. Plugins and skills can be imported from a GitHub URL, a local directory, or a tarball and installed into any Container's profile; skills are auto-sorted into the Container's skill root.
-- **Bundle (整合包) workflow** — group any mix of plugins and skills into a named bundle, then export it two ways:
-  - **Quick export**: GitHub-sourced entries are kept as URLs, keeping the archive tiny.
-  - **Full export**: everything is packed into one portable `.tar.gz`.
-  - Bundles can be re-imported (with your choice of *overwrite* or *keep* on name clashes) and installed into any Container — plugins land in the profile, skills are sorted automatically.
-- **Background tasks you can watch** — every long operation (install, start, rebuild, import, export) runs as a visible queued task with scrolling logs, cancel/retry/delete, and history paging. Each step says what it is doing and how long it took.
-- **A slow daemon never freezes the window** — every Tauri command that talks to the daemon, the filesystem or another process runs off the main thread, and each RPC is bounded by a timeout, so a busy `dshboxd` answers "not yet" instead of holding the UI.
-- **Dual-mode RPC + live event stream** — the daemon owns all state changes and exposes them through a single `POST /rpc` (sync or async — the daemon decides) and a long-lived `GET /events?token=…` SSE stream. CLI, UI, and external agents talk to the same endpoints; UI pages contain zero business logic.
-- **Network-friendly** — automatic proxy detection for GitHub clones, configurable GitHub mirror, and npm registry mirror for installs inside DSH.
-- **Background service & tray** — a small `dshboxd` sidecar keeps things tidy, and a system tray icon lets you control it without keeping the main window open.
-- **Lightweight by design** — Tauri-based, so the installer is small and the memory footprint stays far below Electron alternatives.
-- **Bilingual UI** — English and 简体中文, switchable in Settings.
+- **Isolated containers** — one DSH version, profile, workspace and host process each.
+- **Embedded WebView** — the DSH UI opens in a native window; no ports, no URLs to paste.
+- **Ready in seconds** — a pulled Harness version arrives with its client artifacts built; `run` is a copy (~10s).
+- **Plugin dependency graph** — what loads, in what order, why: depth bands, halves apart, fold a depth away.
+- **Resources: extract, inject, edit** — conversations, keys and plugin state as named copies; any YAML block editable by key path.
+- **An agent surface** — `dshbox apply -f` configures resources from one document; every verb answers `--json`.
+- **Zero-dependency install** — bundled Node, npm, pnpm and Git (Windows), in a clean room.
+- **Version manager** — install any Harness tag and pin a version per container.
+- **Boxfiles** — `FROM` + `ADD` describes a template; build once, run many.
+- **Portable templates** — every payload is materialised into the template, so containers depend on nothing mutable.
+- **Bundles** — group plugins and skills, then export quick (URLs kept) or full (one archive).
+- **Tasks you can watch** — queued, logged with timings, cancellable, with history.
+- **A slow daemon never freezes the window** — commands run off the main thread and every RPC is bounded.
+- **RPC + events** — one `POST /rpc` and one SSE stream serve the UI, the CLI and agents alike.
+- **Network-friendly** — GitHub mirror, npm registry mirror, automatic proxy detection.
+- **Tray and background service** — `dshboxd` keeps working with the window closed.
+- **Lightweight** — Tauri, not Electron.
+- **Bilingual UI** — English and 简体中文.
 
 ![The plugin list: one row per installed plugin, with kind, storage, cache state, auto-indexed mark, and the templates and containers it came from](docs/images/resources-plugins.png)
 
