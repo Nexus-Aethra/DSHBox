@@ -1,5 +1,11 @@
 # DSH Box — Agent Guide
 
+> This file is the engineering guide. User-facing documentation lives in
+> [`README.md`](README.md) (English) and [`README.zh-CN.md`](README.zh-CN.md)
+> (简体中文): the two are kept in step, and a feature that changes what the app
+> does belongs in both, along with a figure under `docs/images/` when it is
+> visible in the UI.
+
 > Desktop launcher and lifecycle manager for DeepSeek Harness (DSH). Tauri 2
 > shell + React management UI + Rust Cargo workspace + `dshboxd` sidecar.
 
