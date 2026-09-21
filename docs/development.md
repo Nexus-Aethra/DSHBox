@@ -7,6 +7,32 @@ Harness (DSH). The Box management UI is a separate React application; it starts
 DSH on loopback and displays the DSH web UI in a WebView. It does not modify or
 imitate DSH's bundled client.
 
+## System boundary
+
+A React management UI, a Tauri shell/CLI, and the `dshboxd` sidecar. The daemon
+is the sole writer of resource state and the only owner of the scheduler: the
+desktop and the CLI submit the same RPC-backed work and consume the same task
+and resource events, and neither keeps a second lifecycle implementation of its
+own.
+
+```text
+React UI / dshbox CLI
+          |
+          v
+ Tauri adapters / HTTP client
+          |
+          v
+ dshboxd: scheduler + state + lifecycle
+          |
+          +-- libgit2 checkout
+          +-- bundled Node/pnpm process execution
+          +-- resource and diagnostics persistence
+```
+
+Only the desktop package depends on Tauri. Crate dependencies flow from
+foundation/runtime/scheduler/state toward the functional crates and then the
+adapters.
+
 ## Current runtime model
 
 The runtime root uses the prepared/sealed model:
@@ -34,6 +60,26 @@ Harness checkout, workspace-path injection, or a symlink/junction from a
 container into the repository/template tree. The complete contract and
 migration policy are in [prepared-template-runtime.md](specs/prepared-template-runtime.md).
 
+## Persistence and publication
+
+`~/.dsh-box/` holds machine-local settings only — `config.json`, notably which
+runtime root is selected. Everything large lives below that root, and
+`<runtime>/state/` holds the indexes: `dshbox.db` is the document store (task
+queue, resource records, resource views), and `resource-map.json` records which
+sealed templates, plugin artifacts and containers still reference each other.
+That map is what gates removal and lets the scheduler clean up in the
+background without deleting something still in use. Content-addressed
+directories (`templates/<digest>/`, `data/<digest>/`, `runtimes/`) stay on disk
+as directories, not as store rows.
+
+Every long operation writes into a task-private `staging/<task-id>/` directory,
+validates what it produced, then atomically renames it into the published path
+and commits the record. A failure therefore cannot leave a visible half-built
+base, template, artifact or container, and it must not mutate one that has
+already been published. Schema changes are forward-only migrations gated by
+`PRAGMA user_version`; per-domain JSON files written by older versions are
+imported on first open and archived as `*.pre-sqlite`.
+
 ## Code modules
 
 The Rust side is a Cargo workspace. Only `src-tauri/`'s top-level `dshbox`
@@ -41,17 +87,27 @@ package depends on Tauri. It owns windows and IPC adapters; business behavior
 lives in framework-free crates.
 
 ```text
-box-foundation  paths, config, document-store contract, JSON persistence, validation
-box-runtime     absolute-path process execution and libgit2 checkout
-box-scheduler   task records, locks, cancellation, recovery
-box-store       SQLite document-store backend + legacy JSON import
-box-state       ResourceStateManager read model
-box-toolchains  bundled Node/npm/pnpm resolution
-box-containers  container metadata and host registry
-box-extensions  repository plugin/skill import and artifact handling
-box-image       .dsh parser and template manifest handling
-dshboxd         scheduler-backed lifecycle and HTTP RPC
-dshbox          Tauri shell and CLI adapters
+box-foundation     paths, config, document-store contract, JSON persistence, validation
+box-api            IPC DTOs shared by the daemon, the desktop and the CLI
+box-store          SQLite document-store backend + legacy JSON import
+box-scheduler      task records, locks, cancellation, recovery
+box-runtime        absolute-path process execution and libgit2 checkout
+box-logger         tracing init and daily-rolled log files
+box-toolchains     bundled Node/npm/pnpm resolution
+box-dsh-versions   Harness release catalogue, install/remove
+box-containers     container metadata and host registry
+box-extensions     repository plugin/skill scan, import, export
+box-image          .dsh parser and template manifest handling
+box-resources      container resource kinds, extraction, injection
+box-plugin-graph   cordis service graph, read from source and lockfiles
+box-template-core  template resources on top of the data scheduler
+box-data-scheduler resource map + durable task queue
+box-dsh-context    patch YAML / context snapshot rendering
+box-state          ResourceStateManager read model
+box-server-core    dshboxd helpers and user-service install
+box-client         RPC client used by the desktop and the CLI
+dshboxd            sidecar binary: scheduler-backed lifecycle + HTTP RPC
+dshbox             Tauri shell and CLI adapters (the only Tauri-dependent package)
 ```
 
 Dependency direction is `foundation/runtime/scheduler/state` → functional

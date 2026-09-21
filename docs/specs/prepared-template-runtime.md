@@ -27,9 +27,8 @@ The cost is intentional per-container preparation work and disk duplication. Box
 ```text
 <runtime-root>/
   state/
-    storage.json                 # schemaVersion: 10
+    dshbox.db                    # document store: tasks, resource records, views
     resource-map.json            # template/plugin/container references
-    task-store.json
   staging/
     <task-id>/                   # private, disposable, never a launch source
   pnpm/

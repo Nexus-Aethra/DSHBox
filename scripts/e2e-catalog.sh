@@ -5,7 +5,8 @@
 # from the git protocol (no GitHub API needed for the primary path).
 set -euo pipefail
 
-DSHBOXD="${DSHBOXD:-/home/wpp/homework/DSHBox/src-tauri/target/release/dshboxd}"
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+DSHBOXD="${DSHBOXD:-$REPO_ROOT/src-tauri/target/release/dshboxd}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRATCH_PARENT="${SCRATCH_PARENT:-$(dirname "$SCRIPT_DIR")/.tmp}"
 mkdir -p "$SCRATCH_PARENT"

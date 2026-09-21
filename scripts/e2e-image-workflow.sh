@@ -12,8 +12,9 @@
 #      - the data snapshot is HARD-COPIED into extensions/data/
 set -euo pipefail
 
-DSHBOXD="${DSHBOXD:-/home/wpp/homework/DSHBox/src-tauri/target/release/dshboxd}"
-DSHBOX="${DSHBOX:-/home/wpp/homework/DSHBox/src-tauri/target/release/dshbox}"
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+DSHBOXD="${DSHBOXD:-$REPO_ROOT/src-tauri/target/release/dshboxd}"
+DSHBOX="${DSHBOX:-$REPO_ROOT/src-tauri/target/release/dshbox}"
 REF="${REF:-github.com/deepseek-ai/deepseek-harness:latest}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRATCH_PARENT="${SCRATCH_PARENT:-$(dirname "$SCRIPT_DIR")/.tmp}"

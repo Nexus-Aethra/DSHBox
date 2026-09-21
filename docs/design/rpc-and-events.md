@@ -27,9 +27,12 @@ container create:    copying sealed template → writing container state
 container start:     allocating port → launching DSH host → waiting ready
 ```
 
-`container create` must never emit `installing DSH dependencies` or `building
-DSH frontend`. Those stages are evidence of the retired shared-runtime flow and
-should be rejected in tests and UI fixtures.
+`container create` emits no `installing DSH dependencies` or `building DSH
+frontend` stage on its normal path — those stages are evidence of the retired
+shared-runtime flow. The one exception is a sealed template whose tree carries
+no artifacts for this commit and platform (an old template, or one imported
+from another OS): that one is rebuilt in place, and its log says which path it
+took.
 
 ## Resource payload requirements
 

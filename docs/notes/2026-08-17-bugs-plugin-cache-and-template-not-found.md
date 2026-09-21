@@ -1,5 +1,9 @@
 # 2026-08-17 — 两个 bug：插件缓存未命中 + run 时 template not found
 
+> **状态：两个 bug 都已修复，本文保留作为历史记录。** 下面的行号与链接对应当时的提交，
+> 其中 `dshboxd/src/image.rs` 已随 prepared base / sealed template 改造删除，因此指向它的
+> 引用只留文字。相关约定见 `AGENTS.md` 的 *Plugin cache dedup* 与 *Template resolution*。
+
 ## 复现
 
 ```sh
@@ -35,11 +39,11 @@ dshbox: template not found: dsh-test
 name+version 就是天然 cache key；同一个 `github.com/.../dsh-better-sidebar@0.12.3`
 再 build 一次应该直接复用现有 entry，不应该 clone 也不会出现第二条 `img-…` 记录。
 
-**实际**：[`build_image_from_script`](file:///home/wpp/homework/DSHBox/src-tauri/crates/dshboxd/src/image.rs#L150-L168)
+**实际**：``build_image_from_script``
 对 `ParsedSource::Github` 直接调 `fetch_github_extension` → clone → `import_into_repository`
 → 永远生成 `img-<task_id>` 全新 id。`name+version` 命中检查完全没做。
 
-[`import_into_repository` 路径](file:///home/wpp/homework/DSHBox/src-tauri/crates/dshboxd/src/extensions.rs#L125-L169)：
+[`import_into_repository` 路径](../../src-tauri/crates/dshboxd/src/extensions.rs#L125-L169)：
 
 ```rust
 let entry_id = format!("img-{}", task.task_id);  // 每个 task 一次新 id
@@ -52,7 +56,7 @@ entries.push(RepositoryExtension { id: entry_id, ... name, version, ... });  // 
 write_repository_index(...);
 ```
 
-对照：[`ParsedSource::BareName`](file:///home/wpp/homework/DSHBox/src-tauri/crates/dshboxd/src/image.rs#L151-L158)
+对照：``ParsedSource::BareName``
 会先 `find_repository_entry` 复用现有 entry，说明意图早就清晰了——只有 GitHub 这条路径漏做了。
 
 **修复方向**：在 `import_into_repository` 末尾（或者在 `build_image_from_script` 里
@@ -64,13 +68,13 @@ git 仍然 clone 一次（克隆很小，比吊诡的"先猜 name"更稳），�
 `skill`/`data` 走的是 data store hash 路径（`fnv1a64` 内容寻址），没有这个问题，
 不需要改。
 
-**已修复**（commit 紧接此文）：[`import_into_repository`](file:///home/wpp/homework/DSHBox/src-tauri/crates/dshboxd/src/extensions.rs#L125-L184)
+**已修复**（commit 紧接此文）：[`import_into_repository`](../../src-tauri/crates/dshboxd/src/extensions.rs#L125-L184)
 在 `repository_metadata` 解析出 `name`/`version` 之后立刻调
 `find_repository_entry_by_identity` 查索引：`Plugin` 要求 `name`+`version` 同时
 匹配（版本与缓存 key 绑定 —— 0.12.2 和 0.12.3 是两条独立 `img-<id>` 行，允许并存），
 `Skill` 不分版本。命中则直接返回现有 entry（task log 打 `reusing cached …`），
 不写新目录、不写新 index 行。回归测试 `extensions::tests::import_dedup_by_name_and_version`
-已加进 [`extensions.rs` 末尾](file:///home/wpp/homework/DSHBox/src-tauri/crates/dshboxd/src/extensions.rs#L594-L713)，
+已加进 [`extensions.rs` 末尾](../../src-tauri/crates/dshboxd/src/extensions.rs#L594-L713)，
 覆盖「同 name+version 共享 id」「不同 version 各自独立」两个分支。
 
 ---
@@ -80,7 +84,7 @@ git 仍然 clone 一次（克隆很小，比吊诡的"先猜 name"更稳），�
 **期望**：container 建好了、plugin 装好了，下一步启动 DSH host 时不应该再去找
 `templates/dsh-test.dsh` 这个文件（built template 本来就没有 `.dsh` 这种文件）。
 
-**实际**：[`start_dsh_container_inner`](file:///home/wpp/homework/DSHBox/src-tauri/crates/dshboxd/src/lifecycle.rs#L49-L64)
+**实际**：[`start_dsh_container_inner`](../../src-tauri/crates/dshboxd/src/lifecycle.rs#L49-L64)
 用 `templates_directory(&root).join(format!("{name}.dsh"))` 直接拼文件路径：
 ```rust
 match value["template"].as_str() {
@@ -102,7 +106,7 @@ match value["template"].as_str() {
   `container.json: template = "dsh-test"`，但这一步的"来源"是 hash 索引，不是
   扁平文件
 
-[`lookup_template_path`](file:///home/wpp/homework/DSHBox/src-tauri/crates/dshboxd/src/image.rs#L672-L686)
+``lookup_template_path``
 是 hash 索引感知的；`materialize_template_container` 早就用上它了，
 只有 `start_dsh_container_inner` 这条启动路径漏了。
 
@@ -110,8 +114,8 @@ match value["template"].as_str() {
 `lookup_template_path(&root, name)`（需要从 image.rs 提升为 `pub(crate)`）。
 `Err("template not found: ...") ` 错误格式也要匹配现有输出。
 
-**已修复**。[`lookup_template_path` 提升为 `pub(crate)`](file:///home/wpp/homework/DSHBox/src-tauri/crates/dshboxd/src/image.rs#L676-L698)，
-[`start_dsh_container_inner`](file:///home/wpp/homework/DSHBox/src-tauri/crates/dshboxd/src/lifecycle.rs#L51-L66) 改为调用它；
+**已修复**。``lookup_template_path` 提升为 `pub(crate)``，
+[`start_dsh_container_inner`](../../src-tauri/crates/dshboxd/src/lifecycle.rs#L51-L66) 改为调用它；
 命中失败时仍报 `template not found: <name> (<error>)` 以兼容既有错误格式。
 `templates_directory` 同步从 lifecycle.rs 的 import 中删除。
 
@@ -124,7 +128,7 @@ match value["template"].as_str() {
 `start_dsh_container_inner` 的包装、**内层**才是 `lookup_template_path` 自己
 吐出来的，这一层就是被假阳性的 `script.dsh` 路径骗出来的。
 
-真正的修复：[`lookup_template_path`](file:///home/wpp/homework/DSHBox/src-tauri/crates/dshboxd/src/image.rs#L676-L698)
+真正的修复：``lookup_template_path``
 遍历 `templates/<id>/` 目录里实际存在的 `script.dsh` / `list.json`，两个都接受
 （template 可同时携带两种形态，但不常发生，遵循"命中即返回、跳过其余"）。
 回归测试 `image::tests::lookup_template_path_finds_built_template_list_json`
@@ -141,7 +145,7 @@ caller 内部失败路径），不要假设 `format!("...({error})")` 里的 `{e
 ## 顺便提一下
 
 - `dsh-test` 这个命名我怀疑是从 `NAME` 字段（`boxfile.dsh` 里写了 `NAME dsh-test`）来的
-  ——`NAME` 解析是支持的（[script.rs L201-L204](file:///home/wpp/homework/DSHBox/src-tauri/crates/box-image/src/script.rs#L201-L204)），
+  ——`NAME` 解析是支持的（[script.rs L201-L204](../../src-tauri/crates/box-image/src/script.rs#L201-L204)），
   是构筑时默认的模板名（`build --name <x>` > `NAME` > 解析器默认 `"image"`），
   没问题。
 - `[1786909555] container container-1786909554 created from built template dsh-test with 1 resource(s)`

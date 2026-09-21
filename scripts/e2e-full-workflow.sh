@@ -4,8 +4,9 @@
 # the full pull → build → start workflow using a single isolated daemon.
 set -euo pipefail
 
-DSHBOX="${DSHBOX:-/home/wpp/homework/DSHBox/src-tauri/target/release/dshbox}"
-DSHBOXD="${DSHBOXD:-/home/wpp/homework/DSHBox/src-tauri/target/release/dshboxd}"
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+DSHBOX="${DSHBOX:-$REPO_ROOT/src-tauri/target/release/dshbox}"
+DSHBOXD="${DSHBOXD:-$REPO_ROOT/src-tauri/target/release/dshboxd}"
 PLUGIN_REF="${PLUGIN_REF:-github.com/omdsh-dev/DSH-better-sidebar}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRATCH_PARENT="${SCRATCH_PARENT:-$(dirname "$SCRIPT_DIR")/.tmp}"

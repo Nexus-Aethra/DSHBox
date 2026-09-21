@@ -6,7 +6,8 @@
 # because $HOME points at the temp directory.
 set -euo pipefail
 
-DSHBOXD="${DSHBOXD:-/home/wpp/homework/DSHBox/src-tauri/target/release/dshboxd}"
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+DSHBOXD="${DSHBOXD:-$REPO_ROOT/src-tauri/target/release/dshboxd}"
 REF="${REF:-github.com/deepseek-ai/deepseek-harness:latest}"
 # Use a working-directory root so the script stays inside the sandbox
 # writable area even when `/tmp` is read-only.

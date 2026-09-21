@@ -14,10 +14,9 @@
 # binaries at $DSHBOXD / $DSHBOX (default: src-tauri/target/release).
 set -euo pipefail
 
-DSHBOXD="${DSHBOXD:-/home/wpp/homework/DSHBox/src-tauri/target/release/dshboxd}"
-DSHBOX="${DSHBOX:-/home/wpp/homework/DSHBox/src-tauri/target/release/dshbox}"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+DSHBOXD="${DSHBOXD:-$REPO_ROOT/src-tauri/target/release/dshboxd}"
+DSHBOX="${DSHBOX:-$REPO_ROOT/src-tauri/target/release/dshbox}"
 SCRATCH_PARENT="${SCRATCH_PARENT:-$(dirname "$REPO_ROOT")/.tmp}"
 mkdir -p "$SCRATCH_PARENT"
 SANDBOX="$(mktemp -d "$SCRATCH_PARENT/dsh-e2e-buildrun-XXXXXX")"
