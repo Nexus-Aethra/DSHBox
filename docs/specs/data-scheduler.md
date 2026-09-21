@@ -63,9 +63,12 @@ All mutating work acquires a resource lock and reports durable stages:
 | Create container | copy sealed template, write metadata, publish |
 | Start host | allocate port, launch, wait ready |
 
-`Create container` must never report an install or frontend-build stage. Those
-operations belong to prepare/seal tasks, making CLI and UI failure logs directly
-comparable.
+`Create container` normally reports no install or frontend-build stage: those
+operations belong to prepare/seal tasks, which is what makes CLI and UI failure
+logs directly comparable. The exception is a sealed template whose tree carries
+no artifacts for this commit and platform — an old template, or one imported
+from another OS, whose native addon is not this machine's. That one is rebuilt
+in place, and its task log says which path it took.
 
 ## Integrity rules
 

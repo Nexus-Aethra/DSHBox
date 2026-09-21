@@ -321,12 +321,12 @@ src-tauri/                 Rust workspace + Tauri 外壳
   src/desktop/app/         领域模块（containers、extensions、tasks……）
   tools/runtime-packager   捆绑 Node/pnpm/Git 运行时打包器
 examples/                  boxfile.dsh + plugin-chains 示例
-docs/                      HANDOFF.md、template-system.md、specs/、design/、
-                           notes/、images/
+docs/                      template-system.md、specs/、design/、notes/、
+                           releases/、images/
 .github/workflows/         release.yml —— v* tag 构建三平台安装包
 ```
 
-boxfile 语法的权威参考是 **`docs/template-system.md`**；镜像/已构建模板的设计在 **`docs/specs/image-build.md`**；完整 RPC 与事件流面在 **`docs/design/rpc-and-events.md`**。
+boxfile 语法的权威参考是 **`docs/template-system.md`**；prepared base / sealed template 的设计在 **`docs/specs/prepared-template-runtime.md`**；完整 RPC 与事件流面在 **`docs/design/rpc-and-events.md`**。
 
 ---
 

@@ -45,6 +45,8 @@ no Defender interface` and continue normally.
 
 ## Status
 
-The standalone script is in place. Auto-invocation on first run
-(elevated UAC prompt) is a separate frontend + IPC task tracked as a
-follow-up.
+Resolved. The standalone script remains the manual form, and the elevated
+auto-invocation on first run shipped: `ensure_defender_exclusions`
+(`src-tauri/src/desktop/app/defender.rs`) asks once per install/runtime pair and
+the exclusion itself is declared by the installer
+(`src-tauri/windows/defender-exclusions.wxs`).

@@ -26,7 +26,8 @@ src-tauri/                 Rust workspace + Tauri shell
   crates/                  Framework-free crates (see Architecture below)
   crates/dshboxd/          Background server sidecar
   tools/runtime-packager   Bundled Node/pnpm runtime packager
-docs/                      HANDOFF.md, development.md, specs/, design/, notes/
+docs/                      development.md, template-system.md, specs/, design/,
+                           notes/, releases/
 examples/                  Sample boxfile.dsh and plugin-chains demo
 scripts/                   Build/prepare scripts and sandbox e2e harnesses
 runtime-lock.json          Pinned Node + pnpm integrity for bundled runtime
@@ -350,11 +351,11 @@ command as done only once the installed app has run it.
 
 | Area | Read |
 |------|------|
-| Architecture, runtime model, milestones | `docs/HANDOFF.md`, `docs/development.md` |
-| Built template design (image pivot) | `docs/specs/image-build.md` |
+| Architecture, runtime model, crate map | `docs/development.md`, `handoff.md` (repo root) |
+| Prepared base / sealed template design | `docs/specs/prepared-template-runtime.md` |
 | Template system behavior | `docs/template-system.md` |
 | Plugin pnpm install flow | `docs/design/pnpm-managed-plugin-install.md` |
-| Recent bugs / partial fixes | `docs/notes/2026-08-17-bugs-plugin-cache-and-template-not-found.md` |
+| Past incidents, kept as history | `docs/notes/` — a fixed bug is context, not a live warning |
 | Linux host-git passthrough / Windows pnpm base | `docs/notes/2026-08-21-*.md` |
 | Release handoff snapshot | `handoff.md` (repo root) |
 
@@ -377,3 +378,7 @@ command as done only once the installed app has run it.
   forward-only migrations gated by `PRAGMA user_version` — no downgrade path.
 - Errors: surface them — Box keeps failed diagnostic logs and a recovery view
   rather than silently falling back.
+- Sandbox e2e harnesses derive the repo root from `$0` instead of hardcoding a
+  checkout path, and let `DSHBOX`/`DSHBOXD`/`SCRATCH_PARENT` be overridden by the
+  environment: a default that names one machine's checkout is wrong on every
+  other machine, and it fails silently — the script just reports "not found".

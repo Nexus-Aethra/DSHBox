@@ -332,12 +332,12 @@ src-tauri/                 Rust workspace + Tauri shell
   src/desktop/app/         domain modules (containers, extensions, tasks, …)
   tools/runtime-packager   bundled Node/pnpm/Git runtime packager
 examples/                  boxfile.dsh + plugin-chains example
-docs/                      HANDOFF.md, template-system.md, specs/, design/,
-                           notes/, images/
+docs/                      template-system.md, specs/, design/, notes/,
+                           releases/, images/
 .github/workflows/         release.yml — a v* tag builds the three installers
 ```
 
-The canonical reference for the boxfile grammar is **`docs/template-system.md`**; image/built-template design lives in **`docs/specs/image-build.md`**; the full RPC + event-stream surface in **`docs/design/rpc-and-events.md`**.
+The canonical reference for the boxfile grammar is **`docs/template-system.md`**; prepared-base/sealed-template design lives in **`docs/specs/prepared-template-runtime.md`**; the full RPC + event-stream surface in **`docs/design/rpc-and-events.md`**.
 
 ---
 
