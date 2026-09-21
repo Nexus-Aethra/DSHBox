@@ -47,7 +47,7 @@ pnpm build                # frontend typecheck + vite build (tsc --noEmit && vit
 pnpm tauri build          # desktop binary (needs `custom-protocol` feature in release)
 
 # Per-platform installers
-pnpm bundle:windows       # NSIS .exe (runs scripts/bundle-windows.mjs)
+pnpm bundle:windows       # MSI (runs scripts/bundle-windows.mjs)
 pnpm bundle:linux         # .deb/.rpm
 pnpm bundle:macos         # .dmg
 
@@ -69,6 +69,8 @@ frontend. Manual `cargo build` for release needs it explicitly.
 | `box-foundation`           | Config, paths, JSON persistence, validation |
 | `box-runtime`              | Absolute-path process exec + libgit2 checkout primitives |
 | `box-scheduler`            | Persisted background task queue, locks, cancellation |
+| `box-store`                | SQLite document-store backend, legacy JSON import |
+| `box-logger`               | tracing init, daily-rolled log files |
 | `box-state`                | `ResourceStateManager` — primary read model |
 | `box-toolchains`           | Bundled Node/npm/pnpm resolver |
 | `box-dsh-versions`         | DSH GitHub catalogue + install/remove |
@@ -76,6 +78,9 @@ frontend. Manual `cargo build` for release needs it explicitly.
 | `box-extensions`           | Repository plugin/skill scan, copy, export |
 | `box-image`                | `.dsh` parser, manifest v6, gzip tar I/O |
 | `box-resources`            | Container resource kinds, extraction, injection |
+| `box-plugin-graph`         | cordis service graph, read from source + lockfiles |
+| `box-template-core`        | Template ops shared by CLI, desktop and daemon |
+| `box-data-scheduler`       | Resource map and the durable removal queue |
 | `box-dsh-context`          | Patch YAML / context snapshot rendering |
 | `box-server-core`          | `dshboxd` helpers, service install |
 | `box-api`, `box-client`    | IPC + client adapter layer |
@@ -326,8 +331,11 @@ command as done only once the installed app has run it.
   hit the existing hash entry (`<root>/repository/plugins/img-<id>/source/`)
   and not produce a duplicate `img-…` row (see
   `docs/notes/2026-08-17-bugs-plugin-cache-and-template-not-found.md`).
-- **Template resolution.** Built templates' `list.json` must be resolved via
-  `lookup_template_path`; do not hardcode `script.dsh` (legacy flat-file path).
+- **Template resolution.** A sealed template is addressed by its digest —
+  `templates/sealed-<digest>/`, through `BoxLayout::sealed_template_dir`, indexed in
+  `state/sealed-templates.json`. Never resolve one by a flat `<name>.dsh` path: that
+  legacy filename lookup misses sealed recipes and reports `template not found` for a
+  container that was materialised correctly moments earlier.
 - **Workspace extension scan** detects plugins/skills under
   `<container>/workspace` for the UI to import into the repo (recently added;
   review alongside related changes before committing).

@@ -116,16 +116,13 @@ pub(crate) fn start_dsh_container_inner(
         .map_err(|error| format!("cannot read container: {error}"))?;
     let value: serde_json::Value = serde_json::from_str(&metadata)
         .map_err(|error| format!("cannot parse container: {error}"))?;
-    // Startup contract: every container must be based on a template (or its
-    // `image` alias). The referenced template must still resolve through the
-    // hash index (built templates live in `templates/<fnv1a64>/list.json`,
-    // not as a flat `<name>.dsh` file — the legacy filename lookup would
-    // miss them and report `template not found` even though the container
-    // was materialised correctly moments before). `lookup_template_path`
-    // falls back to the legacy alias for older installs.
-    // Sealed recipes retain `sealedTemplate`; direct official-template runs
-    // are materialised from a prepared base and rely on the local manifest.
-    // Both forms are self-contained once preparation has completed.
+    // Startup contract: a prepared container is self-contained, and nothing
+    // here resolves the template it came from — the historical lookup by flat
+    // `<name>.dsh` path is what reported `template not found` for a container
+    // materialised correctly moments before. Sealed recipes keep
+    // `sealedTemplate` for provenance, direct official-template runs are
+    // materialised from a prepared base; either way startup installs and
+    // builds nothing.
     if !directory.join("manifest.json").is_file() {
         return Err("container is missing its template manifest".to_owned());
     }
