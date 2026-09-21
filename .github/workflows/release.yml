@@ -133,16 +133,47 @@ jobs:
 
       # Re-running a tag build must not fail on an existing release: upload
       # with --clobber in that case, otherwise create it with generated notes.
+      # The notes are written with the code, in `docs/releases/<tag>.md` (one
+      # file, both languages), and read from there so the release page says what
+      # changed in words a user reads — the generated notes are a list of merged
+      # pull requests, which is a changelog, not a release note. A tag without a
+      # file falls back to them rather than publishing an empty body.
+      - name: Pick the notes for this tag
+        id: notes
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [ -f "docs/releases/${tag}.md" ]; then
+            echo "file=docs/releases/${tag}.md" >> "$GITHUB_OUTPUT"
+            echo "using docs/releases/${tag}.md"
+          else
+            echo "file=" >> "$GITHUB_OUTPUT"
+            echo "no docs/releases/${tag}.md; falling back to generated notes"
+          fi
+
       - name: Attach installers to the release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          NOTES_FILE: ${{ steps.notes.outputs.file }}
         run: |
           tag="${GITHUB_REF_NAME}"
+          # Files, not `installers/*`: the Linux artifact carries `deb/` and
+          # `rpm/` as directories of its own, and a glob hands those to `gh`
+          # as uploads — "read installers/deb: is a directory" — which is how
+          # the v0.1.8 run reached the release step and failed there.
+          mapfile -t files < <(find installers -type f | sort)
+          printf '%s\n' "${files[@]}"
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" installers/* --clobber
+            gh release upload "$tag" "${files[@]}" --clobber
+            if [ -n "$NOTES_FILE" ]; then
+              gh release edit "$tag" --notes-file "$NOTES_FILE"
+            fi
+          elif [ -n "$NOTES_FILE" ]; then
+            gh release create "$tag" "${files[@]}" \
+              --title "$tag" \
+              --notes-file "$NOTES_FILE"
           else
-            gh release create "$tag" installers/* \
+            gh release create "$tag" "${files[@]}" \
               --title "$tag" \
               --generate-notes
           fi
