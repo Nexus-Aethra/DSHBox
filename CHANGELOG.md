@@ -193,6 +193,17 @@ builds from ever showing it.
   no longer sorts `0.1.10` before `0.1.9`.
 - **Reading a published package** falls back to `lib/` when it has no sources,
   and looks for a client entry where the manifest says it is.
+- **The resource page worked in the browser and failed in the installed app.**
+  The resource layer — the type tabs, the copies, the storage browser, the YAML
+  editor, the extract and inject verbs, the installed-plugin list — was
+  reachable over the daemon RPC and through the browser dev bridge, but the
+  desktop shell registered a Tauri command for none of it, so a packaged 0.1.8
+  answered every resource call with `Command list_resource_type not found`. All
+  thirteen are now `#[tauri::command(async)]` wrappers forwarding to the daemon,
+  and a test diffs the command names `box-api.ts` invokes against the
+  `generate_handler!` list, so a UI call only the dev bridge can answer fails
+  the suite instead of shipping. The installers for this version were rebuilt
+  with the fix.
 
 ### Infrastructure
 

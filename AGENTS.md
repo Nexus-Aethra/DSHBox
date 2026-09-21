@@ -131,6 +131,15 @@ the process lifecycle, or opens a native dialog) answer with an explicit "not
 available in browser dev mode" error instead of a stub, so a missing capability is
 obvious. `listenTask` degrades to a no-op and task progress comes from the 3s poll.
 
+**The dev bridge is not the desktop.** It answers `box-api.ts` calls by talking to
+the daemon, so a feature whose Tauri command was never added to
+`generate_handler!` looks finished in the browser and fails only in a packaged
+build — v0.1.8 shipped the entire resource layer that way (`Command
+list_resource_type not found`, while the daemon RPC, the CLI and the browser all
+worked). `command_surface` in `desktop/app.rs` diffs the command literals in
+`box-api.ts` against the registration list; keep it green, and treat a new
+command as done only once the installed app has run it.
+
 ## Known gotchas
 
 - **No system Node/pnpm/Git required (Windows); Linux uses host git with isolated
