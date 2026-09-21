@@ -75,8 +75,27 @@ builds from ever showing it.
 - `examples/boxfile-dshell.dsh`: a reference boxfile for a third-party bundle,
   pinned by the parser test suite.
 
+### Added
+
+- **Fold a dependency depth away.** A band's label folds that layer into one
+  summary box (`第 3 层 · 28 个`), the layer's edges re-point at it, and the rest
+  of the diagram reflows — so a 175-node graph is read one depth at a time. The
+  folded depths appear as chips above the canvas, which unfold them again (a
+  folded band is gone along with its nodes), and a search that matched inside one
+  says how many hits it is hiding.
+
 ### Fixed
 
+- **Red-dashed edges meant nothing in particular.** Every edge the layout could
+  not draw left-to-right was painted as a cycle — 29 of them on a container with
+  no cycle at all. A cycle is a fact about the graph and a crossing is a fact
+  about the drawing, and they come apart for one reason: the default view merges
+  a package's host and browser halves into one box, so `host A → B` beside
+  `browser B → A` draws as a loop that no context has. Cycles are now decided on
+  the half-preserving graph and only inside one context (0 on this container, as
+  the daemon says), real cycles stay red, and everything else is a quiet grey
+  dash with a legend line explaining it. Splitting the halves removes all 29,
+  which is what the layering looks like when the contexts are not mixed.
 - **The dependency graph cried wolf on a container that runs.** Three findings
   were wrong at once. `profileContext` was reported missing because the launcher
   (`apps/cli`) provides it and the launcher was not a node — it is now scanned

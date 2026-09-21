@@ -180,6 +180,7 @@ const COPY = {
     pluginGraphLegendMissing: (n: number) => `Missing service (${n})`,
     pluginGraphLegendInactiveProvider: (n: number) => `Provider not loaded (${n})`,
     pluginGraphLegendCycle: (n: number) => `Load cycle (${n})`,
+    pluginGraphLegendCrosses: (count: number) => `${count} edge${count === 1 ? '' : 's'} drawn across depths — a package's two halves share one box, so two dependency chains meet on one node. Not a cycle.`,
     pluginGraphMissingHint: 'A service these plugins require is declared by no plugin in the graph, so they wait forever.',
     pluginGraphInactiveProviderHint: 'The plugin providing what they require is installed but the profile does not load it.',
     pluginGraphCycleHint: 'These plugins depend on each other, so no load order exists and cordis leaves them pending. A package shipping both a host and a browser half is drawn as one node, so a reported cycle can span both contexts. A name with more than one registration below is usually what closes the loop: a requirement whose name has several owners is drawn against all of them, and one of those extra edges can complete a circle that no single provider makes.',
@@ -193,6 +194,10 @@ const COPY = {
     // A service name implemented once per context. Not a failure and not a
     // conflict — but it is why one name carries N×M lines and why a cycle is
     // reported at all, so it is named rather than left to be inferred.
+    pluginGraphFold: (layer: number, count: number) => `▾ depth ${layer} · ${count} — fold`,
+    pluginGraphUnfold: (layer: number, count: number) => `▸ depth ${layer} · ${count} — unfold`,
+    pluginGraphFoldedNode: (layer: number, count: number) => `depth ${layer} · ${count}`,
+    pluginGraphFoldHint: 'Folding a depth collapses it into one box, so the diagram can be read a level at a time; the layer’s edges re-point at that box and the rest reflows.',
     pluginGraphSharedServices: (n: number) => `${n} service name${n === 1 ? '' : 's'} with more than one registration`,
     pluginGraphSharedServicesExpected: (n: number) => `${n} name${n === 1 ? '' : 's'} registered once per context (expected)`,
     pluginGraphSharedServiceContext: 'one per context',
@@ -387,6 +392,7 @@ const COPY = {
     pluginGraphLegendMissing: (n: number) => `缺失服务（${n}）`,
     pluginGraphLegendInactiveProvider: (n: number) => `提供者未加载（${n}）`,
     pluginGraphLegendCycle: (n: number) => `依赖环（${n}）`,
+    pluginGraphLegendCrosses: (count: number) => `${count} 条边跨层绘制——同一个包的两半身合并成一个节点，两条依赖链落在一个盒子上；这不是环。`,
     pluginGraphMissingHint: '这些插件需要的服务，图中没有任何插件提供，因此会一直等待。',
     pluginGraphInactiveProviderHint: '它们需要的服务由已安装但 profile 未加载的插件提供。',
     pluginGraphCycleHint: '这些插件互相依赖，排不出加载顺序，cordis 会让它们保持挂起。同时包含宿主与浏览器半身的包会画成一个节点，因此这里报告的环可能跨越两种上下文。下方列出的“有多个注册者的服务名”通常才是闭合这个环的原因：一个服务名被多个插件注册时，使用方会被画到全部提供者上，多出的那条边就足以连成一个任何单一提供者都不会形成的圈。',
@@ -397,6 +403,10 @@ const COPY = {
     pluginGraphMissing: (n: number) => `${n} 个缺失服务`,
     pluginGraphInactive: (n: number) => `${n} 个未激活提供者`,
     pluginGraphCycles: (n: number) => `${n} 个依赖环`,
+    pluginGraphFold: (layer: number, count: number) => `▾ 第 ${layer} 层 · ${count} 个 —— 折叠`,
+    pluginGraphUnfold: (layer: number, count: number) => `▸ 第 ${layer} 层 · ${count} 个 —— 展开`,
+    pluginGraphFoldedNode: (layer: number, count: number) => `第 ${layer} 层 · ${count} 个`,
+    pluginGraphFoldHint: '折叠一层会把它收成一个节点，这样可以一层一层地读图；这一层的边会改指到那个节点上，其余部分重新排布。',
     pluginGraphSharedServices: (n: number) => `${n} 个服务名有多个注册者`,
     pluginGraphSharedServicesExpected: (n: number) => `${n} 个名字在宿主/浏览器各注册一次（设计如此）`,
     pluginGraphSharedServiceContext: '每上下文一个',

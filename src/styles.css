@@ -395,6 +395,20 @@ code.missing { color: #b42318; }
 .plugin-graph-node text { fill: var(--color-text); font-family: var(--font-mono); font-size: 11px; pointer-events: none; }
 .plugin-graph-node.inactive rect { fill: var(--color-bg-soft); stroke-dasharray: 4 3; }
 .plugin-graph-node.inactive text { fill: var(--color-text-muted); }
+/* A folded depth: one box standing for a whole layer. Dashed, because it is a
+   summary and not a plugin, and clickable, because that is how it comes back. */
+/* An edge the drawing cannot lay out forwards — two halves merged onto one node
+   put two dependency chains there. Not a cycle, so not red: dashed and quiet. */
+.plugin-graph-edge.crosses { stroke-dasharray: 6 5; stroke: #94a3b8; }
+.swatch.mark-crosses { background: repeating-linear-gradient(90deg, #94a3b8 0 4px, transparent 4px 8px); }
+.plugin-graph-node.layer rect { fill: #f8fafc; stroke: #94a3b8; stroke-dasharray: 5 4; }
+.plugin-graph-node.layer text { fill: #334155; font-weight: 600; }
+.plugin-graph-node.layer:hover rect { fill: #eef2ff; stroke: #6366f1; }
+.plugin-graph-group-label.foldable { cursor: pointer; }
+.plugin-graph-group-label.foldable:hover { fill: #4f46e5; text-decoration: underline; }
+.plugin-graph-folds { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.plugin-graph-fold-chip { border: 1px dashed #94a3b8; background: #f8fafc; color: #334155; border-radius: 999px; padding: 2px 10px; font-size: 12px; cursor: pointer; }
+.plugin-graph-fold-chip:hover { border-color: #6366f1; color: #3730a3; background: #eef2ff; }
 .plugin-graph-node.service rect { fill: var(--color-primary-soft); stroke: var(--color-primary); }
 .plugin-graph-node.service text { fill: var(--color-primary); }
 .plugin-graph-node.missing rect, .plugin-graph-node.cycle rect, .plugin-graph-node.inactive-provider rect { stroke: var(--color-danger); stroke-width: 1.8; }

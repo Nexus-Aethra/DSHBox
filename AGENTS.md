@@ -202,6 +202,17 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   service name registered once per context is the dual-face pattern, not a
   conflict — `SharedService::per_context` says which is which, because cordis
   resolves a name per isolation scope and this diagram merges the contexts.
+- **A cycle is a graph fact; a crossing is a drawing fact.** The graph view can
+  fold a dependency depth into one summary box (`foldLayers` in
+  `src/features/plugin-graph/layout.ts`), and the default view merges a package's
+  two halves into one node. Both make edges the layout cannot point forwards, and
+  neither is a cycle: `host A → B` beside `browser B → A` is two edges that no
+  context loops on. So `PlacedEdge.back` (drawn grey, with a legend line) is kept
+  apart from `PlacedEdge.cyclic` (drawn red, "this cannot load"), and the panel
+  computes the latter from the half-preserving `graph.links`, ignoring
+  cross-context links. Passing `cyclic` into `layoutGraph` is how the caller
+  says which. Splitting the halves should leave zero crossings — that is the
+  check that the layering itself is right.
 - **The desktop must never block its own main thread on the daemon.** A plain
   `#[tauri::command]` runs on the main thread — the same one that renders the
   window — so a slow daemon call freezes the UI. Every command that talks to the

@@ -6,7 +6,7 @@ import { Button } from '../../ui/Button'
 import { Dialog } from '../../ui/Dialog'
 import { Input } from '../../ui/Input'
 import type { LayoutEdge } from './layout'
-import { layoutGraph, MAX_LABEL_CHARS, NODE_HEIGHT, NODE_WIDTH } from './layout'
+import { cyclicEdges, foldLayers, foldedNodeId, isFoldedNodeId, layoutGraph, MAX_LABEL_CHARS, NODE_HEIGHT, NODE_WIDTH } from './layout'
 import type { GraphNodeMeta } from './PluginGraphView'
 import { PluginGraphView } from './PluginGraphView'
 
@@ -42,6 +42,7 @@ export type PluginGraphText = {
   pluginGraphLegendMissing: (count: number) => string
   pluginGraphLegendInactiveProvider: (count: number) => string
   pluginGraphLegendCycle: (count: number) => string
+  pluginGraphLegendCrosses: (count: number) => string
   pluginGraphMissingHint: string
   pluginGraphInactiveProviderHint: string
   pluginGraphCycleHint: string
@@ -56,6 +57,10 @@ export type PluginGraphText = {
   pluginGraphCycles: (count: number) => string
   pluginGraphSharedServices: (count: number) => string
   pluginGraphSharedServicesExpected: (count: number) => string
+  pluginGraphFold: (layer: number, count: number) => string
+  pluginGraphUnfold: (layer: number, count: number) => string
+  pluginGraphFoldedNode: (layer: number, count: number) => string
+  pluginGraphFoldHint: string
   pluginGraphSharedService: (providers: string) => string
   pluginGraphSharedServiceHint: string
   pluginGraphParseNotes: (count: number) => string
@@ -122,6 +127,9 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
   const [showIsolated, setShowIsolated] = useState(false)
   const [showInactive, setShowInactive] = useState(false)
   const [selected, setSelected] = useState<string | null>(null)
+  // Dependency depths the reader folded away. Layers are read one at a time,
+  // and the depth nobody is asking about is exactly the one worth hiding.
+  const [foldedLayers, setFoldedLayers] = useState<Set<number>>(() => new Set())
   const [transform, setTransform] = useState({ scale: 1, x: 0, y: 0 })
   const [query, setQuery] = useState('')
   const [showHelp, setShowHelp] = useState(false)
@@ -415,15 +423,75 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [graph, halfOf, nodes])
 
-  const layout = useMemo(
-    () => layoutGraph({ nodes, edges, order: graph?.order ?? [], weight }),
-    [nodes, edges, graph, weight],
+  // Folding needs to know every node's depth, and the depth comes out of the
+  // layout — so the base pass always runs, and the folded pass only when there is
+  // something to fold.
+  // Cycles are a fact about the tree, not about this drawing, so they are read
+  // from the links as the daemon gives them — one node per half — and only from
+  // edges inside one context. Merging a package's halves for the drawing turns
+  // "host A needs B, browser B needs A" into a loop that no context has.
+  const cyclicKeys = useMemo(() => {
+    if (graph === null || view !== 'plugins') return undefined
+    const sameContext = graph.links.filter((link) => !link.crossContext)
+    const rawNodes = [...new Set(sameContext.flatMap((link) => [link.from, link.to]))]
+    const rawEdges = sameContext
+      .filter((link) => link.from !== link.to)
+      .map((link) => ({ from: link.to, to: link.from }))
+    const cyclic = cyclicEdges(rawNodes, rawEdges)
+    const mapped = new Set<string>()
+    for (const link of sameContext) {
+      const key = `${link.to}\u0000${link.from}`
+      if (cyclic.has(key)) mapped.add(`${displayId(link.to)}\u0000${displayId(link.from)}`)
+    }
+    return mapped
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graph, view, halfOf])
+
+  const base = useMemo(
+    () => layoutGraph({ nodes, edges, order: graph?.order ?? [], weight, cyclic: cyclicKeys }),
+    [nodes, edges, graph, weight, cyclicKeys],
   )
+  const layout = useMemo(() => {
+    if (foldedLayers.size === 0) return base
+    const layerOf = new Map(base.nodes.map((node) => [node.id, node.layer]))
+    return layoutGraph(foldLayers({ nodes, edges, order: graph?.order ?? [], weight, cyclic: cyclicKeys }, layerOf, foldedLayers))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [base, nodes, edges, graph, weight, foldedLayers, cyclicKeys])
+
+  /** Search hits that a folded layer is hiding. */
+  const foldedLayerMatches = (matched: Set<string>, layer: number): number => {
+    let count = 0
+    for (const id of matched) {
+      if (base.nodes.some((node) => node.id === id && node.layer === layer)) count += 1
+    }
+    return count
+  }
+
+  const toggleLayer = (layer: number): void => {
+    setFoldedLayers((current) => {
+      const next = new Set(current)
+      if (next.has(layer)) next.delete(layer)
+      else next.add(layer)
+      return next
+    })
+  }
+
+  /** How many boxes a folded layer is standing in for. */
+  const foldedCounts = useMemo(() => {
+    const counts = new Map<number, number>()
+    for (const node of base.nodes) counts.set(node.layer, (counts.get(node.layer) ?? 0) + 1)
+    return counts
+  }, [base])
 
   // Is the node actually drawn right now? Distinct from "is it in the graph":
   // a filter or the view decides whether it has a box, and only a box can be
   // centred or outlined.
   const drawn = useMemo(() => new Set(layout.nodes.map((node) => node.id)), [layout])
+
+  // Edges the drawing could not lay out forwards while no cycle exists — the
+  // price of merging a package's halves into one box, and worth a legend line so
+  // the dashes are explained rather than wondered about.
+  const crossLayerEdges = layout.edges.filter((edge) => edge.back && !edge.cyclic).length
 
   // Centre a node in the stage. A search hit or a diagnostic entry has to land
   // somewhere the reader can see, not at whatever pan they happened to leave.
@@ -505,6 +573,17 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
   }, [query])
 
   const meta = (nodeId: string): GraphNodeMeta => {
+    // A folded layer is one box standing for a whole depth, and the count is what
+    // makes it honest about how much is behind it.
+    if (isFoldedNodeId(nodeId)) {
+      const layer = Number(nodeId.slice('layer:'.length))
+      const count = foldedCounts.get(layer) ?? 0
+      return {
+        label: text.pluginGraphFoldedNode(layer, count),
+        title: text.pluginGraphUnfold(layer, count),
+        kind: 'layer',
+      }
+    }
     if (graph?.services.includes(nodeId) ?? false) {
       return {
         label: nodeId,
@@ -760,6 +839,9 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
         {marks.cycleCount > 0 && (
           <li><span className="swatch mark-cycle" />{text.pluginGraphLegendCycle(marks.cycleCount)}</li>
         )}
+        {crossLayerEdges > 0 && (
+          <li><span className="swatch mark-crosses" />{text.pluginGraphLegendCrosses(crossLayerEdges)}</li>
+        )}
       </ul>
 
       {/* The how-to-read prose used to sit above the canvas permanently: 84px of
@@ -809,6 +891,23 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
             </p>
           )}
 
+          {/* A folded layer's band is gone with its nodes, so the way back has to
+              live outside the canvas. Each folded depth is a chip; a search that
+              matched inside one says so, because otherwise the hit is invisible
+              and the search looks broken rather than folded away. */}
+          {foldedLayers.size > 0 && (
+            <div className="plugin-graph-folds">
+              {[...foldedLayers].sort((left, right) => left - right).map((layer) => (
+                <button key={layer} type="button" className="plugin-graph-fold-chip" onClick={() => { toggleLayer(layer) }}>
+                  {text.pluginGraphUnfold(layer, foldedCounts.get(layer) ?? 0)}
+                  {search !== null && search.matched.size > 0 && foldedLayerMatches(search.matched, layer) > 0
+                    ? ` · ${text.pluginGraphMatch(foldedLayerMatches(search.matched, layer))}`
+                    : ''}
+                </button>
+              ))}
+            </div>
+          )}
+
           <div className="plugin-graph-body">
             <div className="plugin-graph-main">
             <div
@@ -840,6 +939,10 @@ export function PluginGraphPanel({ kind, id, text, onClose }: Props) {
                   onSelect={selectUnlessDragged}
                   showEdgeLabels={layout.edges.length <= EDGE_LABEL_LIMIT}
                   layerLabel={text.pluginGraphLayerLabel}
+                  foldedLayers={foldedLayers}
+                  onToggleLayer={toggleLayer}
+                  foldLabel={text.pluginGraphFold}
+                  unfoldLabel={text.pluginGraphUnfold}
                   matches={search?.matched ?? null}
                   canvasLabel={text.pluginGraphCanvas}
                   emptyLabel={text.pluginGraphEmpty}
