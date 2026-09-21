@@ -1,11 +1,11 @@
 use super::super::*;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn load_config() -> Result<BoxConfig, String> {
     read_config()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn save_runtime_directory(
     directory: String,
     app: tauri::AppHandle,
@@ -40,7 +40,7 @@ pub(crate) fn save_runtime_directory(
     Ok(config)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn save_language(language: String, app: tauri::AppHandle) -> Result<BoxConfig, String> {
     if language != "en" && language != "zh-CN" {
         return Err("unsupported language".to_owned());
@@ -52,7 +52,7 @@ pub(crate) fn save_language(language: String, app: tauri::AppHandle) -> Result<B
     Ok(config)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn save_mirror_settings(
     github_mirror: Option<String>,
     npm_registry: Option<String>,

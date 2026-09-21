@@ -28,6 +28,13 @@ export type LayoutEdge = {
 export type LayoutInput = {
   nodes: string[]
   edges: LayoutEdge[]
+  // Edge keys (`from\0to`) the caller knows lie on a cycle in the runtime. The
+  // layout can decide this from the edges it is handed, and for a diagram drawn
+  // per context that is the same answer — but a view that merges a package's two
+  // halves into one box invents cycles the tree does not have (host A→B beside
+  // client B→A reads as one loop), so that caller passes what the graph says
+  // instead. Omitted: decide from `edges`.
+  cyclic?: Set<string>
   // Preferred within-layer order, typically the daemon's topological order. Nodes
   // it does not mention keep their relative input order after those it does.
   order?: string[]
@@ -48,9 +55,15 @@ export type PlacedNode = {
 }
 
 export type PlacedEdge = LayoutEdge & {
-  // True when the edge points backwards or sideways in the layer assignment,
-  // which means it is part of (or runs into) a cycle.
+  // True when the layout could not draw this edge left to right: its target sits
+  // at the same or an earlier depth. That is a drawing fact, not a graph one —
+  // merging a package's host and browser halves into one box puts two
+  // dependency chains on one node, and an edge inside one chain then cannot
+  // point forwards.
   back: boolean
+  // True when both ends sit in the same cycle. This is the graph fact, and the
+  // only thing a reader should read as "this cannot load".
+  cyclic: boolean
 }
 
 /** One dependency depth as it ended up on the canvas — its bands unioned. */
@@ -384,6 +397,11 @@ export function layoutGraph(input: LayoutInput): Layout {
     return { nodes: [], edges: [], width: 0, height: 0, layers: 0, groups: [] }
   }
 
+  // Which edges are on a cycle, decided from the graph rather than from where the
+  // boxes ended up. The two disagree exactly when a node carries two dependency
+  // chains (a dual-face package drawn as one box), and the drawing must not
+  // report a cycle the running tree does not have.
+  const cyclic = input.cyclic ?? cyclicEdges(nodes, edges)
   const layer = assignLayers(nodes, edges)
   const layers = groupByLayer(nodes, layer)
 
@@ -445,6 +463,7 @@ export function layoutGraph(input: LayoutInput): Layout {
   const placedEdges: PlacedEdge[] = edges.map((edge) => ({
     ...edge,
     back: (layer.get(edge.to) ?? 0) <= (layer.get(edge.from) ?? 0),
+    cyclic: cyclic.has(`${edge.from}\u0000${edge.to}`),
   }))
 
   // Union each layer's bands into one group rect, in depth order.
@@ -472,4 +491,139 @@ export function layoutGraph(input: LayoutInput): Layout {
     layers: ordered.length,
     groups,
   }
+}
+
+/**
+ * The depths a reader sees as a crowd: more nodes than one band can hold, so the
+ * drawing already has to break them into strips. The panel folds these on open,
+ * so the first thing seen is a summary — a depth at a time is how a profile this
+ * size is read — and one click on the summary brings a depth back.
+ */
+export function layersWorthFolding(layout: Layout): Set<number> {
+  const counts = new Map<number, number>()
+  for (const node of layout.nodes) counts.set(node.layer, (counts.get(node.layer) ?? 0) + 1)
+  const folded = new Set<number>()
+  for (const [layer, count] of counts) {
+    if (count > MAX_ROWS) folded.add(layer)
+  }
+  return folded
+}
+
+// ── folding a layer away ──────────────────────────────────────────────────
+//
+// A profile this size is read one dependency depth at a time, and the depth a
+// reader is not interested in is exactly the one worth getting out of the way.
+// Folding replaces every node of a layer with one summary node, so the diagram
+// keeps its shape — layers are depths, so an edge into a folded layer becomes an
+// edge into its summary and still points forwards — while a layer's worth of
+// boxes becomes one.
+
+/** Node id a folded layer is drawn as. */
+export function foldedNodeId(layer: number): string {
+  return `layer:${layer}`
+}
+
+export function isFoldedNodeId(id: string): boolean {
+  return id.startsWith('layer:')
+}
+
+/**
+ * Replace each folded layer with a single summary node, and re-point the edges
+ * that touched it. Edges with both ends in folded layers become summary-to-summary
+ * edges; a summary that would point at itself is dropped, because "this layer
+ * depends on itself" is not what folding a layer says.
+ */
+export function foldLayers(
+  input: LayoutInput,
+  layerOf: Map<string, number>,
+  folded: Set<number>,
+): LayoutInput {
+  if (folded.size === 0) return input
+  const nodes = input.nodes.filter((id) => {
+    const layer = layerOf.get(id)
+    return layer === undefined || !folded.has(layer)
+  })
+  const seen = new Set<string>()
+  const edges: LayoutEdge[] = []
+  for (const edge of input.edges) {
+    const fromLayer = layerOf.get(edge.from)
+    const toLayer = layerOf.get(edge.to)
+    const from = fromLayer !== undefined && folded.has(fromLayer) ? foldedNodeId(fromLayer) : edge.from
+    const to = toLayer !== undefined && folded.has(toLayer) ? foldedNodeId(toLayer) : edge.to
+    if (from === to) continue
+    const key = `${from}\u0000${to}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    edges.push({ ...edge, from, to })
+  }
+  return { ...input, nodes: [...nodes, ...[...folded].map(foldedNodeId)], edges }
+}
+
+/** Edge keys (`from\0to`) that lie on a cycle: both ends in the same strongly
+ *  connected component of more than one node. Tarjan's algorithm, iterative so a
+ *  deep graph cannot blow the stack. */
+export function cyclicEdges(nodes: string[], edges: LayoutEdge[]): Set<string> {
+  const index = new Map<string, number>()
+  const low = new Map<string, number>()
+  const onStack = new Set<string>()
+  const stack: string[] = []
+  const successors = new Map<string, string[]>()
+  for (const node of nodes) successors.set(node, [])
+  for (const edge of edges) successors.get(edge.from)?.push(edge.to)
+  const cyclic = new Set<string>()
+  let counter = 0
+
+  for (const root of nodes) {
+    if (index.has(root)) continue
+    const work: { node: string; next: number }[] = [{ node: root, next: 0 }]
+    index.set(root, counter)
+    low.set(root, counter)
+    counter += 1
+    stack.push(root)
+    onStack.add(root)
+    while (work.length > 0) {
+      const frame = work[work.length - 1]
+      const children = successors.get(frame.node) ?? []
+      if (frame.next < children.length) {
+        const child = children[frame.next]
+        frame.next += 1
+        if (!index.has(child)) {
+          index.set(child, counter)
+          low.set(child, counter)
+          counter += 1
+          stack.push(child)
+          onStack.add(child)
+          work.push({ node: child, next: 0 })
+        } else if (onStack.has(child)) {
+          low.set(frame.node, Math.min(low.get(frame.node)!, index.get(child)!))
+        }
+        continue
+      }
+      work.pop()
+      const parent = work[work.length - 1]
+      if (parent !== undefined) {
+        low.set(parent.node, Math.min(low.get(parent.node)!, low.get(frame.node)!))
+      }
+      if (low.get(frame.node) === index.get(frame.node)) {
+        // One component: everything popped here is in it, and an edge inside it
+        // is an edge on a cycle.
+        const component: string[] = []
+        for (;;) {
+          const member = stack.pop()!
+          onStack.delete(member)
+          component.push(member)
+          if (member === frame.node) break
+        }
+        if (component.length > 1) {
+          const members = new Set(component)
+          for (const from of component) {
+            for (const to of successors.get(from) ?? []) {
+              if (members.has(to)) cyclic.add(`${from}\u0000${to}`)
+            }
+          }
+        }
+      }
+    }
+  }
+  return cyclic
 }

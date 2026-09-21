@@ -17,7 +17,9 @@
 //! 1. GitHub short form: `github.com/owner/repo[:tag|@ref]`
 //! 2. URL or local tarball: `https://...` / `./relative.tgz` / `/abs/path.tgz`
 //! 3. Local directory: `./plugins/foo` / `/abs/path/foo` (no archive suffix)
-//! 4. Bare package name (already imported into Repository): `name[@version]` or `@scope/name[@version]`
+//! 4. Bare package name: `name[@version]` or `@scope/name[@version]` — forwarded
+//!    to pnpm as a registry spec (`name@version`), not resolved through the Box
+//!    extension repository, which is addressed by its own opaque ids.
 //!
 //! The parser does not validate that sources actually exist; that's the
 //! build step's job.
@@ -128,7 +130,7 @@ pub enum ParsedSource {
     /// Local directory the builder will copy into Repository; the source
     /// path is resolved relative to the script directory at parse time.
     LocalDir { path: PathBuf },
-    /// Bare package name (already in Repository). `scope` is the optional
+    /// Bare package name, resolved from the configured registry. `scope` is the optional
     /// `@scope/` part; `version` is the optional `@1.2.3` / `:1.2.3` pin.
     BareName {
         name: String,

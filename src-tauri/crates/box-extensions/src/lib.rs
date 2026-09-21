@@ -35,7 +35,20 @@ pub struct ExtensionRecord {
     pub content_digest: Option<String>,
 }
 
-/// One immutable extension source owned by the DSH Box repository.
+/// How a repository entry holds its content. A registry/git package is already
+/// in pnpm's content-addressed store, so Box keeps only a row for it; anything
+/// pnpm cannot re-create (a local directory, a hand-made archive) keeps a copy.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RepositoryStorage {
+    /// Box owns the bytes: `<source_path>` is a copy under the repository root.
+    #[default]
+    Owned,
+    /// pnpm owns the bytes: the entry is a pointer at a store-cached spec.
+    Reference,
+}
+
+/// One extension source the DSH Box repository knows about.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryExtension {
@@ -48,11 +61,20 @@ pub struct RepositoryExtension {
     pub source_path: String,
     pub imported_at: u64,
     pub diagnostic: Option<String>,
-    /// Original import source (GitHub URL, directory, or archive path). Quick
-    /// bundle exports use this to keep GitHub entries as URLs instead of
-    /// embedding their content.
+    /// Original import source (GitHub URL, directory, archive path, or pnpm
+    /// spec). Quick bundle exports use this to keep GitHub entries as URLs
+    /// instead of embedding their content; a reference entry uses it to
+    /// re-install the package.
     #[serde(default)]
     pub source: Option<String>,
+    #[serde(default)]
+    pub storage: RepositoryStorage,
+    /// True when Box found this entry by scanning rather than being told about
+    /// it: a mirror of what templates and containers resolved, so it is not
+    /// the user's to delete (a full bundle export materializes it all the
+    /// same).
+    #[serde(default)]
+    pub derived: bool,
 }
 
 /// A valid extension candidate found inside one Container workspace.
@@ -116,6 +138,122 @@ pub fn repository_index_path(runtime: &Path) -> PathBuf {
     repository_root(runtime).join("index.json")
 }
 
+/// A reference entry's identity is the spec it points at: there is no local
+/// content to digest.
+/// fnv1a64, hex — the same identity hash `extension_digest` finishes with.
+fn fnv1a64_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+pub fn reference_digest(spec: Option<&str>) -> String {
+    format!("reference:{}", spec.unwrap_or("unknown"))
+}
+
+/// Record a package Box does not own: the spec is all that is kept, and pnpm's
+/// store holds the bytes. Importing the same spec twice updates one row.
+pub fn upsert_reference_entry(
+    runtime: &Path,
+    kind: ExtensionKind,
+    name: &str,
+    version: Option<&str>,
+    spec: &str,
+) -> Result<RepositoryExtension, String> {
+    let mut entries = scan_repository(runtime);
+    // Deterministic, so importing the same spec twice updates one row.
+    let id = format!("ref-{}", fnv1a64_hex(spec.as_bytes()));
+    let entry = RepositoryExtension {
+        id: id.clone(),
+        kind,
+        name: name.to_owned(),
+        version: version.map(str::to_owned),
+        description: None,
+        content_digest: reference_digest(Some(spec)),
+        source_path: String::new(),
+        imported_at: now_seconds(),
+        diagnostic: None,
+        source: Some(spec.to_owned()),
+        storage: RepositoryStorage::Reference,
+        derived: false,
+    };
+    match entries.iter_mut().find(|existing| existing.id == id) {
+        Some(existing) => *existing = entry.clone(),
+        None => entries.push(entry.clone()),
+    }
+    write_repository_index(runtime, &entries)?;
+    Ok(entry)
+}
+
+/// One row the index should mirror: a package, the version pnpm resolved, and
+/// the spec that installs it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivedEntry {
+    pub name: String,
+    pub version: String,
+    pub spec: String,
+}
+
+/// Mirror the index onto what is installed. Every wanted entry gets a derived
+/// row, a derived row for a spec nothing installs any more is dropped, and rows
+/// the user owns (imported by hand, copied from a directory) are never touched —
+/// including one that shadows a name pnpm now resolved. Returns how many rows
+/// were added.
+pub fn sync_derived_entries(
+    runtime: &Path,
+    kind: ExtensionKind,
+    wanted: &[DerivedEntry],
+) -> Result<usize, String> {
+    let mut kept: Vec<RepositoryExtension> = Vec::new();
+    let mut previous: BTreeMap<String, RepositoryExtension> = BTreeMap::new();
+    for entry in scan_repository(runtime) {
+        if entry.derived {
+            previous.insert(entry.id.clone(), entry);
+        } else {
+            kept.push(entry);
+        }
+    }
+    let mut added = 0;
+    // A name the user already has a row for is the user's: the mirror does not
+    // add a second row for it, and does not touch that one either.
+    let claimed: BTreeSet<String> = kept.iter().map(|entry| entry.name.clone()).collect();
+    for wanted in wanted {
+        if claimed.contains(&wanted.name) {
+            continue;
+        }
+        let id = format!("ref-{}", fnv1a64_hex(wanted.spec.as_bytes()));
+        match previous.remove(&id) {
+            // Same spec, so it keeps its original import time — but the version
+            // is whatever the install says it is now.
+            Some(mut existing) => {
+                existing.version = Some(wanted.version.clone());
+                kept.push(existing);
+            }
+            None => {
+                kept.push(RepositoryExtension {
+                    id,
+                    kind: kind.clone(),
+                    name: wanted.name.clone(),
+                    version: Some(wanted.version.clone()),
+                    description: None,
+                    content_digest: reference_digest(Some(&wanted.spec)),
+                    source_path: String::new(),
+                    imported_at: now_seconds(),
+                    diagnostic: None,
+                    source: Some(wanted.spec.clone()),
+                    storage: RepositoryStorage::Reference,
+                    derived: true,
+                });
+                added += 1;
+            }
+        }
+    }
+    write_repository_index(runtime, &kept)?;
+    Ok(added)
+}
+
 /// Reads the index and verifies every source still exists. Invalid entries remain visible as diagnostics.
 pub fn scan_repository(runtime: &Path) -> Vec<RepositoryExtension> {
     let path = repository_index_path(runtime);
@@ -124,6 +262,13 @@ pub fn scan_repository(runtime: &Path) -> Vec<RepositoryExtension> {
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
     for entry in &mut entries {
+        if entry.storage == RepositoryStorage::Reference {
+            // The bytes live in pnpm's store; there is no directory to check.
+            // Whether the store still holds it is the daemon's question (it
+            // reads the store index), not this one's.
+            entry.content_digest = reference_digest(entry.source.as_deref());
+            continue;
+        }
         let source = Path::new(&entry.source_path);
         if !source.is_dir() {
             entry.diagnostic = Some("repository source directory is missing".to_owned());
@@ -941,6 +1086,8 @@ mod tests {
                 imported_at: 0,
                 diagnostic: None,
                 source: None,
+                storage: RepositoryStorage::Owned,
+                derived: false,
             }],
         )
         .unwrap();
@@ -1078,6 +1225,68 @@ mod tests {
             detect_extension_kind(&plugin).unwrap(),
             ExtensionKind::Plugin
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn derived_entries_mirror_the_install_and_spare_owned_rows() {
+        let root = std::env::temp_dir().join(format!("dshbox-derived-test-{}", now_seconds()));
+        fs::create_dir_all(repository_root(&root)).unwrap();
+        upsert_reference_entry(&root, ExtensionKind::Plugin, "hand-made", Some("1.0.0"), "npm:hand-made@1.0.0").unwrap();
+        write_repository_index(
+            &root,
+            &[
+                scan_repository(&root)[0].clone(),
+                RepositoryExtension {
+                    id: "img-owned".to_owned(),
+                    kind: ExtensionKind::Plugin,
+                    name: "owned".to_owned(),
+                    version: Some("9.9.9".to_owned()),
+                    description: None,
+                    content_digest: "d".to_owned(),
+                    source_path: root.join("source/owned").to_string_lossy().into_owned(),
+                    imported_at: 0,
+                    diagnostic: None,
+                    source: None,
+                    storage: RepositoryStorage::Owned,
+                    derived: false,
+                },
+            ],
+        )
+        .unwrap();
+
+        let wanted = vec![DerivedEntry {
+            name: "@scope/plugin".to_owned(),
+            version: "1.2.3".to_owned(),
+            spec: "@scope/plugin@1.2.3".to_owned(),
+        }];
+        // The user's own row for `hand-made` is left as it is, and the mirror
+        // does not add a second row for the same name.
+        assert_eq!(sync_derived_entries(&root, ExtensionKind::Plugin, &wanted).unwrap(), 1);
+
+        // A second pass changes nothing: the row is keyed by its spec.
+        assert_eq!(sync_derived_entries(&root, ExtensionKind::Plugin, &wanted).unwrap(), 0);
+        let entries = scan_repository(&root);
+        let derived: Vec<&RepositoryExtension> = entries.iter().filter(|entry| entry.derived).collect();
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].name, "@scope/plugin");
+        assert_eq!(derived[0].source.as_deref(), Some("@scope/plugin@1.2.3"));
+        assert_eq!(derived[0].version.as_deref(), Some("1.2.3"));
+
+        // Nothing installs the plugin any more: the mirror drops its row. The
+        // user's own row for `hand-made` stays even though pnpm resolves that
+        // name too.
+        let only_user = vec![DerivedEntry {
+            name: "hand-made".to_owned(),
+            version: "2.0.0".to_owned(),
+            spec: "npm:hand-made@2.0.0".to_owned(),
+        }];
+        assert_eq!(sync_derived_entries(&root, ExtensionKind::Plugin, &only_user).unwrap(), 0);
+        let rows: Vec<(String, bool)> = scan_repository(&root).into_iter().map(|entry| (entry.name, entry.derived)).collect();
+        assert_eq!(rows, vec![
+            ("hand-made".to_owned(), false),
+            ("owned".to_owned(), false),
+        ]);
         let _ = fs::remove_dir_all(root);
     }
 }

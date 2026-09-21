@@ -1078,3 +1078,172 @@ fn an_unloaded_plugin_reports_no_diagnostics() {
     // The edges stay, so the UI can still show the plugin when asked for it.
     assert_eq!(graph.links.len(), 1);
 }
+
+/// A published dual-face package ships the compiled browser half *and* a
+/// directory of chunks beside it: `lib/client.js` next to `lib/client/`. Reading
+/// only the directory attributed the entry file to the host node — `lib/client.js`
+/// does not start with `lib/client` — so the browser half's `inject` list landed
+/// on the host, and services only the browser context provides were then reported
+/// as installed-but-inactive providers.
+#[test]
+fn a_client_entry_file_beside_its_chunk_directory_is_still_the_client_half() {
+    let root = sandbox("half-file-and-dir");
+    let modules = root.join("profile/profiles/web/node_modules/@scope/dual");
+    fs::create_dir_all(modules.join("lib/client")).unwrap();
+    fs::write(
+        modules.join("package.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "name": "@scope/dual",
+            "version": "1.0.0",
+            "main": "lib/index.js",
+            "exports": { "./client": { "default": "./lib/client.js" } },
+            "dsh": { "client": { "platform": "web" } }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        modules.join("lib/index.js"),
+        "export const inject = ['hostOnly']\n",
+    )
+    .unwrap();
+    fs::write(
+        modules.join("lib/client.js"),
+        "export const inject = ['browserOnly']\n",
+    )
+    .unwrap();
+    fs::write(modules.join("lib/client/chunk.js"), "export const x = 1\n").unwrap();
+
+    let graph = build_graph(
+        GraphSource::Container,
+        "container-1",
+        "web",
+        &ScanRoots {
+            harness: None,
+            profile: Some(root.join("profile/profiles/web")),
+            repository: None,
+        },
+        1_700_000_000,
+    );
+
+    let host = graph.plugins.iter().find(|plugin| plugin.id == "@scope/dual").unwrap();
+    let client = graph
+        .plugins
+        .iter()
+        .find(|plugin| plugin.id == "@scope/dual#client")
+        .unwrap();
+    assert_eq!(host.requires, vec!["hostOnly"]);
+    assert_eq!(
+        client.requires,
+        vec!["browserOnly"],
+        "the compiled entry is the client half even with a directory of the same name"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The launcher is not a package: `apps/cli` builds the root context and provides
+/// a few services to the plugins it mounts. Reporting `profileContext` missing for
+/// a container whose own startup audit reports nothing pending is what this avoids.
+#[test]
+fn the_launcher_is_a_provider_like_any_other() {
+    let root = sandbox("launcher");
+    let harness = root.join("harness");
+    fs::create_dir_all(harness.join("apps/cli/src")).unwrap();
+    fs::write(
+        harness.join("apps/cli/src/profile-boot.ts"),
+        "hostCtx.provide('profileContext', profileContext)\n",
+    )
+    .unwrap();
+    write_package(
+        &harness.join("packages/boot/plugin-manager"),
+        "@scope/plugin-manager",
+        &[],
+        "export const inject = ['profileContext']\n",
+    );
+
+    let graph = build_graph(
+        GraphSource::Container,
+        "container-1",
+        "web",
+        &ScanRoots {
+            harness: Some(harness.clone()),
+            profile: None,
+            repository: None,
+        },
+        1_700_000_000,
+    );
+
+    assert!(
+        graph.plugins.iter().any(|plugin| plugin.name == LAUNCHER_NODE),
+        "the launcher is a node, so the graph says who provides its services"
+    );
+    assert!(
+        graph.missing.is_empty(),
+        "a service the launcher provides is not missing: {:?}",
+        graph.missing
+    );
+    assert!(graph.inactive_providers.is_empty(), "and not inactive either");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Two registrations in one context is the case the runtime arbitrates; one per
+/// context is the dual-face pattern the diagram has to explain rather than flag.
+#[test]
+fn shared_service_names_say_whether_the_two_sides_are_contexts_or_a_conflict() {
+    let root = sandbox("shared-contexts");
+    let packages = root.join("harness/packages");
+    write_package(
+        &packages.join("host-a"),
+        "@scope/host-a",
+        &[],
+        "export const provide = ['dual', 'sameSide']\n",
+    );
+    write_package(
+        &packages.join("host-b"),
+        "@scope/host-b",
+        &[],
+        "export const provide = ['sameSide']\n",
+    );
+    let client = packages.join("client-a");
+    fs::create_dir_all(client.join("src/client")).unwrap();
+    fs::write(
+        client.join("package.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "name": "@scope/client-a",
+            "version": "1.0.0",
+            "main": "lib/index.js",
+            "exports": { "./client": { "default": "./src/client/index.ts" } },
+            "dsh": { "client": { "platform": "web" } }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(client.join("src/index.ts"), "export const provide = ['hostHalf']\n").unwrap();
+    fs::write(client.join("src/client/index.ts"), "export const provide = ['dual']\n").unwrap();
+
+    let graph = build_graph(
+        GraphSource::Container,
+        "container-1",
+        "web",
+        &ScanRoots {
+            harness: Some(root.join("harness")),
+            profile: None,
+            repository: None,
+        },
+        1_700_000_000,
+    );
+
+    let dual = graph
+        .shared_services
+        .iter()
+        .find(|service| service.service == "dual")
+        .expect("dual is registered twice");
+    assert!(dual.per_context, "a host half and a client half: {:?}", dual);
+    let same_side = graph
+        .shared_services
+        .iter()
+        .find(|service| service.service == "sameSide")
+        .expect("sameSide is registered twice");
+    assert!(!same_side.per_context, "two host registrations: {:?}", same_side);
+    let _ = fs::remove_dir_all(&root);
+}

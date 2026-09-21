@@ -9,10 +9,10 @@ pub(crate) fn is_safe_version_name(version: &str) -> bool {
 /// half of the template reference); the desktop fills in the GitHub base
 /// from the canonical harness reference. The daemon resolves the rest,
 /// including the missing-tag default of `latest`.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_pull_template(
     version: String,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     if version.is_empty() {
@@ -33,9 +33,9 @@ pub(crate) fn enqueue_pull_template(
         .map_err(|error| format!("invalid task record: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_dsh_catalog_refresh(
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: tauri::AppHandle,
 ) -> Result<TaskRecord, String> {
     let client = connect()?;

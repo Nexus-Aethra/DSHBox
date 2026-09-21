@@ -1,7 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import type { BoxConfig, ContainerExtensions, DataEntry, DshContainer, DshVersion, ExtensionBundle, GraphSourceKind, Language, PluginGraph, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, ResourceState, ServerServiceStatus, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
+import type { BoxConfig, ContainerExtensions, ContainerPathListing, ContainerResources, DataEntry, DshContainer, DshVersion, ExtensionBundle, GraphSourceKind, Language, PluginGraph, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, InstalledPlugin,
+  ResourceState, ResourceTree, ResourceTypeSummary, ResourceView, ServerServiceStatus, StoredResource, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
 
 type ToolchainPayload = { id: string; name: string; managedVersion: string | null }
 
@@ -54,6 +55,27 @@ async function openContainerFront(command: string, id: string): Promise<void> {
 }
 
 /** The sole frontend boundary to desktop IPC and native dialogs. */
+/**
+ * Resolve when a queued task reaches a terminal state. Extraction and
+ * injection are background tasks: a caller that reloads its data right after
+ * `enqueue_*` reads the old state, which is why a copy "does not appear".
+ * Polls the task list, and gives up quietly on timeout so a hung task cannot
+ * spin the UI forever.
+ */
+async function waitForTask(id: string, timeoutMs: number): Promise<TaskRecord | null> {
+  const terminal = new Set(['succeeded', 'failed', 'cancelled', 'interrupted'])
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    let tasks: TaskRecord[] = []
+    try { tasks = await ipc<TaskRecord[]>('list_tasks') } catch { return null }
+    const task = tasks.find((entry) => entry.id === id)
+    // A task that is gone (retried, deleted) is finished as far as we care.
+    if (task === undefined) return null
+    if (terminal.has(task.status)) return task
+    await new Promise((resolve) => setTimeout(resolve, 700))
+  }
+  return null
+}
 export const boxApi = {
   loadConfig: () => ipc<BoxConfig>('load_config'),
   saveRuntimeDirectory: (directory: string) => ipc<BoxConfig>('save_runtime_directory', { directory }),
@@ -75,6 +97,7 @@ export const boxApi = {
     readTemplate: (name: string) => ipc<{ name: string; text: string }>('read_template', { name }),
     importTemplate: (archive: string, name: string | null) => ipc<string>('import_template', { request: { archive, name } }),
     exportTemplate: (name: string, destination: string | null) => ipc<string>('export_template', { request: { name, destination } }),
+
     removeTemplate: (name: string) => ipc<string>('remove_template', { request: { name } }),
     createContainerFromTemplate: (name: string, template: string, profile: string | null) => ipc<TaskRecord>('enqueue_template_container', { request: { name, template, profile } }),
   listContainers: () => ipc<DshContainer[]>('list_dsh_containers'),
@@ -98,7 +121,21 @@ export const boxApi = {
   removeRepositoryPlugin: (id: string, profile: string, name: string) => ipc<void>('remove_repository_plugin', { id, profile, name }),
   listResourceStates: () => ipc<ResourceSnapshot>('list_resource_states'),
   listRepositoryReferenceCounts: () => ipc<RepositoryReferenceRow[]>('list_repository_reference_counts'),
+  listInstalledPlugins: () => ipc<{ plugins: InstalledPlugin[] }>('list_installed_plugins', {}),
   pluginDependencyGraph: (kind: GraphSourceKind, id: string) => ipc<PluginGraph>('plugin_dependency_graph', { kind, id }),
+  listContainerResources: (id: string, plugin?: string) => ipc<ContainerResources>('list_container_resources', { id, plugin }),
+  listResources: () => ipc<{ resources: StoredResource[] }>('list_resources', {}),
+  browseContainerPaths: (id: string, path: string) => ipc<ContainerPathListing>('browse_container_paths', { id, path }),
+  listResourceViews: () => ipc<{ views: ResourceView[] }>('list_resource_views', {}),
+  addResourceView: (request: { kind: string; container: string; label?: string; path?: string }) => ipc<{ view: ResourceView }>('add_resource_view', request),
+  deleteResourceView: (viewId: string) => ipc<void>('delete_resource_view', { viewId }),
+  listResourceType: (kind: string, path?: string) => ipc<ResourceTypeSummary>('list_resource_type', { kind, path }),
+  enqueueResourceExtract: (request: { id: string; kind: string; entry?: string; name?: string; plugin?: string; dest?: string; out?: string }) => ipc<TaskRecord>('enqueue_resource_extract', request),
+  enqueueResourceInject: (request: { id: string; resource?: string; from?: string; input?: string; kind?: string; dest?: string; entry?: string; conflict?: string; restart?: boolean }) => ipc<TaskRecord>('enqueue_resource_inject', request),
+  deleteResource: (resourceId: string) => ipc<void>('delete_resource', { resourceId }),
+  /** One file of a container as a YAML tree, so a block can be edited by path. */
+  readResourceTree: (request: { id: string; path: string; section?: string[] }) => ipc<ResourceTree>('read_resource_tree', request),
+  enqueueResourceWrite: (request: { id: string; path: string; section: string[]; text: string; conflict?: string; restart?: boolean }) => ipc<TaskRecord>('enqueue_resource_write', request),
   getResourceState: (key: string) => ipc<ResourceState | null>('get_resource_state', { key }),
   refreshResourceState: () => ipc<ResourceSnapshot>('refresh_resource_state'),
   listDataEntries: () => ipc<DataEntry[]>('list_data_entries'),
@@ -109,6 +146,7 @@ export const boxApi = {
   enqueueContainerRebuild: (id: string) => ipc<TaskRecord>('enqueue_container_rebuild', { id }),
   openContainer: (id: string) => openContainerFront('open_dsh_front', id),
   listTasks: () => ipc<TaskRecord[]>('list_tasks'),
+  waitForTask: (id: string, timeoutMs = 120_000) => waitForTask(id, timeoutMs),
   cancelTask: (id: string) => ipc<void>('cancel_task', { id }),
   deleteTask: (id: string) => ipc<void>('delete_task', { id }),
   retryTask: (id: string) => ipc<TaskRecord>('retry_task', { id }),

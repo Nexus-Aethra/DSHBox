@@ -280,6 +280,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "box-resources"
+version = "0.1.0"
+dependencies = [
+ "box-foundation",
+ "flate2",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tar",
+]
+
+[[package]]
 name = "box-runtime"
 version = "0.1.0"
 dependencies = [
@@ -356,6 +368,7 @@ version = "0.1.0"
 dependencies = [
  "box-foundation",
  "box-runtime",
+ "rusqlite",
  "serde",
 ]
 
@@ -952,6 +965,7 @@ dependencies = [
  "box-image",
  "box-logger",
  "box-plugin-graph",
+ "box-resources",
  "box-runtime",
  "box-scheduler",
  "box-server-core",
@@ -990,6 +1004,7 @@ dependencies = [
  "box-image",
  "box-logger",
  "box-plugin-graph",
+ "box-resources",
  "box-runtime",
  "box-scheduler",
  "box-server-core",

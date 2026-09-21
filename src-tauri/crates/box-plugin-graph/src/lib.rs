@@ -16,9 +16,11 @@
 //! provides, a provider that is installed but not activated, and a dependency
 //! cycle.
 //!
-//! Deliberately out of scope: npm-level package dependencies. The user-facing
-//! graph is plugin-to-plugin, so a plugin's library dependencies are not nodes
-//! and the profile lockfile is not consulted.
+//! Plugin-to-plugin is the graph; npm-level packaging is [`lockfile`]. A sealed
+//! template keeps no `node_modules`, so the profile's `pnpm-lock.yaml` is the
+//! only record of what a container will install — including the plugins a bundle
+//! pulled in that no boxfile names — and it is where the resolved versions come
+//! from.
 //!
 //! The scanner is text-based, because the workspace has no TypeScript parser. The
 //! forms it recognises were derived from a real harness checkout; see
@@ -26,6 +28,7 @@
 
 pub mod extract;
 pub mod graph;
+pub mod lockfile;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -122,6 +125,13 @@ pub struct SharedService {
     pub service: String,
     /// The activated registrations of `service`, in name order.
     pub providers: Vec<String>,
+    /// True when the registrations are one per context — a host implementation
+    /// and a browser one. cordis resolves a service name per isolation scope, so
+    /// that is not a conflict, and this diagram merges the two contexts, which is
+    /// what makes the name look doubled. False means two registrations share a
+    /// context, which the running tree really does have to arbitrate.
+    #[serde(default)]
+    pub per_context: bool,
 }
 
 /// A derived plugin-to-plugin edge: `from` requires `service`, which `to`
@@ -190,6 +200,13 @@ pub struct PluginGraph {
     pub scanned_at: u64,
 }
 
+/// The launcher is not a package: `apps/cli` builds the root context and
+/// provides a few services to the plugins it mounts. Nothing in the profile's
+/// bundle list names it, so without a node of its own every plugin that injects
+/// one of those services reads as waiting on nobody — `profileContext` was
+/// reported missing for a container whose own startup audit reports nothing.
+pub const LAUNCHER_NODE: &str = "dsh (launcher)";
+
 /// Filesystem roots to scan. Every field is optional so a partially materialised
 /// template or a container built from a legacy base still yields whatever is
 /// available instead of failing outright.
@@ -232,6 +249,20 @@ pub fn build_graph(
             collect_packages(&vendor, 2, &mut candidates);
         }
     }
+    if let Some(harness) = &roots.harness {
+        // Only the launcher's own sources: `apps/cli` is where the root context
+        // is built, and scanning the rest of the app would attribute whatever it
+        // provides in passing to the tree that is running.
+        let launcher = harness.join("apps").join("cli").join("src");
+        if launcher.is_dir() {
+            candidates.push(Candidate {
+                name: LAUNCHER_NODE.to_owned(),
+                version: None,
+                directory: launcher,
+                display: "launcher".to_owned(),
+            });
+        }
+    }
     if let Some(profile_dir) = &roots.profile {
         let modules = profile_dir.join("node_modules");
         if modules.is_dir() {
@@ -255,7 +286,14 @@ pub fn build_graph(
 
     // `None` when the profile tree is absent, e.g. a prepared Harness base: the
     // graph then reports activation as unknown rather than as empty.
-    let activated = activation(roots.profile.as_deref(), &unique, &mut diagnostics);
+    let mut activated = activation(roots.profile.as_deref(), &unique, &mut diagnostics);
+    // The launcher is the process: it is always loaded, and no bundle list names
+    // it. Without this its services look like an installed-but-inactive provider.
+    if let Some(names) = activated.as_mut() {
+        if unique.contains_key(LAUNCHER_NODE) {
+            names.insert(LAUNCHER_NODE.to_owned());
+        }
+    }
 
     let mut discovered: Vec<Discovered> = Vec::new();
     for candidate in unique.into_values() {
@@ -264,7 +302,7 @@ pub fn build_graph(
         // `None` for a host-only package, and for one that declares a client
         // entry whose sources cannot be located — the latter is reported rather
         // than guessed at.
-        let client_dir = client_half_dir(&candidate, &mut diagnostics);
+        let client_prefixes = client_half_prefixes(&candidate, &mut diagnostics);
         let inserts = bundle_inserts(&candidate, &mut diagnostics);
         let mut host = Scan::default();
         let mut client = Scan::default();
@@ -284,9 +322,9 @@ pub fn build_graph(
                             display_path(label)
                         ));
                     }
-                    let belongs_to_client = client_dir
-                        .as_ref()
-                        .is_some_and(|dir| file.starts_with(dir));
+                    let belongs_to_client = client_prefixes
+                        .iter()
+                        .any(|prefix| file.starts_with(prefix));
                     scan_merge(if belongs_to_client { &mut client } else { &mut host }, next);
                 }
                 Err(error) => {
@@ -357,45 +395,76 @@ fn display_path(path: &Path) -> String {
 /// * a published package has no `src/` to point at, so the same declaration
 ///   addresses the code itself: `lib/client.js` and anything under `lib/client/`.
 ///
-/// Both reduce to one path prefix, which is what the caller partitions files by.
+/// Both reduce to path prefixes, which is what the caller partitions files by.
 /// Reading only the first layout reported every published plugin as a package whose
 /// "browser half is not at src/client" — 12 rows on one container, for packages that
 /// ship no `src/` at all.
-fn client_half_dir(candidate: &Candidate, diagnostics: &mut Vec<String>) -> Option<PathBuf> {
-    let manifest = fs::read_to_string(candidate.directory.join("package.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&manifest).ok()?;
-    value.pointer("/dsh/client")?;
+///
+/// There can be two prefixes, and a package that ships both is why: `lib/client.js`
+/// is the compiled half, and `lib/client/` beside it holds the chunks it imports.
+/// Returning only the directory attributed the entry file to the *host* node —
+/// `lib/client.js` does not start with `lib/client` — so the browser half's
+/// `inject` list landed on the host, and every service only the browser context
+/// provides was then reported as an installed-but-inactive provider.
+fn client_half_prefixes(candidate: &Candidate, diagnostics: &mut Vec<String>) -> Vec<PathBuf> {
+    let manifest = fs::read_to_string(candidate.directory.join("package.json")).ok();
+    let Some(value) = manifest
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    else {
+        return Vec::new();
+    };
+    if value.pointer("/dsh/client").is_none() {
+        return Vec::new();
+    }
     // The subpath is the literal key `./client`, and a JSON Pointer escapes `/`
     // as `~1`. `default` over `types`: the compiled entry names the half, while the
     // declaration file inside it is named `index`.
-    let entry = value.pointer("/exports/.~1client")?;
+    let Some(entry) = value.pointer("/exports/.~1client") else {
+        return Vec::new();
+    };
     let target = ["default", "types"]
         .iter()
         .filter_map(|key| entry.get(key).and_then(serde_json::Value::as_str))
         .next()
         .unwrap_or_default();
-    let stem = target.rsplit_once('.').map_or(target, |(head, _)| head);
-    let (prefix, expected) = if candidate.directory.join("src").is_dir() {
+    let entry = target.trim_start_matches("./");
+    let stem = entry.rsplit_once('.').map_or(entry, |(head, _)| head);
+    let has_source_tree = candidate.directory.join("src").is_dir();
+    // The entry file is always part of the half. A published package addresses
+    // the code itself (`lib/client.js`), and a package with a source tree may
+    // address either its source (`src/client/index.ts`) or a build output whose
+    // stem names the source directory (`lib/client.js` → `src/client`).
+    let mut prefixes: Vec<PathBuf> = Vec::new();
+    let entry_file = candidate.directory.join(entry);
+    if entry_file.is_file() {
+        prefixes.push(entry_file);
+    }
+    let (half_dir, expected) = if !has_source_tree {
+        (candidate.directory.join(stem), stem.to_owned())
+    } else if let Some(inside) = entry.strip_prefix("src/") {
+        let parent = inside.rsplit_once('/').map(|(head, _)| head).unwrap_or_default();
+        (
+            candidate.directory.join("src").join(parent),
+            format!("src/{parent}"),
+        )
+    } else {
         let segment = stem.rsplit('/').find(|part| !part.is_empty()).unwrap_or_default();
         (
             candidate.directory.join("src").join(segment),
             format!("src/{segment}"),
         )
-    } else {
-        (
-            candidate.directory.join(stem.trim_start_matches("./")),
-            stem.trim_start_matches("./").to_owned(),
-        )
     };
-    // A file is a valid prefix here: `lib/client.js` is a whole half by itself.
-    if prefix.is_dir() || prefix.is_file() {
-        return Some(prefix);
+    if half_dir.is_dir() || half_dir.is_file() {
+        prefixes.push(half_dir);
+    }
+    if !prefixes.is_empty() {
+        return prefixes;
     }
     diagnostics.push(format!(
         "{}: declares dsh.client but its browser half is not at {expected}",
         candidate.name
     ));
-    None
+    Vec::new()
 }
 
 /// The plugin names a bundle package's patch file inserts, in name order.

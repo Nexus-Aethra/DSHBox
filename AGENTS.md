@@ -1,5 +1,11 @@
 # DSH Box — Agent Guide
 
+> This file is the engineering guide. User-facing documentation lives in
+> [`README.md`](README.md) (English) and [`README.zh-CN.md`](README.zh-CN.md)
+> (简体中文): the two are kept in step, and a feature that changes what the app
+> does belongs in both, along with a figure under `docs/images/` when it is
+> visible in the UI.
+
 > Desktop launcher and lifecycle manager for DeepSeek Harness (DSH). Tauri 2
 > shell + React management UI + Rust Cargo workspace + `dshboxd` sidecar.
 
@@ -68,6 +74,7 @@ frontend. Manual `cargo build` for release needs it explicitly.
 | `box-containers`           | Container metadata + active Host registry |
 | `box-extensions`           | Repository plugin/skill scan, copy, export |
 | `box-image`                | `.dsh` parser, manifest v6, gzip tar I/O |
+| `box-resources`            | Container resource kinds, extraction, injection |
 | `box-dsh-context`          | Patch YAML / context snapshot rendering |
 | `box-server-core`          | `dshboxd` helpers, service install |
 | `box-api`, `box-client`    | IPC + client adapter layer |
@@ -175,14 +182,136 @@ obvious. `listenTask` degrades to a no-op and task progress comes from the 3s po
   blocker — but it also needs a host C compiler, which the runtime bundle
   otherwise never requires.
 - **Prepared/sealed templates.** Pulling a root Harness template prepares a
-  complete source tree (`pnpm install` only — `validate_prepared_harness`
-  checks that tree; the frontend build happens later, when a container is
-  prepared from it at `dshboxd/src/sealed.rs` "Building DSH frontend"). `dshbox build`
-  copies that base and publishes a sealed physical template with locally packed
-  plugin artifacts installed. Container creation copies that sealed tree;
-  Container startup must never install or build DSH. `dshbox image` remains a
-  deprecated alias forwarding to `build`/`template`. The authoritative design
+  complete tree: `pnpm install` **and** the client build (native addon, host and
+  client libraries, web frontend) — `validate_prepared_harness` requires
+  `apps/web/dist/index.html` and the `.dsh-build/box-client-artifacts.json`
+  marker. The build belongs here because it depends only on the source, the
+  commit and the platform, never on a profile's plugins, so one build per
+  Harness version serves every template from that base; a base that predates
+  this is repaired in place the first time a template is built from it. `dshbox
+  build` copies that base and publishes a sealed physical template with locally
+  packed plugin artifacts installed. Container creation copies that sealed tree
+  and links dependencies from the store (~10s); it rebuilds only when the tree
+  carries no artifacts for this commit and platform — an old template, or one
+  imported from another OS, whose native addon is not this machine's.
+  **Container startup must never install or build DSH.** `dshbox image` remains
+  a deprecated alias forwarding to `build`/`template`. The authoritative design
   is `docs/specs/prepared-template-runtime.md`.
+- **The graph reads source, so it must not claim more than source can show.**
+  Three false alarms came from the same mistake — treating an incomplete static
+  view as complete. The launcher (`apps/cli`) provides services to the plugins it
+  mounts and is not a package, so it is scanned and drawn as `dsh (launcher)`;
+  without it `profileContext` reads as missing for a container that starts fine.
+  A dual-face package's half is decided by *prefixes*, plural: a published
+  package ships `lib/client.js` beside `lib/client/`, and the entry file must be
+  a prefix in its own right or its `inject` list lands on the host half. And a
+  service name registered once per context is the dual-face pattern, not a
+  conflict — `SharedService::per_context` says which is which, because cordis
+  resolves a name per isolation scope and this diagram merges the contexts.
+- **A cycle is a graph fact; a crossing is a drawing fact.** The graph view can
+  fold a dependency depth into one summary box (`foldLayers` in
+  `src/features/plugin-graph/layout.ts`), and the default view merges a package's
+  two halves into one node. Both make edges the layout cannot point forwards, and
+  neither is a cycle: `host A → B` beside `browser B → A` is two edges that no
+  context loops on. So `PlacedEdge.back` (drawn grey, with a legend line) is kept
+  apart from `PlacedEdge.cyclic` (drawn red, "this cannot load"), and the panel
+  computes the latter from the half-preserving `graph.links`, ignoring
+  cross-context links. Passing `cyclic` into `layoutGraph` is how the caller
+  says which. Splitting the halves should leave zero crossings — that is the
+  check that the layering itself is right.
+- **The desktop must never block its own main thread on the daemon.** A plain
+  `#[tauri::command]` runs on the main thread — the same one that renders the
+  window — so a slow daemon call freezes the UI. Every command that talks to the
+  daemon, the filesystem, or another process is `#[tauri::command(async)]`,
+  which Tauri runs on its `sync_threadpool`; only in-memory reads
+  (`get_resource_state`, `get_container_details`) stay sync. `box-client` bounds
+  each RPC with a read timeout (60s) and a write timeout, and the liveness probe
+  (`ping_quickly`, 3s) is what the startup gate polls, so a stuck daemon answers
+  "not yet" instead of holding a thread. The frontend polls one request at a
+  time for the same reason: overlapping polls against a busy daemon pile up.
+- **The CLI is the agent surface; the UI is the human one.** `dshbox apply -f
+  <file>` takes a document (`container:`, `types:`, `copies:`) and makes the
+  resource layer match it, so an agent configures resources by writing one file
+  instead of driving verbs in order; applying is idempotent (a type is keyed by
+  kind+container+path, a copy whose name is already stored reports `exists`),
+  `--dry-run` changes nothing and `--json` reports per-entry results. The verbs
+  an agent needs are non-interactive and machine-readable: `dshbox container
+  resource list|stored|types [--json]` to look, `extract|inject|read|write|rm`
+  to act, `dshbox container resource read <id> <path> [--section a.b]` to see a
+  container file as a tree of key paths. Unknown keys in an apply document are
+  an error, not a silent no-op.
+- **Task logs are the UI's only window into a long task.** A daemon task's log
+  file is written by `TaskContext::append_log` and by nothing else — a notifier
+  that writes it too doubles every line. Stage changes (`task.update`) only move
+  the progress bar; a step the user waits minutes for needs a `task.log` line
+  saying what it is doing and how long it took. The live stream is
+  `daemon://event` frames named exactly as `DaemonEvent::event_name` spells them
+  (`task_stage`, `task_log`, `task_finished`, snake_case payloads): `useTasks`
+  switches on those names, so a renamed event is silently dropped and the panel
+  falls back to the 3s poll.
+- **Container resources are user state, not code.** `box-resources` moves chat
+  history, credentials and plugin state between containers. Injection refuses an
+  existing destination unless `--overwrite`/`--merge` is given and refuses a
+  running container unless `--restart` is; a secret kind's payload is `0600` in
+  the store and at the destination; a path never leaves the container
+  (`safe_join` rejects `..` and absolute paths before normalization, and a
+  symlink pointing outside the source is refused, not followed). Plugin
+  declarations (`package.json` → `dshbox.resources`) are trusted; paths scanned
+  out of a plugin's code are candidates the user confirms. Extracted records go
+  through the document store; payloads stay in `<runtime>/resources/<id>/`. A
+  copy's id is `<kind>-<name>`, where the name is the user's, the selected
+  entry's, or the source container's (`build_id` + `free_record_id` in
+  `dshboxd/src/resources.rs`): taking a copy again adds `<name>-2` instead of
+  replacing the one the user already has, since taking a copy is an explicit act
+  — the same kind from two containers must not land on one row.
+- **A resource is one or more parts, and a part may be a YAML section.** A kind
+  declares `parts` (`KindPart`): a container-relative path, optionally with a
+  `section` key path. `credentials` is two parts — `.credentials.yaml` plus
+  `settings.yaml#llm-pi-ai` — because a key authenticates nothing until a
+  provider route names the environment variable that holds it
+  (`apiKeyEnv` is a credential-ref in `llm-pi-ai`), while the rest of
+  `settings.yaml` belongs to other plugins. Extraction writes part 0 at the
+  payload root (unchanged layout, so copies taken before parts still inject) and
+  later parts under `part-<i>/`, plus a `parts.json` the injection reads — a
+  payload describes itself rather than trusting the kind installed now. Section
+  parts merge deep (`merge_yaml`) and refuse/overwrite the section as one value.
+  `transfer::write_section` is the same operation the UI's YAML editor uses:
+  read a block by key path, write it back, merge or replace — copy and edit are
+  one mechanism, so a new YAML-shaped resource needs no new code.
+- **Cache state comes from the pnpm store, the list from the lockfiles.** Box
+  gives pnpm a private store (`PNPM_CONFIG_STORE_DIR` → `<runtime>/pnpm/store`,
+  see `box-runtime/src/process/env.rs`), so "can this install offline" is a
+  lookup in its index — `package_index` keys are `<integrity>\t<name>@<version>`
+  (`box-toolchains/src/pnpm_store.rs`). The *list* of plugins stays lockfile-
+  driven: a store is a cache keyed by content (it holds plain libraries and
+  packages nothing uses any more, and has no owner relation), while a lockfile
+  records what one template or container actually installed.
+- **A repository entry either owns its bytes or points at pnpm's store.**
+  `RepositoryStorage::Owned` is a copy under `<runtime>/repository/…` (local
+  directories, hand-made archives — things pnpm cannot recreate);
+  `RepositoryStorage::Reference` is a row naming a spec whose bytes live in the
+  pnpm store (`source_path` empty). Import classification lives in
+  `dshboxd/src/extensions.rs::classify_import_source` and reuses the boxfile
+  source grammar, so the two accept the same strings. Consequences: installing a
+  reference into a container goes through `container_plugin_add` (spec, store
+  first) instead of copying a directory; removing one deletes only the row; and
+  a *full* bundle export materializes it with `pnpm add` — offline first, and it
+  says so in the log when the store alone cannot resolve peer ranges, never
+  quietly shipping a bundle with an entry missing.
+- **The plugin list is a mirror of what is installed, not a second place to
+  import into.** `list_installed_plugins` merges the extension repository with
+  every sealed template's and container's `profile/profiles/<p>/pnpm-lock.yaml`,
+  classifying a package as a plugin when it is a direct dependency or declares a
+  cordis/dsh peer (`box-plugin-graph/src/lockfile.rs`). The daemon then writes
+  that back: `reconcile_plugin_index` (`dshboxd/src/plugins.rs`) derives one
+  `reference` row per installed plugin at startup and before every list, so a
+  plugin a boxfile installed never looks missing just because nobody imported
+  it. Those rows carry `derived: true`, are dropped once nothing installs them,
+  and never shadow a row the user made; the UI marks them 自动收录 and hides
+  删除 (a scan would put the row straight back). A row's `source` is the spec
+  that installs the package again — `name@version` normally, the lock's
+  `specifier` for a `file:`/git dependency, whose lock *key* is the spec while
+  the entry's own `version:` field holds the version.
 - **Plugin cache dedup.** A second `build` of the same `name+version` should
   hit the existing hash entry (`<root>/repository/plugins/img-<id>/source/`)
   and not produce a duplicate `img-…` row (see

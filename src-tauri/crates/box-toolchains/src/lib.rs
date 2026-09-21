@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::{env, path::PathBuf, process::Command};
 
 pub const TOOLCHAIN_IDS: [&str; 3] = ["node", "npm", "pnpm"];
+pub mod pnpm_store;
+
+pub use pnpm_store::cached_packages;
+
 pub fn is_known_toolchain(id: &str) -> bool {
     TOOLCHAIN_IDS.contains(&id)
 }

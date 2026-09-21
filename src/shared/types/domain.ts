@@ -12,7 +12,12 @@ export type ProfileExtensions = { name: string; plugins: ExtensionPlugin[]; diag
 export type ContainerSkill = { name: string; description: string | null; path: string; diagnostic: string | null }
 export type ContainerExtensions = { containerId: string; profiles: ProfileExtensions[]; skills: ContainerSkill[]; diagnostics: string[]; scannedAt: number }
 export type ExtensionKind = 'plugin' | 'skill'
-export type RepositoryExtension = { id: string; kind: ExtensionKind; name: string; version: string | null; description: string | null; contentDigest: string; sourcePath: string; importedAt: number; diagnostic: string | null; source: string | null }
+export type RepositoryExtension = { id: string; kind: ExtensionKind; name: string; version: string | null; description: string | null; contentDigest: string; sourcePath: string; importedAt: number; diagnostic: string | null; source: string | null   /** `owned` keeps a copy under the runtime; `reference` points at pnpm's store. */
+  storage: 'owned' | 'reference'
+  /** Box found this row by scanning installed templates and containers rather
+   *  than being told about it, so it appears and disappears with them. */
+  derived: boolean
+}
 // Detailed per-entry owner ids surfaced by the daemon for `dshbox plugin
 // refs` and the resources-page owner popover. The on-disk file keeps the
 // raw sets; the snapshot view above projects them to counts.
@@ -58,7 +63,13 @@ export type PluginLink = { from: string; to: string; service: string; crossConte
 // resolves a name per isolation scope, so a host implementation and a browser one
 // are the design. It is reported because this graph merges the contexts, which
 // draws the name as a fan-out wider than the running tree has.
-export type SharedService = { service: string; providers: string[] }
+export type SharedService = {
+  service: string
+  providers: string[]
+  /** One registration per context (a host half and a browser half): the dual-face
+   *  pattern, not a conflict. False means two registrations share a context. */
+  perContext: boolean
+}
 export type PluginGraph = {
   source: GraphSourceKind
   sourceId: string
@@ -190,4 +201,144 @@ export type ImageManifest = {
   container: ImageContainer
   labels: Record<string, string>
   entries: ImageEntry[]
+}
+
+/** How a resource kind reaches the container: Box ships it, a plugin declares
+ * it, or Box read the path out of the plugin's code (a candidate). */
+export type ResourceScope = 'builtin' | 'declared' | 'inferred'
+export type ResourceShape = 'entries' | 'opaque'
+
+export type ResolvedResourceKind = {
+  id: string
+  label: string
+  path: string
+  secret: boolean
+  shape: ResourceShape
+  /** Independent entries sit this deep under the path (chat history: 2). */
+  entryDepth: number
+  inferred: boolean
+}
+
+export type DiscoveredResource = {
+  kind: ResolvedResourceKind
+  scope: ResourceScope
+  plugin: string | null
+  description: string | null
+  exists: boolean
+  bytes: number
+  files: number
+}
+
+// ---- container resources: reading and editing a YAML block by path ----
+/** One node of a container file's YAML document, flattened in pre-order. */
+export type ResourceTreeNode = {
+  /** Key path to this node, which is what a write names. */
+  path: string[]
+  key: string
+  depth: number
+  kind: string
+  preview: string
+  expandable: boolean
+}
+
+export type ResourceTree = {
+  path: string
+  section: string[]
+  /** The YAML at `section` (or the whole document when it is empty). */
+  text: string
+  document: string
+  nodes: ResourceTreeNode[]
+}
+
+export type StoredResource = {
+  id: string
+  kind: string
+  name: string
+  sourceContainer: string
+  sourcePath: string
+  digest: string
+  bytes: number
+  files: number
+  secret: boolean
+  shape: ResourceShape
+  entryDepth: number
+  plugin: string | null
+  createdAt: number
+}
+
+export type ContainerResources = {
+  container: string
+  profile: string
+  resources: DiscoveredResource[]
+  /** Every package installed in the profile, `@scope/name` form. */
+  plugins: string[]
+  stored: StoredResource[]
+}
+
+/** One entry of a container's storage area, as the file tree shows it. */
+export type ContainerPathEntry = {
+  name: string
+  path: string
+  directory: boolean
+  symlink: boolean
+  bytes: number
+  children: number
+  secret: boolean
+}
+
+export type ContainerPathListing = {
+  container: string
+  path: string
+  parent: string
+  entries: ContainerPathEntry[]
+}
+
+/** A resource type the user pinned to the Resources navigation. */
+export type ResourceView = {
+  id: string
+  label: string
+  kind: string
+  container: string
+  path: string | null
+  secret: boolean
+  shape: ResourceShape
+  entryDepth: number
+  createdAt: number
+}
+
+/** One container's standing for a resource type. */
+export type ResourceTypeContainer = {
+  id: string
+  name: string
+  path: string
+  secret: boolean
+  exists: boolean
+  bytes: number
+  files: number
+}
+
+export type ResourceTypeSummary = {
+  kind: string
+  containers: ResourceTypeContainer[]
+  stored: StoredResource[]
+}
+
+/** Where an installed plugin came from: the repository, a template, a container. */
+export type PluginOwner = {
+  kind: 'repository' | 'template' | 'container'
+  id: string
+  name: string
+  version: string | null
+  direct: boolean
+}
+
+/** A plugin that exists on this machine, whether or not it was imported. */
+export type InstalledPlugin = {
+  name: string
+  versions: string[]
+  inRepository: boolean
+  owners: PluginOwner[]
+  /** Versions present in the runtime's pnpm store; null when the store layout
+   *  is unrecognised, so "unknown" is never shown as "not cached". */
+  cachedVersions: string[] | null
 }

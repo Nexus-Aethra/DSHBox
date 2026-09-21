@@ -17,8 +17,11 @@ use super::rpc;
 
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     let Some(action) = arguments.first().map(String::as_str) else {
-        return Err("expected container logs|url|describe|show|open|start|stop|restart|rebuild|rm".to_owned());
+        return Err("expected container logs|url|describe|show|open|start|stop|restart|rebuild|rm|resource".to_owned());
     };
+    if action == "resource" {
+        return super::resource::command(&arguments[1..]);
+    }
     if matches!(action, "help" | "--help" | "-h") {
         println!("dshbox container logs <id>             tail the DSH host log");
         println!("dshbox container url <id>              print the webview URL of a running container");
@@ -30,6 +33,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         println!("dshbox container restart <id>          restart a stopped/crashed host (no rebuild)");
         println!("dshbox container rebuild <id>          re-materialise extensions and restart");
         println!("dshbox container rm <id>               stop and delete the container");
+        println!("dshbox container resource <verb>       list|stored|types|extract|inject|read|write|rm (see `resource help`)");
         return Ok(());
     }
     let id = arguments

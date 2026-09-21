@@ -1,8 +1,8 @@
 use super::super::*;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn list_dsh_containers(
-    _resources: tauri::State<ResourceStateManager>,
+    _resources: tauri::State<'_, ResourceStateManager>,
 ) -> Result<Vec<DshContainer>, String> {
     let client = connect()?;
     let value = call(&client, "list_containers", serde_json::json!({}))?;

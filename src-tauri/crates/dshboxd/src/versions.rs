@@ -177,9 +177,12 @@ pub(crate) fn refresh_dsh_catalog() -> Result<(), String> {
     fetch_remote_dsh_tags().map(|_| ())
 }
 
-/// Pull and prepare a root Harness template. The base seeds the bundled pnpm
-/// cache but deliberately does not build the frontend: the final build must
-/// happen after a container has added its local plugin artifacts.
+/// Pull and prepare a root Harness template. The base is complete: it installs
+/// dependencies and builds the client artifacts (native addon, host/client
+/// libraries, web frontend) once per Harness version, so every template built
+/// from it and every container created from those templates is a copy rather
+/// than another build. The build does not depend on a profile's plugins, which
+/// is what makes sharing it across templates sound.
 pub(crate) fn pull_template_with_cancel(
     ref_value: String,
     cancelled: impl Fn() -> bool + Send + 'static,
@@ -238,6 +241,30 @@ pub(crate) fn pull_template_with_cancel(
             task,
             "prepared-base dependency install",
         )?;
+        task.check_cancelled()?;
+
+        // Build the client artifacts here, once per Harness version, rather
+        // than in every container: the build depends on the source, the commit
+        // and the platform — not on the profile's plugins — so a prepared base
+        // can carry it for every template built from it. This is the slow step
+        // (native addon, host/client libraries, web frontend).
+        task.update("Building DSH client artifacts", 50);
+        task.log("building DSH client artifacts (native addon, host/client libs, web frontend); this is the slow step");
+        let build_started = std::time::Instant::now();
+        run_pnpm_task_with(
+            &pnpm,
+            &harness,
+            ["run", "build"],
+            &log_path,
+            task,
+            "prepared-base client build",
+            &[("DSH_CLIENT_COMMIT_HASH", commit.as_str())],
+        )?;
+        task.log(&format!(
+            "client artifacts built in {}s",
+            build_started.elapsed().as_secs()
+        ));
+        crate::sealed::write_client_artifact_marker(&harness, &commit)?;
         task.check_cancelled()?;
 
         task.update("Validating prepared base", 60);
@@ -384,13 +411,32 @@ fn run_pnpm_task<const N: usize>(
     task: &TaskContext,
     label: &str,
 ) -> Result<(), String> {
+    run_pnpm_task_with(pnpm, directory, args, log_path, task, label, &[])
+}
+
+/// `run_pnpm_task` with extra environment for the child: the client build needs
+/// the same commit hash the container build would embed, or the artifacts it
+/// produces are not the ones a container would have built.
+fn run_pnpm_task_with<const N: usize>(
+    pnpm: &crate::toolchains::ResolvedToolchain,
+    directory: &Path,
+    args: [&str; N],
+    log_path: &Path,
+    task: &TaskContext,
+    label: &str,
+    overrides: &[(&str, &str)],
+) -> Result<(), String> {
     let directory_arg = directory.to_string_lossy().into_owned();
+    let mut policy = pnpm_policy(pnpm)?;
+    for (name, value) in overrides {
+        policy = policy.task_override(*name, *value);
+    }
     let spec = ProcessSpec::new(&pnpm.path)
         .args(&pnpm.arguments)
         .args(["--dir", directory_arg.as_str()])
         .args(args)
         .cwd(directory)
-        .policy(pnpm_policy(pnpm)?)
+        .policy(policy)
         .kind(ExecutionKind::Logged)
         .log_path(log_path);
     let mut process = run_logged(&spec, label)?;
@@ -400,6 +446,7 @@ fn run_pnpm_task<const N: usize>(
     if status.success() {
         Ok(())
     } else {
+        crate::sealed::log_command_tail(log_path, task, 20);
         let hint = pnpm_network_failure_hint(log_path).unwrap_or_default();
         Err(format!(
             "{label} failed; inspect {}.{hint}",
@@ -413,6 +460,11 @@ fn validate_prepared_harness(harness: &Path) -> Result<(), String> {
         "package.json",
         "node_modules/tsx/package.json",
         "apps/cli/src/bin.ts",
+        // The client build runs while the base is prepared, so a base without
+        // its artifacts is incomplete: containers would silently fall back to
+        // building them one by one.
+        "apps/web/dist/index.html",
+        crate::sealed::CLIENT_ARTIFACT_MARKER,
     ] {
         if !harness.join(relative).is_file() {
             return Err(format!(
@@ -650,7 +702,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepared_harness_validation_requires_dependency_cache_but_not_build_output() {
+    fn prepared_harness_validation_requires_the_dependency_cache_and_the_client_artifacts() {
         let temporary = tempfile::tempdir().unwrap();
         let harness = temporary.path().join("harness");
         fs::create_dir_all(harness.join("node_modules/tsx")).unwrap();
@@ -670,7 +722,35 @@ mod tests {
             )
             .unwrap();
         }
+        // The client build runs while the base is prepared, so a base without
+        // its artifacts is incomplete.
+        assert!(validate_prepared_harness(&harness).is_err());
+        fs::create_dir_all(harness.join("apps/web/dist")).unwrap();
+        fs::write(harness.join("apps/web/dist/index.html"), "").unwrap();
+        assert!(validate_prepared_harness(&harness).is_err());
+        crate::sealed::write_client_artifact_marker(&harness, "abc").unwrap();
         validate_prepared_harness(&harness).unwrap();
+    }
+
+    #[test]
+    fn client_artifacts_are_only_trusted_for_the_commit_and_platform_they_were_built_for() {
+        let temporary = tempfile::tempdir().unwrap();
+        let harness = temporary.path().join("harness");
+        fs::create_dir_all(harness.join("apps/web/dist")).unwrap();
+        fs::write(harness.join("apps/web/dist/index.html"), "").unwrap();
+        // No marker: an old template, or one that lost it. Build, do not trust.
+        assert!(!crate::sealed::client_artifacts_present(&harness, "abc"));
+        crate::sealed::write_client_artifact_marker(&harness, "abc").unwrap();
+        assert!(crate::sealed::client_artifacts_present(&harness, "abc"));
+        // A template imported from another machine carries that machine's
+        // native addon, so its artifacts are not this platform's.
+        assert!(!crate::sealed::client_artifacts_present(&harness, "def"));
+        fs::write(
+            harness.join(crate::sealed::CLIENT_ARTIFACT_MARKER),
+            r#"{"commit":"abc","platform":"plan9-sparc"}"#,
+        )
+        .unwrap();
+        assert!(!crate::sealed::client_artifacts_present(&harness, "abc"));
     }
 
     #[test]

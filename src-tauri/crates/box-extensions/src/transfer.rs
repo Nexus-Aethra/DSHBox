@@ -333,6 +333,8 @@ mod tests {
             imported_at: 0,
             diagnostic: None,
             source: None,
+            storage: crate::RepositoryStorage::Owned,
+            derived: false,
         }];
         assert_eq!(
             resolve_conflict_name(&entries, &ExtensionKind::Plugin, "demo", "keep"),

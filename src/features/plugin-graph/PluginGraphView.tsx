@@ -6,7 +6,7 @@ export type GraphNodeMeta = {
   label: string
   /** Full name for the tooltip; the box label is elided to fit. */
   title?: string
-  kind: 'plugin' | 'service'
+  kind: 'plugin' | 'service' | 'layer'
   // A plugin outside the profile's activation closure is installed but never
   // loaded, which is why it is drawn muted rather than as a normal node.
   activated?: boolean
@@ -23,8 +23,12 @@ type Props = {
   // Nodes the search box matched, outlined rather than isolated so the hit keeps
   // the surrounding graph as context.
   matches: Set<string> | null
-  // Labels for the dependency depths, drawn beside each band.
+  // Labels for the dependency depths, drawn beside each band. The caller words
+  // them — a band's label is also the control that folds its depth away.
   layerLabel: (layer: number, count: number) => string
+  // Folding a depth is one action on one layer, from the band label and from the
+  // summary box it leaves behind.
+  onToggleLayer: (layer: number) => void
   // Accessible name for the diagram, and the message shown when it is empty.
   canvasLabel: string
   emptyLabel: string
@@ -88,7 +92,7 @@ function edgeMidpoint(edge: PlacedEdge, from: Box, to: Box): { x: number; y: num
   }
 }
 
-export function PluginGraphView({ layout, meta, selected, onSelect, showEdgeLabels, matches, layerLabel, canvasLabel, emptyLabel }: Props) {
+export function PluginGraphView({ layout, meta, selected, onSelect, showEdgeLabels, matches, layerLabel, onToggleLayer, canvasLabel, emptyLabel }: Props) {
   if (layout.nodes.length === 0) {
     return <p className="plugin-graph-empty">{emptyLabel}</p>
   }
@@ -149,10 +153,21 @@ export function PluginGraphView({ layout, meta, selected, onSelect, showEdgeLabe
                 height={group.height + 16}
                 rx={10}
               />
+              {/* The band label is where a layer is folded: it names the layer,
+                  so it is the thing a reader points at to put it away. */}
               <text
-                className="plugin-graph-group-label"
+                className="plugin-graph-group-label foldable"
                 x={group.x - 8}
                 y={group.y - GROUP_LABEL_GAP}
+                onClick={() => { onToggleLayer(group.layer) }}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault()
+                    onToggleLayer(group.layer)
+                  }
+                }}
               >
                 {layerLabel(group.layer, group.count)}
               </text>
@@ -174,11 +189,16 @@ export function PluginGraphView({ layout, meta, selected, onSelect, showEdgeLabe
             return (
               <g key={`${edge.from}->${edge.to}`} className={classes}>
                 {edge.title !== undefined && <title>{edge.title}</title>}
+                {/* Red-dashed means "on a cycle" and nothing else: it is the one
+                    mark that says this tree cannot load. An edge the drawing
+                    cannot point forwards is a different thing — merging a
+                    package's two halves into one box puts two chains on one node
+                    — so it is drawn plain, not alarming. */}
                 <path
                   d={curve(edge, from, to)}
-                  className={`plugin-graph-edge${edge.back ? ' back' : ''}`}
+                  className={`plugin-graph-edge${edge.cyclic ? ' back' : edge.back ? ' crosses' : ''}`}
                   markerEnd={
-                    edge.back
+                    edge.cyclic
                       ? 'url(#plugin-graph-arrow-back)'
                       : touched
                         ? 'url(#plugin-graph-arrow-active)'
@@ -206,12 +226,22 @@ export function PluginGraphView({ layout, meta, selected, onSelect, showEdgeLabe
                 key={node.id}
                 className={classes}
                 transform={`translate(${node.x}, ${node.y})`}
-                onClick={() => { onSelect(selected === node.id ? null : node.id) }}
+                onClick={() => {
+                  if (info.kind === 'layer') {
+                    onToggleLayer(Number(node.id.slice('layer:'.length)))
+                    return
+                  }
+                  onSelect(selected === node.id ? null : node.id)
+                }}
                 role="button"
                 tabIndex={0}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' || event.key === ' ') {
                     event.preventDefault()
+                    if (info.kind === 'layer') {
+                      onToggleLayer(Number(node.id.slice('layer:'.length)))
+                      return
+                    }
                     onSelect(selected === node.id ? null : node.id)
                   }
                 }}

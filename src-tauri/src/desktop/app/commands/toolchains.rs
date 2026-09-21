@@ -1,8 +1,8 @@
 use super::super::*;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn detect_toolchains(
-    _resources: tauri::State<ResourceStateManager>,
+    _resources: tauri::State<'_, ResourceStateManager>,
 ) -> Result<Vec<ToolchainStatus>, String> {
     let client = connect()?;
     let value = call(&client, "detect_toolchains", serde_json::json!({}))?;
@@ -10,7 +10,7 @@ pub(crate) fn detect_toolchains(
         .map_err(|error| format!("invalid toolchain list: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn save_toolchain_source(
     id: String,
     source: String,

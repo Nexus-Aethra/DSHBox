@@ -11,7 +11,8 @@ use box_extensions::{
     detect_extension_kind, read_bundles, remove_plugin_record,
     repository_root, scan_repository, write_bundles, write_repository_index, ExtensionKind,
     RepositoryExtension,
-};
+    ExtensionRecord,
+    write_extension_record,};
 use box_foundation::{is_safe_identifier, mirror_url, now_seconds, read_config};
 use box_runtime::process::{ExecutionKind, ProcessSpec};
 use box_runtime::shallow_clone_with_cancel;
@@ -216,9 +217,38 @@ pub(crate) fn link_repository_extension(
             if !profile_dir.join("package.json").is_file() {
                 return Err(format!("profile not found: {profile}"));
             }
-            // Install the plugin into the profile via DSH's tooling. The
-            // plugin source lives in the shared repository directory so
-            // multiple containers can reference the same entry.
+            if entry.storage == box_extensions::RepositoryStorage::Reference {
+                // Nothing was copied: install the spec and let pnpm resolve it
+                // from its store first, the network only if the store lacks it.
+                let spec = entry
+                    .source
+                    .clone()
+                    .ok_or("reference entry has no spec to install")?;
+                container_plugin_add(&container.id, profile, &spec, task)?;
+                write_extension_record(
+                    &container,
+                    ExtensionRecord {
+                        kind: ExtensionKind::Plugin,
+                        name: entry.name.clone(),
+                        source_kind: "repository".to_owned(),
+                        source: entry.id.clone(),
+                        profile: Some(profile.to_owned()),
+                        path: profile_dir
+                            .join("node_modules")
+                            .join(&entry.name)
+                            .to_string_lossy()
+                            .into_owned(),
+                        installed_at: now_seconds(),
+                        repository_id: Some(entry.id.clone()),
+                        content_digest: None,
+                    },
+                )
+                .map_err(|error| format!("cannot record the installed plugin: {error}"))?;
+                task.update("Container extension installed", 95);
+                return Ok(());
+            }
+            // Owned entry: the plugin source lives in the shared repository
+            // directory so multiple containers can reference the same entry.
             let source_path = PathBuf::from(&entry.source_path);
             crate::bundles::install_container_plugin(
                 &container,
@@ -258,6 +288,102 @@ pub(crate) fn link_repository_extension(
     }
     task.update("Container extension installed", 95);
     Ok(())
+}
+
+/// What an import source refers to. A package pnpm can install needs no copy:
+/// the registry (or git) is the source and pnpm's store is the cache, so Box
+/// keeps a pointer. A local directory is not recoverable from anywhere else, so
+/// Box copies it.
+pub(crate) enum ImportSource {
+    Reference {
+        name: String,
+        version: Option<String>,
+        spec: String,
+    },
+    Local(PathBuf),
+}
+
+/// Classify an import source with the same grammar a boxfile's `ADD` uses, so
+/// the two accept exactly the same strings.
+pub(crate) fn classify_import_source(raw: &str) -> Result<ImportSource, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("expected a source".to_owned());
+    }
+    if Path::new(trimmed).is_dir() {
+        return Ok(ImportSource::Local(PathBuf::from(trimmed)));
+    }
+    let parsed = box_image::parse_source_token(0, trimmed, Path::new("."))
+        .map_err(|error| error.to_string())?;
+    match parsed {
+        box_image::ParsedSource::NpmPrefix { spec }
+        | box_image::ParsedSource::Passthrough { spec } => {
+            let (name, version) = split_package_spec(&spec)
+                .ok_or_else(|| format!("cannot read a package name out of `{spec}`"))?;
+            Ok(ImportSource::Reference { name, version, spec })
+        }
+        box_image::ParsedSource::BareName { name, scope, version } => {
+            let package = scope
+                .as_deref()
+                .map(|scope| format!("@{scope}/{name}"))
+                .unwrap_or_else(|| name.clone());
+            let spec = version
+                .as_deref()
+                .map(|version| format!("{package}@{version}"))
+                .unwrap_or_else(|| package.clone());
+            Ok(ImportSource::Reference {
+                name: package,
+                version,
+                spec,
+            })
+        }
+        other => Err(format!(
+            "`{trimmed}` cannot be recorded as a package pointer ({other:?}); a local directory is imported as a copy, and anything else belongs in a boxfile: `ADD plugin {trimmed}`"
+        )),
+    }
+}
+
+/// `@scope/name@1.2.3` → name and version; a bare `name` has no version.
+fn split_package_spec(spec: &str) -> Option<(String, Option<String>)> {
+    if let Some((name, version)) = spec.rsplit_once('@') {
+        if !name.is_empty()
+            && version.chars().next().is_some_and(|character| character.is_ascii_digit())
+        {
+            return Some((name.to_owned(), Some(version.to_owned())));
+        }
+    }
+    if spec.starts_with('@') && spec.matches('@').count() == 1 {
+        return None;
+    }
+    Some((spec.to_owned(), None))
+}
+
+/// Import whatever the source names: a pointer for a package, a copy for a
+/// directory.
+pub(crate) fn import_source(task: &TaskContext, raw: &str) -> Result<(), String> {
+    match classify_import_source(raw)? {
+        ImportSource::Reference { name, version, spec } => {
+            let root = read_config()?
+                .runtime_directory
+                .ok_or("DSH Box storage is not configured")?;
+            task.update("Recording the package reference", 40);
+            let entry = box_extensions::upsert_reference_entry(
+                Path::new(&root),
+                ExtensionKind::Plugin,
+                &name,
+                version.as_deref(),
+                &spec,
+            )?;
+            task.log(&format!(
+                "{}{} → {} (pnpm keeps the package; the repository keeps the pointer)",
+                entry.name,
+                entry.version.as_deref().map(|version| format!("@{version}")).unwrap_or_default(),
+                entry.id
+            ));
+            Ok(())
+        }
+        ImportSource::Local(path) => import_into_repository(task, &path).map(|_| ()),
+    }
 }
 
 /// Import a directory into the repository index (used by build scripts
@@ -368,6 +494,8 @@ pub(crate) fn import_into_repository(
         imported_at: now_seconds(),
         diagnostic: None,
         source: Some(source.to_string_lossy().into_owned()),
+        storage: box_extensions::RepositoryStorage::Owned,
+        derived: false,
     });
     write_repository_index(Path::new(&root), &entries)?;
     let created = entries
@@ -527,12 +655,15 @@ pub(crate) fn remove_repository_extension(id: &str) -> Result<(), String> {
             parts.join(" and ")
         ));
     }
-    fs::remove_dir_all(
-        PathBuf::from(&entry.source_path)
-            .parent()
-            .ok_or("repository source has no parent")?,
-    )
-    .map_err(|error| error.to_string())?;
+    // A reference entry owns no directory: pnpm holds the package, so there is
+    // nothing to delete but the row.
+    if entry.storage == box_extensions::RepositoryStorage::Owned {
+        if let Some(directory) = PathBuf::from(&entry.source_path).parent() {
+            if directory.exists() {
+                fs::remove_dir_all(directory).map_err(|error| error.to_string())?;
+            }
+        }
+    }
     entries.retain(|entry| entry.id != id);
     write_repository_index(Path::new(&root), &entries)?;
     let mut bundles = read_bundles(Path::new(&root));
@@ -1093,10 +1224,61 @@ mod tests {
             imported_at: 0,
             diagnostic: None,
             source: None,
+            storage: box_extensions::RepositoryStorage::Owned,
+            derived: false,
         };
         assert_eq!(
             repository_plugin_artifact(&entry).unwrap(),
             PathBuf::from("D:/runtime/repository/plugins/img-1/artifact.tgz")
         );
+    }
+}
+
+#[cfg(test)]
+mod import_source_tests {
+    use super::*;
+
+    #[test]
+    fn a_package_spec_becomes_a_reference() {
+        match classify_import_source("@nexus-aethra/dshell-ssh@0.1.5").unwrap() {
+            ImportSource::Reference { name, version, spec } => {
+                assert_eq!(name, "@nexus-aethra/dshell-ssh");
+                assert_eq!(version.as_deref(), Some("0.1.5"));
+                assert_eq!(spec, "@nexus-aethra/dshell-ssh@0.1.5");
+            }
+            _ => panic!("a package spec must not be copied"),
+        }
+        match classify_import_source("npm:zod@3.22.0").unwrap() {
+            ImportSource::Reference { name, version, .. } => {
+                assert_eq!(name, "zod");
+                assert_eq!(version.as_deref(), Some("3.22.0"));
+            }
+            _ => panic!("npm: prefix must resolve to a reference"),
+        }
+        // A bare name has no version to pin; it still points at the registry.
+        match classify_import_source("cordis-plugin-bar").unwrap() {
+            ImportSource::Reference { version, .. } => assert!(version.is_none()),
+            _ => panic!("a bare name must be a reference"),
+        }
+    }
+
+    #[test]
+    fn a_local_directory_is_copied() {
+        let directory = std::env::temp_dir().join(format!("box-ext-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        match classify_import_source(directory.to_string_lossy().as_ref()).unwrap() {
+            ImportSource::Local(path) => assert_eq!(path, directory),
+            _ => panic!("a local directory must be copied in"),
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_remote_archive_points_at_the_boxfile_instead() {
+        let error = match classify_import_source("https://example.com/plugin.tar.gz") {
+            Ok(_) => panic!("a remote archive must not be silently accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("boxfile"), "{error}");
     }
 }

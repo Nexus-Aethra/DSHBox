@@ -8,9 +8,12 @@ import type { TaskRecord } from '../shared/types/domain'
  */
 type DaemonEvent =
   | { event: 'snapshot'; payload: { tasks?: TaskRecord[] } }
-  | { event: 'TaskStage' | 'TaskLog' | 'TaskFinished' | 'RollbackStarted' | 'RollbackFinished' | 'RollbackFailed'; payload: TaskRecord }
-  | { event: 'ResourceAdded' | 'ResourceRemoved' | 'ResourceUpdated'; payload: { key: string; kind?: string } }
-  | { event: 'TagsFetched'; payload: { tags: string[] } }
+  | { event: 'task_stage'; payload: { task_id: string; stage: string; progress: number } }
+  | { event: 'task_log'; payload: { task_id: string; line: string } }
+  | { event: 'task_finished'; payload: { task_id: string; status: string } }
+  // Everything else the daemon broadcasts. These carry no task record of their
+  // own and are picked up by the poll.
+  | { event: 'rollback_started' | 'rollback_finished' | 'rollback_failed' | 'resource_added' | 'resource_removed' | 'resource_updated' | 'tags_fetched'; payload: Record<string, unknown> }
 
 export type TaskRefreshers = {
   onVersionsChanged: () => void
@@ -60,23 +63,22 @@ export function useTasks(refreshers: TaskRefreshers, onError: (message: string |
     const taskEvents = ['task://created', 'task://updated', 'task://finished'].map((event) => boxApi.listenTask<TaskRecord>(event, (payload) => { update(payload); refreshForTask(payload) }))
     const logEvent = boxApi.listenTask<{ taskId: string; line: string }>('task://log', (payload) => setTaskLogs((current) => payload.taskId in current ? { ...current, [payload.taskId]: `${current[payload.taskId] ? '\n' : ''}${payload.line}` } : current))
     // Daemon-owned tasks stream through `/events`; the desktop event
-    // subscriber forwards every frame as `daemon://event`. Subscribe once
-    // and route by `event` so a single listener handles stage, log and
-    // finished transitions without duplicate code.
+    // subscriber forwards every frame as `daemon://event`, named and shaped
+    // exactly as the daemon serialises it (`task_stage`, `{task_id, stage,
+    // progress}`). The names below are the wire names, not a local spelling:
+    // a mismatch here silently drops every live update.
     const daemonEvents = boxApi.listenTask<DaemonEvent>('daemon://event', (payload) => {
       switch (payload.event) {
         case 'snapshot':
           if (Array.isArray(payload.payload.tasks)) setTasks(payload.payload.tasks)
           break
-        case 'TaskStage':
-        case 'TaskFinished':
-        case 'RollbackStarted':
-        case 'RollbackFinished':
-        case 'RollbackFailed':
-          update(payload.payload); refreshForTask(payload.payload); break
-        case 'TaskLog': {
-          const line = payload.payload.stage ?? ''
-          const taskId = payload.payload.id
+        case 'task_stage': {
+          const { task_id: taskId, stage, progress } = payload.payload
+          setTasks((current) => current.map((task) => task.id === taskId ? { ...task, stage, progress } : task))
+          break
+        }
+        case 'task_log': {
+          const { task_id: taskId, line } = payload.payload
           if (taskId && line) {
             setTaskLogs((current) => taskId in current
               ? { ...current, [taskId]: `${current[taskId]}${current[taskId] ? '\n' : ''}${line}` }
@@ -84,33 +86,54 @@ export function useTasks(refreshers: TaskRefreshers, onError: (message: string |
           }
           break
         }
-        case 'ResourceAdded':
-        case 'ResourceRemoved':
-        case 'ResourceUpdated':
-        case 'TagsFetched':
+        case 'task_finished':
+          // The frame carries only the id and the status; read the record so
+          // the refreshers that depend on `kind` run against the real thing.
+          void boxApi.listTasks().then(absorb).catch(() => undefined)
+          break
+        case 'rollback_started':
+        case 'rollback_finished':
+        case 'rollback_failed':
+        case 'resource_added':
+        case 'resource_removed':
+        case 'resource_updated':
+        case 'tags_fetched':
           // The list-level refreshers below pick these up on the next poll
           // tick; nothing to do here yet.
           break
       }
     })
     const unlisteners = Promise.all([...taskEvents, logEvent, daemonEvents])
+    /** Merge a fresh list into the panel, running the refreshers for whatever
+     *  just succeeded. Shared by the poll and by the daemon's finish event. */
+    const absorb = (latest: TaskRecord[]): void => setTasks((current) => {
+      const currentMap = new Map(current.map((t) => [t.id, t]))
+      for (const task of latest) {
+        const existing = currentMap.get(task.id)
+        if (!existing || existing.status !== task.status || existing.progress !== task.progress) {
+          currentMap.set(task.id, task)
+          if (task.status === 'succeeded' && (!existing || existing.status !== 'succeeded')) {
+            refreshForTask(task)
+          }
+        }
+      }
+      return [...currentMap.values()].sort((a, b) => b.createdAt - a.createdAt)
+    })
     // Poll for tasks enqueued by the CLI process (which cannot emit Tauri
     // events into this process). The backend merges the shared state file on
     // every call, so the next poll picks up progress and completion too.
+    //
+    // One poll at a time: a daemon that is slow (or busy with a long task) would
+    // otherwise collect a queue of overlapping requests, each holding a thread
+    // until it answers. Skipping a tick costs nothing — the next one is 3s away.
+    let polling = false
     const pollInterval = setInterval(() => {
-      void boxApi.listTasks().then((latest) => setTasks((current) => {
-        const currentMap = new Map(current.map((t) => [t.id, t]))
-        for (const task of latest) {
-          const existing = currentMap.get(task.id)
-          if (!existing || existing.status !== task.status || existing.progress !== task.progress) {
-            currentMap.set(task.id, task)
-            if (task.status === 'succeeded' && (!existing || existing.status !== 'succeeded')) {
-              refreshForTask(task)
-            }
-          }
-        }
-        return [...currentMap.values()].sort((a, b) => b.createdAt - a.createdAt)
-      })).catch(() => undefined)
+      if (polling) return
+      polling = true
+      void boxApi.listTasks()
+        .then(absorb)
+        .catch(() => undefined)
+        .finally(() => { polling = false })
     }, 3000)
     return () => {
       clearInterval(pollInterval)

@@ -153,15 +153,15 @@ fn describe_parsed(value: &ParsedSource) -> String {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn preview_image_script_command(path: String) -> Result<PreviewScriptResult, String> {
     preview_image_script(Path::new(&path))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_image_build(
     request: BuildImageRequest,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: AppHandle,
 ) -> Result<TaskRecord, String> {
     let client = connect()?;
@@ -182,7 +182,7 @@ pub(crate) fn enqueue_image_build(
 
 /// List the local templates (`<root>/templates/*.dsh`) with their harness
 /// ref and profile so the UI can offer them when creating containers.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn list_templates() -> Result<Vec<TemplateInfo>, String> {
     let client = connect()?;
     let value = call(&client, "list_templates", serde_json::json!({}))?;
@@ -192,7 +192,7 @@ pub(crate) fn list_templates() -> Result<Vec<TemplateInfo>, String> {
 
 /// Read the raw text of a local template so the UI can preview it before
 /// building or exporting.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn read_template(name: String) -> Result<TemplateText, String> {
     let client = connect()?;
     let value = call(&client, "read_template", serde_json::json!({ "name": name }))?;
@@ -206,7 +206,7 @@ pub(crate) fn read_template(name: String) -> Result<TemplateText, String> {
 
 /// Import a template archive (the same `.dsh.tar.gz` shape `export_template`
 /// writes) and add it to `<root>/templates/`.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn import_template(request: ImportTemplateRequest) -> Result<String, String> {
     let client = connect()?;
     let mut params = serde_json::json!({
@@ -225,7 +225,7 @@ pub(crate) fn import_template(request: ImportTemplateRequest) -> Result<String, 
 
 /// Export a local template to a gzip tarball at the given destination
 /// (default: `./<name>.dsh.tar.gz`).
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn export_template(request: ExportTemplateRequest) -> Result<String, String> {
     let client = connect()?;
     let mut params = serde_json::json!({ "name": request.name });
@@ -242,7 +242,7 @@ pub(crate) fn export_template(request: ExportTemplateRequest) -> Result<String, 
 
 /// Remove a local template. Refuses if any container still references it
 /// (mirrors the reference-counting guard the plugin resource uses).
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn remove_template(request: RemoveTemplateRequest) -> Result<String, String> {
     let client = connect()?;
     let value = call(&client, "remove_template", serde_json::json!({ "name": request.name }))?;
@@ -253,10 +253,10 @@ pub(crate) fn remove_template(request: RemoveTemplateRequest) -> Result<String, 
     Ok(name)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_template_container(
     request: CreateTemplateContainerRequest,
-    _manager: tauri::State<TaskManager>,
+    _manager: tauri::State<'_, TaskManager>,
     _app: AppHandle,
 ) -> Result<TaskRecord, String> {
     let client = connect()?;
@@ -273,10 +273,10 @@ pub(crate) fn enqueue_template_container(
         .map_err(|error| format!("invalid task record: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_image_commit_stub(
     _request: CommitImageRequest,
-    manager: tauri::State<TaskManager>,
+    manager: tauri::State<'_, TaskManager>,
     app: AppHandle,
 ) -> Result<TaskRecord, String> {
     let task = queue_task(
@@ -289,10 +289,10 @@ pub(crate) fn enqueue_image_commit_stub(
     Ok(task)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn enqueue_image_load_stub(
     _request: LoadImageRequest,
-    manager: tauri::State<TaskManager>,
+    manager: tauri::State<'_, TaskManager>,
     app: AppHandle,
 ) -> Result<TaskRecord, String> {
     let task = queue_task(

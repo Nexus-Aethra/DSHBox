@@ -162,6 +162,20 @@ const COMMANDS = {
   detect_toolchains: () => callDaemon('detect_toolchains', {}),
   list_installed_dsh_versions: () => callDaemon('list_installed_dsh_versions', {}),
   plugin_dependency_graph: ({ kind, id }) => callDaemon('plugin_dependency_graph', { kind, id }),
+  list_container_resources: ({ id, plugin }) => callDaemon('list_container_resources', { id, plugin }),
+  list_resources: () => callDaemon('list_resources', {}),
+  list_installed_plugins: () => callDaemon('list_installed_plugins', {}),
+  read_resource_tree: ({ id, path, section }) => callDaemon('read_resource_tree', { id, path, section }),
+  enqueue_resource_write: ({ id, path, section, text, conflict, restart }) =>
+    callDaemon('enqueue_resource_write', { id, path, section, text, conflict, restart }),
+  browse_container_paths: ({ id, path }) => callDaemon('browse_container_paths', { id, path }),
+  list_resource_views: () => callDaemon('list_resource_views', {}),
+  add_resource_view: (request) => callDaemon('add_resource_view', request),
+  delete_resource_view: ({ viewId }) => callDaemon('delete_resource_view', { viewId }),
+  list_resource_type: ({ kind, path }) => callDaemon('list_resource_type', { kind, path }),
+  enqueue_resource_extract: (request) => callDaemon('enqueue_resource_extract', request),
+  enqueue_resource_inject: (request) => callDaemon('enqueue_resource_inject', request),
+  delete_resource: ({ resourceId }) => callDaemon('delete_resource', { resourceId }),
 
   // Not a projection of the installed names: the daemon already answers with the
   // full derived catalog, `{ name, installed }` per row, which is the shape the

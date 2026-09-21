@@ -395,6 +395,23 @@ code.missing { color: #b42318; }
 .plugin-graph-node text { fill: var(--color-text); font-family: var(--font-mono); font-size: 11px; pointer-events: none; }
 .plugin-graph-node.inactive rect { fill: var(--color-bg-soft); stroke-dasharray: 4 3; }
 .plugin-graph-node.inactive text { fill: var(--color-text-muted); }
+/* A folded depth: one box standing for a whole layer. Dashed, because it is a
+   summary and not a plugin, and clickable, because that is how it comes back. */
+/* An edge the drawing cannot lay out forwards — two halves merged onto one node
+   put two dependency chains there. Not a cycle, so not red, and not darker than a
+   normal edge either: once a depth or two is folded these are most of the lines,
+   so they have to read as the quiet background a normal edge stands out from. */
+.plugin-graph-edge.crosses { stroke: #ccd2d9; stroke-width: 1.2; stroke-dasharray: 5 5; }
+.plugin-graph-edges .edge.touched .plugin-graph-edge.crosses { stroke: var(--color-primary); stroke-width: 2; }
+.swatch.mark-crosses { background: repeating-linear-gradient(90deg, #94a3b8 0 4px, transparent 4px 8px); }
+.plugin-graph-node.layer rect { fill: #f8fafc; stroke: #94a3b8; stroke-dasharray: 5 4; }
+.plugin-graph-node.layer text { fill: #334155; font-weight: 600; }
+.plugin-graph-node.layer:hover rect { fill: #eef2ff; stroke: #6366f1; }
+.plugin-graph-group-label.foldable { cursor: pointer; }
+.plugin-graph-group-label.foldable:hover { fill: #4f46e5; text-decoration: underline; }
+.plugin-graph-folds { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.plugin-graph-fold-chip { border: 1px dashed #94a3b8; background: #f8fafc; color: #334155; border-radius: 999px; padding: 2px 10px; font-size: 12px; cursor: pointer; }
+.plugin-graph-fold-chip:hover { border-color: #6366f1; color: #3730a3; background: #eef2ff; }
 .plugin-graph-node.service rect { fill: var(--color-primary-soft); stroke: var(--color-primary); }
 .plugin-graph-node.service text { fill: var(--color-primary); }
 .plugin-graph-node.missing rect, .plugin-graph-node.cycle rect, .plugin-graph-node.inactive-provider rect { stroke: var(--color-danger); stroke-width: 1.8; }
@@ -466,3 +483,100 @@ code.missing { color: #b42318; }
 
 @media (max-width: 768px) { .app-shell { padding: 18px 20px 48px; } .topbar { align-items: flex-start; gap: 12px; flex-direction: column; } .navigation { width: 100%; overflow-x: auto; } .nav-item { padding: 8px 9px; white-space: nowrap; } .workspace, .onboarding { padding: 58px 0 34px; } .card, .toolchain-row { align-items: flex-start; flex-direction: column; } .toolchain-actions { width: 100%; justify-content: space-between; } .settings-layout { grid-template-columns: 1fr; gap: 16px; } .settings-sidebar { border-bottom: 1px solid #e6e8eb; border-right: 0; display: flex; padding: 0 0 12px; } .settings-row { align-items: flex-start; flex-direction: column; } .settings-row > :last-child { width: 100%; } .settings-input { width: 100%; } .settings-controls { justify-content: flex-start; } .extensions-heading, .extension-row, .extension-import { align-items: flex-start; flex-direction: column; } .extension-row > div:last-child { max-width: 100%; text-align: left; } .extension-import input { width: 100%; } }
 .plugin-graph-note.danger { color: var(--color-danger); }
+
+/* Container resources panel: a table of what the container persists, with the
+   extract/inject actions on each row. */
+.resource-panel { display: flex; flex-direction: column; gap: 16px; }
+/* A dialog needs its own scroll box; the page does not. */
+dialog .resource-panel { max-height: 70vh; overflow-y: auto; }
+.resource-section { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-strong, #111827); }
+.resource-note { margin: 0; font-size: 13px; color: #6b7280; }
+.resource-error { margin: 0; font-size: 13px; color: #b91c1c; }
+.resource-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.resource-restart { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #374151; }
+.resource-detect { display: flex; gap: 8px; align-items: center; }
+.resource-detect .ui-input { flex: 1; }
+.resource-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.resource-table th { text-align: left; font-weight: 500; color: #6b7280; padding: 4px 8px 4px 0; border-bottom: 1px solid #f3f4f6; }
+.resource-table td { padding: 6px 8px 6px 0; border-bottom: 1px solid #f9fafb; vertical-align: middle; }
+.resource-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #4b5563; }
+.resource-table .ui-badge { margin-left: 6px; }
+.resource-from { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; }
+.resource-footer { display: flex; justify-content: flex-end; }
+
+.resource-combo { flex: 1; display: flex; flex-direction: column; gap: 4px; }
+.resource-combo-list { list-style: none; margin: 0; padding: 4px; display: flex; flex-wrap: wrap; gap: 4px; max-height: 92px; overflow-y: auto; border: 1px solid #f3f4f6; border-radius: 8px; background: #fafafa; }
+.resource-combo-list button { border: 0; background: transparent; font-size: 12px; padding: 2px 8px; border-radius: 999px; cursor: pointer; color: #374151; }
+.resource-combo-list button:hover { background: #eef2ff; }
+.resource-combo-list button.active { background: #e0e7ff; color: #3730a3; }
+.resource-combo-empty { font-size: 12px; color: #9ca3af; padding: 2px 8px; }
+.resource-browser { border: 1px solid #f3f4f6; border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 8px; background: #fcfcfd; }
+.resource-browser-head { display: flex; align-items: center; gap: 8px; }
+.resource-browser-head code { font-size: 12px; color: #4b5563; }
+.resource-browser-list { list-style: none; margin: 0; padding: 0; max-height: 200px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+.resource-browser-list li { display: flex; align-items: center; gap: 6px; }
+.resource-browser-list button { border: 0; background: transparent; text-align: left; font-size: 13px; padding: 3px 6px; border-radius: 6px; cursor: pointer; color: #1f2937; }
+.resource-browser-list button:hover { background: #f3f4f6; }
+.resource-browser-list button.active { background: #e0e7ff; color: #3730a3; }
+.resource-browser-meta { font-size: 11px; color: #9ca3af; }
+.resource-browser-pick { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.resource-browser-pick code { font-size: 12px; color: #4b5563; }
+
+.resource-browser-list .resource-browser-name { font-size: 13px; color: #1f2937; padding: 3px 0; }
+.resource-browser-list .resource-browser-open { font-weight: 500; }
+
+/* A trailing "add a resource type" affordance in the Resources tab list. */
+.ui-tab-action { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+.ui-tab-action .ui-button { border: 1px dashed #c7d2fe; color: #3730a3; }
+.resource-type-head { display: flex; align-items: center; gap: 10px; margin: 0 0 10px; }
+.resource-type-head h2 { margin: 0; font-size: 15px; }
+.resource-type-head .resource-note { margin-left: auto; }
+.resource-kind-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
+.resource-kind-list button { width: 100%; text-align: left; border: 1px solid #f3f4f6; background: #fff; border-radius: 8px; padding: 6px 10px; font-size: 13px; cursor: pointer; display: flex; gap: 8px; align-items: center; }
+.resource-kind-list button:hover { border-color: #c7d2fe; background: #f8faff; }
+.resource-kind-list button.active { border-color: #a5b4fc; background: #eef2ff; }
+.resource-kind-list .resource-browser-meta { margin-left: auto; }
+
+.resource-modes { display: inline-flex; gap: 4px; margin-left: auto; }
+.resource-modes .ui-button.active { background: #eef2ff; color: #3730a3; }
+
+/* A resource type is its list of copies: pick a container above, attach a copy
+   to a container on its row. */
+/* The copies list owns the attach options: a copy is what gets attached, so
+   the conflict policy and the restart switch belong beside that list. */
+.resource-copies-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+/* Editing a YAML block: the document as a tree, the block in a textarea. */
+.resource-yaml-tree { list-style: none; margin: 0; padding: 0; max-height: 220px; overflow-y: auto; border: 1px solid #f3f4f6; border-radius: 8px; background: #fafafa; }
+.resource-yaml-tree button { width: 100%; display: flex; align-items: center; gap: 8px; border: 0; background: transparent; font-size: 12px; text-align: left; padding: 4px 8px; cursor: pointer; }
+.resource-yaml-tree button:hover { background: #eef2ff; }
+.resource-yaml-tree button.active { background: #e0e7ff; }
+.resource-yaml-key { color: #111827; font-weight: 600; }
+.resource-yaml-kind { color: #9ca3af; font-size: 11px; }
+.resource-yaml-preview { color: #6b7280; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.resource-yaml-path { display: flex; align-items: center; gap: 8px; }
+.resource-yaml-path .ui-field-label, .resource-yaml-path .resource-section { white-space: nowrap; }
+.resource-yaml-body { width: 100%; min-height: 140px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 8px; resize: vertical; }
+.resource-footer { gap: 8px; align-items: center; }
+.resource-copies { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.resource-copies li { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid #f3f4f6; border-radius: 10px; background: #fff; }
+.resource-copy-text { flex: 1; min-width: 0; }
+.resource-copy-name { font-size: 13px; color: #111827; overflow: hidden; text-overflow: ellipsis; }
+.resource-copy-meta { font-size: 11px; color: #9ca3af; }
+.resource-options { margin-left: auto; font-size: 12px; color: #6b7280; }
+.resource-options summary { cursor: pointer; }
+
+/* Selects inside a row size to their content: a full-width select next to a
+   text column squeezes the column to nothing. */
+.resource-copies .ui-select { flex: 0 0 auto; width: auto; min-width: 11rem; max-width: 15rem; }
+.resource-copy-text { flex: 1 1 14rem; min-width: 12rem; }
+.resource-copies li { flex-wrap: wrap; }
+
+/* The extensions heading: one row, scope left, actions right, everything on the
+   same baseline (the old layout stacked a field label over the select). */
+.extensions-heading-left { align-items: center; display: flex; gap: 12px; min-width: 0; }
+.extensions-heading-left h2 { margin: 0; }
+.extensions-profile { align-items: center; display: inline-flex; gap: 6px; }
+.extensions-profile .ui-select { width: auto; min-width: 7rem; max-width: 12rem; }
+.extensions-heading-actions { align-items: center; display: flex; gap: 8px; flex: 0 0 auto; }
+
+
