@@ -191,6 +191,7 @@ pub fn extract(
         &[PayloadPart {
             path: rel.to_owned(),
             section: Vec::new(),
+            slot: None,
         }],
         selection,
         payload_dir,
@@ -206,6 +207,12 @@ pub struct PayloadPart {
     pub path: String,
     #[serde(default)]
     pub section: Vec<String>,
+    /// The version slot this part came from, when it came from one. An
+    /// injection re-picks the destination's own part for that slot, so a copy
+    /// taken from a newer Harness layout lands where the older container keeps
+    /// the same state rather than cloning its source's path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
 }
 
 /// What the payload says about itself. It is written whenever a payload has
@@ -220,6 +227,7 @@ pub fn payload_parts(payload_dir: &Path, fallback_path: &str) -> Vec<PayloadPart
         vec![PayloadPart {
             path: fallback_path.to_owned(),
             section: Vec::new(),
+            slot: None,
         }]
     })
 }
@@ -357,25 +365,96 @@ fn extract_section(
 /// The file a section part travels as, inside its part directory.
 const SECTION_FILE: &str = "section.yaml";
 
-/// The value at a YAML key path, when the document has one.
+/// The item of a layer list whose `id` is `id`. Cordis keeps a profile's
+/// overrides as `- id: <plugin>\n  config: {…}`, so a plugin's settings are one
+/// item rather than a key of the document.
+fn layer_item<'a>(document: &'a serde_yaml::Value, id: &str) -> Option<&'a serde_yaml::Value> {
+    document.as_sequence()?.iter().find(|item| {
+        item.get("id").and_then(|value| value.as_str()) == Some(id)
+    })
+}
+
+/// The value at a YAML key path, when the document has one. A `#<id>` step names
+/// a layer item and continues inside its `config`.
 fn section_value<'a>(document: &'a serde_yaml::Value, section: &[String]) -> Option<&'a serde_yaml::Value> {
     let mut current = document;
     for key in section {
-        current = current.get(key.as_str())?;
+        current = match key.strip_prefix('#') {
+            Some(id) => layer_item(current, id)?.get("config")?,
+            None => current.get(key.as_str())?,
+        };
     }
     Some(current)
 }
 
 /// Wrap a value back up in its section keys, so merging it into the destination
-/// document is one deep merge.
+/// document is one deep merge. A `#<id>` step wraps in a one-item layer list
+/// carrying `id` and `config`.
 fn nest(section: &[String], value: serde_yaml::Value) -> serde_yaml::Value {
     let mut current = value;
     for key in section.iter().rev() {
-        let mut mapping = serde_yaml::Mapping::new();
-        mapping.insert(serde_yaml::Value::String(key.clone()), current);
-        current = serde_yaml::Value::Mapping(mapping);
+        current = match key.strip_prefix('#') {
+            Some(id) => {
+                let mut entry = serde_yaml::Mapping::new();
+                entry.insert(
+                    serde_yaml::Value::String("id".to_owned()),
+                    serde_yaml::Value::String(id.to_owned()),
+                );
+                entry.insert(serde_yaml::Value::String("config".to_owned()), current);
+                serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(entry)])
+            }
+            None => {
+                let mut mapping = serde_yaml::Mapping::new();
+                mapping.insert(serde_yaml::Value::String(key.clone()), current);
+                serde_yaml::Value::Mapping(mapping)
+            }
+        };
     }
     current
+}
+
+/// Drop the value a section step names: a key of a mapping, or the `config` of
+/// one layer item. A layer keeps its `id` and `name` when its settings are
+/// replaced — those two are what Cordis uses to find the plugin, and dropping
+/// them would leave an entry that resolves to nothing.
+fn remove_step(document: &mut serde_yaml::Value, step: &str) -> bool {
+    match step.strip_prefix('#') {
+        Some(id) => match document {
+            serde_yaml::Value::Sequence(items) => {
+                let Some(item) = items
+                    .iter_mut()
+                    .find(|entry| entry.get("id").and_then(|value| value.as_str()) == Some(id))
+                else {
+                    return false;
+                };
+                match item {
+                    serde_yaml::Value::Mapping(mapping) => mapping
+                        .remove(serde_yaml::Value::String("config".to_owned()))
+                        .is_some(),
+                    _ => false,
+                }
+            }
+            _ => false,
+        },
+        None => match document {
+            serde_yaml::Value::Mapping(mapping) => {
+                mapping.remove(serde_yaml::Value::String(step.to_owned())).is_some()
+            }
+            _ => false,
+        },
+    }
+}
+
+/// Descend one step for a mutable walk, creating nothing.
+fn descend_mut<'a>(document: &'a mut serde_yaml::Value, step: &str) -> Option<&'a mut serde_yaml::Value> {
+    match step.strip_prefix('#') {
+        Some(id) => document
+            .as_sequence_mut()?
+            .iter_mut()
+            .find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id))?
+            .get_mut("config"),
+        None => document.get_mut(step),
+    }
 }
 
 fn remove_section(document: &mut serde_yaml::Value, section: &[String]) -> bool {
@@ -384,15 +463,12 @@ fn remove_section(document: &mut serde_yaml::Value, section: &[String]) -> bool 
     };
     let mut current = document;
     for key in parents {
-        match current.get_mut(key.as_str()) {
+        match descend_mut(current, key) {
             Some(next) => current = next,
             None => return false,
         }
     }
-    match current {
-        serde_yaml::Value::Mapping(mapping) => mapping.remove(serde_yaml::Value::String(last.clone())).is_some(),
-        _ => false,
-    }
+    remove_step(current, last)
 }
 
 /// The independent entries of a tree at the kind's depth, as `(relative, path)`
@@ -448,6 +524,7 @@ pub fn inject(
         &[PayloadPart {
             path: rel.to_owned(),
             section: Vec::new(),
+            slot: None,
         }],
         conflict,
         shape,
@@ -773,6 +850,25 @@ fn merge_value(base: serde_yaml::Value, overlay: serde_yaml::Value) -> serde_yam
                 base.insert(key, merged);
             }
             Value::Mapping(base)
+        }
+        (Value::Sequence(mut base), Value::Sequence(overlay)) => {
+            // A layer list merges by `id`: carrying one provider route into a
+            // container must leave the other plugins' layers it already had.
+            for item in overlay {
+                match item.get("id").and_then(|value| value.as_str()).map(str::to_owned) {
+                    Some(id) => {
+                        let existing = base.iter_mut().find(|entry| {
+                            entry.get("id").and_then(|value| value.as_str()) == Some(id.as_str())
+                        });
+                        match existing {
+                            Some(slot) => *slot = merge_value(slot.clone(), item),
+                            None => base.push(item),
+                        }
+                    }
+                    None => base.push(item),
+                }
+            }
+            Value::Sequence(base)
         }
         (_, overlay) => overlay,
     }

@@ -196,6 +196,29 @@ command as done only once the installed app has run it.
   headers by hand makes the same container build and start, so this is the only
   blocker — but it also needs a host C compiler, which the runtime bundle
   otherwise never requires.
+- **A container starts the built entry, never the source one.** `apps/cli` ships
+  `bin: { dsh: lib/bin.js }` and Box launches exactly that. Launching
+  `apps/cli/src/bin.ts` under `tsx` splits the process into two module worlds:
+  `tsconfig.base.json` maps every first-party package to `src`, so a package
+  imported by name loads from `src`, while the plugin row loader — which follows
+  `package.json` `exports` — loads the same package from `lib`. Each copy creates
+  its own `Symbol`, so a seam keyed by one misses: the `dsh-tools` scheduler is
+  stored under the `lib` symbol and looked up with the `src` one, and every agent
+  tool call dies ~1 ms after `tool/call`, which the UI renders as a one-second
+  interruption rather than a crash. `apps/cli/lib/bin.js` is therefore part of the
+  artifact check (`client_artifacts_present`, `validate_prepared_harness`): a tree
+  without it is rebuilt, not launched the broken way.
+- **A resource slot is version-scoped, and a copy re-resolves it.** `KindPart`
+  carries `path` (which may contain `{profile}`), `section` (a `#<id>` step names
+  one Cordis layer item and travels its `config`), and optional
+  `slot`/`since`/`until`. `credentials` needs it because the provider route
+  moved: `settings.yaml#llm-pi-ai` up to 0.1.6, `profiles/<p>/cordis.patch.yml`
+  from 0.1.7, where DSH archives the old file as `settings.yaml.imported`.
+  Extraction records the slot in `parts.json`; injection re-picks the
+  **destination's** part for that slot (`retarget_parts`), so a copy crosses
+  versions to where that container keeps the state instead of cloning its
+  source's path. Plugin `dshbox.resources` entries take the same fields — declare
+  the same id twice with different bounds.
 - **Prepared/sealed templates.** Pulling a root Harness template prepares a
   complete tree: `pnpm install` **and** the client build (native addon, host and
   client libraries, web frontend) — `validate_prepared_harness` requires
