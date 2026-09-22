@@ -1183,6 +1183,12 @@ pub(crate) fn client_artifacts_present(harness: &Path, commit: &str) -> bool {
     if !harness.join("apps/web/dist/index.html").is_file() {
         return false;
     }
+    // The host starts this built entry, so a tree carrying the marker without
+    // it (an interrupted build, or one that predates the entry requirement)
+    // has to be rebuilt rather than trusted.
+    if !harness.join("apps/cli/lib/bin.js").is_file() {
+        return false;
+    }
     let Ok(body) = fs::read_to_string(harness.join(CLIENT_ARTIFACT_MARKER)) else {
         return false;
     };

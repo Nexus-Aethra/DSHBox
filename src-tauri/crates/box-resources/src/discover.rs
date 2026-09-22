@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::kinds::{builtin, builtins, ResolvedKind, Shape};
+use crate::kinds::{builtin, builtins, select_specs, PartSpec, ResolvedKind, Shape};
 use crate::transfer::tree_stats;
 
 /// One entry of a plugin's `dshbox.resources` declaration.
@@ -13,7 +13,8 @@ pub struct DeclaredResource {
     pub id: String,
     #[serde(default)]
     pub label: Option<String>,
-    /// Container-relative path the plugin persists to.
+    /// Container-relative path the plugin persists to. `{profile}` is replaced
+    /// with the container's profile.
     pub path: String,
     #[serde(default)]
     pub secret: bool,
@@ -24,6 +25,33 @@ pub struct DeclaredResource {
     pub depth: Option<u8>,
     #[serde(default)]
     pub description: Option<String>,
+    /// A key path inside `path` when only part of the file belongs to this
+    /// resource; a `#<id>` step names one item of a Cordis layer list.
+    #[serde(default)]
+    pub section: Vec<String>,
+    /// Groups alternatives: declare the same `slot` twice with different
+    /// version bounds when the plugin's state moved between Harness versions.
+    /// Defaults to `id`.
+    #[serde(default)]
+    pub slot: Option<String>,
+    /// Lowest Harness version (inclusive) this declaration serves.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Highest Harness version (exclusive) this declaration serves.
+    #[serde(default)]
+    pub until: Option<String>,
+}
+
+/// The Harness version a container runs, as recorded by its own tree. `None`
+/// when the tree cannot be read, which resolves every slot to its evergreen
+/// declaration rather than guessing a version.
+pub fn harness_version(container_root: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(container_root.join("harness").join("package.json")).ok()?;
+    serde_json::from_str::<serde_json::Value>(&body)
+        .ok()?
+        .get("version")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 
@@ -236,10 +264,11 @@ fn classify(raw: &str) -> Arg {
 /// none.
 pub fn discover(container_root: &Path, profile_name: &str, plugin: Option<&str>) -> Vec<Discovered> {
     let profile = container_root.join("profile");
+    let version = harness_version(container_root);
     let mut found: Vec<Discovered> = builtins()
         .iter()
         .map(|kind| {
-            let resolved = ResolvedKind::from_builtin(kind);
+            let resolved = ResolvedKind::from_builtin(kind, profile_name, version.as_deref());
             measured(container_root, resolved, Scope::Builtin, None, None)
         })
         .collect();
@@ -472,25 +501,48 @@ fn measured(
 }
 
 /// Resolve a kind id against the built-ins and one plugin's declarations.
-pub fn resolve(kind_id: &str, declared: &[DeclaredResource]) -> Option<ResolvedKind> {
+/// Several declarations may share an `id` and differ only by version bound: that
+/// is how a plugin whose state moved between Harness versions says where it
+/// lives for *this* container.
+pub fn resolve(
+    kind_id: &str,
+    declared: &[DeclaredResource],
+    profile_name: &str,
+    harness_version: Option<&str>,
+) -> Option<ResolvedKind> {
     if let Some(kind) = builtin(kind_id) {
-        return Some(ResolvedKind::from_builtin(kind));
+        return Some(ResolvedKind::from_builtin(kind, profile_name, harness_version));
     }
-    declared
+    let entries: Vec<&DeclaredResource> = declared
         .iter()
-        .find(|entry| entry.id == kind_id)
-        .map(|entry| ResolvedKind {
-            id: entry.id.clone(),
-            label: entry.label.clone().unwrap_or_else(|| entry.id.clone()),
+        .filter(|entry| entry.id == kind_id)
+        .collect();
+    let first = entries.first()?;
+    let specs: Vec<PartSpec> = entries
+        .iter()
+        .map(|entry| PartSpec {
             path: container_path(&entry.path),
-            secret: entry.secret,
-            shape: entry
-                .shape
-                .as_deref()
-                .and_then(Shape::parse)
-                .unwrap_or(Shape::Opaque),
-            entry_depth: entry.depth.unwrap_or(1).max(1),
-            inferred: false,
-            parts: Vec::new(),
+            section: entry.section.clone(),
+            slot: entry.slot.clone().or_else(|| {
+                (entries.len() > 1).then(|| kind_id.to_owned())
+            }),
+            since: entry.since.clone(),
+            until: entry.until.clone(),
         })
+        .collect();
+    let parts = select_specs(&specs, profile_name, harness_version);
+    Some(ResolvedKind {
+        id: first.id.clone(),
+        label: first.label.clone().unwrap_or_else(|| first.id.clone()),
+        path: parts.first().map(|part| part.path.clone()).unwrap_or_default(),
+        secret: first.secret,
+        shape: first
+            .shape
+            .as_deref()
+            .and_then(Shape::parse)
+            .unwrap_or(Shape::Opaque),
+        entry_depth: first.depth.unwrap_or(1).max(1),
+        inferred: false,
+        parts,
+    })
 }

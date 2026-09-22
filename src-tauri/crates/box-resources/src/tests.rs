@@ -1,4 +1,4 @@
-use crate::kinds::{Conflict, Shape};
+use crate::kinds::{Conflict, ResolvedKind, Shape};
 use crate::{discover, transfer};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,11 +37,113 @@ fn builtin_kinds_cover_the_two_v1_resources() {
     assert_eq!(credentials.path(), "profile/.credentials.yaml");
     assert!(credentials.secret, "credentials are a secret kind");
     // A key is only half of it: the provider route that names its environment
-    // variable lives in settings.yaml.
-    assert_eq!(credentials.parts.len(), 2);
+    // variable travels too, and where that lives is a version fact — hence the
+    // two candidates for one slot.
+    assert_eq!(credentials.parts.len(), 3);
     assert_eq!(credentials.parts[1].path, "profile/settings.yaml");
     assert_eq!(credentials.parts[1].section, ["llm-pi-ai"]);
+    assert_eq!(credentials.parts[1].slot, Some("provider-route"));
+    assert_eq!(credentials.parts[2].slot, Some("provider-route"));
     assert!(crate::builtin("sshkey").is_none());
+}
+
+#[test]
+fn the_provider_route_slot_follows_the_containers_harness_version() {
+    let credentials = crate::builtin("credentials").expect("credentials kind");
+    let route = |version: Option<&str>| {
+        ResolvedKind::from_builtin(&credentials, "web", version)
+            .payload_parts()
+            .remove(1)
+    };
+
+    let before = route(Some("dsh-v0.1.6-alpha.2"));
+    assert_eq!(before.path, "profile/settings.yaml");
+    assert_eq!(before.section, ["llm-pi-ai"]);
+
+    // From 0.1.7 the profile keeps its overrides in a Cordis layer list, and the
+    // path is per profile — which is why it carries `{profile}`.
+    let after = route(Some("dsh-v0.1.7-alpha.1"));
+    assert_eq!(after.path, "profile/profiles/web/cordis.patch.yml");
+    assert_eq!(after.section, ["#llm-pi-ai"]);
+
+    // A tree whose version cannot be read gets the evergreen declaration, not a
+    // guess at the newest one.
+    assert_eq!(route(None).path, "profile/settings.yaml");
+    assert_eq!(crate::kinds::version_triple("dsh-v0.1.7-alpha.1"), Some((0, 1, 7)));
+}
+
+#[test]
+fn a_layer_section_travels_the_cordis_item_it_names() {
+    let root = temp_dir("cordis-layer");
+    let rel = "profile/profiles/web/cordis.patch.yml";
+    write(
+        &root.join(rel),
+        r#"- id: agent-loop
+  name: "@deepseek-ai/dsh-agent-loop"
+  config:
+    maxParallelToolCalls: 20
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      minimax-cn:
+        apiKeyEnv: MINIMAX_CN_API_KEY
+"#,
+    );
+    let route = vec!["#llm-pi-ai".to_owned()];
+
+    // Merging a second provider in keeps the one already there and leaves the
+    // other plugins' layers alone.
+    transfer::write_section(
+        &root,
+        rel,
+        &route,
+        "providers:\n  step:\n    apiKeyEnv: STEP_API_KEY\n",
+        Conflict::Merge,
+    )
+    .unwrap();
+    let body = fs::read_to_string(root.join(rel)).unwrap();
+    assert!(body.contains("minimax-cn"), "the route already there was replaced:\n{body}");
+    assert!(body.contains("step"), "the incoming route was not merged in:\n{body}");
+    assert!(
+        body.contains("maxParallelToolCalls"),
+        "another plugin's layer was dropped:\n{body}"
+    );
+
+    // A layer that does not exist yet is appended as one more item.
+    transfer::write_section(
+        &root,
+        rel,
+        &vec!["#agent-default-model".to_owned()],
+        "provider: step\nmodel: x\n",
+        Conflict::Merge,
+    )
+    .unwrap();
+    let body = fs::read_to_string(root.join(rel)).unwrap();
+    assert_eq!(body.matches("- id:").count(), 3, "expected three layers:\n{body}");
+
+    // An existing layer is not overwritten silently.
+    assert!(transfer::write_section(&root, rel, &route, "providers: {}\n", Conflict::Refuse).is_err());
+
+    // Overwriting replaces the section as one value, and the item keeps the
+    // `name` Cordis resolves it by.
+    transfer::write_section(
+        &root,
+        rel,
+        &route,
+        "providers:\n  only:\n    apiKeyEnv: ONLY_KEY\n",
+        Conflict::Overwrite,
+    )
+    .unwrap();
+    let body = fs::read_to_string(root.join(rel)).unwrap();
+    assert!(!body.contains("minimax-cn"), "overwrite left the old route:\n{body}");
+    assert!(body.contains("only"), "overwrite lost the incoming route:\n{body}");
+    assert!(
+        body.contains("@deepseek-ai/dsh-llm-pi-ai"),
+        "overwrite dropped the layer's package name:\n{body}"
+    );
+    assert!(body.contains("maxParallelToolCalls"), "overwrite dropped another layer:\n{body}");
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -295,10 +397,12 @@ fn credentials_parts() -> Vec<transfer::PayloadPart> {
         transfer::PayloadPart {
             path: "profile/.credentials.yaml".to_owned(),
             section: Vec::new(),
+            slot: None,
         },
         transfer::PayloadPart {
             path: "profile/settings.yaml".to_owned(),
             section: vec!["llm-pi-ai".to_owned()],
+            slot: None,
         },
     ]
 }

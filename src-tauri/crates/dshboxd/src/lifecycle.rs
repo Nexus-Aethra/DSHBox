@@ -213,12 +213,26 @@ pub(crate) fn start_dsh_container_inner(
         // before we get here.
         wait_for_pnpm_links(&source, std::time::Duration::from_secs(15))
             .map_err(|error| format!("DSH runtime not ready ({error})"))?;
-        // Launch the DSH host directly via `node --import tsx/esm` instead of
-        // going through `pnpm dsh`.  pnpm's lifecycle runner wraps the exit
-        // code in `[ELIFECYCLE]` and swallows the actual error message,
-        // making it impossible to diagnose startup failures.  Running the
-        // script directly lets the node process's stderr propagate to the
-        // host.log unmodified.
+        // Launch the built CLI entry (`apps/cli` declares `bin: { dsh:
+        // lib/bin.js }`), never the source one. The Harness tree carries both
+        // `src/` and the `lib/` built from it, and `tsx` honours
+        // `tsconfig.base.json`'s `paths`, which map every first-party package
+        // to `src` — so a host started through `tsx + src/bin.ts` loads such a
+        // package twice, once from `src` (paths) and once from `lib` (the
+        // manifest `exports` the plugin row loader follows). Each copy creates
+        // its own `Symbol`, and the agent loop then looks up
+        // `ctx.tools[TOOL_RUNTIME_SCHEDULER]` under a different symbol than the
+        // one `ToolRuntime` stored it under: every tool call dies ~1 ms after
+        // it is appended, which the UI renders as a very short interruption.
+        let entry = source.join("apps/cli/lib/bin.js");
+        if !entry.is_file() {
+            return Err(format!(
+                "DSH host cannot start: {} has no built CLI entry at \
+                 apps/cli/lib/bin.js — rebuild this container's template so the \
+                 client artifacts are produced",
+                source.display()
+            ));
+        }
         let node = resolve_toolchain("node")?;
         // The pnpm tree hangs off the runtime root (<root>/pnpm) as a
         // sibling of node/ on every platform. Take it from the manifest
@@ -254,12 +268,7 @@ pub(crate) fn start_dsh_container_inner(
         }
         let spec = ProcessSpec::new(node.path.clone())
             .args([
-                "--import",
-                "tsx/esm",
-                source
-                    .join("apps/cli/src/bin.ts")
-                    .to_string_lossy()
-                    .as_ref(),
+                entry.to_string_lossy().as_ref(),
                 "--profile",
                 profile,
                 "--patch",
