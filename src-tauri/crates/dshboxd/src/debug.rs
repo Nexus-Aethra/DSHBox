@@ -621,6 +621,16 @@ pub(crate) fn page_text_rpc(state: &DaemonState, request: &Value) -> Result<Valu
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase);
+    // Scope the listing to one named container. Two controls can legitimately
+    // share a name -- a settings dialog and the chat screen behind it both offer
+    // the same one -- and with no way to say which is meant, an agent acts on the
+    // wrong element while every response still looks correct.
+    let within_name = request
+        .get("within")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
 
     with_session(state, request, |session| {
         // An unavailable Accessibility domain is an error, never an empty
@@ -632,6 +642,18 @@ pub(crate) fn page_text_rpc(state: &DaemonState, request: &Value) -> Result<Valu
                 format!("accessibility tree is unavailable on this target: {error}")
             })?;
         let viewport = viewport_metrics(session)?;
+        // nodeId -> parentId, so containment can be answered from the tree
+        // itself. Rectangles cannot answer it: a modal's rect is large enough to
+        // cover the chat rendered behind it, so a geometric test admits controls
+        // the dialog has nothing to do with.
+        let mut parent_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for node in tree["nodes"].as_array().into_iter().flatten() {
+            if let (Some(id), Some(parent)) = (node["nodeId"].as_str(), node["parentId"].as_str()) {
+                parent_of.insert(id, parent);
+            }
+        }
+        // One ancestor chain per emitted element, in the same order.
+        let mut ancestry: Vec<Vec<String>> = Vec::new();
 
         let mut elements: Vec<Value> = Vec::new();
         let mut below_fold = 0usize;
@@ -697,7 +719,49 @@ pub(crate) fn page_text_rpc(state: &DaemonState, request: &Value) -> Result<Valu
                     entry["inViewport"] = json!(in_viewport);
                 }
             }
+            if within_name.is_some() {
+                let mut chain = Vec::new();
+                let mut cursor = node["nodeId"].as_str();
+                let mut guard = 0;
+                while let Some(id) = cursor {
+                    chain.push(id.to_owned());
+                    cursor = parent_of.get(id).copied();
+                    guard += 1;
+                    if guard > 64 {
+                        break;
+                    }
+                }
+                ancestry.push(chain);
+            }
             elements.push(entry);
+        }
+
+        // Keep only what the named container actually contains.
+        if let Some(wanted) = within_name.as_deref() {
+            let scope_index = elements
+                .iter()
+                .position(|entry| {
+                    entry["name"]
+                        .as_str()
+                        .is_some_and(|name| name.to_ascii_lowercase() == wanted)
+                })
+                .ok_or_else(|| format!("no element named {wanted:?} to scope to"))?;
+            let scope_node = ancestry
+                .get(scope_index)
+                .and_then(|chain| chain.first())
+                .cloned()
+                .ok_or_else(|| format!("no element named {wanted:?} to scope to"))?;
+            let kept: Vec<Value> = elements
+                .iter()
+                .zip(ancestry.iter())
+                .filter(|(_, chain)| chain.contains(&scope_node))
+                .map(|(entry, _)| entry.clone())
+                .collect();
+            below_fold = kept
+                .iter()
+                .filter(|entry| entry["inViewport"] == json!(false))
+                .count();
+            elements = kept;
         }
 
         Ok(json!({

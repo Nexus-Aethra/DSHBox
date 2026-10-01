@@ -534,6 +534,14 @@ export function applyBoxTools(ctx: Context): void {
       properties: {
         containerId: { type: 'string', description: 'Container id to read.' },
         role: { type: 'string', description: 'Only roles containing this text, e.g. button or textbox. Omit for everything.' },
+        within: {
+          type: 'string',
+          description:
+            + 'Name of a container to scope the listing to, such as a dialog. Use it when a'
+            + 'name is ambiguous: a settings dialog and the chat screen behind it can'
+            + 'both offer the same one, and acting on the wrong element still looks like'
+            + 'it worked.',
+        },
         limit: { type: 'number', description: 'Maximum entries to return. Defaults to 200.' },
       },
       required: ['containerId'],
@@ -582,6 +590,7 @@ export function applyBoxTools(ctx: Context): void {
       const result = await withSession<PageText>(containerId, 'debug_page_text', {
         role: typeof record.role === 'string' ? record.role : undefined,
         limit: typeof record.limit === 'number' ? record.limit : undefined,
+        within: typeof record.within === 'string' ? record.within : undefined,
       })
       return { containerId, ...result }
     },
