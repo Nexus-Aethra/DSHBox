@@ -68,6 +68,14 @@ interface HostServices {
       name?: string
     }): Promise<ImageAttachmentRef>
   }
+  /** One prompt section carrying the cross-tool workflow. */
+  systemPrompt: {
+    section(section: {
+      name: string
+      order: number
+      text: string | (() => string)
+    }): () => void
+  }
 }
 
 /**
@@ -77,7 +85,7 @@ interface HostServices {
  * assertion here means the rest of the file is checked against the transcribed
  * types, so a shape change surfaces as one cast rather than a scatter of them.
  */
-function hostServices(ctx: Context): HostServices {
+export function hostServices(ctx: Context): HostServices {
   return ctx as unknown as HostServices
 }
 
@@ -732,4 +740,108 @@ export function applyBoxTools(ctx: Context): void {
       return { containerId, ...result }
     },
   })
+
+  registerTool(ctx, {
+    name: 'box_set_browser',
+    description:
+      'Choose which browser the other box_* tools drive, and report the one in use. Call it '
+      + 'when a page tool fails to launch a browser, or when auto-detection picks a browser you '
+      + 'would rather not use. Pass an absolute path to a Chrome or Edge executable to pin it; '
+      + 'pass an empty string to go back to auto-detection. The path is validated before it is '
+      + 'saved, so a typo is rejected here rather than surfacing later as a failed launch.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Absolute path to a browser executable, or an empty string to return to auto-detection.',
+        },
+      },
+      required: [],
+    },
+    timeoutMs: WARM_BUDGET_MS,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          available: { type: 'boolean' },
+          kind: { type: 'string' },
+          path: { type: 'string' },
+          configured: { type: 'boolean' },
+          configuredPath: { type: 'string' },
+          problem: { type: 'string' },
+        },
+        required: ['available'],
+      },
+      render: (_args, value) => {
+        const record = asRecord(value)
+        if (record.available === false) {
+          return [{
+            type: 'text',
+            text: 'No browser is available: ' + String(record.problem ?? 'unknown reason')
+              + (record.configuredPath ? ' (configured: ' + String(record.configuredPath) + ')' : '')
+              + nextHint('pass a browser executable path to box_set_browser, then retry the page tool'),
+          }]
+        }
+        const pinned = record.configured === true
+        return [{
+          type: 'text',
+          text: 'Using ' + String(record.kind ?? 'browser') + ' at ' + String(record.path ?? 'unknown')
+            + (pinned ? ' (pinned by you).' : ' (auto-detected).')
+            + nextHint('call box_page_text to see what the page looks like now'),
+        }]
+      },
+    },
+    async execute(args) {
+      const record = asRecord(args)
+      const path = typeof record.path === 'string' ? record.path : ''
+      // Only send the field when the caller meant to set one; a bare call is a
+      // status query, and an empty path is an explicit reset.
+      return path === '' && record.path === undefined
+        ? getRpc().call<Record<string, unknown>>('debug_browser_status', {})
+        : getRpc().call<Record<string, unknown>>('debug_set_browser_path', { path })
+    },
+  })
+
+  registerTool(ctx, {
+    name: 'box_close',
+    description:
+      'Close the headless browser for a container and release it. Call it when a long debugging '
+      + 'session is finished; the next page tool opens a fresh one. Sessions also close on their '
+      + 'own, so this is for tidying up rather than for making something work.',
+    parameters: {
+      type: 'object',
+      properties: {
+        containerId: { type: 'string', description: 'Container whose browser session to close.' },
+      },
+      required: ['containerId'],
+    },
+    timeoutMs: WARM_BUDGET_MS,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          containerId: { type: 'string' },
+          closed: { type: 'boolean' },
+        },
+        required: ['containerId', 'closed'],
+      },
+      render: (_args, value) => {
+        const record = asRecord(value)
+        return [{
+          type: 'text',
+          text: (record.closed === true ? 'Closed' : 'There was no open session to close for')
+            + ' the browser of container ' + String(record.containerId) + '.',
+        }]
+      },
+    },
+    async execute(args) {
+      const containerId = containerIdOf(args)
+      const result = await getRpc().call<{ closed: boolean }>('debug_close', { id: containerId })
+      return { containerId, ...result }
+    },
+  })
+
 }

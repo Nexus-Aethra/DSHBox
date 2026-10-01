@@ -27,7 +27,7 @@ import {
   type Discovery,
 } from './rpc'
 import { getRpc, resetRpc } from './rpc'
-import { applyBoxTools } from './tools'
+import { applyBoxTools, hostServices } from './tools'
 
 /** Cordis plugin name used by loader diagnostics and the patch overlay. */
 export const name = 'dsh-box-sandbox'
@@ -37,7 +37,7 @@ export const name = 'dsh-box-sandbox'
  * transport and needs no host service. Tools built on top of it will
  * declare their own.
  */
-export const inject: string[] = ['tools', 'attachments']
+export const inject: string[] = ['tools', 'attachments', 'systemPrompt']
 
 /**
  * Plugin config. Both fields carry defaults, so the mount works with an
@@ -116,6 +116,41 @@ export async function status(config?: Partial<Config>): Promise<Status> {
   }
 }
 
+/**
+ * Cross-tool guidance, contributed once as a prompt section.
+ *
+ * Each tool's description already says what that one tool does. What no single
+ * description can carry is the order, and getting the order wrong is what costs an
+ * agent the most: reading a page, acting on a control that was never on screen, and
+ * treating a blocked click as a broken app.
+ *
+ * Registered inside a cordis effect so the section is removed when this mount is
+ * disposed. A duplicate name throws in the host, which would turn a re-apply into a
+ * load failure; scoping the registration to the effect is what makes that impossible.
+ *
+ * Deliberately short. It earns its place by carrying what no tool response repeats;
+ * anything a tool already reports belongs in that tool.
+ */
+
+const WORKFLOW_PROMPT_SECTION = 'dsh-box-sandbox:page-workflow'
+
+const WORKFLOW_PROMPT_ORDER = 3050
+function pageWorkflowPrompt(): string {
+  return [
+    'Debugging a page with the box_* tools:',
+    'Start with box_page_text. It needs no selector and returns every control with its role,',
+    'name and position, so it replaces guessing at selectors.',
+    'Check the in-viewport flag before acting. A control marked below the fold exists; scroll to',
+    'it with box_scroll rather than concluding it is missing.',
+    'Prefer box_click_element with a role and name over box_click_at. A click reports whether it',
+    'landed, so believe that field, not the fact that you dispatched a click: when landed is',
+    'false something covered the target, and a page that looks unchanged is not a broken app.',
+    'Before typing, click the field. box_type_text reports the focused element and inserts nothing',
+    'when no editable field holds focus.',
+    'If a page tool cannot find a browser, box_set_browser reports which one is in use and pins a',
+    'different one.',
+  ].join('\n')
+}
 /** Register the plugin against a freshly mounted Cordis context. */
 export function apply(ctx: Context, config?: Partial<Config>): void {
   resetRpc()
@@ -123,4 +158,12 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
   applyBoxTools(ctx)
   // Re-apply means a new config; the old singleton must not outlive it.
   ctx.effect(() => () => resetRpc(), 'dsh-box-sandbox.client()')
+  // The section is registered inside an effect, so disposing this mount
+  // removes it. Registering it unconditionally would make the second mount
+  // throw on a duplicate section name and take every tool down with it.
+  ctx.effect(() => hostServices(ctx).systemPrompt.section({
+    name: WORKFLOW_PROMPT_SECTION,
+    order: WORKFLOW_PROMPT_ORDER,
+    text: pageWorkflowPrompt,
+  }), 'dsh-box-sandbox.systemPrompt()')
 }
