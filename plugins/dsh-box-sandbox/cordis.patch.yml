@@ -1,0 +1,11 @@
+# @deepseek-ai/dsh-box-sandbox: mounts the host-side development sandbox.
+#
+# Every field is optional. With no config the client honours
+# DSHBOX_CONFIG_DIR and falls back to ~/.dsh-box, which is where DSH Box
+# publishes its discovery record. Overriding configDir is only needed to
+# point at a non-default profile.
+
+- insert:
+    - id: dsh-box-sandbox
+      name: '@deepseek-ai/dsh-box-sandbox'
+      config: {}

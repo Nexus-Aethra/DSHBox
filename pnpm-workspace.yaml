@@ -1,5 +1,6 @@
 packages:
   - .
   - src-tauri/crates/box-dsh-context/dsh-box-context
+  - plugins/dsh-box-sandbox
 allowBuilds:
   esbuild: true

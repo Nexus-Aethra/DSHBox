@@ -9,6 +9,11 @@
 !/src-tauri/resources/plugins/.gitkeep
 /src-tauri/crates/box-dsh-context/dsh-box-context/dist/
 /src-tauri/crates/box-dsh-context/dsh-box-context/node_modules/
+# Plugins under plugins/ are workspace packages with their own installs and
+# build output. The root-anchored /node_modules/ and /dist/ rules above do not
+# reach them, and every plugin would otherwise need its own pair of entries.
+/plugins/*/node_modules/
+/plugins/*/dist/
 /src-tauri/.build-stamp
 # Local debugging / build leftovers: never commit these.
 /.e2e-dbg/
