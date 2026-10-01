@@ -94,18 +94,6 @@ const LAUNCH_BUDGET_MS = 90_000
 /** A click or a query against an already-warm session is fast. */
 const WARM_BUDGET_MS = 30_000
 
-interface ElementSummary {
-  tag?: string
-  id?: string | null
-  classes?: string | null
-  text?: string
-  visible?: boolean
-  width?: number
-  height?: number
-  centerX?: number
-  centerY?: number
-}
-
 function containerIdOf(args: unknown): string {
   const id = (args as { containerId?: unknown } | undefined)?.containerId
   if (typeof id !== 'string' || id.trim() === '')
@@ -143,30 +131,6 @@ async function withSession<T>(
     await rpc.call('debug_open', { id })
     return await rpc.call<T>(method, { id, ...params })
   }
-}
-
-function renderElements(elements: ElementSummary[]): string {
-  if (elements.length === 0) return 'No elements matched.'
-  return elements
-    .map((element, index) => {
-      const tag = element.tag ?? '?'
-      const id = element.id ? '#' + element.id : ''
-      const cls = element.classes ? '.' + element.classes.split(/\s+/).join('.') : ''
-      const where = element.visible === false ? ' (hidden)' : ''
-      const size = element.width !== undefined && element.height !== undefined
-        ? ' ' + Math.round(element.width) + 'x' + Math.round(element.height)
-        : ''
-      const text = element.text ? ' ' + JSON.stringify(element.text) : ''
-      const at = Math.round(element.centerX ?? 0) + ',' + Math.round(element.centerY ?? 0)
-      return '[' + index + '] <' + tag + id + cls + '>' + size + ' at (' + at + ')' + where + text
-    })
-    .join('\n')
-}
-interface ElementQuery {
-  selector: string
-  count: number
-  truncated: boolean
-  elements: ElementSummary[]
 }
 
 interface ClickResult {
@@ -374,61 +338,6 @@ export function applyBoxTools(ctx: Context): void {
       return { containerId, attachment }
     },
   })
-  registerTool(ctx, {
-    name: 'box_query_elements',
-    description:
-      'List the elements a CSS selector matches on a running dshbox container page, with each '
-      + 'tag, classes, visible text and centre coordinates. Use it to find the selector to '
-      + 'click, or to confirm a selector still matches after a change. A broad selector such '
-      + 'as body returns a capped sample rather than the whole tree.',
-    parameters: {
-      type: 'object',
-      properties: {
-        containerId: { type: 'string', description: 'Container id to inspect.' },
-        selector: { type: 'string', description: 'CSS selector to match, e.g. button or [role=button]. Defaults to body.', },
-        limit: { type: 'number', description: 'Maximum elements to return; the daemon caps this at 200. Defaults to 50.', },
-      },
-      required: ['containerId'],
-    },
-    timeoutMs: WARM_BUDGET_MS,
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-        containerId: { type: 'string' },
-        
-          selector: { type: 'string' },
-        
-          count: { type: 'number' },
-        
-          truncated: { type: 'boolean' },
-        
-          elements: { type: 'array', items: { type: 'object' } },
-      },
-      required: ['containerId', 'selector', 'count', 'truncated', 'elements'],
-      },
-      render: (_args, value) => {
-        const record = asRecord(value)
-        const elements = Array.isArray(record.elements)
-          ? (record.elements as ElementSummary[])
-          : []
-        const header = 'Matched ' + String(record.count) + ' element(s) for '
-          + String(record.selector)
-          + (record.truncated === true ? ' (truncated).' : '.')
-        return [{ type: 'text', text: header + '\n' + renderElements(elements) }]
-      },
-    },
-    async execute(args) {
-      const containerId = containerIdOf(args)
-      const record = asRecord(args)
-      const result = await withSession<ElementQuery>(containerId, 'debug_query_elements', {
-        selector: typeof record.selector === 'string' ? record.selector : 'body',
-        limit: typeof record.limit === 'number' ? record.limit : 50,
-      })
-      return { containerId, ...result }
-    },
-  })
 
   registerTool(ctx, {
     name: 'box_click_element',
@@ -515,8 +424,8 @@ export function applyBoxTools(ctx: Context): void {
     name: 'box_click_at',
     description:
       'Click a point, in viewport coordinates, on a running dshbox container page. Use it when '
-      + 'the target has no usable selector. Coordinates come from box_query_elements or from '
-      + 'box_screenshot. Prefer box_click_element when a selector exists.',
+      + 'the target has no accessible name. Coordinates come from box_page_text or from '
+      + 'box_screenshot. Prefer box_click_element whenever the page listed a name for it.',
     parameters: {
       type: 'object',
       properties: {
@@ -572,9 +481,9 @@ export function applyBoxTools(ctx: Context): void {
     description:
       'CALL THIS FIRST when you need to know what is on a page. It renders the whole page as '
       + 'text: every control and region with its role, name, on-screen position, and whether it '
-      + 'is currently visible. You need no selector, so it answers "what is here" in one call '
-      + 'where box_query_elements needs a selector you do not have yet. Then use the '
-      + 'role+name it returns with box_click_element, or the coordinates with box_click_at. '
+      + 'is currently visible, and whether it is disabled. It needs no selector, and it is the '
+      + 'only listing: there is no second way to ask what is on a page. Then hand the role+name '
+      + 'it returns straight back to box_click_element. '
       + 'Anything marked BELOW FOLD needs box_scroll before you can act on it.',
     parameters: {
       type: 'object',
