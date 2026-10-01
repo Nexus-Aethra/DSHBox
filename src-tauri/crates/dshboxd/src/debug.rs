@@ -339,6 +339,22 @@ pub(crate) fn query_elements_rpc(
 }
 
 fn dispatch_click(session: &mut BrowserSession, x: f64, y: f64) -> Result<(), String> {
+    // Move first. A great deal of interface opens on hover rather than on
+    // click -- a menu revealing its submenu, a card expanding, a tooltip
+    // carrying the only instructions on screen -- and a press delivered with
+    // no preceding move never triggers it. The press then lands on a menu
+    // that is not open, so the caller clicks a submenu item that does not
+    // exist and is told the click landed.
+    session.call(
+        "Input.dispatchMouseEvent",
+        json!({
+            "type": "mouseMoved",
+            "x": x,
+            "y": y,
+            "button": "none",
+            "buttons": 0
+        }),
+    )?;
     // A click is a press plus a release; sending only one leaves the page
     // with a button held down.
     for kind in ["mousePressed", "mouseReleased"] {
@@ -423,6 +439,41 @@ fn scroll_node_into_view(
         }),
     )?;
     backend_node_rect(session, backend_node_id)
+}
+/// Find a visible element by its rendered text, without the accessibility tree.
+///
+/// Some menus are simply not in the accessibility tree. A provider picker
+/// rendered in a portal with its own accessibility context is one: it opens,
+/// it is on screen, a screenshot shows every item in it, and a listing of the
+/// accessibility tree returns nothing at all. An agent told "nothing named
+/// that matches" would conclude the control is not there.
+///
+/// So the search falls back to the document: walk the rendered text, keep what
+/// is visible and sized, and return the smallest element carrying the name --
+/// the smallest, because a container and its label both contain the same
+/// words and clicking the container can miss the control inside it.
+fn dom_text_probe_js(name: &str) -> String {
+    let needle = serde_json::to_string(name).unwrap_or_else(|_| String::from("\"\""));
+    format!(
+        r##"JSON.stringify((function () {{
+          var wanted = {needle};
+          var best = null;
+          var bestArea = Infinity;
+          var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+          for (var node = walker.nextNode(); node; node = walker.nextNode()) {{
+            var text = (node.textContent || "").trim();
+            if (text !== wanted) continue;
+            var rect = node.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) continue;
+            var style = window.getComputedStyle(node);
+            if (style.visibility === "hidden" || style.display === "none") continue;
+            if (Number(style.opacity) === 0) continue;
+            var area = rect.width * rect.height;
+            if (area < bestArea) {{ bestArea = area; best = {{ x: rect.x, y: rect.y, w: rect.width, h: rect.height, tag: node.tagName.toLowerCase() }}; }}
+          }}
+          return best;
+        }})())"##
+    )
 }
 /// Click the control identified by the role and name a page listing reported.
 ///
@@ -597,6 +648,29 @@ pub(crate) fn click_by_name_rpc(state: &DaemonState, request: &Value) -> Result<
                 return Err(format!(
                     "{name:?} is listed as {} but has no position to click, so it is not rendered here",
                     unplaceable.join(", "),
+                ));
+            }
+            // The accessibility tree does not contain everything on screen. A
+            // provider picker in a portal with its own accessibility context is
+            // not in the tree at all: it opens, a screenshot shows every item in
+            // it, and the tree returns nothing. Falling back to the rendered
+            // document finds what the tree omits, and saying so in the match
+            // tells the caller which answer they got.
+            let raw = evaluate(session, &dom_text_probe_js(&name))?;
+            let text = raw
+                .as_str()
+                .ok_or_else(|| "dom text probe returned a non-string result".to_owned())?;
+            let measured: Value = serde_json::from_str(text)
+                .map_err(|error| format!("cannot parse dom probe result: {error}"))?;
+            if !measured.is_null() {
+                let cx = measured["x"].as_f64().unwrap_or(0.0) + measured["w"].as_f64().unwrap_or(0.0) / 2.0;
+                let cy = measured["y"].as_f64().unwrap_or(0.0) + measured["h"].as_f64().unwrap_or(0.0) / 2.0;
+                return Ok((
+                    cx,
+                    cy,
+                    format!("{} {:?} (found by text, absent from the accessibility tree)",
+                        measured["tag"].as_str().unwrap_or("element"),
+                        name),
                 ));
             }
             return Err(format!("nothing named {:?} matches", name));
