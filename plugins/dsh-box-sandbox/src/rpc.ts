@@ -253,3 +253,32 @@ export class DshboxRpc {
     return this.call('ping')
   }
 }
+
+/**
+ * Configuration for the lazily created singleton. Kept structural so rpc.ts
+ * does not have to import the plugin entry that owns the validated Config.
+ */
+export interface RpcConfig {
+  configDir?: string
+  timeoutMs?: number
+}
+
+/**
+ * One daemon per host, so the client is a module-level singleton.
+ *
+ * It is created lazily and torn down by resetRpc() on remount: cordis
+ * re-applies a plugin whenever its config changes, and a stale client would
+ * keep pointing at the previous config directory.
+ */
+let current: DshboxRpc | null = null
+
+/** The active client, constructed from the given config on first use. */
+export function getRpc(config?: RpcConfig): DshboxRpc {
+  if (current === null) current = new DshboxRpc(config ?? {})
+  return current
+}
+
+/** Drop the singleton so the next getRpc() picks up fresh config. */
+export function resetRpc(): void {
+  current = null
+}

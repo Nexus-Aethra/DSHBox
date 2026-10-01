@@ -14,6 +14,10 @@
       "types": "./dist/rpc.d.mts",
       "default": "./dist/rpc.mjs"
     },
+    "./tools": {
+      "types": "./dist/tools.d.mts",
+      "default": "./dist/tools.mjs"
+    },
     "./src/*": "./src/*",
     "./package.json": "./package.json"
   },

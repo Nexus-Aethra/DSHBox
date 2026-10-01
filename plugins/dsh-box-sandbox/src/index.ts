@@ -27,6 +27,8 @@ import {
   discoveryPath,
   type Discovery,
 } from './rpc'
+import { getRpc, resetRpc } from './rpc'
+import { applyBoxTools } from './tools'
 
 /** Cordis plugin name used by loader diagnostics and the patch overlay. */
 export const name = 'dsh-box-sandbox'
@@ -36,7 +38,7 @@ export const name = 'dsh-box-sandbox'
  * transport and needs no host service. Tools built on top of it will
  * declare their own.
  */
-export const inject: string[] = []
+export const inject: string[] = ['tools', 'attachments']
 
 /**
  * Plugin config. Both fields carry defaults, so the mount works with an
@@ -59,28 +61,8 @@ export const Config: z<Config> = z.object({
   timeoutMs: z.number().default(30_000),
 })
 
-export { DshboxRpc, DshboxUnavailableError, discoveryPath }
+export { DshboxRpc, DshboxUnavailableError, discoveryPath, getRpc, resetRpc }
 export type { Discovery }
-
-/**
- * One daemon per host, so the client is a module-level singleton.
- *
- * It is created lazily and torn down by resetRpc() on remount: cordis
- * re-applies a plugin whenever its config changes, and a stale client would
- * keep pointing at the previous config directory.
- */
-let current: DshboxRpc | null = null
-
-/** The active client, constructed from the given config on first use. */
-export function getRpc(config?: Config): DshboxRpc {
-  if (current === null) current = new DshboxRpc(config ?? {})
-  return current
-}
-
-/** Drop the singleton so the next getRpc() picks up fresh config. */
-export function resetRpc(): void {
-  current = null
-}
 
 /** Snapshot of reachability, for diagnostics and prompt surfaces. */
 export interface Status {
@@ -126,6 +108,7 @@ export async function status(config?: Config): Promise<Status> {
 export function apply(ctx: Context, config: Config): void {
   resetRpc()
   getRpc(config)
+  applyBoxTools(ctx)
   // Re-apply means a new config; the old singleton must not outlive it.
   ctx.effect(() => () => resetRpc(), 'dsh-box-sandbox.client()')
 }
