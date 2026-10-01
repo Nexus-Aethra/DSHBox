@@ -709,37 +709,68 @@ pub(crate) fn page_text_rpc(state: &DaemonState, request: &Value) -> Result<Valu
     })
 }
 
-/// JS that reports scroll extent and, when given a target, moves there.
-///
-/// `to` is interpolated as a number literal, never as script text, so a
-/// caller cannot turn a scroll into code execution inside the debugged page.
-/// One multi-line literal: Rust does not concatenate neighbouring string
-/// literals the way C does.
-fn scroll_probe_js(to: Option<f64>) -> String {
+fn scroll_probe_js(to: Option<f64>, at: Option<(f64, f64)>) -> String {
     let target = match to {
         Some(value) => value.to_string(),
         None => "null".to_owned(),
     };
+    // Kept as two bare numbers rather than a point literal: a nested format!
+    // would have its braces consumed by the outer one.
+    let (px, py) = match at {
+        Some((x, y)) => (x.to_string(), y.to_string()),
+        None => ("null".to_owned(), "null".to_owned()),
+    };
     format!(
-        r#"JSON.stringify((function () {{
-          var el = document.scrollingElement || document.documentElement;
-          if (!el) return {{ scrollTop: 0, scrollHeight: 0, viewportHeight: 0, screensBelow: 0, moved: false }};
+        r##"JSON.stringify((function () {{
+          function scrollable(node) {{
+            if (!node || node === document.body || node === document.documentElement) return null;
+            var style = window.getComputedStyle(node);
+            if (!/(auto|scroll|overlay)/.test(style.overflowY)) return null;
+            if (node.scrollHeight - node.clientHeight <= 1) return null;
+            return node;
+          }}
+          // A modal usually owns its own scroller, so the document reports
+          // nothing below the fold while the panel is full of controls the
+          // caller can see named but cannot reach. Prefer the nearest
+          // scrollable ancestor of a point inside the region of interest.
+          var px = {px};
+          var py = {py};
+          var el = null;
+          if (px !== null && py !== null) {{
+            var under = document.elementFromPoint(px, py);
+            while (under) {{
+              var found = scrollable(under);
+              if (found) {{ el = found; break; }}
+              under = under.parentElement;
+            }}
+          }}
+          if (!el) el = scrollable(document.scrollingElement || document.documentElement);
+          if (!el) el = document.scrollingElement || document.documentElement;
+          if (!el) return {{ scrollTop: 0, scrollHeight: 0, viewportHeight: 0, screensBelow: 0, moved: false, scroller: null, scrollerIsDocument: true }};
           var wanted = {target};
           var moved = false;
           if (wanted !== null) {{
             el.scrollTop = wanted;
             moved = true;
           }}
-          var viewportHeight = window.innerHeight || el.clientHeight || 0;
+          var isDocument = el === document.scrollingElement || el === document.documentElement;
+          var viewportHeight = isDocument ? (window.innerHeight || el.clientHeight || 0) : el.clientHeight;
           var remaining = el.scrollHeight - (el.scrollTop + viewportHeight);
+          var label = el.tagName ? el.tagName.toLowerCase() : "document";
+          if (el.id) label += "#" + el.id;
+          if (typeof el.className === "string" && el.className.trim()) {{
+            label += "." + el.className.trim().split(/\s+/).slice(0, 2).join(".");
+          }}
           return {{
             scrollTop: el.scrollTop,
             scrollHeight: el.scrollHeight,
             viewportHeight: viewportHeight,
-            screensBelow: remaining > 0 ? Math.ceil(remaining / viewportHeight) : 0,
-            moved: moved
+            screensBelow: remaining > 0 && viewportHeight > 0 ? Math.ceil(remaining / viewportHeight) : 0,
+            moved: moved,
+            scroller: label,
+            scrollerIsDocument: isDocument
           }};
-        }})())"#
+        }})())"##
     )
 }
 
@@ -750,7 +781,15 @@ fn scroll_probe_js(to: Option<f64>) -> String {
 /// complete, and only submitting reveals what was underneath.
 pub(crate) fn scroll_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
     let to = request.get("to").and_then(Value::as_f64);
-    let expression = scroll_probe_js(to);
+    let x = request.get("x").and_then(Value::as_f64);
+    let y = request.get("y").and_then(Value::as_f64);
+    // A point is only meaningful as a pair; half of one would probe the
+    // wrong element and report somebody else's scroller.
+    let at = match (x, y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => None,
+    };
+    let expression = scroll_probe_js(to, at);
     let raw = with_session(state, request, |session| evaluate(session, &expression))?;
     let text = raw
         .as_str()
@@ -763,6 +802,8 @@ pub(crate) fn scroll_rpc(state: &DaemonState, request: &Value) -> Result<Value, 
         "viewportHeight": measured["viewportHeight"].clone(),
         "screensBelow": measured["screensBelow"].clone(),
         "moved": measured["moved"].clone(),
+        "scroller": measured["scroller"].clone(),
+        "scrollerIsDocument": measured["scrollerIsDocument"].clone(),
     }))
 }
 
