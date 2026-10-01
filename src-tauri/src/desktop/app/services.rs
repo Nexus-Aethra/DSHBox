@@ -17,9 +17,6 @@ pub(crate) fn write_startup_log(message: &str) {
     let _ = fs::OpenOptions::new().create(true).append(true).open(root.join("desktop.log")).and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
 }
 
-pub(crate) const DEFAULT_NODE_VERSION: &str = "v24.11.1";
-pub(crate) const DEFAULT_PNPM_VERSION: &str = "11.21.0";
-
 pub(crate) fn bundled_target() -> &'static str {
     match (env::consts::OS, env::consts::ARCH) {
         ("linux", "x86_64") => "linux-x64",
@@ -276,7 +273,6 @@ pub(crate) fn initialize_bundled_runtime(resource_directory: PathBuf) -> Result<
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
         .unwrap_or_else(|| "unknown".to_owned());
-    let git_dir = runtime.git_dir();
     BUNDLED_RUNTIME
         .set(BundledRuntime {
             node_version: runtime.manifest.node_version,
@@ -285,7 +281,6 @@ pub(crate) fn initialize_bundled_runtime(resource_directory: PathBuf) -> Result<
             node,
             npm,
             pnpm,
-            git_dir,
         })
         .map_err(|_| "bundled runtime was initialized twice".to_owned())
 }

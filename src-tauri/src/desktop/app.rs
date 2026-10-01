@@ -75,7 +75,6 @@ pub(crate) struct BundledRuntime {
     node: PathBuf,
     npm: PathBuf,
     pnpm: PathBuf,
-    git_dir: Option<PathBuf>,
 }
 
 static BUNDLED_RUNTIME: OnceLock<BundledRuntime> = OnceLock::new();

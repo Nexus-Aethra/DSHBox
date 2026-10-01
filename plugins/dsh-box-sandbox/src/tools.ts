@@ -195,15 +195,12 @@ export function applyBoxTools(ctx: Context): void {
       + 'Use it to see the real state of a page instead of guessing from logs or markup. '
       + 'Opens a headless browser on the container on first use.',
     parameters: {
-      containerId: {
-        type: 'string',
-        required: true,
-        description: 'Container id to look at, e.g. from a container list.',
+      type: 'object',
+      properties: {
+        containerId: { type: 'string', description: 'Container id to look at, e.g. from a container list.', },
+        fullPage: { type: 'boolean', description: 'Capture the whole scrollable page instead of the viewport. Defaults to false.', },
       },
-      fullPage: {
-        type: 'boolean',
-        description: 'Capture the whole scrollable page instead of the viewport. Defaults to false.',
-      },
+      required: ['containerId'],
     },
     timeoutMs: LAUNCH_BUDGET_MS,
     output: {
@@ -211,9 +208,11 @@ export function applyBoxTools(ctx: Context): void {
         type: 'object',
         additionalProperties: false,
         properties: {
-          containerId: { type: 'string', required: true },
-          attachment: { type: 'object', required: true },
-        },
+        containerId: { type: 'string' },
+        
+          attachment: { type: 'object' },
+      },
+      required: ['containerId', 'attachment'],
       },
       render: (_args, value) => {
         const record = asRecord(value)
@@ -254,15 +253,13 @@ export function applyBoxTools(ctx: Context): void {
       + 'click, or to confirm a selector still matches after a change. A broad selector such '
       + 'as body returns a capped sample rather than the whole tree.',
     parameters: {
-      containerId: { type: 'string', required: true, description: 'Container id to inspect.' },
-      selector: {
-        type: 'string',
-        description: 'CSS selector to match, e.g. button or [role=button]. Defaults to body.',
+      type: 'object',
+      properties: {
+        containerId: { type: 'string', description: 'Container id to inspect.' },
+        selector: { type: 'string', description: 'CSS selector to match, e.g. button or [role=button]. Defaults to body.', },
+        limit: { type: 'number', description: 'Maximum elements to return; the daemon caps this at 200. Defaults to 50.', },
       },
-      limit: {
-        type: 'number',
-        description: 'Maximum elements to return; the daemon caps this at 200. Defaults to 50.',
-      },
+      required: ['containerId'],
     },
     timeoutMs: WARM_BUDGET_MS,
     output: {
@@ -270,12 +267,17 @@ export function applyBoxTools(ctx: Context): void {
         type: 'object',
         additionalProperties: false,
         properties: {
-          containerId: { type: 'string', required: true },
-          selector: { type: 'string', required: true },
-          count: { type: 'number', required: true },
-          truncated: { type: 'boolean', required: true },
-          elements: { type: 'array', required: true, items: { type: 'object' } },
-        },
+        containerId: { type: 'string' },
+        
+          selector: { type: 'string' },
+        
+          count: { type: 'number' },
+        
+          truncated: { type: 'boolean' },
+        
+          elements: { type: 'array', items: { type: 'object' } },
+      },
+      required: ['containerId', 'selector', 'count', 'truncated', 'elements'],
       },
       render: (_args, value) => {
         const record = asRecord(value)
@@ -306,12 +308,12 @@ export function applyBoxTools(ctx: Context): void {
       + 'at its centre. Prefer this over box_click_at when the target has a selector: it '
       + 'survives the layout moving. Re-screenshot or re-query afterwards to see the result.',
     parameters: {
-      containerId: { type: 'string', required: true, description: 'Container id to click in.' },
-      selector: {
-        type: 'string',
-        required: true,
-        description: 'CSS selector of the element to click, e.g. button.submit or [role=button].',
+      type: 'object',
+      properties: {
+        containerId: { type: 'string', description: 'Container id to click in.' },
+        selector: { type: 'string', description: 'CSS selector of the element to click, e.g. button.submit or [role=button].', },
       },
+      required: ['containerId', 'selector'],
     },
     timeoutMs: WARM_BUDGET_MS,
     output: {
@@ -319,13 +321,19 @@ export function applyBoxTools(ctx: Context): void {
         type: 'object',
         additionalProperties: false,
         properties: {
-          containerId: { type: 'string', required: true },
-          selector: { type: 'string', required: true },
-          x: { type: 'number', required: true },
-          y: { type: 'number', required: true },
-          tag: { type: 'string', required: true },
-          text: { type: 'string', required: true },
-        },
+        containerId: { type: 'string' },
+        
+          selector: { type: 'string' },
+        
+          x: { type: 'number' },
+        
+          y: { type: 'number' },
+        
+          tag: { type: 'string' },
+        
+          text: { type: 'string' },
+      },
+      required: ['containerId', 'selector', 'x', 'y', 'tag', 'text'],
       },
       render: (_args, value) => {
         const record = asRecord(value)
@@ -358,9 +366,13 @@ export function applyBoxTools(ctx: Context): void {
       + 'the target has no usable selector. Coordinates come from box_query_elements or from '
       + 'box_screenshot. Prefer box_click_element when a selector exists.',
     parameters: {
-      containerId: { type: 'string', required: true, description: 'Container id to click in.' },
-      x: { type: 'number', required: true, description: 'Horizontal viewport coordinate, from the left edge.' },
-      y: { type: 'number', required: true, description: 'Vertical viewport coordinate, from the top edge.' },
+      type: 'object',
+      properties: {
+        containerId: { type: 'string', description: 'Container id to click in.' },
+        x: { type: 'number', description: 'Horizontal viewport coordinate, from the left edge.' },
+        y: { type: 'number', description: 'Vertical viewport coordinate, from the top edge.' },
+      },
+      required: ['containerId', 'x', 'y'],
     },
     timeoutMs: WARM_BUDGET_MS,
     output: {
@@ -368,10 +380,13 @@ export function applyBoxTools(ctx: Context): void {
         type: 'object',
         additionalProperties: false,
         properties: {
-          containerId: { type: 'string', required: true },
-          x: { type: 'number', required: true },
-          y: { type: 'number', required: true },
-        },
+        containerId: { type: 'string' },
+        
+          x: { type: 'number' },
+        
+          y: { type: 'number' },
+      },
+      required: ['containerId', 'x', 'y'],
       },
       render: (_args, value) => {
         const record = asRecord(value)

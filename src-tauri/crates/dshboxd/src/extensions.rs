@@ -3,7 +3,9 @@
 //! Mirrors the desktop's `extensions.rs` paths without Tauri deps.
 
 use crate::bundles::{install_container_plugin, install_container_skill};
-use crate::toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel};
+use crate::toolchains::{
+    pnpm_network_failure_hint, pnpm_policy, resolve_toolchain, run_logged, TaskCancel,
+};
 use box_extensions::transfer::{
     append_plugin_archive, archive_content_root, copy_extension_source, extract_extension_tarball,
 };
@@ -778,7 +780,25 @@ pub(crate) fn container_plugin_add(
         )
         .map_err(|error| format!("dsh plugin add: {error}"))?;
     if !status.success() {
-        return Err(format!("dsh plugin add exited with {status}"));
+        // The child's stdout and stderr are both forwarded into the task log
+        // (see ExecutionKind::Logged above), so pnpm's actual complaint lives
+        // in that file rather than in this string. A bare exit status named
+        // neither the log nor the container, which left every genuine failure
+        // needing a manual hunt through the task list before it could be
+        // diagnosed. The template path has always pointed at the log
+        // (`sealed.rs`); this is its container-side twin.
+        let mut message = format!(
+            "dsh plugin add exited with {status}; inspect {}",
+            task_record.log_path
+        );
+        // A third-party mirror with flaky connectivity makes pnpm report a
+        // misleading downstream lifecycle error, so translate that pattern when
+        // the log shows it. The helper is crate-internal and already used by
+        // the DSH version installer, so this adds no second log parser.
+        if let Some(hint) = pnpm_network_failure_hint(Path::new(&task_record.log_path)) {
+            message.push_str(&hint);
+        }
+        return Err(message);
     }
     task.update("Plugin installed", 95);
     Ok(())
