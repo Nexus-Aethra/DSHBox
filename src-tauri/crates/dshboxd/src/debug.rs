@@ -475,6 +475,52 @@ fn dom_text_probe_js(name: &str) -> String {
         }})())"##
     )
 }
+/// Names close enough to what was asked for to be worth offering.
+///
+/// Forms name their fields after what they are, and the index is part of the
+/// name: a catalogue row is "Model ID 1", not "Model ID". An exact match
+/// fails on that, and a bare "nothing matches" leaves the caller to re-read the
+/// whole page guessing. So the near misses come back with the answer -- close
+/// first, then anything sharing a long prefix, capped so the reply stays short.
+fn near_miss_names(tree: &Value, wanted: &str, limit: usize) -> Vec<String> {
+    let wanted = wanted.to_ascii_lowercase();
+    let mut close: Vec<(usize, String)> = Vec::new();
+    for node in tree["nodes"].as_array().into_iter().flatten() {
+        if node["ignored"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        let name = node["name"]["value"].as_str().unwrap_or("").to_owned();
+        if name.is_empty() {
+            continue;
+        }
+        let lowered = name.to_ascii_lowercase();
+        // Rank by how much of the wanted name survives, so a field called
+        // "Model ID 1" outranks an unrelated "Model" three entries away.
+        let score = if lowered == wanted {
+            0
+        } else if lowered.starts_with(&wanted) || wanted.starts_with(&lowered) {
+            1 + wanted.chars().count().abs_diff(lowered.chars().count())
+        } else if lowered.contains(&wanted) || wanted.contains(&lowered) {
+            50 + wanted.chars().count().abs_diff(lowered.chars().count())
+        } else {
+            let shared = lowered
+                .chars()
+                .zip(wanted.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if shared >= 3 && shared * 2 >= wanted.chars().count() {
+                100 - shared
+            } else {
+                continue;
+            }
+        };
+        let role = node["role"]["value"].as_str().unwrap_or("");
+        close.push((score, format!("{role} {name:?}")));
+    }
+    close.sort_by(|a, b| a.0.cmp(&b.0));
+    close.dedup_by(|a, b| a.1 == b.1);
+    close.into_iter().take(limit).map(|(_, entry)| entry).collect()
+}
 /// Click the control identified by the role and name a page listing reported.
 ///
 /// A page listing answers "what is here" as role plus name, so acting on that
@@ -671,6 +717,17 @@ pub(crate) fn click_by_name_rpc(state: &DaemonState, request: &Value) -> Result<
                     format!("{} {:?} (found by text, absent from the accessibility tree)",
                         measured["tag"].as_str().unwrap_or("element"),
                         name),
+                ));
+            }
+            // Offer the near misses with the failure. A caller who typed a
+            // name that does not exist should not have to go and re-read the
+            // page to discover what the page called it.
+            let near = near_miss_names(&tree, &name, 8);
+            if !near.is_empty() {
+                return Err(format!(
+                    "nothing named {:?} matches. Closest names: {}",
+                    name,
+                    near.join(", "),
                 ));
             }
             return Err(format!("nothing named {:?} matches", name));
@@ -1444,6 +1501,33 @@ mod tests {
         assert!(!is_listable_text("StaticText", "   ", false));
         // Only text is judged here; other roles are decided by the noise filter.
         assert!(!is_listable_text("Button", "Save", false));
+    }
+
+    #[test]
+    fn near_misses_rank_the_field_the_caller_meant_first() {
+        // A form names its rows with an index, so the name a caller reaches
+        // for is the label without it.
+        let tree = json!({
+            "nodes": [
+                { "role": { "value": "textbox" }, "name": { "value": "Model ID 1" } },
+                { "role": { "value": "button" }, "name": { "value": "Model" } },
+                { "role": { "value": "textbox" }, "name": { "value": "Provider ID" } },
+            ]
+        });
+        let near = near_miss_names(&tree, "Model ID", 8);
+        assert_eq!(near.first().map(String::as_str), Some("textbox \"Model ID 1\""), "{near:?}");
+        // Unrelated names stay out of the answer entirely.
+        assert!(!near.iter().any(|entry| entry.contains("Provider ID")), "{near:?}");
+    }
+
+    #[test]
+    fn near_misses_are_empty_when_nothing_is_close() {
+        let tree = json!({
+            "nodes": [
+                { "role": { "value": "button" }, "name": { "value": "Save" } },
+            ]
+        });
+        assert!(near_miss_names(&tree, "zzz", 8).is_empty());
     }
 
     #[test]
