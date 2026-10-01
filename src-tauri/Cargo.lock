@@ -1012,6 +1012,7 @@ name = "dshboxd"
 version = "0.1.0"
 dependencies = [
  "box-api",
+ "box-browser",
  "box-containers",
  "box-dsh-context",
  "box-dsh-versions",

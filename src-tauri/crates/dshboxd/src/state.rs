@@ -277,6 +277,10 @@ pub(crate) struct DaemonState {
     /// Event bus for SSE streaming. Every task progress update, log line,
     /// and resource change is broadcast to all `/events` subscribers.
     pub(crate) events: std::sync::Arc<crate::events::DaemonEvents>,
+    /// Headless browser sessions backing the page-debugging RPCs, keyed by
+    /// container id. A session holds a live DevTools socket, so it is kept
+    /// between calls and torn down on close or daemon exit.
+    pub(crate) browser: Mutex<crate::debug::Sessions>,
 }
 
 impl DaemonState {
@@ -315,6 +319,7 @@ impl DaemonState {
             containers: Arc::new(ContainerManager::default()),
             resources: ResourceStateManager::default(),
             events: std::sync::Arc::new(crate::events::DaemonEvents::new()),
+            browser: Mutex::new(crate::debug::Sessions::new()),
         })
     }
 
@@ -335,20 +340,17 @@ impl DaemonState {
 pub(crate) struct DaemonNotifier {
     manager: TaskManager,
     resources: ResourceStateManager,
-    paths: BoxPaths,
     events: std::sync::Arc<crate::events::DaemonEvents>,
 }
 
 impl DaemonNotifier {
     pub(crate) fn from_paths(
         manager: TaskManager,
-        paths: BoxPaths,
         events: std::sync::Arc<crate::events::DaemonEvents>,
     ) -> Self {
         Self {
             manager,
             resources: ResourceStateManager::default(),
-            paths,
             events,
         }
     }

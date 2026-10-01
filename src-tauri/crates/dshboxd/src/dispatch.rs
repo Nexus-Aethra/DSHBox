@@ -165,6 +165,16 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("delete_extension_bundle") => delete_extension_bundle_rpc(request).map(Sync),
         Some("stop_container") => stop_container_rpc(state, request).map(Sync),
         Some("container_url") => container_url_rpc(state, request).map(Sync),
+    // Page-debugging surface. browser_status and set_browser_path take no
+    // container; the rest address one running container's headless session.
+    Some("debug_browser_status") => crate::debug::browser_status_rpc().map(Sync),
+    Some("debug_set_browser_path") => crate::debug::set_browser_path_rpc(request).map(Sync),
+    Some("debug_open") => crate::debug::open_rpc(state, request).map(Sync),
+    Some("debug_close") => crate::debug::close_rpc(state, request).map(Sync),
+    Some("debug_capture_screenshot") => crate::debug::screenshot_rpc(state, request).map(Sync),
+    Some("debug_query_elements") => crate::debug::query_elements_rpc(state, request).map(Sync),
+    Some("debug_click_element") => crate::debug::click_element_rpc(state, request).map(Sync),
+    Some("debug_click_at") => crate::debug::click_at_rpc(state, request).map(Sync),
         Some("save_mirror_settings") => save_mirror_settings_rpc(request).map(Sync),
         Some("save_runtime_directory") => save_runtime_directory_rpc(state, request).map(Sync),
         Some("refresh_dsh_catalog") => enqueue_dsh_catalog_refresh(state),
@@ -665,7 +675,7 @@ fn spawn_task_worker(
     let task_id = task.id.clone();
     let events = state.events.clone();
     std::thread::spawn(move || {
-        let notifier = DaemonNotifier::from_paths(manager.clone(), paths.clone(), events);
+        let notifier = DaemonNotifier::from_paths(manager.clone(), events);
         run_queued(
             &manager,
             &paths,
@@ -1011,6 +1021,17 @@ fn stop_container_rpc(state: &DaemonState, request: &Value) -> Result<Value, Str
 
 fn container_url_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
+    container_url(state, &id).map(|url| json!({ "id": id, "url": url }))
+}
+
+/// Resolve a running container's authenticated loopback URL.
+///
+/// DSH 0.1.2+ answers every tokenless request with 401, so callers that open
+/// a browser at this URL need the per-launch capability form, not the bare
+/// host URL. Shared by the webview (`container_url_rpc`) and the headless
+/// debug browser, which must both present a usable URL.
+pub(crate) fn container_url(state: &DaemonState, id: &str) -> Result<String, String> {
+    let id = id.to_owned();
     let running = state
         .containers
         .running
@@ -1023,7 +1044,7 @@ fn container_url_rpc(state: &DaemonState, request: &Value) -> Result<Value, Stri
             .authenticated_url
             .clone()
             .unwrap_or_else(|| host.url.clone());
-        return Ok(json!({ "id": id, "url": url }));
+        return Ok(url);
     }
     drop(running);
     let record =
@@ -1039,7 +1060,7 @@ fn container_url_rpc(state: &DaemonState, request: &Value) -> Result<Value, Stri
             // webview the authenticated URL whenever the start path parsed
             // one from the host log.
             let url = record.authenticated_url.unwrap_or(record.host_url);
-            Ok(json!({ "id": id, "url": url }))
+            Ok(url)
         }
         None => Err(format!("container is not running: {id}")),
     }
@@ -1596,6 +1617,7 @@ mod tests {
             containers: Arc::new(ContainerManager::default()),
             resources: box_state::ResourceStateManager::default(),
             events: Arc::new(crate::events::DaemonEvents::new()),
+            browser: std::sync::Mutex::new(crate::debug::Sessions::new()),
         };
         (state, id, home, runtime)
     }

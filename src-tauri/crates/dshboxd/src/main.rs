@@ -9,6 +9,7 @@
 mod bundles;
 mod containers;
 mod data;
+mod debug;
 mod dispatch;
 mod events;
 mod extensions;
