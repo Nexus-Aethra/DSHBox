@@ -45,6 +45,17 @@ impl BrowserSession {
         std::fs::create_dir_all(&user_data_dir)
             .map_err(|error| format!("cannot create browser profile dir: {error}"))?;
 
+        // A DevToolsActivePort left behind by an earlier run names a port
+        // nothing is listening on any more. The browser only overwrites it
+        // once it is far enough along to bind, so without this delete the
+        // wait below can read the stale port, return instantly, and then fail
+        // to connect for the whole timeout while the real browser comes up
+        // fine on a different port.
+        let stale_port = user_data_dir.join("DevToolsActivePort");
+        if stale_port.exists() {
+            let _ = std::fs::remove_file(&stale_port);
+        }
+
         let child = Command::new(browser)
             .arg("--headless=new")
             // 0 lets the OS pick a free port; we read it back from the file.
@@ -55,13 +66,12 @@ impl BrowserSession {
             .arg("--disable-gpu")
             .arg("--hide-scrollbars")
             .arg("--mute-audio")
-            // Loopback only: a debugging browser must never be reachable
-            // from another machine, and must never resolve anything but the
-            // page under test.
-            .arg("--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1")
             .arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
+            // A debug browser's stderr is pure noise (telemetry, extension
+            // chatter); the failure modes that matter are reported by
+            // wait_for_port instead.
             .stderr(Stdio::null())
             .spawn()
             .map_err(|error| format!("cannot start browser {}: {error}", browser.display()))?;

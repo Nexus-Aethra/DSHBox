@@ -244,7 +244,7 @@ pub fn resolve(configured: Option<&str>) -> Result<BrowserCandidate, String> {
     found
         .into_iter()
         .next()
-        .ok_or_else(|| no_browser_message())
+        .ok_or_else(no_browser_message)
 }
 
 fn no_browser_message() -> String {

@@ -551,7 +551,7 @@ pub fn normalize_runtime_directory(directory: &str) -> BoxResult<String> {
 /// True for drive-relative roots like `D:`, where a bare trailing colon makes
 /// every joined path resolve against the drive's current directory.
 #[cfg(windows)]
-fn drive_root(path: &PathBuf) -> bool {
+fn drive_root(path: &Path) -> bool {
     let bytes = path.to_string_lossy();
     let bytes = bytes.as_bytes();
     bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
