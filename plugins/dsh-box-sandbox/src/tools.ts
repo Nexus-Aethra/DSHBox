@@ -215,6 +215,11 @@ interface PageElement {
   width?: number
   height?: number
   inViewport?: boolean
+  disabled?: boolean
+  required?: boolean
+  invalid?: boolean
+  checked?: boolean
+  expanded?: boolean
   clickable?: boolean
 }
 
@@ -245,7 +250,20 @@ function renderPageElements(elements: PageElement[]): string {
         ? ' ' + Math.round(element.width) + 'x' + Math.round(element.height)
         : ''
       const off = element.inViewport === false ? ' [BELOW FOLD - scroll first]' : ''
-      return '[' + index + '] ' + role + ' ' + JSON.stringify(name) + value + size + ' at (' + at + ')' + off
+      // State, not just position. A disabled button is drawn exactly like an
+      // enabled one here, and clicking it would report landing and do nothing,
+      // so the flag belongs next to the name rather than in a JSON field an
+      // agent has to know to look in.
+      const state = [
+        element.disabled === true ? 'DISABLED' : '',
+        element.required === true ? 'required' : '',
+        element.invalid === true ? 'invalid' : '',
+        element.checked === true ? 'checked' : '',
+        element.expanded === false ? 'collapsed' : '',
+      ].filter((flag) => flag !== '').join(',')
+      const marks = state === '' ? '' : ' [' + state + ']'
+      return '[' + index + '] ' + role + ' ' + JSON.stringify(name) + value + size
+        + ' at (' + at + ')' + off + marks
     })
     .join('\n')
 }

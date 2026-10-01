@@ -166,7 +166,39 @@ fn with_session<T>(
     let session = sessions
         .get_mut(&id)
         .ok_or_else(|| format!("no debug session for {id}; call debug_open first"))?;
-    action(session)
+    let outcome = action(session);
+    // A browser that died leaves a session whose socket is closed. Every later
+    // call then fails with a transport error about a dead connection, which
+    // reads as a broken page rather than a browser that is no longer there --
+    // and re-opening does not help, because the stale session is still in the
+    // map. Dropping it here turns the next call into the "call debug_open
+    // first" message that actually says what to do.
+    if let Err(error) = &outcome {
+        if is_dead_session_error(error) {
+            sessions.remove(&id);
+        }
+    }
+    outcome
+}
+
+/// Whether an error means the browser behind a session is gone.
+///
+/// Matched on the transport failures a closed socket produces rather than on
+/// any error containing a word: a page that throws must keep its session.
+fn is_dead_session_error(error: &str) -> bool {
+    if error.contains("IO error") || error.contains("os error 10054") {
+        return true;
+    }
+    [
+        "connection reset",
+        "connection closed",
+        "connection refused",
+        "not connected",
+        "broken pipe",
+        "WebSocket",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
 }
 
 /// Evaluate an expression in the page and return its value.
@@ -514,6 +546,21 @@ pub(crate) fn click_by_name_rpc(state: &DaemonState, request: &Value) -> Result<
             if node_role.is_empty() || is_structural_noise(&node_role) {
                 continue;
             }
+            // A control that is disabled cannot respond. Dispatching a click
+            // anyway reports landing and changes nothing, which is the worst
+            // answer a tool can give: it looks like the page is broken.
+            let disabled = node["properties"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|property| property["name"].as_str() == Some("disabled"))
+                .and_then(|property| property["value"]["value"].as_bool())
+                .unwrap_or(false);
+            if disabled {
+                return Err(format!(
+                    "{name:?} is disabled: a click would report landing and do nothing."
+                ));
+            }
             let Some(id) = node["backendDOMNodeId"].as_i64() else {
                 unplaceable.push(node_role.clone());
                 continue;
@@ -696,13 +743,27 @@ fn is_structural_noise(role: &str) -> bool {
             | "presentation"
             | "generic"
             | "InlineTextBox"
-            | "StaticText"
             | "LineBreak"
             | "Separator"
             | "ScrollBar"
             | "ScrollArea"
             | "RootWebArea"
     )
+}
+
+/// Whether a text node is worth listing on its own.
+///
+/// A button's label is text too, and listing both would put "Save" on the
+/// page twice. But a form's validation message is also text, and it is the one
+/// thing on screen that says why nothing happened -- dropping it as noise left
+/// a page that plainly said "at least one model is required" looking complete.
+/// Static text is therefore kept unless it belongs to a control that is listed
+/// in its own right, where the control's name already carries the words.
+fn is_listable_text(role: &str, name: &str, parent_is_control: bool) -> bool {
+    if role != "StaticText" {
+        return false;
+    }
+    !name.trim().is_empty() && !parent_is_control
 }
 
 /// Roles that accept a pointer click.
@@ -873,7 +934,24 @@ pub(crate) fn page_text_rpc(state: &DaemonState, request: &Value) -> Result<Valu
                 continue;
             }
             let role = node["role"]["value"].as_str().unwrap_or("");
-            if role.is_empty() || is_structural_noise(role) {
+            let name = node["name"]["value"].as_str().unwrap_or("");
+            if role.is_empty() {
+                continue;
+            }
+            // Text is kept when it is not already carried by a control, so a
+            // validation message survives while a button's own label is not
+            // listed twice.
+            let inside_control = node["parentId"]
+                .as_str()
+                .and_then(|parent| {
+                    tree["nodes"]
+                        .as_array()?
+                        .iter()
+                        .find(|candidate| candidate["nodeId"].as_str() == Some(parent))
+                        .and_then(|candidate| candidate["role"]["value"].as_str())
+                })
+                .is_some_and(is_clickable_role);
+            if is_structural_noise(role) && !is_listable_text(role, name, inside_control) {
                 continue;
             }
             if let Some(wanted) = role_filter.as_deref() {
@@ -905,6 +983,22 @@ pub(crate) fn page_text_rpc(state: &DaemonState, request: &Value) -> Result<Valu
             });
             if !value.is_empty() {
                 entry["value"] = json!(value);
+            }
+            // State, not just identity. A disabled button looks exactly like an
+            // enabled one in a listing of roles and names, and clicking it
+            // reports landing while nothing can happen -- so the reason a page
+            // stopped responding has to be readable without a screenshot.
+            for flag in ["disabled", "checked", "expanded", "required", "invalid"] {
+                if let Some(state) = node["properties"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|property| property["name"].as_str() == Some(flag))
+                {
+                    if let Some(actual) = state["value"]["value"].as_bool() {
+                        entry[flag] = json!(actual);
+                    }
+                }
             }
             // A node with no box is laid out as display:none and has no place
             // to be clicked. The rect keys stay present and null rather than
@@ -944,6 +1038,31 @@ pub(crate) fn page_text_rpc(state: &DaemonState, request: &Value) -> Result<Valu
                 ancestry.push(chain);
             }
             elements.push(entry);
+        }
+
+        // A control's label is text too, and listing both would put "Save" on
+        // the page twice. Deciding that from parent links proved unreliable --
+        // the label often sits under a generic wrapper rather than under the
+        // button -- so it is decided from the finished list instead: text that
+        // merely repeats a listed control's name is that control's label, and
+        // text that repeats nothing is a message in its own right.
+        let control_names: Vec<String> = elements
+            .iter()
+            .filter(|entry| {
+                entry["role"]
+                    .as_str()
+                    .is_some_and(is_clickable_role)
+            })
+            .filter_map(|entry| entry["name"].as_str().map(str::to_ascii_lowercase))
+            .collect();
+        if !control_names.is_empty() {
+            elements.retain(|entry| {
+                if entry["role"].as_str() != Some("StaticText") {
+                    return true;
+                }
+                let name = entry["name"].as_str().unwrap_or("").to_ascii_lowercase();
+                !control_names.iter().any(|control| *control == name)
+            });
         }
 
         // Keep only what the named container actually contains.
@@ -1217,7 +1336,7 @@ mod tests {
 
     #[test]
     fn structural_noise_is_filtered_by_exact_role() {
-        for role in ["none", "presentation", "generic", "StaticText", "ScrollBar"] {
+        for role in ["none", "presentation", "generic", "ScrollBar"] {
             assert!(is_structural_noise(role), "{role} should be noise");
         }
         // Substring matching would swallow real content: "GenericButton" and
@@ -1225,6 +1344,20 @@ mod tests {
         for role in ["Button", "StaticLabel", "ScrollableRegion", "Generic"] {
             assert!(!is_structural_noise(role), "{role} must survive");
         }
+    }
+
+    #[test]
+    fn standalone_text_is_listed_but_a_controls_own_label_is_not() {
+        // A validation message is the only thing on screen explaining why a
+        // button did nothing, so it has to survive as text of its own.
+        assert!(is_listable_text("StaticText", "at least one model is required", false));
+        // The same words inside a button are already carried by the button's
+        // name; listing them again just buries everything else.
+        assert!(!is_listable_text("StaticText", "Save", true));
+        // Whitespace is not a message.
+        assert!(!is_listable_text("StaticText", "   ", false));
+        // Only text is judged here; other roles are decided by the noise filter.
+        assert!(!is_listable_text("Button", "Save", false));
     }
 
     #[test]
