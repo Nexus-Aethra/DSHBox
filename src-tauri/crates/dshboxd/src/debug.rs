@@ -1067,7 +1067,7 @@ pub(crate) fn page_text_rpc(state: &DaemonState, request: &Value) -> Result<Valu
 
         // Keep only what the named container actually contains.
         if let Some(wanted) = within_name.as_deref() {
-            let scope_index = elements
+            let named = elements
                 .iter()
                 .position(|entry| {
                     entry["name"]
@@ -1075,11 +1075,23 @@ pub(crate) fn page_text_rpc(state: &DaemonState, request: &Value) -> Result<Valu
                         .is_some_and(|name| name.to_ascii_lowercase() == wanted)
                 })
                 .ok_or_else(|| format!("no element named {wanted:?} to scope to"))?;
-            let scope_node = ancestry
-                .get(scope_index)
-                .and_then(|chain| chain.first())
+            let named_chain = ancestry
+                .get(named)
                 .cloned()
                 .ok_or_else(|| format!("no element named {wanted:?} to scope to"))?;
+            // Naming a dialog by its heading is the natural thing to do, and a
+            // heading is a text node rather than a container. The scope is
+            // therefore the nearest ancestor of the named node that actually
+            // contains things, so a heading scopes to the panel it titles.
+            let scope_node = named_chain
+                .iter()
+                .find(|candidate| {
+                    ancestry.iter().any(|chain| {
+                        chain.iter().skip(1).any(|ancestor| ancestor == *candidate)
+                    })
+                })
+                .cloned()
+                .unwrap_or_else(|| named_chain[0].clone());
             let kept: Vec<Value> = elements
                 .iter()
                 .zip(ancestry.iter())
