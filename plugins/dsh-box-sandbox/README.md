@@ -1,4 +1,4 @@
-# @deepseek-ai/dsh-box-sandbox
+# @nexus-aethra/dsh-box-sandbox
 
 Host-side bridge from a DSH session to the DSH Box daemon.
 
@@ -44,7 +44,7 @@ restart (new port, new token) is transparent to callers.
 
 ## Usage
 
-    import { getRpc, status } from '@deepseek-ai/dsh-box-sandbox'
+    import { getRpc, status } from '@nexus-aethra/dsh-box-sandbox'
 
     const pong = await getRpc().ping()
     const containers = await getRpc().call('list_containers')
@@ -61,7 +61,7 @@ fatal — a missing daemon is a normal first-run state, not a load error.
 
     - insert:
         - id: dsh-box-sandbox
-          name: '@deepseek-ai/dsh-box-sandbox'
+          name: '@nexus-aethra/dsh-box-sandbox'
           config: {}
 
 | Field | Default | Meaning |

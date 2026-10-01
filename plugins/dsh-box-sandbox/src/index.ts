@@ -1,5 +1,5 @@
 /**
- * @deepseek-ai/dsh-box-sandbox host half.
+ * @nexus-aethra/dsh-box-sandbox host half.
  *
  * Makes the DSH Box daemon reachable from inside a DSH session on the same
  * host, so the agent can drive boxes, templates, plugins and resources
@@ -15,7 +15,7 @@
  * record is a normal first-run state, not a load error -- it surfaces on the
  * first call, as a message that names the path consulted.
  *
- * @module @deepseek-ai/dsh-box-sandbox
+ * @module @nexus-aethra/dsh-box-sandbox
  */
 
 import type { Context } from '@deepseek-ai/cordis'
