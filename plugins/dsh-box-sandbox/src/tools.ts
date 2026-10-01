@@ -415,16 +415,24 @@ export function applyBoxTools(ctx: Context): void {
   registerTool(ctx, {
     name: 'box_click_element',
     description:
-      'Click the first element matching a CSS selector on a running dshbox container page, '
-      + 'at its centre. Prefer this over box_click_at when the target has a selector: it '
-      + 'survives the layout moving. Re-screenshot or re-query afterwards to see the result.',
+      'Click a control on a running dshbox container page, at its centre, and report '
+      + 'whether the click landed. Identify the target either by the role and name '
+      + 'box_page_text returned, or by a CSS selector. Prefer role and name: a name is '
+      + 'already in hand from the listing, while a selector has to be guessed and a '
+      + 'guessed selector that happens to match hits the wrong control and still '
+      + 'reports success. Add within when the same name appears both in a dialog and '
+      + 'on the page behind it. Prefer this over box_click_at, which needs you to '
+      + 'compute a point yourself.',
     parameters: {
       type: 'object',
       properties: {
         containerId: { type: 'string', description: 'Container id to click in.' },
-        selector: { type: 'string', description: 'CSS selector of the element to click, e.g. button.submit or [role=button].', },
+        name: { type: 'string', description: 'Accessible name of the control, matched exactly, e.g. the one box_page_text reported.' },
+        role: { type: 'string', description: 'Role to require alongside the name, e.g. button or textbox.' },
+        within: { type: 'string', description: 'Container name to scope the search to, when the same name appears in more than one place.' },
+        selector: { type: 'string', description: 'CSS selector instead of a name, e.g. button.submit or [role=button].' },
       },
-      required: ['containerId', 'selector'],
+      required: ['containerId'],
     },
     timeoutMs: WARM_BUDGET_MS,
     output: {
@@ -434,6 +442,12 @@ export function applyBoxTools(ctx: Context): void {
         properties: {
         containerId: { type: 'string' },
         
+          name: { type: 'string' },
+          matched: { type: 'string' },
+          landed: { type: 'boolean' },
+          hitTag: { type: 'string' },
+          hitText: { type: 'string' },
+          occludedBy: { type: 'string' },
           selector: { type: 'string' },
         
           x: { type: 'number' },
@@ -444,21 +458,36 @@ export function applyBoxTools(ctx: Context): void {
         
           text: { type: 'string' },
       },
-      required: ['containerId', 'selector', 'x', 'y', 'tag', 'text'],
+      required: ['containerId', 'x', 'y', 'landed'],
       },
       render: (_args, value) => {
         const record = asRecord(value)
         const label = textOf(record.text)
-        return renderClick(value, '<' + String(record.tag) + '> matching '
-          + String(record.selector) + (label ? ' labelled ' + JSON.stringify(label) : ''))
+        const target = typeof record.name === 'string' && record.name !== ''
+          ? JSON.stringify(record.name)
+          : '<' + String(record.tag) + '> matching ' + String(record.selector)
+        return renderClick(value, target + (label ? ' labelled ' + JSON.stringify(label) : ''))
       },
     },
     async execute(args) {
       const containerId = containerIdOf(args)
       const record = asRecord(args)
+      const name = record.name
       const selector = record.selector
-      if (typeof selector !== 'string' || selector.trim() === '')
-        throw new Error('selector is required')
+      const hasName = typeof name === 'string' && name.trim() !== ''
+      const hasSelector = typeof selector === 'string' && selector.trim() !== ''
+      if (!hasName && !hasSelector)
+        throw new Error('give a name, a selector, or both')
+      // A name wins when both are given: it is the one taken from the listing
+      // that describes the element, and the selector is the guess.
+      if (hasName) {
+        const result = await withSession<ClickResult>(containerId, 'debug_click_by_name', {
+          name,
+          role: typeof record.role === 'string' ? record.role : undefined,
+          within: typeof record.within === 'string' ? record.within : undefined,
+        })
+        return { containerId, ...result }
+      }
       const result = await withSession<ClickResult>(containerId, 'debug_click_element', { selector })
       return { containerId, ...result }
     },

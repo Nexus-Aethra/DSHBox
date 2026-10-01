@@ -367,6 +367,216 @@ pub(crate) fn click_at_rpc(state: &DaemonState, request: &Value) -> Result<Value
     Ok(click_response(json!({ "x": x, "y": y }), hit))
 }
 
+/// Scroll a node into the middle of the window and return its rect afterwards.
+///
+/// Clicking the centre of a control that is half past the bottom edge puts the
+/// point on the boundary: the click reports landing and nothing receives it. A
+/// control a listing named but a click cannot focus is indistinguishable from
+/// one that does not exist, so it is brought fully into view first.
+fn scroll_node_into_view(
+    session: &mut BrowserSession,
+    backend_node_id: i64,
+) -> Result<(f64, f64, f64, f64), String> {
+    let resolved = session.call("DOM.resolveNode", json!({ "backendNodeId": backend_node_id }))?;
+    let Some(object) = resolved["object"]["objectId"].as_str().map(str::to_owned) else {
+        return backend_node_rect(session, backend_node_id);
+    };
+    session.call(
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object,
+            "functionDeclaration":
+                "function () { this.scrollIntoView({ block: 'center', inline: 'nearest' }); }",
+            "returnByValue": true,
+        }),
+    )?;
+    backend_node_rect(session, backend_node_id)
+}
+/// Click the control identified by the role and name a page listing reported.
+///
+/// A page listing answers "what is here" as role plus name, so acting on that
+/// answer should take the same pair. Requiring a CSS selector in between forces
+/// the caller to translate one vocabulary into another -- by hand, from a name
+/// that is a translated string rather than an id -- and the translation is where
+/// the mistakes happen. A wrong selector misses; a wrong-but-matching selector
+/// hits the wrong thing and still reads as success.
+///
+/// Names are compared exactly. Substring matching is what let a toolbar and a
+/// settings sidebar both answer to one name, and near-misses are the whole
+/// problem this verb exists to remove.
+pub(crate) fn click_by_name_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    let name = request["name"].as_str().unwrap_or("").to_owned();
+    if name.trim().is_empty() {
+        return Err("click_by_name requires a non-empty name".to_owned());
+    }
+    let role = request
+        .get("role")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let nth = request.get("nth").and_then(Value::as_u64).map(|n| n as usize);
+    // Same scoping page_text offers, so a name that exists twice can still be
+    // acted on without counting matches by hand.
+    let within_name = request
+        .get("within")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let (x, y, matched) = with_session(state, request, |session| {
+        let tree = session
+            .call("Accessibility.getFullAXTree", json!({}))
+            .map_err(|error| format!("accessibility tree is unavailable on this target: {error}"))?;
+        let mut parent_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for node in tree["nodes"].as_array().into_iter().flatten() {
+            if let (Some(id), Some(parent)) = (node["nodeId"].as_str(), node["parentId"].as_str()) {
+                parent_of.insert(id, parent);
+            }
+        }
+        let chain_of = |id: &str| -> Vec<String> {
+            let mut chain = Vec::new();
+            let mut cursor = Some(id);
+            let mut guard = 0;
+            while let Some(current) = cursor {
+                chain.push(current.to_owned());
+                cursor = parent_of.get(current).copied();
+                guard += 1;
+                if guard > 64 {
+                    break;
+                }
+            }
+            chain
+        };
+        // The scope is the nearest node carrying that name, so a nested panel
+        // wins over an outer one with the same label.
+        let scope: Option<Vec<String>> = within_name.as_deref().and_then(|wanted| {
+            tree["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|node| {
+                    let id = node["nodeId"].as_str()?;
+                    let node_name = node["name"]["value"].as_str().unwrap_or("").to_ascii_lowercase();
+                    (node_name == wanted).then(|| chain_of(id))
+                })
+                .min_by_key(Vec::len)
+        });
+        if within_name.is_some() && scope.is_none() {
+            return Err(format!(
+                "nothing named {:?} to scope to",
+                within_name.unwrap_or_default()
+            ));
+        }
+
+        let viewport = viewport_metrics(session)?;
+        // Centre of the control, after making sure it is actually on screen.
+        let reveal = |session: &mut BrowserSession, id: i64| -> Option<(f64, f64, f64, f64)> {
+            let Ok((x, y, width, height)) = backend_node_rect(session, id) else {
+                return None;
+            };
+            let clipped = x < 0.0
+                || y < 0.0
+                || x + width > viewport.width + 1.0
+                || y + height > viewport.height + 1.0;
+            if clipped {
+                return scroll_node_into_view(session, id).ok();
+            }
+            Some((x, y, width, height))
+        };
+        let mut found: Vec<(f64, f64, String)> = Vec::new();
+        // Names that matched but had nowhere to click. Dropping them in
+        // silence is the failure this verb exists to remove: the caller would
+        // be told the control is absent while a listing has just named it.
+        let mut unplaceable: Vec<String> = Vec::new();
+        for node in tree["nodes"].as_array().into_iter().flatten() {
+            if node["ignored"].as_bool().unwrap_or(false) {
+                continue;
+            }
+            let node_role = node["role"]["value"].as_str().unwrap_or("").to_owned();
+            let node_name = node["name"]["value"].as_str().unwrap_or("").to_owned();
+            if let Some(scope) = scope.as_ref() {
+                let Some(id) = node["nodeId"].as_str() else {
+                    continue;
+                };
+                if !chain_of(id).iter().any(|ancestor| scope.contains(ancestor)) {
+                    continue;
+                }
+            }
+            if node_name != name {
+                continue;
+            }
+            if let Some(wanted) = role.as_deref() {
+                if !node_role.to_ascii_lowercase().contains(wanted) {
+                    continue;
+                }
+            }
+            if node_role.is_empty() || is_structural_noise(&node_role) {
+                continue;
+            }
+            let Some(id) = node["backendDOMNodeId"].as_i64() else {
+                unplaceable.push(node_role.clone());
+                continue;
+            };
+            let Some((rx, ry, width, height)) = reveal(session, id) else {
+                unplaceable.push(node_role.clone());
+                continue;
+            };
+            if width <= 0.0 || height <= 0.0 {
+                unplaceable.push(node_role.clone());
+                continue;
+            }
+            found.push((rx + width / 2.0, ry + height / 2.0, format!("{} {:?}", node_role, node_name)));
+        }
+        if found.is_empty() {
+            // Distinguish "no such control" from "it is not in the scope you
+            // named". A dropdown rendered in a portal is a child of the page,
+            // not of the dialog it belongs to, so scoping to the dialog hides
+            // it -- and a message that only said "not found" sends the caller
+            // looking for a control that is plainly on screen.
+            if let Some(wanted) = within_name.as_deref() {
+                let elsewhere = tree["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|node| node["name"]["value"].as_str() == Some(name.as_str()));
+                if elsewhere {
+                    return Err(format!(
+                        "{name:?} is not inside {wanted:?}; a dropdown is often rendered in a portal.",
+                    ));
+                }
+            }
+            if !unplaceable.is_empty() {
+                return Err(format!(
+                    "{name:?} is listed as {} but has no position to click, so it is not rendered here",
+                    unplaceable.join(", "),
+                ));
+            }
+            return Err(format!("nothing named {:?} matches", name));
+        }
+        let pick = match nth {
+            Some(n) => found.get(n).ok_or_else(|| {
+                format!("{:?} matches {} things, no entry {}", name, found.len(), n)
+            })?,
+            None if found.len() == 1 => &found[0],
+            None => {
+                return Err(format!(
+                    "{:?} matches {} things: {} -- pass nth to pick one, or within to scope it",
+                    name,
+                    found.len(),
+                    found.iter().map(|entry| entry.2.clone()).collect::<Vec<_>>().join(", ")
+                ));
+            }
+        };
+        Ok((pick.0, pick.1, pick.2.clone()))
+    })?;
+    let hit = with_session(state, request, |session| run_hit_test(session, x, y, None))?;
+    with_session(state, request, |session| dispatch_click(session, x, y))?;
+    Ok(click_response(
+        json!({ "name": name, "matched": matched, "x": x, "y": y }),
+        hit,
+    ))
+}
 /// Insert text into whatever currently has focus.
 ///
 /// CDP's `Input.insertText` is the one input method that behaves the way a

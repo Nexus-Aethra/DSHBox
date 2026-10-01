@@ -175,6 +175,7 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
     Some("debug_query_elements") => crate::debug::query_elements_rpc(state, request).map(Sync),
     Some("debug_click_element") => crate::debug::click_element_rpc(state, request).map(Sync),
     Some("debug_click_at") => crate::debug::click_at_rpc(state, request).map(Sync),
+    Some("debug_click_by_name") => crate::debug::click_by_name_rpc(state, request).map(Sync),
     Some("debug_type_text") => crate::debug::type_text_rpc(state, request).map(Sync),
     Some("debug_press_key") => crate::debug::press_key_rpc(state, request).map(Sync),
     Some("debug_page_text") => crate::debug::page_text_rpc(state, request).map(Sync),
