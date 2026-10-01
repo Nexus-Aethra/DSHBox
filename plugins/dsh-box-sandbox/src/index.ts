@@ -19,7 +19,6 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import z from '@deepseek-ai/schemastery'
 
 import {
   DshboxRpc,
@@ -55,11 +54,24 @@ export interface Config {
   timeoutMs: number
 }
 
-/** Schemastery-validated config. */
-export const Config: z<Config> = z.object({
-  configDir: z.string().default(''),
-  timeoutMs: z.number().default(30_000),
-})
+/**
+ * Effective configuration after defaults.
+ *
+ * Deliberately not a schemastery schema. A schema would make this entry
+ * import `@deepseek-ai/schemastery` at module load, and a bare import that
+ * cannot be resolved from wherever the plugin was installed is a *load*
+ * failure -- DSH reports it as "failed to import" and the tool never mounts.
+ * The two knobs are read from the environment instead, which costs a schema
+ * nobody has to keep in sync and makes the bundle import nothing but node:*.
+ */
+function resolveConfig(config?: Partial<Config>): Config {
+  const fromEnv = process.env.DSHBOX_RPC_TIMEOUT_MS
+  const parsed = fromEnv === undefined ? Number.NaN : Number(fromEnv)
+  return {
+    configDir: config?.configDir ?? process.env.DSHBOX_CONFIG_DIR ?? '',
+    timeoutMs: config?.timeoutMs ?? (Number.isFinite(parsed) ? parsed : 30_000),
+  }
+}
 
 export { DshboxRpc, DshboxUnavailableError, discoveryPath, getRpc, resetRpc }
 export type { Discovery }
@@ -82,8 +94,8 @@ export interface Status {
  * that a status surface can render "dshbox is not running" without every
  * caller having to catch.
  */
-export async function status(config?: Config): Promise<Status> {
-  const rpc = getRpc(config)
+export async function status(config?: Partial<Config>): Promise<Status> {
+  const rpc = getRpc(resolveConfig(config))
   const path = discoveryPath(rpc.configDir)
   try {
     const record = rpc.discovery()
@@ -105,9 +117,9 @@ export async function status(config?: Config): Promise<Status> {
 }
 
 /** Register the plugin against a freshly mounted Cordis context. */
-export function apply(ctx: Context, config: Config): void {
+export function apply(ctx: Context, config?: Partial<Config>): void {
   resetRpc()
-  getRpc(config)
+  getRpc(resolveConfig(config))
   applyBoxTools(ctx)
   // Re-apply means a new config; the old singleton must not outlive it.
   ctx.effect(() => () => resetRpc(), 'dsh-box-sandbox.client()')

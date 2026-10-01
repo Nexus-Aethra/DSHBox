@@ -63,6 +63,12 @@ impl BrowserSession {
             .arg(format!("--user-data-dir={}", user_data_dir.display()))
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
+            // A throwaway profile still inherits extensions from a machine-wide
+            // policy, and an extension's injected UI lands inside the page. That
+            // is fatal for this browser specifically: a popup shifts the page's
+            // hit targets, so a screenshot shows a stranger's widget and a
+            // coordinate click lands on it instead of the element underneath.
+            .arg("--disable-extensions")
             .arg("--disable-gpu")
             .arg("--hide-scrollbars")
             .arg("--mute-audio")

@@ -14,10 +14,6 @@
       "types": "./dist/rpc.d.mts",
       "default": "./dist/rpc.mjs"
     },
-    "./tools": {
-      "types": "./dist/tools.d.mts",
-      "default": "./dist/tools.mjs"
-    },
     "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
@@ -37,9 +33,8 @@
     "typecheck": "tsc --noEmit"
   },
   "license": "MIT",
-  "dependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/schemastery": "^3.18.1"
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

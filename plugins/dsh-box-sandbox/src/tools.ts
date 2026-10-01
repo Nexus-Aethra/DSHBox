@@ -187,6 +187,109 @@ function registerTool(ctx: Context, definition: HostToolDefinition): void {
   hostServices(ctx).tools.register(definition)
 }
 
+
+
+/**
+ * Render one page element on a line an agent can act on.
+ *
+ * The role is what the page says the control *is*, which is what an agent
+ * should dispatch on; the coordinates are what box_click_at needs; and the
+ * off-screen marker is what stops an agent from concluding that a control
+ * does not exist because it happens to be below the fold.
+ */
+
+interface PageElement {
+  role?: string
+  name?: string
+  value?: string
+  x?: number
+  y?: number
+  width?: number
+  height?: number
+  inViewport?: boolean
+  clickable?: boolean
+}
+
+interface PageText {
+  count: number
+  truncated: boolean
+  belowFold: number
+  elements: PageElement[]
+}
+
+interface ScrollState {
+  scrollTop: number
+  scrollHeight: number
+  viewportHeight: number
+  screensBelow: number
+  moved: boolean
+}
+
+function renderPageElements(elements: PageElement[]): string {
+  if (elements.length === 0) return 'No elements on this page.'
+  return elements
+    .map((element, index) => {
+      const role = element.role ?? '?'
+      const name = element.name ?? ''
+      const value = element.value ? ' value=' + JSON.stringify(element.value) : ''
+      const at = Math.round(element.x ?? 0) + ',' + Math.round(element.y ?? 0)
+      const size = element.width !== undefined && element.height !== undefined
+        ? ' ' + Math.round(element.width) + 'x' + Math.round(element.height)
+        : ''
+      const off = element.inViewport === false ? ' [BELOW FOLD - scroll first]' : ''
+      return '[' + index + '] ' + role + ' ' + JSON.stringify(name) + value + size + ' at (' + at + ')' + off
+    })
+    .join('\n')
+}
+
+/**
+ * The one line that keeps a response self-teaching.
+ *
+ * An agent meeting this toolset for the first time should learn the next
+ * move from the response it already has, not from a manual it will never
+ * read. So every tool ends by naming the call that usually follows.
+ */
+function nextHint(next: string): string {
+  return '\nnext: ' + next
+}
+
+interface ClickVerification {
+  landed?: boolean
+  hitTag?: string
+  hitText?: string
+  occludedBy?: string
+}
+
+/**
+ * Render a click, distinguishing the two outcomes an agent must not confuse.
+ *
+ * A dispatched event is not a delivered one. When something covers the target
+ * -- an overlay, a cookie bar, an extension injected into the page -- the click
+ * reaches that instead and the page appears to do nothing, which reads as a
+ * broken app rather than a blocked click. Naming the cover turns a dead end
+ * into a decision: scroll, dismiss, or target the overlay itself.
+ */
+function renderClick(value: Record<string, unknown>, target: string): unknown[] {
+  const record = asRecord(value) as Record<string, unknown> & ClickVerification
+  if (record.landed === false) {
+    const cover = record.occludedBy
+      ? ' it was covered by <' + String(record.occludedBy) + '>'
+        + (record.hitText ? ' ' + JSON.stringify(record.hitText) : '')
+      : ' something else was on top of it'
+    return [{
+      type: 'text',
+      text: 'The click on ' + target + ' in container ' + String(record.containerId)
+        + ' did NOT land:' + cover + '.'
+        + nextHint('scroll with box_scroll, or dismiss the covering element, then click again'),
+    }]
+  }
+  return [{
+    type: 'text',
+    text: 'Clicked ' + target + ' in container ' + String(record.containerId) + '.'
+      + nextHint('call box_page_text to see what the page looks like now'),
+  }]
+}
+
 export function applyBoxTools(ctx: Context): void {
   registerTool(ctx, {
     name: 'box_screenshot',
@@ -338,14 +441,8 @@ export function applyBoxTools(ctx: Context): void {
       render: (_args, value) => {
         const record = asRecord(value)
         const label = textOf(record.text)
-        return [{
-          type: 'text',
-          text: 'Clicked <' + String(record.tag) + '> matching ' + String(record.selector)
-            + ' at (' + String(record.x) + ', ' + String(record.y) + ') in container '
-            + String(record.containerId)
-            + (label ? ' labelled ' + JSON.stringify(label) : '')
-            + '. Screenshot again to see what changed.',
-        }]
+        return renderClick(value, '<' + String(record.tag) + '> matching '
+          + String(record.selector) + (label ? ' labelled ' + JSON.stringify(label) : ''))
       },
     },
     async execute(args) {
@@ -388,15 +485,8 @@ export function applyBoxTools(ctx: Context): void {
       },
       required: ['containerId', 'x', 'y'],
       },
-      render: (_args, value) => {
-        const record = asRecord(value)
-        return [{
-          type: 'text',
-          text: 'Clicked (' + String(record.x) + ', ' + String(record.y)
-            + ') in container ' + String(record.containerId)
-            + '. Screenshot again to see what changed.',
-        }]
-      },
+      render: (_args, value) => renderClick(value, 'at ('
+        + String(asRecord(value).x) + ', ' + String(asRecord(value).y) + ')'),
     },
     async execute(args) {
       const containerId = containerIdOf(args)
@@ -408,6 +498,237 @@ export function applyBoxTools(ctx: Context): void {
         'debug_click_at',
         { x: record.x, y: record.y },
       )
+      return { containerId, ...result }
+    },
+  })
+
+/* ------------------------------------------------------------------ */
+/* Page orientation, scrolling, typing and key presses.                 */
+/*                                                                        */
+/* Every tool below reports what it OBSERVED, not what it attempted.     */
+/* These tools are read and driven by agents other than the one that     */
+/* wrote them, so a response that says 'clicked' when the click landed   */
+/* on a popup is worse than no tool: the agent builds the next step on   */
+/* a false belief and never recovers.                                   */
+/* ------------------------------------------------------------------ */
+
+  registerTool(ctx, {
+    name: 'box_page_text',
+    description:
+      'CALL THIS FIRST when you need to know what is on a page. It renders the whole page as '
+      + 'text: every control and region with its role, name, on-screen position, and whether it '
+      + 'is currently visible. You need no selector, so it answers "what is here" in one call '
+      + 'where box_query_elements needs a selector you do not have yet. Then use the '
+      + 'role+name it returns with box_click_element, or the coordinates with box_click_at. '
+      + 'Anything marked BELOW FOLD needs box_scroll before you can act on it.',
+    parameters: {
+      type: 'object',
+      properties: {
+        containerId: { type: 'string', description: 'Container id to read.' },
+        role: { type: 'string', description: 'Only roles containing this text, e.g. button or textbox. Omit for everything.' },
+        limit: { type: 'number', description: 'Maximum entries to return. Defaults to 200.' },
+      },
+      required: ['containerId'],
+    },
+    timeoutMs: WARM_BUDGET_MS,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          containerId: { type: 'string' },
+          count: { type: 'number' },
+          truncated: { type: 'boolean' },
+          belowFold: { type: 'number' },
+          elements: { type: 'array', items: { type: 'object' } },
+        },
+        required: ['containerId', 'count', 'truncated', 'belowFold', 'elements'],
+      },
+      render: (_args, value) => {
+        const record = asRecord(value)
+        const elements = Array.isArray(record.elements)
+          ? (record.elements as PageElement[])
+          : []
+        const below = Number(record.belowFold ?? 0)
+        const lines: string[] = []
+        lines.push(
+          'Page of container ' + String(record.containerId) + ': ' + String(record.count)
+          + ' entr' + (record.count === 1 ? 'y' : 'ies')
+          + (record.truncated === true ? ' (truncated at the limit).' : '.'),
+        )
+        if (below > 0) {
+          lines.push(
+            below + ' entr' + (below === 1 ? 'y is' : 'ies are') + ' below the fold; call box_scroll to reach them.',
+          )
+        }
+        lines.push(renderPageElements(elements))
+        lines.push(nextHint(
+          'act on an entry with box_click_element (role+name) or box_click_at (x,y)',
+        ))
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    async execute(args) {
+      const containerId = containerIdOf(args)
+      const record = asRecord(args)
+      const result = await withSession<PageText>(containerId, 'debug_page_text', {
+        role: typeof record.role === 'string' ? record.role : undefined,
+        limit: typeof record.limit === 'number' ? record.limit : undefined,
+      })
+      return { containerId, ...result }
+    },
+  })
+
+  registerTool(ctx, {
+    name: 'box_scroll',
+    description:
+      'Report how far a page extends and optionally scroll it. Call it with no coordinates to '
+      + 'learn how many screens are below the fold, which is how you find out that a control '
+      + 'exists but is not reachable yet. Call it with an absolute pixel offset to move. '
+      + 'Coordinates are viewport pixels, so a position from a page listing is used as-is.',
+    parameters: {
+      type: 'object',
+      properties: {
+        containerId: { type: 'string', description: 'Container id to scroll.' },
+        to: { type: 'number', description: 'Absolute scroll offset in pixels. Omit to only report the extent.' },
+      },
+      required: ['containerId'],
+    },
+    timeoutMs: WARM_BUDGET_MS,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          containerId: { type: 'string' },
+          scrollTop: { type: 'number' },
+          scrollHeight: { type: 'number' },
+          viewportHeight: { type: 'number' },
+          screensBelow: { type: 'number' },
+          moved: { type: 'boolean' },
+        },
+        required: ['containerId', 'scrollTop', 'scrollHeight', 'viewportHeight', 'screensBelow', 'moved'],
+      },
+      render: (_args, value) => {
+        const record = asRecord(value)
+        const below = Number(record.screensBelow ?? 0)
+        return [{
+          type: 'text',
+          text: 'Scroll of container ' + String(record.containerId) + ': at '
+            + String(record.scrollTop) + ' of ' + String(record.scrollHeight)
+            + ' px, viewport ' + String(record.viewportHeight) + ' px.'
+            + (record.moved === true ? ' Moved.' : '')
+            + (below > 0 ? ' ' + below + ' screen(s) still below.' : ' Nothing below the fold.')
+            + nextHint('call box_page_text again to see the newly reachable entries'),
+        }]
+      },
+    },
+    async execute(args) {
+      const containerId = containerIdOf(args)
+      const record = asRecord(args)
+      const result = await withSession<ScrollState>(containerId, 'debug_scroll', {
+        to: typeof record.to === 'number' ? record.to : undefined,
+      })
+      return { containerId, ...result }
+    },
+  })
+  registerTool(ctx, {
+    name: 'box_type_text',
+    description:
+      'Type text into whatever field currently has focus. Click the field with box_click_element '
+      + 'first, then call this. It reports which element held focus, so a value that landed '
+      + 'nowhere is visible as a failure rather than a silent no-op. For a submit keystroke use '
+      + 'box_press_key with Enter, which is what a form expects.',
+    parameters: {
+      type: 'object',
+      properties: {
+        containerId: { type: 'string', description: 'Container id to type into.' },
+        text: { type: 'string', description: 'Text to insert at the focused field.' },
+      },
+      required: ['containerId', 'text'],
+    },
+    timeoutMs: WARM_BUDGET_MS,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          containerId: { type: 'string' },
+          inserted: { type: 'number' },
+          focused: { type: 'string' },
+          landed: { type: 'boolean' },
+        },
+        required: ['containerId', 'inserted', 'landed'],
+      },
+      render: (_args, value) => {
+        const record = asRecord(value)
+        const landed = record.landed === true
+        return [{
+          type: 'text',
+          text: landed
+            ? 'Typed ' + String(record.inserted) + ' character(s) into <' + String(record.focused ?? 'input') + '> in container ' + String(record.containerId) + '.'
+              + nextHint('press Enter with box_press_key to submit, or click the submit control')
+            : 'Nothing was focused, so the ' + String(record.inserted) + ' character(s) went nowhere.'
+              + nextHint('click the field with box_click_element first, then type again'),
+        }]
+      },
+    },
+    async execute(args) {
+      const containerId = containerIdOf(args)
+      const record = asRecord(args)
+      if (typeof record.text !== 'string' || record.text === '')
+        throw new Error('text is required and must be non-empty')
+      const result = await withSession<{ inserted: number, focused: string | null, landed: boolean }>(
+        containerId, 'debug_type_text', { text: record.text },
+      )
+      return { containerId, ...result }
+    },
+  })
+
+  registerTool(ctx, {
+    name: 'box_press_key',
+    description:
+      'Press and release one named key, for a submit or a keyboard shortcut. Enter submits a '
+      + 'form and submits nothing that is not a form, so when a click on the submit control '
+      + 'reports landed:false, try Enter here instead. Names: Enter, Tab, Escape, Backspace, '
+      + 'Delete, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Shift, '
+      + 'Control, Alt. An unknown name is an error, never a guess.',
+    parameters: {
+      type: 'object',
+      properties: {
+        containerId: { type: 'string', description: 'Container id to press in.' },
+        key: { type: 'string', description: 'Key name, e.g. Enter or PageDown.' },
+      },
+      required: ['containerId', 'key'],
+    },
+    timeoutMs: WARM_BUDGET_MS,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          containerId: { type: 'string' },
+          key: { type: 'string' },
+        },
+        required: ['containerId', 'key'],
+      },
+      render: (_args, value) => {
+        const record = asRecord(value)
+        return [{
+          type: 'text',
+          text: 'Pressed ' + String(record.key) + ' in container ' + String(record.containerId) + '.'
+            + nextHint('call box_page_text to see what the page looks like now'),
+        }]
+      },
+    },
+    async execute(args) {
+      const containerId = containerIdOf(args)
+      const record = asRecord(args)
+      if (typeof record.key !== 'string' || record.key.trim() === '')
+        throw new Error('key is required')
+      const result = await withSession<{ key: string }>(containerId, 'debug_press_key', {
+        key: record.key.trim(),
+      })
       return { containerId, ...result }
     },
   })
