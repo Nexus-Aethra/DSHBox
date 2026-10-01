@@ -373,6 +373,14 @@ pub struct BoxConfig {
     /// /opt/myteam/bin/git) without exporting PATH globally.
     #[serde(default)]
     pub git_path: Option<String>,
+    /// Optional absolute path to a Chromium-family browser executable used by
+    /// the debug surface (screenshot, element query, clicks). When unset,
+    /// `box-browser` probes the well-known install locations for Edge, Chrome,
+    /// Brave and Chromium. Box drives the browser headless, so a headless-capable
+    /// build is required; this override exists for a portable or custom Chromium
+    /// the discovery probe does not know about.
+    #[serde(default)]
+    pub browser_path: Option<String>,
     /// When false (the default), DSH Box inherits the host's
     /// HTTP/HTTPS/NO_PROXY variables into the clean-room package-manager
     /// child so developers behind a corporate mirror can still reach
@@ -413,6 +421,7 @@ impl Default for BoxConfig {
             github_mirror: None,
             npm_registry: None,
             git_path: None,
+        browser_path: None,
             inherit_proxy: default_true(),
             plugins_manifest_digest: None,
             defender_exclusions_for: None,

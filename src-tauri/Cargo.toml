@@ -10,6 +10,7 @@ default-run = "dshbox"
 members = [
   "crates/box-foundation",
   "crates/box-api",
+  "crates/box-browser",
   "crates/box-scheduler",
   "crates/box-runtime",
   "crates/box-toolchains",
