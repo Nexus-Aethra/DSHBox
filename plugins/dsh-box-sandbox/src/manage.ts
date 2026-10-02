@@ -175,7 +175,7 @@ export function registerManageTools(ctx: Context): void {
         include: {
           type: 'string',
           description:
-            'Comma-separated: containers, templates, plugins. Defaults to all three.',
+            'Comma-separated: box, containers, templates, plugins. Defaults to all four.',
         },
       },
       required: [],
@@ -183,16 +183,26 @@ export function registerManageTools(ctx: Context): void {
     timeoutMs: 60_000,
     output: textOutput(
       {
+        box: { type: 'object' },
         containers: { type: 'array', items: { type: 'object' } },
         templates: { type: 'array', items: { type: 'object' } },
         plugins: { type: 'array', items: { type: 'object' } },
       },
-      ['containers', 'templates', 'plugins'],
+      ['box', 'containers', 'templates', 'plugins'],
       (value) => {
         const lines: string[] = []
+        const box = (value.box ?? {}) as Record<string, unknown>
         const containers = (value.containers ?? []) as Record<string, unknown>[]
         const templates = (value.templates ?? []) as Record<string, unknown>[]
         const plugins = (value.plugins ?? []) as Record<string, unknown>[]
+        const stamp = box.buildStamp !== undefined ? ` (build ${String(box.buildStamp)})` : ''
+        lines.push(
+          `Box${stamp}: `
+          + Object.entries(box)
+            .filter(([key]) => key !== 'buildStamp')
+            .map(([key, entry]) => `${key}=${typeof entry === 'object' ? JSON.stringify(entry) : String(entry)}`)
+            .join('  '),
+        )
         lines.push(
           `Containers (${containers.length}):`,
           ...containers.map(
@@ -212,12 +222,18 @@ export function registerManageTools(ctx: Context): void {
       },
     ),
     async execute(args) {
-      const want = (optional(args as Record<string, unknown>, 'include') ?? 'containers,templates,plugins')
+      const want = (optional(args as Record<string, unknown>, 'include') ?? 'box,containers,templates,plugins')
         .split(',')
         .map((part) => part.trim())
         .filter((part) => part !== '')
       const rpc = getRpc()
-      const result: Record<string, unknown> = { containers: [], templates: [], plugins: [] }
+      const result: Record<string, unknown> = { box: {}, containers: [], templates: [], plugins: [] }
+      if (want.includes('box')) {
+        // What the box itself reports: counts, the runtime it is using, the
+        // build it is on. Useful before acting, because it is the one answer
+        // that says whether this is a fresh install or something already set up.
+        result.box = asObject(await rpc.call('get_info'))
+      }
       if (want.includes('containers')) {
         result.containers = asArray(await rpc.call('list_containers'))
       }
@@ -242,7 +258,10 @@ export function registerManageTools(ctx: Context): void {
     parameters: {
       type: 'object',
       properties: {
-        action: actionProperty('resources', ['list', 'read', 'write', 'extract', 'inject']),
+        action: actionProperty(
+          'resources',
+          ['list', 'read', 'write', 'extract', 'inject', 'rm', 'rm-view', 'prune'],
+        ),
         containerId: { type: 'string', description: 'Container to act on.' },
         path: {
           type: 'string',
@@ -256,7 +275,8 @@ export function registerManageTools(ctx: Context): void {
           description: 'YAML key path to read or write at, e.g. llm-pi-ai. Empty means the whole file.',
         },
         text: { type: 'string', description: 'The YAML block to place at --section.' },
-        resourceId: { type: 'string', description: 'Which stored resource to inject.' },
+        resourceId: { type: 'string', description: 'Which stored resource to inject or remove.' },
+        viewId: { type: 'string', description: 'Which resource view to remove.' },
         name: { type: 'string', description: 'Name for an extracted resource.' },
         merge: { type: 'boolean', description: 'Merge into an existing destination instead of refusing.' },
         overwrite: { type: 'boolean', description: 'Replace the destination first.' },
@@ -332,8 +352,29 @@ export function registerManageTools(ctx: Context): void {
           const task = await runTask('enqueue_resource_inject', params)
           return { action, containerId, result: { kind: task.kind, logPath: task.logPath ?? '' } }
         }
+        case 'rm':
+          // Removal is the one action here with no undo, so it takes a resource
+          // id and nothing else: it cannot be inferred, and a wrong guess would
+          // delete state rather than fail.
+          return {
+            action,
+            containerId,
+            result: asObject(
+              await rpc.call('delete_resource', { resourceId: required(record, 'resourceId') }),
+            ),
+          }
+        case 'rm-view':
+          return {
+            action,
+            containerId,
+            result: asObject(
+              await rpc.call('delete_resource_view', { id: required(record, 'viewId') }),
+            ),
+          }
+        case 'prune':
+          return { action, containerId, result: { removed: await rpc.call('prune_orphaned_data') } }
         default:
-          badAction('resources', action, ['list', 'read', 'write', 'extract', 'inject'])
+          badAction('resources', action, ['list', 'read', 'write', 'extract', 'inject', 'rm', 'rm-view', 'prune'])
       }
     },
   })
@@ -618,7 +659,10 @@ export function registerManageTools(ctx: Context): void {
     parameters: {
       type: 'object',
       properties: {
-        action: actionProperty('plugins', ['list', 'installed', 'container', 'add', 'import', 'export', 'bundle', 'graph']),
+        action: actionProperty(
+          'plugins',
+          ['list', 'installed', 'container', 'add', 'remove', 'import', 'export', 'bundle', 'prune', 'graph'],
+        ),
         containerId: { type: 'string', description: 'Container to read, install into, or graph.' },
         profile: { type: 'string', description: 'Profile inside the container. Defaults to web.' },
         spec: { type: 'string', description: 'What to install: a package spec, a directory, or a row id.' },
@@ -666,6 +710,15 @@ export function registerManageTools(ctx: Context): void {
         }
         case 'export':
           return { action, result: asObject(await rpc.call('export_repository_extension', { id: required(record, 'extensionId') })) }
+        case 'remove':
+          return {
+            action,
+            result: asObject(
+              await rpc.call('remove_repository_extension', { id: required(record, 'extensionId') }),
+            ),
+          }
+        case 'prune':
+          return { action, result: { removed: asArray(await rpc.call('prune_repository_extensions')) } }
         case 'bundle': {
           const name = optional(record, 'name')
           const ids = Array.isArray(record.ids) ? (record.ids as string[]).filter((e) => typeof e === 'string') : []
@@ -688,7 +741,11 @@ export function registerManageTools(ctx: Context): void {
         case 'graph':
           return { action, result: asObject(await rpc.call('plugin_dependency_graph', { id: needContainer('graphing'), kind: 'container' })) }
         default:
-          badAction('plugins', action, ['list', 'installed', 'container', 'add', 'import', 'export', 'bundle', 'graph'])
+          badAction(
+            'plugins',
+            action,
+            ['list', 'installed', 'container', 'add', 'remove', 'import', 'export', 'bundle', 'prune', 'graph'],
+          )
       }
     },
   })
@@ -783,7 +840,10 @@ export function registerManageTools(ctx: Context): void {
     parameters: {
       type: 'object',
       properties: {
-        action: actionProperty('templates', ['list', 'show', 'pull', 'import', 'export', 'remove', 'catalog']),
+        action: actionProperty(
+          'templates',
+          ['list', 'show', 'pull', 'import', 'export', 'remove', 'prune', 'catalog'],
+        ),
         name: { type: 'string', description: 'Which template, or which DSH version to pull.' },
         archive: { type: 'string', description: 'Absolute path of an archive to import.' },
         destination: { type: 'string', description: 'Where to write an export. Defaults to a temp file.' },
@@ -833,8 +893,14 @@ export function registerManageTools(ctx: Context): void {
         }
         case 'remove':
           return { action, result: asObject(await rpc.call('remove_template', { name: required(record, 'name') })) }
+        case 'prune':
+          return { action, result: { removed: asArray(await rpc.call('prune_template_snapshots')) } }
         default:
-          badAction('templates', action, ['list', 'show', 'pull', 'import', 'export', 'remove', 'catalog'])
+          badAction(
+            'templates',
+            action,
+            ['list', 'show', 'pull', 'import', 'export', 'remove', 'prune', 'catalog'],
+          )
       }
     },
   })
