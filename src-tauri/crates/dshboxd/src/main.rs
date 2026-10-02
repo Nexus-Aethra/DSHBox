@@ -23,6 +23,7 @@ mod state;
 mod test_support;
 mod toolchains;
 mod versions;
+mod workspaces;
 
 use box_runtime::process;
 use box_server_core::{read_discovery, remove_discovery, write_discovery, ServerDiscovery};

@@ -18,6 +18,7 @@ pub mod rpc;
 pub mod run;
 pub mod setup_path;
 pub mod template;
+pub mod workspace;
 
 use crate::desktop;
 use serde_json::json;

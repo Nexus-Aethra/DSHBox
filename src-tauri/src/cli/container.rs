@@ -17,10 +17,13 @@ use super::rpc;
 
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     let Some(action) = arguments.first().map(String::as_str) else {
-        return Err("expected container logs|url|describe|show|open|start|stop|restart|rebuild|rm|resource".to_owned());
+        return Err("expected container logs|url|describe|show|open|start|stop|restart|rebuild|rm|resource|workspace".to_owned());
     };
     if action == "resource" {
         return super::resource::command(&arguments[1..]);
+    }
+    if action == "workspace" {
+        return super::workspace::command(&arguments[1..]);
     }
     if matches!(action, "help" | "--help" | "-h") {
         println!("dshbox container logs <id>             tail the DSH host log");

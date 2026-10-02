@@ -202,7 +202,13 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
             prune_sealed_template_snapshots().map(|removed| Sync(json!({ "removed": removed })))
         }
         Some("plugin_dependency_graph") => plugin_dependency_graph_rpc(request).map(Sync),
-        Some("list_container_resources") => {
+        Some("list_container_workspaces") => {
+        crate::workspaces::list_container_workspaces_rpc(state, request).map(Sync)
+    }
+    Some("add_container_workspace") => {
+        crate::workspaces::add_container_workspace_rpc(state, request).map(Sync)
+    }
+    Some("list_container_resources") => {
             crate::resources::list_container_resources(state, request).map(Sync)
         }
         Some("list_resources") => crate::resources::list_resources(state, request).map(Sync),
