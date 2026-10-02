@@ -284,9 +284,13 @@ export function applyBoxTools(ctx: Context): void {
   registerTool(ctx, {
     name: 'box_screenshot',
     description:
-      'Capture what a running dshbox container currently renders, as a PNG you can look at. '
-      + 'Use it to see the real state of a page instead of guessing from logs or markup. '
-      + 'Opens a headless browser on the container on first use.',
+      'Capture what a running dshbox container currently renders, and store it as a PNG. '
+      + 'Read this before you rely on it: the image is NOT shown to you. A tool result is '
+      + 'assistant-side content, and the host sends text only on that side, so the model receives '
+      + 'the dimensions and nothing else -- asking it to look at the picture asks for something '
+      + 'that cannot arrive. Use box_page_text when you need to know what is on the page; it is '
+      + 'built for exactly that. Take a screenshot to leave an artifact for a human, or to '
+      + 'confirm something visually that the page text cannot express.',
     parameters: {
       type: 'object',
       properties: {
