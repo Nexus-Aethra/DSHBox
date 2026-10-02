@@ -437,6 +437,74 @@ export function registerManageTools(ctx: Context): void {
     },
   })
   register(ctx, {
+    name: 'box_set_viewport',
+    description:
+      'Resize the page an agent is looking at, and report the size now in effect. '
+      + 'The page opens at 1600x1200, which fits most applications on one screen, but a wide '
+      + 'table or a tall form may still fold. A fold is not cosmetic: box_page_text marks '
+      + 'anything below the fold, so a control that is in fact visible reads as something to '
+      + 'scroll for, and box_click_element on it is a wasted round trip. Make it taller, or '
+      + 'wider when a row is being cut off on the right, then read the page again. Resizing '
+      + 'keeps the page where it is, so a session survives the change.',
+    parameters: {
+      type: 'object',
+      properties: {
+        containerId: { type: 'string', description: 'Which debug session to resize.' },
+        width: {
+          type: 'number',
+          description: 'Width in CSS pixels. 320-7680. Omit to read the current size.',
+        },
+        height: {
+          type: 'number',
+          description: 'Height in CSS pixels. 240-4320. Omit to read the current size.',
+        },
+      },
+      required: ['containerId'],
+    },
+    timeoutMs: 60_000,
+    output: textOutput(
+      {
+        width: { type: 'number' },
+        height: { type: 'number' },
+        clamped: { type: 'boolean' },
+      },
+      ['width', 'height'],
+      (value) =>
+        `Viewport is now ${String(value.width)}x${String(value.height)}`
+        + (value.clamped === true
+          ? '. That is smaller than it was asked for: the browser has a maximum.'
+          : '.'),
+    ),
+    async execute(args) {
+      const record = args as Record<string, unknown>
+      const containerId = required(record, 'containerId')
+      const rpc = getRpc()
+      const params: Record<string, unknown> = { id: containerId }
+      const width = number(record, 'width')
+      const height = number(record, 'height')
+      if (width === undefined && height === undefined) {
+        // With neither, this is a question rather than an instruction, and the
+        // layout metrics are what actually answer it -- the window size that
+        // was requested is not the viewport the page is laid out into.
+        const metrics = await rpc.call<Record<string, unknown>>('debug_set_viewport', params)
+        return { width: Number(metrics.width), height: Number(metrics.height), clamped: false }
+      }
+      if (width === undefined || height === undefined) {
+        throw new Error('Give both width and height to resize the viewport.')
+      }
+      const result = await rpc.call<Record<string, unknown>>('debug_set_viewport', {
+        ...params,
+        width,
+        height,
+      })
+      return {
+        width: Number(result.width),
+        height: Number(result.height),
+        clamped: result.clamped === true,
+      }
+    },
+  })
+  register(ctx, {
     name: 'box_task',
     description:
       'Watch, read or cancel dshbox background work. Most box_* calls already wait for their own '
@@ -503,6 +571,12 @@ export function registerManageTools(ctx: Context): void {
   })
 }
 
+/** Read an optional finite number, treating blank and NaN as absent. */
+function number(args: Record<string, unknown>, field: string): number | undefined {
+  const value = args[field]
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+  return Math.round(value)
+}
 /** The daemon answers list-shaped methods with a bare array; guard that here. */
 function asArray(value: unknown): Record<string, unknown>[] {
   if (Array.isArray(value)) return value as Record<string, unknown>[]

@@ -46,7 +46,7 @@ fn main() {
     let url = format!("file:///{}", page.display().to_string().replace('\\', "/"));
 
     println!("launching headless on {url}");
-    let mut session = match BrowserSession::launch(&browser, &url, scratch.join("profile")) {
+    let mut session = match BrowserSession::launch(&browser, &url, scratch.join("profile"), BrowserSession::DEFAULT_VIEWPORT) {
         Ok(session) => session,
         Err(error) => {
             eprintln!("FAIL launch: {error}");

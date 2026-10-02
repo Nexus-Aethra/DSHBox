@@ -174,7 +174,18 @@ pub(crate) fn open_rpc(state: &DaemonState, request: &Value) -> Result<Value, St
     // have been recycled by an unrelated process, which is worse than a
     // fresh launch.
     sessions.remove(&id);
-    let session = BrowserSession::launch(&browser.path, &url, profile)?;
+    // A caller may ask for a size on open; otherwise the browser's default
+    // 800x600 applies, which folds pages that are not folded on a real screen.
+    let viewport = (
+        request["width"].as_u64().filter(|value| *value > 0).unwrap_or(BrowserSession::DEFAULT_VIEWPORT.0 as u64),
+        request["height"].as_u64().filter(|value| *value > 0).unwrap_or(BrowserSession::DEFAULT_VIEWPORT.1 as u64),
+    );
+    let session = BrowserSession::launch(
+        &browser.path,
+        &url,
+        profile,
+        (viewport.0 as u32, viewport.1 as u32),
+    )?;
     let reply = json!({
         "id": id,
         "url": session.url(),
@@ -1646,4 +1657,67 @@ mod tests {
         assert!(!hit_test_js(1.0, 2.0, None).contains("querySelector(\\\""));
     }
 
+}
+/// `debug_set_viewport` — resize a session's page, and report the size now in effect.
+///
+/// The window a session opens at is a guess. A page that fits in one is fine,
+/// and a page that needs a tall scroll is a stream of partial views: the listing
+/// marks controls below the fold that the caller would rather see in one pass,
+/// and a click near the edge lands somewhere the agent was not looking at.
+/// Resizing is the cheap correction, and it must not cost a relaunch -- losing
+/// the session to change its geometry would make the correction worse than the
+/// complaint.
+///
+/// Reported back, rather than assumed: whether the override actually took is
+/// the emulator's answer, not this function's, and a caller that believes a
+/// resize it did not get will misread every coordinate after it.
+pub(crate) fn set_viewport_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    let id = request["id"].as_str().unwrap_or("").to_owned();
+    if id.is_empty() {
+        return Err("debug_set_viewport requires a container id".to_owned());
+    }
+    let width = request["width"].as_u64().filter(|value| *value > 0);
+    let height = request["height"].as_u64().filter(|value| *value > 0);
+    let (width, height) = match (width, height) {
+        (Some(width), Some(height)) => (width, height),
+        _ => return Err("debug_set_viewport requires a positive width and height".to_owned()),
+    };
+    // Chrome refuses absurd sizes by silently clamping, so a caller asking for
+    // the whole world back gets a number it did not ask for. Bounded to
+    // something a real display can do, and said in the error rather than
+    // returned as a surprise.
+    if !(320..=7680).contains(&width) || !(240..=4320).contains(&height) {
+        return Err(format!(
+            "{width}x{height} is not a usable viewport; use 320..7680 by 240..4320"
+        ));
+    }
+    with_session(state, request, |session| {
+        session.call(
+            "Emulation.setDeviceMetricsOverride",
+            json!({
+                "width": width,
+                "height": height,
+                "deviceScaleFactor": 1,
+                "mobile": false,
+            }),
+        )?;
+        let metrics = session
+            .call("Page.getLayoutMetrics", json!({}))
+            .map_err(|error| format!("viewport was set but its size could not be read: {error}"))?;
+        let actual_width = metrics["cssLayoutViewport"]["clientWidth"]
+            .as_u64()
+            .or_else(|| metrics["layoutViewport"]["clientWidth"].as_u64())
+            .unwrap_or(width);
+        let actual_height = metrics["cssLayoutViewport"]["clientHeight"]
+            .as_u64()
+            .or_else(|| metrics["layoutViewport"]["clientHeight"].as_u64())
+            .unwrap_or(height);
+        Ok(json!({
+            "id": id,
+            "requested": { "width": width, "height": height },
+            "width": actual_width,
+            "height": actual_height,
+            "clamped": actual_width != width || actual_height != height,
+        }))
+    })
 }

@@ -40,7 +40,22 @@ pub struct BrowserSession {
 
 impl BrowserSession {
     /// Start a headless browser on 'url' and attach to its first page target.
-    pub fn launch(browser: &Path, url: &str, user_data_dir: PathBuf) -> Result<Self, String> {
+    /// The window size a debug session opens at.
+    ///
+    /// Chrome's headless default is 800x600, which is small enough that real
+    /// application pages arrive already folded. A listing then reports controls
+    /// as below the fold that are not below it on the user's screen, and the
+    /// caller scrolls to reach something that was always visible.
+    pub const DEFAULT_VIEWPORT: (u32, u32) = (1600, 1200);
+
+    /// Launch a headless browser on `url` at `viewport`, and attach to its
+    /// first page target.
+    pub fn launch(
+        browser: &Path,
+        url: &str,
+        user_data_dir: PathBuf,
+        viewport: (u32, u32),
+    ) -> Result<Self, String> {
         let user_data_dir = absolute(&user_data_dir);
         std::fs::create_dir_all(&user_data_dir)
             .map_err(|error| format!("cannot create browser profile dir: {error}"))?;
@@ -58,6 +73,10 @@ impl BrowserSession {
 
         let child = Command::new(browser)
             .arg("--headless=new")
+        // An explicit size, because the default folds pages that are not
+        // folded on a real screen and every listing built on this viewport then
+        // under-reports what the caller can see.
+        .arg(format!("--window-size={},{}", viewport.0, viewport.1))
             // 0 lets the OS pick a free port; we read it back from the file.
             .arg("--remote-debugging-port=0")
             .arg(format!("--user-data-dir={}", user_data_dir.display()))

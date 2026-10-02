@@ -180,6 +180,7 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
     Some("debug_press_key") => crate::debug::press_key_rpc(state, request).map(Sync),
     Some("debug_page_text") => crate::debug::page_text_rpc(state, request).map(Sync),
     Some("debug_scroll") => crate::debug::scroll_rpc(state, request).map(Sync),
+    Some("debug_set_viewport") => crate::debug::set_viewport_rpc(state, request).map(Sync),
         Some("save_mirror_settings") => save_mirror_settings_rpc(request).map(Sync),
         Some("save_runtime_directory") => save_runtime_directory_rpc(state, request).map(Sync),
         Some("refresh_dsh_catalog") => enqueue_dsh_catalog_refresh(state),
