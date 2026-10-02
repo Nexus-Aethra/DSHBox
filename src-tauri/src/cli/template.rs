@@ -44,8 +44,8 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         "install" => install(arguments.get(1).ok_or("expected a template reference (e.g. `github.com/deepseek-ai/deepseek-harness:tag`)")?),
         "uninstall" => uninstall(arguments.get(1).ok_or("expected a template name")?),
         "ls" | "list" => list(&rest),
-        "show" | "cat" => show(arguments.get(1).ok_or("expected a template name")?),
-        "info" => info(arguments.get(1).ok_or("expected a template name")?),
+        "show" | "cat" => show(arguments.get(1).ok_or("expected a template name")?, &arguments[2..]),
+        "info" => info(arguments.get(1).ok_or("expected a template name")?, &arguments[2..]),
         "import" => import(
             arguments.get(1).ok_or("expected an archive path")?,
             &arguments[2..],
@@ -55,7 +55,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
             arguments.get(2).map(String::as_str),
         ),
         "rm" | "remove" => remove(arguments.get(1).ok_or("expected a template name")?),
-        "prune" => prune(),
+        "prune" => prune(&rest),
         other => Err(format!("unknown template action: {other}")),
     }
 }
@@ -150,7 +150,8 @@ fn list(rest: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn show(name: &str) -> Result<(), String> {
+fn show(name: &str, rest: &[String]) -> Result<(), String> {
+    super::read_flags(rest, &[])?;
     let client = rpc::connect()?;
     let value = rpc::call(&client, "read_template", json!({ "name": name }))?;
     let text = value["text"]
@@ -196,7 +197,8 @@ fn remove(name: &str) -> Result<(), String> {
 
 /// GC data-store digests no built template (and no live container)
 /// references.
-fn prune() -> Result<(), String> {
+fn prune(rest: &[String]) -> Result<(), String> {
+    super::read_flags(rest, &[])?;
     let client = rpc::connect()?;
     let value = rpc::call(&client, "prune_template_snapshots", json!({}))?;
     let removed: Vec<String> = serde_json::from_value(value["removed"].clone())
@@ -211,7 +213,8 @@ fn prune() -> Result<(), String> {
     Ok(())
 }
 
-fn info(name: &str) -> Result<(), String> {
+fn info(name: &str, rest: &[String]) -> Result<(), String> {
+    super::read_flags(rest, &[])?;
     let client = rpc::connect()?;
     let value = rpc::call(&client, "template_info", json!({ "name": name }))?;
 

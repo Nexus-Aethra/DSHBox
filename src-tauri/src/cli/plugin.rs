@@ -25,7 +25,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     }
     match action {
         "ls" | "list" if arguments.len() >= 2 => container_plugins(&arguments[1..]),
-        "ls" | "list" => repository_list(),
+        "ls" | "list" => repository_list(&arguments[1..]),
         "import" => repository_import(
             arguments
                 .get(1)
@@ -36,16 +36,21 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
             arguments.get(2).ok_or("expected a destination path")?,
         ),
         "rm" => repository_remove(arguments.get(1).ok_or("expected a repository entry id")?),
-        "prune" => repository_prune(),
-        "refs" => repository_refs(arguments.iter().skip(1).any(|arg| arg == "--verbose")),
+        "prune" => repository_prune(&arguments[1..]),
+        "refs" => repository_refs(&arguments[1..]),
         "install" | "add" => container_plugin_add(&arguments[1..]),
         _ => Err(format!("unknown plugin action: {action}")),
     }
 }
 
-fn repository_list() -> Result<(), String> {
+fn repository_list(rest: &[String]) -> Result<(), String> {
+    let as_json = super::read_flags(rest, &["--json"])?;
     let client = rpc::connect()?;
     let value = rpc::call(&client, "list_repository_extensions", json!({}))?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+        return Ok(());
+    }
     let entries: Vec<box_extensions::RepositoryExtension> = serde_json::from_value(value)
         .map_err(|error| format!("invalid repository list from daemon: {error}"))?;
     println!("ID\tKIND\tNAME\tVERSION\tSTORAGE");
@@ -108,9 +113,15 @@ fn repository_remove(id: &str) -> Result<(), String> {
 /// that currently reference it. Useful when `plugin rm` or `plugin prune`
 /// reports a "still in use" error and the user wants to know which owner
 /// is blocking the delete. Pass `--verbose` to expand the id columns.
-fn repository_refs(verbose: bool) -> Result<(), String> {
+fn repository_refs(rest: &[String]) -> Result<(), String> {
+    let verbose = rest.iter().any(|argument| argument == "--verbose");
+    let as_json = super::read_flags(rest, &["--json", "--verbose"])?;
     let client = rpc::connect()?;
     let value = rpc::call(&client, "list_repository_reference_counts", json!({}))?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+        return Ok(());
+    }
     let rows: Vec<box_extensions::RepositoryReferenceRow> = serde_json::from_value(value)
         .map_err(|error| format!("invalid reference rows from daemon: {error}"))?;
     if rows.is_empty() {
@@ -149,7 +160,10 @@ fn repository_refs(verbose: bool) -> Result<(), String> {
 
 /// Deletes repository entries whose reference count dropped to zero (no
 /// container links them anymore). Entries still in use are left untouched.
-fn repository_prune() -> Result<(), String> {
+fn repository_prune(rest: &[String]) -> Result<(), String> {
+    // Nothing to honour, but said aloud: a verb that takes no flag must not
+    // silently accept one.
+    super::read_flags(rest, &[])?;
     let client = rpc::connect()?;
     let value = rpc::call(&client, "prune_repository_extensions", json!({}))?;
     let removed: Vec<String> = serde_json::from_value(value)

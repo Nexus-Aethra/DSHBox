@@ -138,7 +138,7 @@ fn raw_rpc(arguments: &[String]) -> Result<(), String> {
 /// like success. `dshbox ps --jsn` would print a table and exit zero, and the
 /// caller would not learn that the one thing it asked for was not applied until
 /// something downstream choked on the shape it got.
-fn read_flags(rest: &[String], known: &[&str]) -> Result<bool, String> {
+pub(crate) fn read_flags(rest: &[String], known: &[&str]) -> Result<bool, String> {
     let takes = known.join(", ");
     let mut as_json = false;
     for argument in rest {

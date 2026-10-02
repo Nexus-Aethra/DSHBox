@@ -44,20 +44,21 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         .ok_or_else(|| format!("expected a container id after `container {action}`"))?
         .clone();
     match action {
-        "logs" => logs(&id),
-        "url" => url(&id),
+        "logs" => logs(&id, &arguments[2..]),
+        "url" => url(&id, &arguments[2..]),
         "describe" | "show" => describe(&id, &arguments[2..]),
-        "open" => open(&id),
-        "start" => start(&id),
-        "stop" => stop(&id),
-        "restart" => restart(&id),
-        "rebuild" => rebuild(&id),
-        "rm" | "remove" => remove(&id),
+        "open" => open(&id, &arguments[2..]),
+        "start" => start(&id, &arguments[2..]),
+        "stop" => stop(&id, &arguments[2..]),
+        "restart" => restart(&id, &arguments[2..]),
+        "rebuild" => rebuild(&id, &arguments[2..]),
+        "rm" | "remove" => remove(&id, &arguments[2..]),
         other => Err(format!("unknown container action: {other}")),
     }
 }
 
-fn logs(id: &str) -> Result<(), String> {
+fn logs(id: &str, rest: &[String]) -> Result<(), String> {
+    super::read_flags(rest, &[])?;
     let client = rpc::connect()?;
     let containers_value = rpc::call(&client, "list_containers", json!({}))?;
     let containers: Vec<box_containers::DshContainer> =
@@ -76,7 +77,8 @@ fn logs(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn url(id: &str) -> Result<(), String> {
+fn url(id: &str, rest: &[String]) -> Result<(), String> {
+    super::read_flags(rest, &[])?;
     let client = rpc::connect()?;
     let value = rpc::call(&client, "container_url", json!({ "id": id }))?;
     let url = value["url"].as_str().unwrap_or("?");
@@ -89,6 +91,9 @@ fn url(id: &str) -> Result<(), String> {
 /// and the default text view for humans, which walks the extensions
 /// profile/skill tree inline.
 fn describe(id: &str, rest: &[String]) -> Result<(), String> {
+    // --json is the only flag, and an argument that is not it is refused
+    // rather than ignored: a dropped flag makes a typo look like success.
+    super::read_flags(rest, &["--json"])?;
     let client = rpc::connect()?;
     let value = rpc::call(&client, "describe_container", json!({ "id": id }))?;
     if rest.iter().any(|flag| flag == "--json") {
@@ -211,7 +216,8 @@ fn print_description_text(value: &Value) {
 /// Open the running container through a desktop client. The CLI and Tauri
 /// client are separate processes, so launch the client with a private
 /// hand-off argument; it calls its own `open_dsh_front` implementation.
-fn open(id: &str) -> Result<(), String> {
+fn open(id: &str, rest: &[String]) -> Result<(), String> {
+    super::read_flags(rest, &[])?;
     let client = rpc::connect()?;
     let value = rpc::call(&client, "container_url", json!({ "id": id }))?;
     let _url = value["url"]
@@ -228,19 +234,23 @@ fn open(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn start(id: &str) -> Result<(), String> {
+fn start(id: &str, rest: &[String]) -> Result<(), String> {
+    super::read_flags(rest, &[])?;
     enqueue_lifecycle(id, "enqueue_container_start", "container-start")
 }
 
-fn stop(id: &str) -> Result<(), String> {
+fn stop(id: &str, rest: &[String]) -> Result<(), String> {
+    super::read_flags(rest, &[])?;
     enqueue_lifecycle(id, "enqueue_container_stop", "container-stop")
 }
 
-fn restart(id: &str) -> Result<(), String> {
+fn restart(id: &str, rest: &[String]) -> Result<(), String> {
+    super::read_flags(rest, &[])?;
     enqueue_lifecycle(id, "enqueue_container_restart", "container-restart")
 }
 
-fn rebuild(id: &str) -> Result<(), String> {
+fn rebuild(id: &str, rest: &[String]) -> Result<(), String> {
+    super::read_flags(rest, &[])?;
     enqueue_lifecycle(id, "enqueue_container_rebuild", "container-rebuild")
 }
 
@@ -258,7 +268,8 @@ fn enqueue_lifecycle(id: &str, method: &str, kind: &str) -> Result<(), String> {
 /// reference counts for repository-backed plugins can be released), then
 /// deletes the container directory. Both steps happen inside the daemon's
 /// `delete_container` RPC — the CLI never deletes anything itself.
-fn remove(id: &str) -> Result<(), String> {
+fn remove(id: &str, rest: &[String]) -> Result<(), String> {
+    super::read_flags(rest, &[])?;
     let client = rpc::connect()?;
     let value = rpc::call(&client, "delete_container", json!({ "id": id }))?;
     let deleted = value["deleted"].as_bool().unwrap_or(false);

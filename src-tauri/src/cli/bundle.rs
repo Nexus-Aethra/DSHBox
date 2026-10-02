@@ -18,7 +18,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         return Ok(());
     }
     match action {
-        "ls" | "list" => list_bundles(),
+        "ls" | "list" => list_bundles(&arguments[1..]),
         "create" => create_bundle(&arguments[1..]),
         "rm" => delete_bundle(arguments.get(1).ok_or("expected a bundle id")?),
         "save" => save_bundle(&arguments[1..]),
@@ -27,9 +27,14 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     }
 }
 
-fn list_bundles() -> Result<(), String> {
+fn list_bundles(rest: &[String]) -> Result<(), String> {
+    let as_json = super::read_flags(rest, &["--json"])?;
     let client = rpc::connect()?;
     let value = rpc::call(&client, "list_bundles", json!({}))?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+        return Ok(());
+    }
     let bundles: Vec<box_extensions::ExtensionBundle> = serde_json::from_value(value)
         .map_err(|error| format!("invalid bundle list from daemon: {error}"))?;
     println!("ID\tNAME\tENTRIES\tCREATED");
