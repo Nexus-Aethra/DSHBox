@@ -119,6 +119,43 @@ fn profile_dir(state: &DaemonState, id: &str) -> Result<PathBuf, String> {
     Ok(runtime.join("debug-browser").join(id))
 }
 
+/// Close the sessions of containers that are no longer running.
+///
+/// A debug browser must not outlive the container it was opened to look at.
+/// Nothing else ties the two together: the session map is keyed by container
+/// id and the browser is a separate process, so stopping a container leaves a
+/// headless browser alive on a page whose host is gone. That is a process the
+/// user did not ask for, holding a window open, and it accumulates -- one per
+/// container that was ever inspected, across restarts.
+///
+/// So the set of live sessions is reconciled against the containers that are
+/// actually running before any new one is opened. Dropping the entry also drops
+/// the `BrowserSession`, which kills the process.
+///
+/// A container whose liveness cannot be read at all is left alone: an
+/// unreadable record is not evidence that the container is gone, and closing a
+/// browser over a failed lookup would be the worse mistake.
+fn close_sessions_of_stopped_containers(sessions: &mut Sessions) {
+    let stopped: Vec<String> = sessions
+        .keys()
+        .filter(|id| container_is_stopped(id))
+        .cloned()
+        .collect();
+    for id in stopped {
+        sessions.remove(&id);
+    }
+}
+
+/// True only when the daemon can positively say this container is not running.
+fn container_is_stopped(id: &str) -> bool {
+    match crate::dispatch::container_url_probe(id) {
+        Ok(_) => false,
+        // A running container answers with a URL. Anything else -- no record,
+        // a dead pid, a host that is not yet up -- means the container is not
+        // something we can attach to, and the browser has nothing left to show.
+        Err(_) => true,
+    }
+}
 /// Launch (or replace) the headless session attached to a container.
 pub(crate) fn open_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
@@ -130,6 +167,9 @@ pub(crate) fn open_rpc(state: &DaemonState, request: &Value) -> Result<Value, St
     let profile = profile_dir(state, &id)?;
 
     let mut sessions = lock_sessions(state)?;
+    // Sweep first: inspecting any container is a good moment to notice that a
+    // different one stopped and is still holding a browser open.
+    close_sessions_of_stopped_containers(&mut sessions);
     // Re-opening replaces: a stale session is attached to a port that may
     // have been recycled by an unrelated process, which is worse than a
     // fresh launch.

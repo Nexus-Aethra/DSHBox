@@ -1031,6 +1031,28 @@ fn container_url_rpc(state: &DaemonState, request: &Value) -> Result<Value, Stri
 
 /// Resolve a running container's authenticated loopback URL.
 ///
+/// Whether a container still has a running host, read without daemon state.
+///
+/// `container_url` needs the in-memory registry because a live host is served
+/// from there. Liveness cleanup does not: it walks the session map on a call
+/// that may have no registry entry for the container at all, and taking a
+/// `DaemonState` would force that call to borrow state it otherwise never
+/// touches. The durable host record plus a pid check answers the same question
+/// for every container that is not being started this very instant.
+pub(crate) fn container_url_probe(id: &str) -> Result<String, String> {
+    let record =
+        host::read_host_record(id).map_err(|error| format!("cannot read host record: {error}"))?;
+    match record.filter(|record| {
+        matches!(
+            record.state,
+            HostState::Starting | HostState::Ready | HostState::Running
+        ) && box_containers::is_host_pid_alive(record.host_pid)
+    }) {
+        Some(record) => Ok(record.authenticated_url.unwrap_or(record.host_url)),
+        None => Err(format!("container is not running: {id}")),
+    }
+}
+
 /// DSH 0.1.2+ answers every tokenless request with 401, so callers that open
 /// a browser at this URL need the per-launch capability form, not the bare
 /// host URL. Shared by the webview (`container_url_rpc`) and the headless
