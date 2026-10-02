@@ -62,17 +62,24 @@ const TERMINAL = new Set(['succeeded', 'cancelled', 'interrupted', 'rolledback']
 /**
  * True once a task will not change again.
  *
- * `Failed` is the exception the daemon's own docs call out: a failed task
- * rolls back, and only a failed *rollback* ends it. The record has no other
- * field that distinguishes the two, so the presence of `rollbackError` is what
- * says this failure is the end of it.
+ * `Failed` is the exception the daemon's own docs call out: a failed task rolls
+ * back, and only a failed *rollback* ends it. So `failed` on its own is not
+ * the end of a task -- polling on it alone waits out the budget and then reports
+ * a task that stopped as one that never stopped.
+ *
+ * What actually says the failure is over is the daemon's own `finishedAt`: it is
+ * stamped when the task, rollback included, is done, and it stays null while a
+ * rollback is still releasing locks. A task carrying one will not be handed to a
+ * worker again, so treating it as finished is not a guess about the state
+ * machine -- it is reading the same field the scheduler writes.
  */
 export function isFinished(task: TaskRecord): boolean {
   const current = state(task)
   if (TERMINAL.has(current)) return true
   if (current === 'failed') {
     const rollback = task.rollbackError
-    return typeof rollback === 'string' && rollback.length > 0
+    if (typeof rollback === 'string' && rollback.length > 0) return true
+    return typeof task.finishedAt === 'number' && task.finishedAt > 0
   }
   return false
 }
