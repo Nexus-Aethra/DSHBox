@@ -686,6 +686,33 @@ export function registerManageTools(ctx: Context): void {
       }
     },
   })
+  /**
+   * The arguments one action needs, checked here rather than at the call site.
+   *
+   * The parameter schema is a flat union of every action's fields, so a field
+   * that only one action uses reads as a requirement for all of them, and a
+   * caller that omits it gets whichever branch's complaint fires first --
+   * "extensionId is required" from an action that never wanted it. Naming the
+   * action and its own list turns that into something a caller can act on
+   * without reading the source, which is the whole reason the union is there.
+   */
+  function needs(
+    record: Record<string, unknown>,
+    action: string,
+    spec: Record<string, readonly string[]>,
+  ): void {
+    const missing = (spec[action] ?? []).filter(
+      (field) => typeof record[field] !== 'string' || (record[field] as string).trim() === '',
+    )
+    if (missing.length > 0) {
+      throw new Error(
+        `box_plugins ${action} needs ${missing.join(' and ')}. `
+          + `For this action the arguments are: ${(spec[action] ?? []).join(', ')}. `
+          + 'Actions that need none: list, installed, container, prune, bundle (list).',
+      )
+    }
+  }
+
   register(ctx, {
     name: 'box_plugins',
     description:
@@ -707,9 +734,9 @@ export function registerManageTools(ctx: Context): void {
         ),
         containerId: { type: 'string', description: 'Container to read, install into, or graph.' },
         profile: { type: 'string', description: 'Profile inside the container. Defaults to web.' },
-        spec: { type: 'string', description: 'What to install: a package spec, a directory, or a row id.' },
-        extensionId: { type: 'string', description: 'Which repository extension to export.' },
-        name: { type: 'string', description: 'Bundle name, a plugin name, or a name to import under.' },
+        spec: { type: 'string', description: 'For add, what to install; for import, the directory to import.' },
+        extensionId: { type: 'string', description: 'A repository row id (img-...). For copy, export, install-bundle.' },
+        name: { type: 'string', description: 'A plugin package name for remove-plugin, e.g. @scope/name. Also a bundle name.' },
         path: { type: 'string', description: 'Absolute path, for importing from or exporting to the workspace.' },
         destination: { type: 'string', description: 'Absolute path to write an export to.' },
         overwrite: { type: 'boolean', description: 'Install a bundle, replacing what is there instead of keeping it.' },
@@ -728,6 +755,19 @@ export function registerManageTools(ctx: Context): void {
       const record = args as Record<string, unknown>
       const action = required(record, 'action')
       const rpc = getRpc()
+      needs(record, action, {
+        add: ['containerId', 'spec'],
+        'add-extension': ['containerId', 'spec'],
+        copy: ['containerId', 'extensionId'],
+        'remove-plugin': ['containerId', 'name'],
+        import: ['spec'],
+        export: ['extensionId'],
+        'export-installed': ['containerId', 'path', 'destination'],
+        'import-workspace': ['containerId', 'path'],
+        'install-bundle': ['containerId', 'extensionId'],
+        container: ['containerId'],
+        graph: ['containerId'],
+      })
       const containerId = optional(record, 'containerId')
       const profile = optional(record, 'profile') ?? 'web'
       const needContainer = (what: string): string => {
@@ -797,11 +837,16 @@ export function registerManageTools(ctx: Context): void {
           return { action, result: { kind: task.kind, logPath: task.logPath ?? '' } }
         }
         case 'remove-plugin':
+          // The daemon's `id` here is the *container*, not the repository row --
+          // the same word meaning two different things one method over, which is
+          // the sort of thing that turns a working call into a silent no-op if you
+          // pass the wrong one. The name is the package name it is recorded
+          // under, and the profile is where it is enabled.
           return {
             action,
             result: asObject(
               await rpc.call('remove_repository_plugin', {
-                id: required(record, 'extensionId'),
+                id: needContainer('removing from'),
                 profile,
                 name: required(record, 'name'),
               }),

@@ -26,7 +26,7 @@ import { getRpc } from './rpc'
 export interface TaskRecord {
   id: string
   kind: string
-  /** Succeeded, Failed, RollingBack, RolledBack, Cancelled, Interrupted, Queued, Running. */
+  /** Lower case, as the daemon serialises it: succeeded, failed, rollingback, rolledback, cancelled, interrupted, queued, running. */
   status: string
   /** A human-readable stage label such as Completed. */
   stage: string
@@ -40,8 +40,24 @@ export interface TaskRecord {
   finishedAt?: number
 }
 
+/**
+ * The daemon's wire form for a task state.
+ *
+ * `TaskState` is declared in Rust with `#[serde(rename_all = "lowercase")]`, so
+ * what crosses the wire is `succeeded`, `rolledback`, `cancelled` -- not the
+ * PascalCase the enum spells in source. Comparing against the Rust spelling
+ * matches nothing: a finished task is not recognised as finished, so a poll
+ * runs to its full budget and then reports a task that is sitting at 100%
+ * successful as one that did not finish. Normalising here rather than at each
+ * call site is also what makes the two separators irrelevant, so a future
+ * `rolling_back` cannot reintroduce the same silence a different way.
+ */
+function state(task: TaskRecord): string {
+  return task.status.trim().toLowerCase().replace(/[\s_-]/g, '')
+}
+
 /** States the daemon will not move out of. */
-const TERMINAL = new Set(['Succeeded', 'Cancelled', 'Interrupted', 'RolledBack'])
+const TERMINAL = new Set(['succeeded', 'cancelled', 'interrupted', 'rolledback'])
 
 /**
  * True once a task will not change again.
@@ -52,8 +68,9 @@ const TERMINAL = new Set(['Succeeded', 'Cancelled', 'Interrupted', 'RolledBack']
  * says this failure is the end of it.
  */
 export function isFinished(task: TaskRecord): boolean {
-  if (TERMINAL.has(task.status)) return true
-  if (task.status === 'Failed') {
+  const current = state(task)
+  if (TERMINAL.has(current)) return true
+  if (current === 'failed') {
     const rollback = task.rollbackError
     return typeof rollback === 'string' && rollback.length > 0
   }
@@ -62,7 +79,8 @@ export function isFinished(task: TaskRecord): boolean {
 
 /** True when the task stopped without doing what was asked. */
 export function failed(task: TaskRecord): boolean {
-  return task.status === 'Failed' || task.status === 'Interrupted' || task.status === 'RolledBack'
+  const current = state(task)
+  return current === 'failed' || current === 'interrupted' || current === 'rolledback'
 }
 
 export interface WaitOptions {

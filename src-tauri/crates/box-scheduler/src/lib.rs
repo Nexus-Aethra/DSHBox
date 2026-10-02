@@ -1217,3 +1217,29 @@ mod tests {
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 }
+
+#[cfg(test)]
+mod wire_format_tests {
+    use super::TaskState;
+
+    /// The spelling a caller sees on the wire, pinned here because a task
+    /// poll is written against it. The Rust spelling is not it: a caller
+    /// comparing against `Succeeded` matches nothing, and a finished task is
+    /// then never recognised as finished.
+    #[test]
+    fn task_state_serialises_in_lower_case() {
+        for (state, wire) in [
+            (TaskState::Queued, "queued"),
+            (TaskState::Running, "running"),
+            (TaskState::Succeeded, "succeeded"),
+            (TaskState::Failed, "failed"),
+            (TaskState::Cancelled, "cancelled"),
+            (TaskState::Interrupted, "interrupted"),
+            (TaskState::RollingBack, "rollingback"),
+            (TaskState::RolledBack, "rolledback"),
+        ] {
+            let encoded = serde_json::to_string(&state).expect("a task state encodes");
+            assert_eq!(encoded, format!("\"{wire}\""), "{state:?} on the wire");
+        }
+    }
+}
