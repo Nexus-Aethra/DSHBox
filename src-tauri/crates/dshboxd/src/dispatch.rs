@@ -1037,6 +1037,29 @@ fn container_url_rpc(state: &DaemonState, request: &Value) -> Result<Value, Stri
     container_url(state, &id).map(|url| json!({ "id": id, "url": url }))
 }
 
+/// The URL a caller may actually open, or why there is not one yet.
+///
+/// A `Starting` record with no authenticated URL is a host that has not
+/// finished booting. An old runtime that serves the bare URL is a different
+/// thing, and it is never `Starting` without one, so the state tells the two
+/// apart -- not the absence of the field.
+///
+/// Handing out the bare URL during that window is what makes this a trap: DSH
+/// 0.1.2+ answers every tokenless request with 401, so the webview and the
+/// headless browser both land on "authentication required". That reads like a
+/// permission problem rather than "not yet", and nothing in the reply tells
+/// the caller to wait, so an agent opens it once, sees a wall, and concludes
+/// the container is broken.
+fn usable_url(record: &host::ContainerHostRecord) -> Result<String, String> {
+    match (&record.authenticated_url, record.state) {
+        (Some(url), _) => Ok(url.clone()),
+        (None, host::HostState::Starting) => Err(format!(
+            "container {} is still starting; its URL cannot be opened until the host announces one (retry in a moment)",
+            record.id
+        )),
+        (None, _) => Ok(record.host_url.clone()),
+    }
+}
 /// Resolve a running container's authenticated loopback URL.
 ///
 /// Whether a container still has a running host, read without daemon state.
@@ -1056,7 +1079,7 @@ pub(crate) fn container_url_probe(id: &str) -> Result<String, String> {
             HostState::Starting | HostState::Ready | HostState::Running
         ) && box_containers::is_host_pid_alive(record.host_pid)
     }) {
-        Some(record) => Ok(record.authenticated_url.unwrap_or(record.host_url)),
+        Some(record) => usable_url(&record),
         None => Err(format!("container is not running: {id}")),
     }
 }
@@ -1075,11 +1098,14 @@ pub(crate) fn container_url(state: &DaemonState, id: &str) -> Result<String, Str
     if let Some(host) = running.get(&id) {
         // DSH 0.1.2+ rejects tokenless requests with 401, so prefer the
         // authenticated URL when the start path parsed one.
-        let url = host
-            .authenticated_url
-            .clone()
-            .unwrap_or_else(|| host.url.clone());
-        return Ok(url);
+        if let Some(url) = &host.authenticated_url {
+            return Ok(url.clone());
+        }
+        // No token in the in-memory entry is ambiguous -- the host has not
+        // announced one yet, or the runtime does not use them -- and only the
+        // record can tell those apart, because it carries the state. It is
+        // written before the readiness probe begins, so it covers the whole
+        // window this registry entry lives in.
     }
     drop(running);
     let record =
@@ -1090,13 +1116,7 @@ pub(crate) fn container_url(state: &DaemonState, id: &str) -> Result<String, Str
             HostState::Starting | HostState::Ready | HostState::Running
         ) && box_containers::is_host_pid_alive(record.host_pid)
     }) {
-        Some(record) => {
-            // DSH 0.1.2+ rejects tokenless requests with 401, so hand the
-            // webview the authenticated URL whenever the start path parsed
-            // one from the host log.
-            let url = record.authenticated_url.unwrap_or(record.host_url);
-            Ok(url)
-        }
+        Some(record) => usable_url(&record),
         None => Err(format!("container is not running: {id}")),
     }
 }
@@ -1840,5 +1860,69 @@ mod tests {
             plugin_dependency_graph_rpc(&json!({ "kind": "template", "id": "nope" })).unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
         cleanup(&home, &runtime);
+    }
+}
+
+#[cfg(test)]
+mod usable_url_tests {
+    use super::*;
+
+    fn record(state: host::HostState, authenticated: Option<&str>) -> host::ContainerHostRecord {
+        host::ContainerHostRecord {
+            id: "container-test".to_owned(),
+            name: "test".to_owned(),
+            template: None,
+            profile: "web".to_owned(),
+            host_pid: 1,
+            host_pgid: 0,
+            host_port: 1234,
+            host_url: "http://127.0.0.1:1234".to_owned(),
+            authenticated_url: authenticated.map(str::to_owned),
+            started_at: 0,
+            last_seen: 0,
+            state,
+            generation: 0,
+            exit_status: None,
+            exit_signal: None,
+            unhealthy_count: 0,
+            probe_count: 0,
+        }
+    }
+
+    /// A booting host has no token yet. Handing out the bare URL there sends
+    /// every caller into the 401 fence, which reads as "broken" rather than
+    /// "not yet" -- so the reply must name the wait instead.
+    #[test]
+    fn starting_without_a_token_refuses_and_says_to_wait() {
+        let error = usable_url(&record(host::HostState::Starting, None)).unwrap_err();
+        assert!(error.contains("still starting"), "{error}");
+        assert!(error.contains("retry"), "{error}");
+        assert!(!error.contains("http"), "{error}");
+    }
+
+    /// The same absence, once the host is up, means an old runtime that never
+    /// had a token. Refusing there would break it for no reason.
+    #[test]
+    fn ready_without_a_token_is_an_older_runtime_and_keeps_its_bare_url() {
+        for state in [host::HostState::Ready, host::HostState::Running] {
+            assert_eq!(
+                usable_url(&record(state, None)).unwrap(),
+                "http://127.0.0.1:1234"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_is_preferred_in_every_state() {
+        for state in [
+            host::HostState::Starting,
+            host::HostState::Ready,
+            host::HostState::Running,
+        ] {
+            assert_eq!(
+                usable_url(&record(state, Some("http://127.0.0.1:1234/?token=t"))).unwrap(),
+                "http://127.0.0.1:1234/?token=t"
+            );
+        }
     }
 }

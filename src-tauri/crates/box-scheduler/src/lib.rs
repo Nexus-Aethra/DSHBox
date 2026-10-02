@@ -644,6 +644,51 @@ impl TaskManager {
         Ok(updated)
     }
 
+    /// Mark every task that has not reached a terminal state as `Interrupted`,
+    /// releasing its resource locks. Returns the ids it closed.
+    ///
+    /// A daemon that goes down takes its tasks with it, and without this the
+    /// record simply stops mid-line: the last thing written is a progress
+    /// message, and the next start finds a task that is neither running nor
+    /// finished. That reads exactly like a task that hung, and a container that
+    /// was halfway through starting looks like a container that will not start
+    /// at all. Naming the cause turns both into something a user can act on --
+    /// and, because the locks are released, the retry that follows is not
+    /// blocked behind a task that no longer exists.
+    ///
+    /// `Interrupted` rather than `Failed`: nothing about the task's own work
+    /// went wrong. It was still doing fine when its supervisor went away, and a
+    /// report that says "failed" sends the reader looking in the wrong place.
+    pub fn interrupt_running(&self, reason: &str) -> BoxResult<Vec<String>> {
+        let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
+        let open: Vec<String> = state
+            .tasks
+            .values()
+            // `status` is the serialised (lower-case) form, so it is compared
+            // as a string. `TaskState` is the same enum behind a Display impl,
+            // and the Rust spelling matches none of the wire values.
+            .filter(|task| !matches!(
+                task.status.as_str(),
+                "succeeded" | "failed" | "cancelled" | "interrupted" | "rolledback"
+            ))
+            .map(|task| task.id.clone())
+            .collect();
+        if open.is_empty() {
+            return Ok(Vec::new());
+        }
+        state.running = 0;
+        state.active_resources.clear();
+        for id in &open {
+            let task = state.tasks.get_mut(id).ok_or("task not found")?;
+            task.transition_to(TaskState::Interrupted).ok();
+            task.stage = "Interrupted".to_owned();
+            task.finished_at = Some(now_seconds());
+            task.error = Some(reason.to_owned());
+        }
+        drop(state);
+        self.persist()?;
+        Ok(open)
+    }
     /// Transition a failed task into the `RollingBack` state. The resource
     /// locks are temporarily retained so the rollback has exclusive access.
     /// Returns the updated task record, or an error if the transition is
@@ -953,6 +998,55 @@ mod tests {
         }
     }
 
+    /// The point of `interrupt_running`: a task whose daemon went away is
+    /// neither running nor finished, and that third state is what makes it
+    /// look like a hang. It must land on `interrupted`, carry the reason, and
+    /// -- the part that is easy to miss -- give its resource lock back, so the
+    /// retry after the restart is not queued behind a task that no longer
+    /// exists.
+    #[test]
+    fn interrupt_running_closes_open_tasks_and_frees_their_locks() {
+        let paths = paths("interrupt");
+        let manager = TaskManager::json(&paths).unwrap();
+        let open = manager
+            .enqueue(
+                &paths,
+                "container-start",
+                vec!["container:one".to_owned()],
+                serde_json::json!({ "id": "one" }),
+            )
+            .unwrap();
+        manager
+            .enqueue(
+                &paths,
+                "container-start",
+                vec!["container:two".to_owned()],
+                serde_json::json!({ "id": "two" }),
+            )
+            .unwrap();
+        assert!(!manager.resource_idle("container:one").unwrap());
+
+        let closed = manager.interrupt_running("the daemon went away").unwrap();
+        assert_eq!(closed.len(), 2, "both open tasks are closed: {closed:?}");
+
+        for record in manager.list().unwrap() {
+            assert_eq!(record.status, "interrupted", "{}", record.id);
+            assert_eq!(record.stage, "Interrupted");
+            assert_eq!(record.error.as_deref(), Some("the daemon went away"));
+            assert!(record.finished_at.is_some(), "{} has no finish time", record.id);
+        }
+        assert!(manager.resource_idle("container:one").unwrap(), "lock held");
+        assert!(manager.resource_idle("container:two").unwrap(), "lock held");
+
+        // A second shutdown finds nothing left to close, and does not touch
+        // what it already closed.
+        assert!(manager.interrupt_running("again").unwrap().is_empty());
+        assert_eq!(
+            manager.list().unwrap()[0].error.as_deref(),
+            Some("the daemon went away"),
+        );
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
     #[test]
     fn queued_task_reserves_its_resource_for_short_transactions() {
         let paths = paths("resource");

@@ -99,6 +99,37 @@ pub(crate) fn reconcile_daemon_build(server: &Path) {
     write_startup_log(&format!(
         "daemon build stamp {remote_stamp:?} != client {CLIENT_BUILD_STAMP:?}; restarting daemon"
     ));
+    // Do not stop a daemon that is in the middle of something. `shutdown`
+    // ends whatever the daemon is running, and the desktop starts routinely --
+    // opening the app is enough -- so a stamp left over from an earlier build
+    // would kill a container start, a build, or a bundle export the user had
+    // just asked for. The task is now recorded as interrupted rather than
+    // vanishing, but the work is still lost, and a daemon one build behind is
+    // a far smaller problem than a task that stopped for no visible reason.
+    let busy = client
+        .call("list_tasks", serde_json::json!({}))
+        .ok()
+        .and_then(|tasks| tasks.as_array().cloned())
+        .map(|tasks| {
+            tasks
+                .iter()
+                .filter(|task| {
+                    !matches!(
+                        task["status"].as_str().unwrap_or_default(),
+                        "succeeded" | "failed" | "cancelled" | "interrupted" | "rolledback"
+                    )
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    if busy > 0 {
+        write_startup_log(&format!(
+            "leaving the stale daemon alone: {busy} task(s) still running. It is one \
+             build behind, which costs a restart later; stopping it now would cost \
+             the work in flight."
+        ));
+        return;
+    }
     let _ = client.call("shutdown", serde_json::json!({}));
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while daemon_alive() && std::time::Instant::now() < deadline {
