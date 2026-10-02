@@ -109,7 +109,10 @@ export function registerManageTools(ctx: Context): void {
     parameters: {
       type: 'object',
       properties: {
-        action: actionProperty('lifecycle', ['start', 'stop', 'restart', 'rebuild', 'remove']),
+        action: actionProperty(
+          'lifecycle',
+          ['start', 'stop', 'stop-now', 'restart', 'rebuild', 'remove'],
+        ),
         containerId: {
           type: 'string',
           description: 'Container to act on. box_overview lists the ids.',
@@ -129,12 +132,27 @@ export function registerManageTools(ctx: Context): void {
       const record = args as Record<string, unknown>
       const containerId = required(record, 'containerId')
       const action = required(record, 'action')
+      const rpc = getRpc()
       const methods: Record<string, string> = {
         start: 'enqueue_container_start',
         stop: 'enqueue_container_stop',
         restart: 'enqueue_container_restart',
         rebuild: 'enqueue_container_rebuild',
         remove: 'delete_container',
+      }
+      // `stop-now` is the daemon's synchronous stop: no task, no log, it is
+      // done when it returns. `stop` is the queued one and leaves a record. Both
+      // exist in the daemon and they are not the same call, so both are offered
+      // rather than pretending the other does not.
+      if (action === 'stop-now') {
+        if (runsInside(containerId)) {
+          throw new Error('This agent is running inside ' + containerId + ', so stopping it would end the call before it could report a result.')
+        }
+        return {
+          action,
+          containerId,
+          kind: await rpc.call('stop_container', { id: containerId }),
+        }
       }
       const method = methods[action]
       if (method === undefined) {
@@ -260,7 +278,7 @@ export function registerManageTools(ctx: Context): void {
       properties: {
         action: actionProperty(
           'resources',
-          ['list', 'read', 'write', 'extract', 'inject', 'rm', 'rm-view', 'prune'],
+          ['list', 'read', 'write', 'extract', 'inject', 'rm', 'rm-view', 'prune', 'types', 'views'],
         ),
         containerId: { type: 'string', description: 'Container to act on.' },
         path: {
@@ -269,7 +287,10 @@ export function registerManageTools(ctx: Context): void {
             'Container-relative file. Required for read and write, and names the resource '
             + 'kind\'s default location for extract.',
         },
-        kind: { type: 'string', description: 'Resource kind, e.g. sessions or credentials.' },
+        kind: {
+          type: 'string',
+          description: 'Resource kind, e.g. sessions or credentials. Required by action types.',
+        },
         section: {
           type: 'string',
           description: 'YAML key path to read or write at, e.g. llm-pi-ai. Empty means the whole file.',
@@ -373,8 +394,26 @@ export function registerManageTools(ctx: Context): void {
           }
         case 'prune':
           return { action, containerId, result: { removed: await rpc.call('prune_orphaned_data') } }
+        case 'types': {
+          // The daemon requires a kind here, and says so as "expected a
+          // resource kind" -- a message that names neither this tool nor the
+          // field. Requiring it in the tool turns that into a message that names
+          // both, before the call is made.
+          const request: Record<string, unknown> = { id: containerId, kind: required(record, 'kind') }
+          return { action, containerId, result: { types: await rpc.call('list_resource_type', request) } }
+        }
+        case 'views': {
+          const request: Record<string, unknown> = { id: containerId }
+          const kind = optional(record, 'kind')
+          if (kind !== undefined) request.kind = kind
+          return { action, containerId, result: { views: await rpc.call('list_resource_views', request) } }
+        }
         default:
-          badAction('resources', action, ['list', 'read', 'write', 'extract', 'inject', 'rm', 'rm-view', 'prune'])
+          badAction(
+            'resources',
+            action,
+            ['list', 'read', 'write', 'extract', 'inject', 'rm', 'rm-view', 'prune', 'types', 'views'],
+          )
       }
     },
   })
@@ -661,13 +700,19 @@ export function registerManageTools(ctx: Context): void {
       properties: {
         action: actionProperty(
           'plugins',
-          ['list', 'installed', 'container', 'add', 'remove', 'import', 'export', 'bundle', 'prune', 'graph'],
+          [
+            'list', 'installed', 'container', 'add', 'add-extension', 'copy', 'remove-plugin', 'import',
+            'export', 'export-installed', 'import-workspace', 'install-bundle', 'bundle', 'prune', 'graph',
+          ],
         ),
         containerId: { type: 'string', description: 'Container to read, install into, or graph.' },
         profile: { type: 'string', description: 'Profile inside the container. Defaults to web.' },
         spec: { type: 'string', description: 'What to install: a package spec, a directory, or a row id.' },
         extensionId: { type: 'string', description: 'Which repository extension to export.' },
-        name: { type: 'string', description: 'Bundle name, for a bundle action.' },
+        name: { type: 'string', description: 'Bundle name, a plugin name, or a name to import under.' },
+        path: { type: 'string', description: 'Absolute path, for importing from or exporting to the workspace.' },
+        destination: { type: 'string', description: 'Absolute path to write an export to.' },
+        overwrite: { type: 'boolean', description: 'Install a bundle, replacing what is there instead of keeping it.' },
         ids: { type: 'array', items: { type: 'string' }, description: 'Repository row ids that make up a bundle.' },
         subaction: { type: 'string', enum: ['list', 'create', 'import', 'export', 'delete'], description: 'What to do with a bundle.' },
       },
@@ -717,6 +762,64 @@ export function registerManageTools(ctx: Context): void {
               await rpc.call('remove_repository_extension', { id: required(record, 'extensionId') }),
             ),
           }
+        case 'add-extension': {
+          // The daemon has two ways in. `add` resolves a package spec through
+          // the plugin path; this one takes an extension source the repository
+          // already understands, which is what a boxfile-style entry uses.
+          const task = await runTask('enqueue_container_extension_add', {
+            id: needContainer('adding to'),
+            profile,
+            source: required(record, 'spec'),
+          })
+          return { action, result: { kind: task.kind, logPath: task.logPath ?? '' } }
+        }
+        case 'copy': {
+          // A copy of a repository entry a container already has, which is
+          // different from `add`: that resolves a spec, this moves bytes the
+          // repository has already vetted.
+          const task = await runTask('enqueue_container_extension_copy', {
+            id: needContainer('copying into'),
+            profile,
+            repositoryId: required(record, 'extensionId'),
+          })
+          return { action, result: { kind: task.kind, logPath: task.logPath ?? '' } }
+        }
+        case 'remove-plugin':
+          return {
+            action,
+            result: asObject(
+              await rpc.call('remove_repository_plugin', {
+                id: required(record, 'extensionId'),
+                profile,
+                name: required(record, 'name'),
+              }),
+            ),
+          }
+        case 'export-installed': {
+          const params: Record<string, unknown> = {
+            sourceContainerId: needContainer('exporting from'),
+            sourcePath: required(record, 'path'),
+            destination: required(record, 'destination'),
+          }
+          const task = await runTask('enqueue_plugin_export', params)
+          return { action, result: { kind: task.kind, logPath: task.logPath ?? '' } }
+        }
+        case 'import-workspace': {
+          const params: Record<string, unknown> = { path: required(record, 'path') }
+          const name = optional(record, 'name')
+          if (name !== undefined) params.name = name
+          const task = await runTask('enqueue_workspace_extension_import', params)
+          return { action, result: { kind: task.kind, logPath: task.logPath ?? '' } }
+        }
+        case 'install-bundle': {
+          const task = await runTask('enqueue_container_bundle_install', {
+            id: needContainer('installing into'),
+            profile,
+            bundleId: required(record, 'extensionId'),
+            conflict: flag(record, 'overwrite') ? 'overwrite' : 'keep',
+          })
+          return { action, result: { kind: task.kind, logPath: task.logPath ?? '' } }
+        }
         case 'prune':
           return { action, result: { removed: asArray(await rpc.call('prune_repository_extensions')) } }
         case 'bundle': {
@@ -744,7 +847,10 @@ export function registerManageTools(ctx: Context): void {
           badAction(
             'plugins',
             action,
-            ['list', 'installed', 'container', 'add', 'remove', 'import', 'export', 'bundle', 'prune', 'graph'],
+            [
+              'list', 'installed', 'container', 'add', 'add-extension', 'copy', 'remove-plugin', 'import',
+              'export', 'export-installed', 'import-workspace', 'install-bundle', 'bundle', 'prune', 'graph',
+            ],
           )
       }
     },
@@ -904,7 +1010,116 @@ export function registerManageTools(ctx: Context): void {
       }
     },
   })
+  register(ctx, {
+    name: 'box_settings',
+    description:
+      'The box itself rather than anything in it: the toolchains and DSH versions it '
+      + 'can use, the catalogue of versions available, the mirrors and runtime '
+      + 'directory it is configured with, and the templates behind them. The read '
+      + 'actions need nothing. The ones that change the box for everything on this '
+      + 'machine -- moving where its data lives, changing the mirrors, removing an '
+      + 'installed DSH version -- need confirm true, so they cannot happen by '
+      + 'accident from a half-remembered argument. Moving the runtime directory '
+      + 'rebuilds the plugin set and asks for a restart; the reply says so.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: actionProperty(
+          'settings',
+          [
+            'toolchains', 'installed', 'catalog', 'refresh-catalog',
+            'data', 'references', 'template-info', 'template-list',
+            'save-mirrors', 'set-runtime-directory', 'uninstall-dsh',
+          ],
+        ),
+        version: { type: 'string', description: 'Which DSH version, for uninstall-dsh or template-info.' },
+        runtimeDirectory: { type: 'string', description: 'Absolute path to move the box data to.' },
+        githubMirror: { type: 'string', description: 'GitHub mirror URL. Omit to clear it.' },
+        npmRegistry: { type: 'string', description: 'npm registry URL. Omit to clear it.' },
+        confirm: {
+          type: 'boolean',
+          description: 'Required true for the three actions that change the box itself.',
+        },
+      },
+      required: ['action'],
+    },
+    timeoutMs: LONG_BUDGET_MS,
+    output: textOutput(
+      { action: { type: 'string' }, result: { type: 'object' } },
+      ['action', 'result'],
+      (value) => 'box_settings ' + String(value.action) + ':\n' + JSON.stringify(value.result, null, 2).slice(0, 6000),
+    ),
+    async execute(args) {
+      const record = args as Record<string, unknown>
+      const action = required(record, 'action')
+      const rpc = getRpc()
+      // These three change the box for every container and every future session,
+      // so they take a flag the caller has to set deliberately. The alternative --
+      // refusing them -- leaves a capability an agent is told about and cannot
+      // use, which is worse than one it has to think about.
+      const risky: Record<string, string> = {
+        'save-mirrors': 'changing the mirrors every install goes through',
+        'set-runtime-directory': 'moving where all box data lives',
+        'uninstall-dsh': 'removing an installed DSH version',
+      }
+      const what = risky[action]
+      if (what !== undefined && !flag(record, 'confirm')) {
+        throw new Error(
+          action + ' means ' + what + ', and it affects every container and every future '
+            + 'session, not just this one. Pass confirm true when that is what you want.',
+        )
+      }
+      switch (action) {
+        case 'toolchains':
+          return { action, result: asObject(await rpc.call('detect_toolchains')) }
+        case 'installed':
+          return { action, result: asObject(await rpc.call('list_installed_dsh_versions')) }
+        case 'catalog':
+          return { action, result: asObject(await rpc.call('list_dsh_catalog')) }
+        case 'refresh-catalog': {
+          const task = await runTask('refresh_dsh_catalog', {})
+          return { action, result: { kind: task.kind, logPath: task.logPath ?? '' } }
+        }
+        case 'data':
+          return { action, result: { entries: asArray(await rpc.call('list_data_entries')) } }
+        case 'references':
+          return { action, result: asObject(await rpc.call('list_repository_reference_counts')) }
+        case 'template-info':
+          return { action, result: asObject(await rpc.call('template_info', { name: required(record, 'version') })) }
+        case 'template-list':
+          return { action, result: asObject(await rpc.call('read_template_list', { name: required(record, 'version') })) }
+        case 'save-mirrors': {
+          const params: Record<string, unknown> = {}
+          params.githubMirror = optional(record, 'githubMirror') ?? null
+          params.npmRegistry = optional(record, 'npmRegistry') ?? null
+          return { action, result: asObject(await rpc.call('save_mirror_settings', params)) }
+        }
+        case 'set-runtime-directory':
+          return {
+            action,
+            result: asObject(
+              await rpc.call('save_runtime_directory', {
+                runtimeDirectory: required(record, 'runtimeDirectory'),
+              }),
+            ),
+          }
+        case 'uninstall-dsh':
+          return { action, result: asObject(await rpc.call('uninstall_dsh_version', { version: required(record, 'version') })) }
+        default:
+          badAction(
+            'settings',
+            action,
+            [
+              'toolchains', 'installed', 'catalog', 'refresh-catalog',
+              'data', 'references', 'template-info', 'template-list',
+              'save-mirrors', 'set-runtime-directory', 'uninstall-dsh',
+            ],
+          )
+      }
+    },
+  })
 }
+
 
 
 
