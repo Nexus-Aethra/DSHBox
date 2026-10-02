@@ -27,6 +27,7 @@ import {
   type Discovery,
 } from './rpc'
 import { getRpc, resetRpc } from './rpc'
+import { registerManageTools } from './manage'
 import { applyBoxTools, hostServices } from './tools'
 
 /** Cordis plugin name used by loader diagnostics and the patch overlay. */
@@ -158,6 +159,9 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
   resetRpc()
   getRpc(resolveConfig(config))
   applyBoxTools(ctx)
+  // Driven through the same host tools service, so an agent sees one namespace
+  // rather than a debugging set and a management set it has to know about.
+  registerManageTools(ctx)
   // Re-apply means a new config; the old singleton must not outlive it.
   ctx.effect(() => () => resetRpc(), 'dsh-box-sandbox.client()')
   // The section is registered inside an effect, so disposing this mount

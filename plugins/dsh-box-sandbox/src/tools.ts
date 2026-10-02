@@ -45,7 +45,7 @@ interface ImageAttachmentRef {
   name?: string
 }
 
-interface HostToolDefinition {
+export interface HostToolDefinition {
   name: string
   description: string
   /** JSON Schema object for the arguments, as sent to the model. */
