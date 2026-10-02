@@ -68,35 +68,6 @@ interface HostServices {
       name?: string
     }): Promise<ImageAttachmentRef>
   }
-  /**
-   * DSH's own Workspace remote, reached without a client half.
-   *
-   * Adding a workspace normally goes through a native directory picker, and a
-   * native picker is not a thing an agent can drive: it opens on the host
-   * desktop, outside the page, so a headless browser cannot see it and a click
-   * on the trigger reports success while achieving nothing. The command behind
-   * the picker takes a path, though, and it lives on the host -- which is where
-   * this plugin already runs. The dialog is a way of obtaining a path, not a
-   * requirement, and the path is the whole of the input.
-   *
-   * `created: false` means the path was already registered. That is reported
-   * rather than raised: re-adding a workspace is how a caller confirms one
-   * exists, and a tool that treats the idempotent case as an error makes that
-   * impossible to express.
-   *
-   * The path is passed through verbatim. It is the host's own validation that
-   * decides what a legal directory is on the platform it runs on, so this tool
-   * assumes no separator, no drive letter and no root -- a POSIX path and a
-   * Windows path are equally just strings here.
-   */
-  remote: {
-    workspace: {
-      create(request: { path: string }): Promise<{
-        workspace: { id: string; path: string; title?: string }
-        created: boolean
-      }>
-    }
-  }
   /** One prompt section carrying the cross-tool workflow. */
   systemPrompt: {
     section(section: {
@@ -839,61 +810,5 @@ export function applyBoxTools(ctx: Context): void {
   })
 
 
-  registerTool(ctx, {
-    name: 'box_add_workspace',
-    description:
-      'Register a directory on the host as a DSH workspace, by path, with no file dialog. '
-      + 'The UI does this through a native picker that an agent cannot operate, because it opens '
-      + 'outside the page; this calls the same host command with the path given, so a session can '
-      + 'be pointed at a directory from a script or a tool call. Pass a fully qualified path as the '
-      + 'host spells it on its own platform. Already being registered is reported, not treated as '
-      + 'an error, so it doubles as a way to check.',
-    parameters: {
-      type: 'object',
-      properties: {
-        path: {
-          type: 'string',
-          description: 'Absolute path of an existing directory on the host.',
-        },
-      },
-      required: ['path'],
-    },
-    timeoutMs: WARM_BUDGET_MS,
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          path: { type: 'string' },
-          workspaceId: { type: 'string' },
-          title: { type: 'string' },
-          created: { type: 'boolean' },
-        },
-        required: ['path', 'workspaceId', 'created'],
-      },
-      render: (_args, value) => {
-        const record = asRecord(value)
-        const label = String(record.title ?? record.workspaceId)
-        return [{
-          type: 'text',
-          text: (record.created === true ? 'Registered' : 'Already registered')
-            + ' the workspace ' + label + ' at ' + String(record.path) + '.',
-        }]
-      },
-    },
-    async execute(args) {
-      const record = asRecord(args)
-      const path = String(record.path ?? '').trim()
-      if (path === '') {
-        throw new Error('box_add_workspace requires a path.')
-      }
-      const result = await hostServices(ctx).remote.workspace.create({ path })
-      return {
-        path,
-        workspaceId: result.workspace.id,
-        title: result.workspace.title ?? result.workspace.path,
-        created: result.created,
-      }
-    },
-  })
+
 }
