@@ -82,7 +82,7 @@ fn wait_for_daemon(timeout: Duration) -> Option<box_client::RpcClient> {
 /// different build batch than this desktop binary (a stale daemon left
 /// over from before an upgrade), stop it and start the daemon shipped with
 /// this install. Failures are logged but never block startup.
-pub(crate) fn reconcile_daemon_build(server: &Path) {
+pub(crate) fn reconcile_daemon_build() {
     let Some(client) = wait_for_daemon(Duration::from_secs(5)) else {
         write_startup_log("daemon did not become reachable; skipping build stamp check");
         return;
@@ -96,95 +96,26 @@ pub(crate) fn reconcile_daemon_build(server: &Path) {
         write_startup_log(&format!("daemon build stamp matches ({remote_stamp})"));
         return;
     }
+    // Log it, and do not act on it.
+    //
+    // This used to stop the daemon and start the one from this install, and
+    // the reason it no longer does is that the hammer was aimed at a rare
+    // case. A daemon left over from a previous build is a version behind on
+    // a loopback RPC that only grows; the client falls back for the calls it
+    // cannot make, and the cost of being wrong is a feature that needs a
+    // newer server. The cost of stopping it is a container start, a build, or
+    // a bundle export the user asked for a second earlier -- because the
+    // desktop starts routinely, so merely opening the app was enough to end
+    // whatever the daemon was doing. That trade was backwards, and "the
+    // daemon is busy" was only one of the reasons it fired.
+    //
+    // So: report, and let the server stand. A restart stays available to the
+    // user as one they chose, rather than one that happened to them.
     write_startup_log(&format!(
-        "daemon build stamp {remote_stamp:?} != client {CLIENT_BUILD_STAMP:?}; restarting daemon"
+        "daemon build stamp {remote_stamp:?} != client {CLIENT_BUILD_STAMP:?}; keeping the running daemon"
     ));
-    // Do not stop a daemon that is in the middle of something. `shutdown`
-    // ends whatever the daemon is running, and the desktop starts routinely --
-    // opening the app is enough -- so a stamp left over from an earlier build
-    // would kill a container start, a build, or a bundle export the user had
-    // just asked for. The task is now recorded as interrupted rather than
-    // vanishing, but the work is still lost, and a daemon one build behind is
-    // a far smaller problem than a task that stopped for no visible reason.
-    let busy = client
-        .call("list_tasks", serde_json::json!({}))
-        .ok()
-        .and_then(|tasks| tasks.as_array().cloned())
-        .map(|tasks| {
-            tasks
-                .iter()
-                .filter(|task| {
-                    !matches!(
-                        task["status"].as_str().unwrap_or_default(),
-                        "succeeded" | "failed" | "cancelled" | "interrupted" | "rolledback"
-                    )
-                })
-                .count()
-        })
-        .unwrap_or(0);
-    if busy > 0 {
-        write_startup_log(&format!(
-            "leaving the stale daemon alone: {busy} task(s) still running. It is one \
-             build behind, which costs a restart later; stopping it now would cost \
-             the work in flight."
-        ));
-        return;
-    }
-    let _ = client.call("shutdown", serde_json::json!({}));
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while daemon_alive() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(120));
-    }
+    return;
     // Bring the freshly-installed daemon up: through the user service when
-    // one exists, otherwise by spawning the bundled sidecar directly.
-    #[cfg(unix)]
-    {
-        if let Err(error) = restart_user_service() {
-            write_startup_log(&format!(
-                "daemon restart via service failed ({error}); spawning directly"
-            ));
-            spawn_daemon_fallback(server);
-        }
-    }
-    #[cfg(windows)]
-    {
-        // Windows uses a per-user scheduled task (dshboxd) for the daemon,
-        // but schtasks /RL LIMITED is fragile: it silently fails when the
-        // task hasn't been created yet, when the user lacks rights, or
-        // when the desktop session is detached. Without a fallback the UI
-        // hangs on "Starting DSH Box server…" forever, because no
-        // discovery.json ever gets written. So on Windows we always run
-        // the scheduled task AND, if it didn't bring the daemon up,
-        // spawn the sidecar directly. The single-instance check in
-        // dshboxd keeps the duplicate from clobbering the live process.
-        match restart_user_service() {
-            Ok(()) => write_startup_log("daemon restart via scheduled task"),
-            Err(error) => write_startup_log(&format!(
-                "daemon restart via scheduled task failed ({error}); spawning directly"
-            )),
-        }
-        // Give the task a moment to start before we decide to fall back.
-        // If the task succeeded, the fallback is a no-op (daemon_alive
-        // returns true and spawn_daemon_fallback skips itself).
-        if !daemon_alive() {
-            spawn_daemon_fallback(server);
-        }
-    }
-    if let Some(client) = wait_for_daemon(Duration::from_secs(5)) {
-        let stamp = client
-            .call("get_info", serde_json::json!({}))
-            .ok()
-            .and_then(|info| info["buildStamp"].as_str().map(str::to_owned))
-            .unwrap_or_default();
-        let message = if stamp == CLIENT_BUILD_STAMP {
-            format!("daemon restarted with matching build stamp ({stamp})")
-        } else {
-            "daemon restarted but build stamp still does not match".to_owned()
-        };
-        write_startup_log(&message);
-    } else {
-        write_startup_log("daemon did not come back after restart");
-    }
 }
 
 /// Fallback launcher for platforms without a per-user service manager

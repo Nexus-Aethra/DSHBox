@@ -272,7 +272,7 @@ fn run_inner() -> Result<(), String> {
                 }
                 // Protocol handshake: restart a daemon built in a different
                 // build batch (stale binary left over from before an upgrade).
-                reconcile_daemon_build(&server);
+                reconcile_daemon_build();
             } else {
                 write_startup_log(&format!("dshboxd sidecar is missing: {}", server.display()));
             }

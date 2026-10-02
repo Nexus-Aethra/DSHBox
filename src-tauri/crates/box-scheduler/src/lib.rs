@@ -1008,7 +1008,7 @@ mod tests {
     fn interrupt_running_closes_open_tasks_and_frees_their_locks() {
         let paths = paths("interrupt");
         let manager = TaskManager::json(&paths).unwrap();
-        let open = manager
+        manager
             .enqueue(
                 &paths,
                 "container-start",
