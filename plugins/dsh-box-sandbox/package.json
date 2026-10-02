@@ -1,7 +1,26 @@
 {
   "name": "@nexus-aethra/dsh-box-sandbox",
   "version": "0.1.0",
-  "private": true,
+  "description": "Host-side bridge from a DSH session to the DSH Box daemon: typed box_* tools an agent can call without a shell.",
+  "keywords": [
+    "dsh",
+    "dsh-box",
+    "cordis",
+    "agent",
+    "box",
+    "tools"
+  ],
+  "homepage": "https://github.com/aethra-tech/DSHBox/tree/main/plugins/dsh-box-sandbox",
+  "bugs": {
+    "url": "https://github.com/aethra-tech/DSHBox/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aethra-tech/DSHBox.git",
+    "directory": "plugins/dsh-box-sandbox"
+  },
+  "author": "Nexus Aethra",
+  "license": "MIT",
   "type": "module",
   "main": "dist/index.mjs",
   "types": "dist/index.d.mts",
@@ -14,13 +33,13 @@
       "types": "./dist/rpc.d.mts",
       "default": "./dist/rpc.mjs"
     },
-    "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
   "files": [
     "dist/",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
@@ -32,7 +51,6 @@
     "watch": "tsdown --watch",
     "typecheck": "tsc --noEmit"
   },
-  "license": "MIT",
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1"
   },
