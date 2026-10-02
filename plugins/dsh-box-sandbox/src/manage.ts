@@ -692,7 +692,155 @@ export function registerManageTools(ctx: Context): void {
       }
     },
   })
+  register(ctx, {
+    name: 'box_create',
+    description:
+      'Make a container, and look at one in full. An agent that can start and stop '
+      + 'containers but not create them is doing half the job: create from a '
+      + 'template, create from a DSH version, describe what exists, get the URL a '
+      + 'running one is serving, or list the directories a container can open. '
+      + 'Creating from a template starts the container and returns its id, so the '
+      + 'next call can act on it. A plain create materialises the tree without '
+      + 'starting anything; start it with box_lifecycle. The name has to be safe '
+      + 'for a path, and is not the id.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: actionProperty('create', ['from-template', 'from-version', 'describe', 'url', 'browse']),
+        name: { type: 'string', description: 'Name for a new container, or which one to describe.' },
+        template: { type: 'string', description: 'Template to create from. Defaults to the one box_templates reports.' },
+        version: { type: 'string', description: 'DSH version to create from, for from-version.' },
+        containerId: { type: 'string', description: 'Which container, for describe, url and browse.' },
+        profile: { type: 'string', description: 'Profile to create with. Defaults to web.' },
+        start: { type: 'boolean', description: 'Start it after creating. Only from-version; from-template always starts.' },
+      },
+      required: ['action'],
+    },
+    timeoutMs: LONG_BUDGET_MS,
+    output: textOutput(
+      { action: { type: 'string' }, result: { type: 'object' } },
+      ['action', 'result'],
+      (value) => 'box_create ' + String(value.action) + ':\n' + JSON.stringify(value.result, null, 2).slice(0, 6000),
+    ),
+    async execute(args) {
+      const record = args as Record<string, unknown>
+      const action = required(record, 'action')
+      const rpc = getRpc()
+      const profile = optional(record, 'profile') ?? 'web'
+      const needId = (): string => {
+        const id = optional(record, 'containerId')
+        if (id === undefined) {
+          throw new Error('create ' + action + ' needs a containerId. box_overview lists them.')
+        }
+        return id
+      }
+      switch (action) {
+        case 'from-template': {
+          const name = required(record, 'name')
+          const template = optional(record, 'template')
+          if (template === undefined) {
+            throw new Error('from-template needs a template name; box_templates with action list reports what exists.')
+          }
+          const task = await runTask('create_container_from_template', { name, template, profile })
+          return { action, result: { kind: task.kind, name, logPath: task.logPath ?? '' } }
+        }
+        case 'from-version': {
+          const name = required(record, 'name')
+          const version = optional(record, 'version')
+          if (version === undefined) {
+            throw new Error('from-version needs a DSH version; box_templates with action catalog reports what exists.')
+          }
+          const created = await rpc.call<Record<string, unknown>>('create_container', { name, version, profile })
+          const id = created && created.id !== undefined ? String(created.id) : ''
+          if (id !== '' && flag(record, 'start')) {
+            await runTask('enqueue_container_start', { id })
+          }
+          return { action, result: { ...created, started: id !== '' && flag(record, 'start') } }
+        }
+        case 'describe':
+          return { action, result: asObject(await rpc.call('describe_container', { id: needId() })) }
+        case 'url': {
+          const url = await rpc.call<Record<string, unknown>>('container_url', { id: needId() })
+          return { action, result: asObject(url) }
+        }
+        case 'browse':
+          return { action, result: asObject(await rpc.call('browse_container_paths', { id: needId() })) }
+        default:
+          badAction('create', action, ['from-template', 'from-version', 'describe', 'url', 'browse'])
+      }
+    },
+  })
+
+  register(ctx, {
+    name: 'box_templates',
+    description:
+      'The templates a box can create containers from, and the DSH versions behind '
+      + 'them: list them, read one, pull a newer one, import an archive, export one '
+      + 'out, or remove one. Pulling and importing are waited on. A template is the '
+      + 'shape a new container starts from, so this is what you look at before '
+      + 'box_create from-template. Removing one is refused while a container was '
+      + 'built from it.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: actionProperty('templates', ['list', 'show', 'pull', 'import', 'export', 'remove', 'catalog']),
+        name: { type: 'string', description: 'Which template, or which DSH version to pull.' },
+        archive: { type: 'string', description: 'Absolute path of an archive to import.' },
+        destination: { type: 'string', description: 'Where to write an export. Defaults to a temp file.' },
+        versions: { type: 'boolean', description: 'With list, also report installed DSH versions.' },
+      },
+      required: ['action'],
+    },
+    timeoutMs: LONG_BUDGET_MS,
+    output: textOutput(
+      { action: { type: 'string' }, result: { type: 'object' } },
+      ['action', 'result'],
+      (value) => 'box_templates ' + String(value.action) + ':\n' + JSON.stringify(value.result, null, 2).slice(0, 6000),
+    ),
+    async execute(args) {
+      const record = args as Record<string, unknown>
+      const action = required(record, 'action')
+      const rpc = getRpc()
+      switch (action) {
+        case 'list': {
+          const templates = asArray(await rpc.call('list_templates'))
+          const result: Record<string, unknown> = { templates }
+          if (flag(record, 'versions')) {
+            result.dshVersions = asObject(await rpc.call('list_installed_dsh_versions'))
+          }
+          return { action, result }
+        }
+        case 'show':
+          return { action, result: asObject(await rpc.call('read_template', { name: required(record, 'name') })) }
+        case 'catalog':
+          return { action, result: asObject(await rpc.call('list_dsh_catalog')) }
+        case 'pull': {
+          const task = await runTask('pull_template', { name: required(record, 'name') })
+          return { action, result: { kind: task.kind, logPath: task.logPath ?? '' } }
+        }
+        case 'import': {
+          const archive = required(record, 'archive')
+          const params: Record<string, unknown> = { archive }
+          const name = optional(record, 'name')
+          if (name !== undefined) params.name = name
+          return { action, result: asObject(await rpc.call('import_template', params)) }
+        }
+        case 'export': {
+          const params: Record<string, unknown> = { name: required(record, 'name') }
+          const destination = optional(record, 'destination')
+          if (destination !== undefined) params.destination = destination
+          return { action, result: asObject(await rpc.call('export_template', params)) }
+        }
+        case 'remove':
+          return { action, result: asObject(await rpc.call('remove_template', { name: required(record, 'name') })) }
+        default:
+          badAction('templates', action, ['list', 'show', 'pull', 'import', 'export', 'remove', 'catalog'])
+      }
+    },
+  })
 }
+
+
 
   /** Keep a structured RPC reply an object, so rendering never sees an array. */
   function asObject(value: unknown): Record<string, unknown> {
