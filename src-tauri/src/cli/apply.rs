@@ -22,11 +22,9 @@
 //! existing copy keeps its name, so a second run reports "exists" instead of
 //! adding a second copy. `--dry-run` says what would happen and changes nothing.
 
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::rpc;
-use box_client::RpcClient;
 
 const HELP: &str = "\
 dshbox apply -f <file.yaml|json> [--json] [--dry-run]
@@ -50,46 +48,6 @@ dshbox apply -f <file.yaml|json> [--json] [--dry-run]
 Re-applying is safe: a type is keyed by (kind, container, path), and a copy whose
 name is already in the store is reported as `exists` rather than copied again.";
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Manifest {
-    #[serde(default)]
-    container: Option<String>,
-    #[serde(default)]
-    types: Vec<TypeSpec>,
-    #[serde(default)]
-    copies: Vec<CopySpec>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TypeSpec {
-    kind: String,
-    #[serde(default)]
-    label: Option<String>,
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    container: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CopySpec {
-    name: String,
-    kind: String,
-    #[serde(default)]
-    from: Option<String>,
-    /// An explicit path, for `kind: path` — state nothing declared.
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    container: Option<String>,
-    #[serde(default)]
-    entry: Option<String>,
-    #[serde(default)]
-    out: Option<String>,
-}
 
 /// What one entry did, which is also what `--json` prints.
 struct Outcome {
@@ -130,123 +88,40 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         index += 1;
     }
     let file = file.ok_or("expected --file <file.yaml|json>")?;
-    let body = std::fs::read_to_string(&file)
-        .map_err(|error| format!("cannot read {file}: {error}"))?;
-    let manifest: Manifest = serde_yaml::from_str(&body)
-        .map_err(|error| format!("{file} is not a valid apply document: {error}"))?;
-    if manifest.types.is_empty() && manifest.copies.is_empty() {
-        return Err(format!("{file} declares neither types nor copies"));
-    }
 
     let client = rpc::connect()?;
-    let containers = containers_by_name(&client)?;
-    let mut outcomes: Vec<Outcome> = Vec::new();
-
-    for (index, spec) in manifest.types.iter().enumerate() {
-        let container = spec
-            .container
-            .clone()
-            .or_else(|| manifest.container.clone())
-            .ok_or_else(|| format!("types[{index}] has no container, and the document names none"))?;
-        let id = resolve_container(&containers, &container)?;
-        let label = spec
-            .label
-            .clone()
-            .unwrap_or_else(|| spec.path.clone().unwrap_or_else(|| spec.kind.clone()));
-        let target = format!("type {label} ({})", spec.kind);
-        if dry_run {
-            outcomes.push(Outcome {
-                action: "type",
-                target,
-                status: "would-apply",
-                detail: Some(format!("container {container}")),
-            });
-            continue;
-        }
-        let mut request = json!({ "kind": spec.kind, "container": id });
-        if let Some(path) = &spec.path {
-            request["path"] = json!(path);
-        }
-        if let Some(label) = &spec.label {
-            request["label"] = json!(label);
-        }
-        match rpc::call(&client, "add_resource_view", request) {
-            Ok(_) => outcomes.push(Outcome {
-                action: "type",
-                target,
-                status: "applied",
-                detail: Some(format!("container {container}")),
-            }),
-            Err(error) => outcomes.push(Outcome {
-                action: "type",
-                target,
-                status: "failed",
-                detail: Some(error),
-            }),
-        }
-    }
-
-    let existing = stored_copy_names(&client).unwrap_or_default();
-    for (index, spec) in manifest.copies.iter().enumerate() {
-        let container = spec
-            .from
-            .clone()
-            .or_else(|| spec.container.clone())
-            .or_else(|| manifest.container.clone())
-            .ok_or_else(|| format!("copies[{index}] has no container, and the document names none"))?;
-        let id = resolve_container(&containers, &container)?;
-        let target = format!("copy {} ({} from {})", spec.name, spec.kind, container);
-        if existing.contains(&spec.name) {
-            outcomes.push(Outcome {
-                action: "copy",
-                target,
-                status: "exists",
-                detail: Some("a copy with this name is already in the store".to_owned()),
-            });
-            continue;
-        }
-        if dry_run {
-            outcomes.push(Outcome {
-                action: "copy",
-                target,
-                status: "would-apply",
-                detail: None,
-            });
-            continue;
-        }
-        let mut request = json!({ "id": id, "kind": spec.kind, "name": spec.name });
-        if let Some(path) = &spec.path {
-            request["dest"] = json!(path);
-        }
-        if let Some(entry) = &spec.entry {
-            request["entry"] = json!(entry);
-        }
-        if let Some(out) = &spec.out {
-            request["out"] = json!(rpc::absolutize_path(out));
-        }
-        match rpc::enqueue(&client, "enqueue_resource_extract", request) {
-            Ok(task) => match rpc::wait_task(&client, &task.id) {
-                Ok(()) => outcomes.push(Outcome {
-                    action: "copy",
-                    target,
-                    status: "applied",
-                    detail: Some(task.id),
-                }),
-                Err(error) => outcomes.push(Outcome {
-                    action: "copy",
-                    target,
-                    status: "failed",
-                    detail: Some(error),
-                }),
+    // The document's meaning lives in the daemon, which owns the storage layout
+    // and the order its entries depend on. This used to sequence five calls here,
+    // which meant a second caller had to learn that sequence too -- and would
+    // drift from it. One implementation, two front ends.
+    let value = rpc::call(
+        &client,
+        "apply_document",
+        json!({ "file": file, "dryRun": dry_run }),
+    )?;
+    let outcomes: Vec<Outcome> = value["outcomes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| Outcome {
+            action: match entry["action"].as_str().unwrap_or("") {
+                "type" => "type",
+                _ => "copy",
             },
-            Err(error) => outcomes.push(Outcome {
-                action: "copy",
-                target,
-                status: "failed",
-                detail: Some(error),
-            }),
-        }
-    }
+            target: entry["target"].as_str().unwrap_or_default().to_owned(),
+            status: match entry["status"].as_str().unwrap_or("") {
+                "applied" => "applied",
+                "would-apply" => "would-apply",
+                "exists" => "exists",
+                _ => "failed",
+            },
+            detail: entry["detail"]
+                .as_str()
+                .filter(|detail| !detail.is_empty())
+                .map(str::to_owned),
+        })
+        .collect();
 
     report(&outcomes, as_json)?;
     let failed = outcomes.iter().filter(|entry| entry.status == "failed").count();
@@ -289,47 +164,4 @@ fn report(outcomes: &[Outcome], as_json: bool) -> Result<(), String> {
         );
     }
     Ok(())
-}
-
-/// Container id by name, so a document can say `test` instead of a uuid.
-fn containers_by_name(client: &RpcClient) -> Result<Vec<(String, String)>, String> {
-    let value = rpc::call(client, "list_containers", json!({}))?;
-    let containers: Vec<box_containers::DshContainer> =
-        serde_json::from_value(value).map_err(|error| format!("invalid container list: {error}"))?;
-    Ok(containers
-        .into_iter()
-        .map(|container| (container.name, container.id))
-        .collect())
-}
-
-fn resolve_container(containers: &[(String, String)], name: &str) -> Result<String, String> {
-    if let Some((_, id)) = containers.iter().find(|(candidate, _)| candidate == name) {
-        return Ok(id.clone());
-    }
-    // An id is accepted too: a document generated from a listing uses one.
-    if containers.iter().any(|(_, id)| id == name) {
-        return Ok(name.to_owned());
-    }
-    Err(format!(
-        "no such container: {name} (have: {})",
-        containers
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<&str>>()
-            .join(", ")
-    ))
-}
-
-/// The names copies carry, not their ids: a document names a copy the way the
-/// user does, and the id is `<kind>-<name>`.
-fn stored_copy_names(client: &RpcClient) -> Result<Vec<String>, String> {
-    let value = rpc::call(client, "list_resources", json!({}))?;
-    Ok(value["resources"]
-        .as_array()
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| row["name"].as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default())
 }

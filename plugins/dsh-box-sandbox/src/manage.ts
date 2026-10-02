@@ -350,12 +350,17 @@ export function registerManageTools(ctx: Context): void {
       properties: {
         mode: {
           type: 'string',
-          enum: ['build'],
-          description: 'What to do. `build` compiles a boxfile into a template.',
+          enum: ['build', 'apply'],
+          description:
+            '`build` compiles a boxfile into a template. `apply` makes a resource layer match a document.',
         },
         file: {
           type: 'string',
-          description: 'Absolute path to the boxfile, or to the document apply reads.',
+          description: 'Absolute path to the boxfile, or to the apply document.',
+        },
+        document: {
+          type: 'string',
+          description: 'An apply document as YAML or JSON, given inline instead of a file.',
         },
         containerId: {
           type: 'string',
@@ -366,7 +371,7 @@ export function registerManageTools(ctx: Context): void {
           description: 'Report what apply would change without changing it.',
         },
       },
-      required: ['mode', 'file'],
+      required: ['mode'],
     },
     timeoutMs: LONG_BUDGET_MS,
     output: textOutput(
@@ -379,12 +384,21 @@ export function registerManageTools(ctx: Context): void {
     async execute(args) {
       const record = args as Record<string, unknown>
       const mode = required(record, 'mode')
-      const file = required(record, 'file')
+      const file = optional(record, 'file') ?? ''
       if (mode === 'build') {
         const task = await runTask('enqueue_build', { path: file, name: optional(record, 'containerId') })
         return { mode, file, result: { kind: task.kind, logPath: task.logPath ?? '' } }
       }
-      badAction('build', mode, ['build'])
+      if (mode === 'apply') {
+        const rpc = getRpc()
+        const params: Record<string, unknown> = { dryRun: flag(record, 'dryRun') }
+        const document = optional(record, 'document')
+        if (document !== undefined) params.document = document
+        if (file !== '') params.file = file
+        const applied = await rpc.call<Record<string, unknown>>('apply_document', params)
+        return { mode, file, result: applied }
+      }
+      badAction('build', mode, ['build', 'apply'])
     },
   })
 

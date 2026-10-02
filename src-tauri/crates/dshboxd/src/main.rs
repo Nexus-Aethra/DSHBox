@@ -6,6 +6,7 @@
 //! Transport: TCP on `127.0.0.1:0` (OS-assigned ephemeral port), HTTP/1.1
 //! over `std::net`. Zero external dependencies. Single POST route: `/rpc`.
 
+mod apply;
 mod bundles;
 mod containers;
 mod data;
