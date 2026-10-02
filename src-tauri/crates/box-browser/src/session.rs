@@ -229,6 +229,25 @@ impl Drop for BrowserSession {
             }
             let _ = child.wait();
         }
+        // taskkill /T issues the kill and the children take a moment to actually
+        // die, and `child.wait()` only covers the browser process itself.
+        // Removing the profile straight away races them: it fails on a file
+        // still held open, and the leftover directory then makes the *next*
+        // launch fail with "browser exited during startup", because the new
+        // browser finds a profile another process still owns. A short retry
+        // turns that from a hard failure into a slightly slower teardown.
+        for attempt in 0..10 {
+            if std::fs::remove_dir_all(&self.user_data_dir).is_ok() {
+                return;
+            }
+            if attempt < 9 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        // Last resort: leave it. A stale scratch directory is untidy, but a
+        // blocking retry here would hang the drop, and the next launch handles
+        // a leftover profile by failing loudly rather than silently reusing one
+        // whose state is unknown.
         let _ = std::fs::remove_dir_all(&self.user_data_dir);
     }
 }
