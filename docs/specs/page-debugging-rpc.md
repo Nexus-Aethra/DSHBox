@@ -96,18 +96,95 @@ focused target is reported rather than counted as inserted.
 Request: id, key (named key; unknown names are an error, never a guess).
 Response: key (the canonical CDP spelling).
 
+## The methods added after this file was first written
+
+These joined the same session contract and are not described above. All take
+`id` like every other method, except where noted.
+
+### debug_open, debug_close
+
+Open and release a headless Chrome for a container, and report the viewport in
+use. `debug_open` takes optional `width` and `height` to set the window at
+launch; without them the default is 1600x1200. A session is per container and
+opens on demand, so a caller need not open before it can read -- but closing is
+worth doing, because the profile is only released then.
+
+### debug_set_viewport
+
+Resize a live session: `Emulation.setDeviceMetricsOverride`, then
+`Page.getLayoutMetrics` to report the size actually in effect. The reply carries
+`clamped`, because a request outside 320..7680 x 240..4320 is honoured as far as
+the browser allows, and a caller that assumed otherwise would compute positions
+from a viewport that is not the one on screen. `debug_browser_status` reports
+which browser is in use and is worth reading first when a launch fails, since
+the answer is often a browser installed somewhere other than where it was
+expected; `debug_set_browser_path` pins it.
+
+### debug_click_by_name
+
+Click by the role and name `debug_page_text` reported -- the one path that
+cannot hit the wrong control, since a CSS selector is a guess and a guess that
+happens to match still reports success. Takes optional `within` to scope the
+search when the same name appears in a dialog and the page behind it.
+
+### debug_query_elements
+
+A narrow CSS-selector query, kept for what `debug_page_text` cannot express.
+The plugin exposes no tool for it: `debug_page_text` covers what an agent
+actually asks, and a second listing is a second thing to choose between. The
+RPC remains, because the UI and a future caller may want it.
+
+### Container workspace and URL methods
+
+Not page methods, but on the same session and sharing the `id` convention, and
+needed before a caller can open anything: `container_url` (the running host's
+authenticated loopback URL), `browse_container_paths`, `container_url_probe`,
+`list_container_workspaces`, `add_container_workspace`,
+`remove_container_workspace`.
+
 ## What the plugin layer adds
 
-Four tools over the above, whose descriptions are written as instructions
-rather than mechanism summaries:
+Nine page tools, whose descriptions are written as instructions rather than
+mechanism summaries:
 
-  box_page_text    the recommended first call; renders the page as text
-  box_scroll       reports and changes scroll extent
-  box_click_element  verifies the click landed on the intended element
-  box_click_at       same, by coordinate
-  box_type_text      types into the focused field and reports focus
-  box_press_key      presses a named key
+  box_page_text       the recommended first call; renders the page as text
+  box_scroll          reports and changes scroll extent
+  box_click_element   verifies the click landed on the intended element
+  box_click_by_name   the same, by the role and name the listing reported
+  box_click_at        the same, by coordinate
+  box_type_text       types into the focused field and reports focus
+  box_press_key       presses a named key
+  box_screenshot      stores a PNG; the image does not reach the model
+  box_close           releases the browser
 
-box_page_text must open with an explicit instruction to call it first, and
-every tool response carries a next field naming the natural follow-up call,
-so an agent that has never seen these tools is oriented by a single response.
+Eleven more cover the box itself (`box_lifecycle`, `box_overview`,
+`box_resources`, `box_build`, `box_workspace`, `box_set_viewport`,
+`box_task`, `box_plugins`, `box_create`, `box_templates`, `box_settings`).
+83 of the daemon's 91 methods are reachable from one of them.
+
+`box_page_text` opens with an explicit instruction to call it first, and every
+response names the natural follow-up, so an agent that has never seen these
+tools is oriented by a single response.
+
+Three things the wrapping absorbs, because the daemon is not consistent about
+them and a caller should not have to be:
+
+- **One argument name for the container.** The daemon spells it `id`,
+  `containerId` or `container` depending on the method. A tool takes
+  `containerId` for every action and maps it per call, because a caller that
+  guesses once is right for most verbs and silently wrong for the rest.
+- **Enqueue and wait together.** Most of what an agent does to a box is a
+  background task, not a call. The tools enqueue and poll together and return
+  the finished record, so a caller never writes a polling loop -- and never
+  reports a task that is still running as though it had finished.
+- **Task states are lower case on the wire.** `TaskState` is declared with
+  `#[serde(rename_all = "lowercase")]`, so what crosses is `succeeded`,
+  `rolledback`, `cancelled`. The Rust spelling matches none of them. A
+  `failed` task is finished when the record carries `finishedAt`, which the
+  scheduler stamps once the task *and its rollback* are done -- a task still
+  rolling back has none, and is correctly still waited on.
+
+One consequence worth writing down, because it looks like a broken tool and is
+not: a rebuilt bundle copied into a running container's `node_modules` changes
+nothing, because the host loaded the plugin when it started. A call that
+returns the previous build's error message is measuring the previous build.

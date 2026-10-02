@@ -244,7 +244,23 @@ command as done only once the installed app has run it.
   (`ping_quickly`, 3s) is what the startup gate polls, so a stuck daemon answers
   "not yet" instead of holding a thread. The frontend polls one request at a
   time for the same reason: overlapping polls against a busy daemon pile up.
-- **The CLI is the agent surface; the UI is the human one.** `dshbox apply -f
+- **An agent inside a container talks to the box through a plugin, not the CLI.**
+  The DSH-side plugin registers `box_*` tools on the host it runs in, so an agent
+  can drive the box that contains it without a shell, a second connection, or
+  anything to install. That plugin is the agent surface now; `dshbox` and the UI
+  remain for a person. Two things it absorbs on a caller's behalf, because the
+  daemon is not consistent about them: the same argument is named differently
+  per method (`id` for the graph, `containerId` for a container's plugin list,
+  `container` for others), and task states are serialised in lower case
+  (`#[serde(rename_all = "lowercase"]`) while the enum spells PascalCase in
+  source. A caller written against the Rust spelling matches nothing, and a
+  finished task then reads as one that never finished -- so the wire form is
+  pinned by a test in `box-scheduler`, not left to a reader to remember. A
+  read verb that takes `--json` must reject any flag it does not know: a flag
+  silently dropped makes a typo look like success, and the caller goes on to
+  parse a table as JSON and fails somewhere unrelated.
+- **`dshbox apply -f` is the declarative path, and is still the right one for a
+  file.** `dshbox apply -f
   <file>` takes a document (`container:`, `types:`, `copies:`) and makes the
   resource layer match it, so an agent configures resources by writing one file
   instead of driving verbs in order; applying is idempotent (a type is keyed by

@@ -77,8 +77,8 @@ pub fn run() -> Option<i32> {
             println!("dshbox {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        "ps" => print_containers(),
-        "info" => print_info(),
+        "ps" => print_containers(&arguments[1..]),
+        "info" => print_info(&arguments[1..]),
         "pull" => pull::command(&arguments[1..]),
         "plugin" => plugin::command(&arguments[1..]),
         "bundle" => bundle::command(&arguments[1..]),
@@ -132,9 +132,46 @@ fn raw_rpc(arguments: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn print_containers() -> Result<(), String> {
+/// Read a verb's flags, refusing any it does not know.
+///
+/// The alternative -- ignoring what it does not recognise -- makes a typo look
+/// like success. `dshbox ps --jsn` would print a table and exit zero, and the
+/// caller would not learn that the one thing it asked for was not applied until
+/// something downstream choked on the shape it got.
+fn read_flags(rest: &[String], known: &[&str]) -> Result<bool, String> {
+    let takes = known.join(", ");
+    let mut as_json = false;
+    for argument in rest {
+        if argument == "--json" {
+            as_json = true;
+        } else {
+            let kind = if argument.starts_with('-') { "flag" } else { "argument" };
+            return Err(format!("unknown {kind} {argument}. This command takes: {takes}"));
+        }
+    }
+    Ok(as_json)
+}
+
+/// `ps [--json]`, and nothing else.
+///
+/// A flag this verb does not understand used to be dropped on the floor, so
+/// `dshbox ps --json` printed a table and exited zero -- a caller asking for
+/// machine-readable output got a human one and no signal that it had not been
+/// given what it asked for. An unrecognised argument is now an error, because
+/// silently ignoring the only thing that changes the output shape is worse than
+/// refusing: the caller goes on to parse a table as JSON and fails somewhere
+/// unrelated, with nothing pointing back here.
+fn print_containers(rest: &[String]) -> Result<(), String> {
+    let as_json = read_flags(rest, &["--json"])?;
     let client = rpc::connect()?;
     let value = rpc::call(&client, "list_containers", json!({}))?;
+    if as_json {
+        // Printed from the daemon's own reply rather than from a re-encoded
+        // struct, so --json reports exactly what the RPC returned instead of a
+        // second, possibly lossy, description of it.
+        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+        return Ok(());
+    }
     let containers: Vec<box_containers::DshContainer> = serde_json::from_value(value)
         .map_err(|error| format!("invalid container list from daemon: {error}"))?;
     println!("ID\tNAME\tVERSION\tSTATUS");
@@ -147,9 +184,16 @@ fn print_containers() -> Result<(), String> {
     Ok(())
 }
 
-fn print_info() -> Result<(), String> {
+/// `info [--json]`, and nothing else. See [`print_containers`] for why an
+/// unrecognised argument is an error rather than a shrug.
+fn print_info(rest: &[String]) -> Result<(), String> {
+    let as_json = read_flags(rest, &["--json"])?;
     let client = rpc::connect()?;
     let info = rpc::call(&client, "get_info", json!({}))?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&info).unwrap_or_default());
+        return Ok(());
+    }
     println!("DSH Box {}", info["version"].as_str().unwrap_or("?"));
     match info["runtimeDirectory"].as_str() {
         Some(root) => {
