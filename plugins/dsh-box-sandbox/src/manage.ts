@@ -23,6 +23,9 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 
+import { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 import { getRpc } from './rpc'
 import { runTask, type TaskRecord } from './tasks'
 import { hostServices, type HostToolDefinition } from './tools'
@@ -99,7 +102,9 @@ export function registerManageTools(ctx: Context): void {
       + 'failure with the reason rather than a task id and silence. Use it instead of running '
       + 'dshbox on a shell: a start that quietly did not start is the failure this removes. '
       + 'Rebuild re-materialises plugins and resources before starting; restart does not. '
-      + 'After a start, box_overview reports the new state.',
+      + 'After a start, box_overview reports the new state. stop and remove are refused '
+      + 'when the target is the container this agent is itself running in, because that '
+      + 'ends the call before it can report anything; restart cycles it safely.',
     parameters: {
       type: 'object',
       properties: {
@@ -133,6 +138,21 @@ export function registerManageTools(ctx: Context): void {
       const method = methods[action]
       if (method === undefined) {
         badAction('lifecycle', action, Object.keys(methods))
+      }
+      // Stopping or removing the container this call is running inside ends the
+      // host that is executing it, so the task finishes and nobody is left to
+      // hear about it. The call looks like a hang, and the next thing the agent
+      // knows about its own container is that it is gone. Restart and rebuild
+      // survive it -- the session comes back -- so only these two are refused.
+      if (action === 'stop' || action === 'remove') {
+        const self = ownContainerId()
+        if (self !== undefined && self === containerId) {
+          throw new Error(
+            `This agent is running inside ${containerId}, so ${action} would end the`
+              + ' host running this call before it could report a result. Use restart to'
+              + ' cycle it, or run ' + action + ' from outside the container.'
+          )
+        }
       }
       const task: TaskRecord = await runTask(method, { id: containerId })
       return { action, containerId, kind: task.kind }
@@ -571,6 +591,31 @@ export function registerManageTools(ctx: Context): void {
   })
 }
 
+/** A container id as the daemon mints them. */
+const CONTAINER_ID = /^container-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * The container this plugin is running inside, if it can be told.
+ *
+ * Nothing hands the plugin its own id -- the host process is told which
+ * container it is, but not the plugins it mounts -- so it is read back out of
+ * where the plugin itself is installed, which is always
+ * `<instance>/profile/profiles/<p>/node_modules/...`. Matching the id's own
+ * shape rather than the parent directory's name keeps this working under any
+ * runtime directory, including one the user chose.
+ * */
+function ownContainerId(): string | undefined {
+  let here: string
+  try {
+    here = dirname(fileURLToPath(import.meta.url))
+  } catch {
+    return undefined
+  }
+  for (const part of here.split(/[\\/]/)) {
+    if (CONTAINER_ID.test(part)) return part
+  }
+  return undefined
+}
 /** Read an optional finite number, treating blank and NaN as absent. */
 function number(args: Record<string, unknown>, field: string): number | undefined {
   const value = args[field]

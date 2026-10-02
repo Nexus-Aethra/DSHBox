@@ -265,6 +265,18 @@ pub(crate) fn start_dsh_container_inner(
                 context_files.patch_path.to_string_lossy().as_ref(),
                 "--patch",
                 patch.to_string_lossy().as_ref(),
+                // Without this the host opens the user's real default browser
+                // on every start, restart and rebuild, and takes the foreground
+                // with it. Two things made that hard to see: the spawn sits in a
+                // retry loop, so one start could pop the browser up to three
+                // times, and a browser that is already running is handed the URL
+                // instead of being started, so no new process appears and a
+                // before/after process count reports nothing at all. The host
+                // log says so itself: "opening the default browser; pass --no-open
+                // to disable". Box is a server: the UI it opens is a webview the
+                // user asks for, and the agent drives it over loopback. Nothing
+                // about running a container should take over the desktop.
+                "--no-open",
             ])
             .cwd(&source)
             .policy(policy)
