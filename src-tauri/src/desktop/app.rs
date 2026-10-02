@@ -345,6 +345,7 @@ fn run_inner() -> Result<(), String> {
             commands::config::save_mirror_settings,
             get_server_service_status,
             get_daemon_status,
+            get_daemon_build_notice,
             restart_server_service,
             start_server_service,
             stop_server_service,

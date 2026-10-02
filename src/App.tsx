@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { boxApi } from './shared/api/box-api'
+import type { DaemonBuildNotice } from './shared/api/box-api'
 import type { Language } from './shared/types/domain'
 import { pickText } from './i18n'
 import { NPM_REGISTRY_PRESETS, useSettings } from './state/useSettings'
@@ -87,6 +88,18 @@ export function MainApp() {
   const [error, setError] = useState<string | null>(null)
   const [section, setSection] = useState<Section>('resources')
   const [settingsPane, setSettingsPane] = useState<SettingsPane>('general')
+  // Whether the running daemon is from another build. Read once: the answer is
+  // decided at startup and cannot change while this window is open, and the
+  // command only reports a value the check already computed.
+  const [staleDaemon, setStaleDaemon] = useState<DaemonBuildNotice>({ stale: false })
+
+  useEffect(() => {
+    let cancelled = false
+    void boxApi.getDaemonBuildNotice()
+      .then((notice) => { if (!cancelled) setStaleDaemon(notice) })
+      .catch(() => { /* a build that cannot answer this is not worth an error */ })
+    return () => { cancelled = true }
+  }, [])
 
   const settings = useSettings(setError)
   const { config, setConfig } = settings
@@ -219,6 +232,11 @@ export function MainApp() {
   return <main className="app-shell">
     <header className="topbar">
       <div className="brand">DSH Box</div>
+      {staleDaemon.stale && (
+        <p className="stale-daemon" role="status">
+          {text.daemonBuildStale(staleDaemon.runningStamp, staleDaemon.clientStamp)}
+        </p>
+      )}
       <nav className="navigation" aria-label="Workspace sections">
         {(['resources', 'container'] as const).map((item) => (
           <Button

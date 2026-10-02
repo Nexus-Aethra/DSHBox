@@ -6,6 +6,32 @@ use tauri::{
     Manager,
 };
 
+/// What the startup check found, for the UI to ask about later.
+///
+/// The check runs once, before the window exists, so its one result is kept
+/// here: `None` means the running daemon belongs to this build. A mismatch is
+/// reported rather than acted on, and the person who can act on it is the one
+/// looking at the window -- which is the only place the answer is useful.
+static DAEMON_BUILD: std::sync::OnceLock<std::sync::Mutex<Option<(String, String)>>> =
+    std::sync::OnceLock::new();
+
+/// `None` when the running daemon matches this desktop binary; otherwise the
+/// stamps, running first.
+pub(crate) fn daemon_build_status() -> Option<(String, String)> {
+    let cell = DAEMON_BUILD.get()?;
+    let guard = cell.lock().ok()?;
+    guard.clone()
+}
+
+fn record_daemon_build(running: &str, client: &str) {
+    // `get_or_init`, not `get`: an uninitialised `OnceLock` reads as `None`
+    // forever, which is indistinguishable from "no mismatch" and so reports a
+    // stale daemon as current -- the notice silently never appears.
+    let cell = DAEMON_BUILD.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut inner) = cell.lock() {
+        *inner = Some((running.to_owned(), client.to_owned()));
+    }
+}
 /// Writes diagnostics before Tauri logging is available.
 pub(crate) fn write_startup_log(message: &str) {
     let root = dirs::data_local_dir()
@@ -93,6 +119,7 @@ pub(crate) fn reconcile_daemon_build() {
         .and_then(|info| info["buildStamp"].as_str().map(str::to_owned))
         .unwrap_or_default();
     if remote_stamp == CLIENT_BUILD_STAMP {
+        record_daemon_build(&remote_stamp, CLIENT_BUILD_STAMP);
         write_startup_log(&format!("daemon build stamp matches ({remote_stamp})"));
         return;
     }
@@ -111,13 +138,30 @@ pub(crate) fn reconcile_daemon_build() {
     //
     // So: report, and let the server stand. A restart stays available to the
     // user as one they chose, rather than one that happened to them.
+    record_daemon_build(&remote_stamp, CLIENT_BUILD_STAMP);
     write_startup_log(&format!(
         "daemon build stamp {remote_stamp:?} != client {CLIENT_BUILD_STAMP:?}; keeping the running daemon"
     ));
-    return;
-    // Bring the freshly-installed daemon up: through the user service when
 }
 
+
+/// Whether the running daemon is from a different build than this one.
+///
+/// A plain read of a value the startup check already computed, so it costs
+/// nothing and cannot itself disturb the daemon. `stale` false means the two
+/// match; true means the server is left running on purpose and the person who
+/// can decide what to do about it is looking at this window.
+#[tauri::command(async)]
+pub fn get_daemon_build_notice() -> serde_json::Value {
+    match daemon_build_status() {
+        Some((running, client)) => serde_json::json!({
+            "stale": true,
+            "runningStamp": running,
+            "clientStamp": client,
+        }),
+        None => serde_json::json!({ "stale": false }),
+    }
+}
 /// Fallback launcher for platforms without a per-user service manager
 /// (macOS) and for environments where service installation failed: spawns
 /// the bundled daemon directly unless one is already reachable, so the

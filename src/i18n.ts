@@ -4,6 +4,8 @@ const COPY = {
   en: {
     versions: 'DSH Version Code', container: 'DSH Container', settings: 'Settings',
     startingService: 'Starting DSH Box server…',
+    daemonBuildStale: (running: string, client: string) =>
+      `The DSH Box server in the background is from an older build (${running}); this app is ${client}. It was left running on purpose — everything works, and some features need a restart to reach this build. Restart it from Settings when you are not mid-task.`,
     chooseTitle: 'Choose DSH runtime directory', welcome: 'Set up DSH Box', welcomeNote: 'Choose a local folder for DSH Box data.',
     chooseDirectory: 'Choose folder', runtimeDirectory: 'Runtime directory', changeDirectory: 'Change directory',
     toolchainTitle: 'Bundled runtime', toolchainNote: 'DSH Box includes a private Node, npm, and pnpm runtime.', managed: 'Included with DSH Box', notFound: 'Unavailable', refresh: 'Refresh',
@@ -225,6 +227,8 @@ const COPY = {
   'zh-CN': {
     versions: 'DSH 版本代码', container: 'DSH 容器', settings: '设置',
     startingService: '正在启动 DSH Box 服务…',
+    daemonBuildStale: (running: string, client: string) =>
+      `后台的 DSH Box 服务来自较早的构建（${running}），当前应用是 ${client}。这是有意保留的——一切照常可用，只是部分功能需要重启服务才能用上这个版本。等手上没有任务时，可以在设置里重启它。`,
     chooseTitle: '选择 DSH 运行目录', welcome: '设置 DSH Box', welcomeNote: '选择一个本地文件夹来存储 DSH Box 数据。',
     chooseDirectory: '选择文件夹', runtimeDirectory: '运行目录', changeDirectory: '更改目录',
     toolchainTitle: '内置运行时', toolchainNote: 'DSH Box 已内置私有的 Node、npm 与 pnpm 运行时。', managed: '随 DSH Box 提供', notFound: '不可用', refresh: '刷新',

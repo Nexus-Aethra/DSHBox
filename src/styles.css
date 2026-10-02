@@ -579,4 +579,21 @@ dialog .resource-panel { max-height: 70vh; overflow-y: auto; }
 .extensions-profile .ui-select { width: auto; min-width: 7rem; max-width: 12rem; }
 .extensions-heading-actions { align-items: center; display: flex; gap: 8px; flex: 0 0 auto; }
 
-
+/*
+ * The daemon-build notice. Sits in the topbar rather than over the page, and
+ * carries no button: the server was left running deliberately, so the only
+ * action it implies is a restart the user chooses from Settings, and a button
+ * here would invite the click that skips the busy-check we just added.
+ * Amber rather than red, because nothing is broken.
+ */
+.stale-daemon {
+  background: #fff8e6;
+  border: 1px solid #f0d9a0;
+  border-radius: 6px;
+  color: #6b5320;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+  max-width: 560px;
+  padding: 8px 12px;
+}
