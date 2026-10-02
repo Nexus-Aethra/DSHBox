@@ -23,15 +23,50 @@ pub(crate) fn daemon_build_status() -> Option<(String, String)> {
     guard.clone()
 }
 
+/// The notice a compared pair of stamps earns, or `None` when they agree.
+///
+/// Pure, and separate from the cell, because "equal stamps produce no notice"
+/// is the entire contract and it is the half that went missing: the first
+/// version recorded the pair on both paths and let the *presence* of a record
+/// stand in for the verdict, so a matching daemon came back `stale: true` and
+/// the window told the user their server was older than the app while quoting
+/// two identical stamps. The log said "matches" the whole time -- a log line is
+/// what the first version of this feature checked, and it agreed.
+fn build_notice(running: &str, client: &str) -> Option<(String, String)> {
+    if running == client {
+        return None;
+    }
+    Some((running.to_owned(), client.to_owned()))
+}
+
 fn record_daemon_build(running: &str, client: &str) {
     // `get_or_init`, not `get`: an uninitialised `OnceLock` reads as `None`
     // forever, which is indistinguishable from "no mismatch" and so reports a
     // stale daemon as current -- the notice silently never appears.
     let cell = DAEMON_BUILD.get_or_init(|| std::sync::Mutex::new(None));
     if let Ok(mut inner) = cell.lock() {
-        *inner = Some((running.to_owned(), client.to_owned()));
+        *inner = build_notice(running, client);
     }
 }
+
+#[cfg(test)]
+mod build_notice_tests {
+    use super::build_notice;
+
+    #[test]
+    fn equal_stamps_earn_no_notice() {
+        assert!(build_notice("1790858088", "1790858088").is_none());
+    }
+
+    #[test]
+    fn different_stamps_earn_a_notice_carrying_both_in_order() {
+        assert_eq!(
+            build_notice("1790858088", "1790900000"),
+            Some((String::from("1790858088"), String::from("1790900000"))),
+        );
+    }
+}
+
 /// Writes diagnostics before Tauri logging is available.
 pub(crate) fn write_startup_log(message: &str) {
     let root = dirs::data_local_dir()

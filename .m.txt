@@ -1,0 +1,21 @@
+fix(ui): stop the build notice claiming an older server when stamps match
+
+The notice said the running server was from an older build while quoting two
+identical stamps, because the verdict was never computed. `record_daemon_build`
+was called from both branches of the check and always stored the pair, and the
+command read *presence* of that record as `stale: true`. So a matching daemon
+earned a notice about a mismatch that did not exist.
+
+The decision now lives in `build_notice`, a pure function, and the cell is only
+a sink for its answer. Both tests pin the halves that mattered: equal stamps
+earn nothing, different stamps carry both in order.
+
+Reported by a user, and worth recording why I missed it. The previous commit's
+message claimed both directions were verified. The log said
+`daemon build stamp matches`, which agreed the whole time -- I took that as the
+banner being absent and wrote it up as verified without ever looking at the
+window. A log line is a fact about the server, not about what the window did
+with it; those are different claims, and only a screenshot answers the second.
+
+Verified on the installed app with the stamps equal: the topbar renders the
+brand and the navigation and nothing between them.
