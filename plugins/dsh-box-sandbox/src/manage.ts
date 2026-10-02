@@ -606,7 +606,102 @@ export function registerManageTools(ctx: Context): void {
       }
     },
   })
+  register(ctx, {
+    name: 'box_plugins',
+    description:
+      'Plugins a box has, and the ones it can have: the repository, a container, '
+      + 'install, import, export, bundles, and the dependency graph. Installing and '
+      + 'importing are waited on, so a call ends with a result rather than a task '
+      + 'id. One containerId covers all of it: the daemon names that argument '
+      + 'differently per method, which is a detail of its wire format and not '
+      + 'something a caller should have to remember per verb.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: actionProperty('plugins', ['list', 'installed', 'container', 'add', 'import', 'export', 'bundle', 'graph']),
+        containerId: { type: 'string', description: 'Container to read, install into, or graph.' },
+        profile: { type: 'string', description: 'Profile inside the container. Defaults to web.' },
+        spec: { type: 'string', description: 'What to install: a package spec, a directory, or a row id.' },
+        extensionId: { type: 'string', description: 'Which repository extension to export.' },
+        name: { type: 'string', description: 'Bundle name, for a bundle action.' },
+        ids: { type: 'array', items: { type: 'string' }, description: 'Repository row ids that make up a bundle.' },
+        subaction: { type: 'string', enum: ['list', 'create', 'import', 'export', 'delete'], description: 'What to do with a bundle.' },
+      },
+      required: ['action'],
+    },
+    timeoutMs: LONG_BUDGET_MS,
+    output: textOutput(
+      { action: { type: 'string' }, result: { type: 'object' } },
+      ['action', 'result'],
+      (value) => 'box_plugins ' + String(value.action) + ':\n' + JSON.stringify(value.result, null, 2).slice(0, 6000),
+    ),
+    async execute(args) {
+      const record = args as Record<string, unknown>
+      const action = required(record, 'action')
+      const rpc = getRpc()
+      const containerId = optional(record, 'containerId')
+      const profile = optional(record, 'profile') ?? 'web'
+      const needContainer = (what: string): string => {
+        if (containerId === undefined) {
+          throw new Error(action + ' ' + what + ' needs a containerId. box_overview lists them.')
+        }
+        return containerId
+      }
+      switch (action) {
+        case 'list':
+          return { action, result: { repository: asArray(await rpc.call('list_repository_extensions')) } }
+        case 'installed':
+          return { action, result: asObject(await rpc.call('list_installed_plugins')) }
+        case 'container':
+          return { action, result: { plugins: await rpc.call('container_list_plugins', { containerId: needContainer('listing'), profile }) } }
+        case 'add': {
+          const spec = required(record, 'spec')
+          const task = await runTask('container_plugin_add', { id: needContainer('installing into'), profile, spec })
+          return { action, result: { kind: task.kind, logPath: task.logPath ?? '' } }
+        }
+        case 'import': {
+          const spec = required(record, 'spec')
+          const task = await runTask('import_repository_extension', { spec })
+          return { action, result: { kind: task.kind, logPath: task.logPath ?? '' } }
+        }
+        case 'export':
+          return { action, result: asObject(await rpc.call('export_repository_extension', { id: required(record, 'extensionId') })) }
+        case 'bundle': {
+          const name = optional(record, 'name')
+          const ids = Array.isArray(record.ids) ? (record.ids as string[]).filter((e) => typeof e === 'string') : []
+          const sub = optional(record, 'subaction') ?? (name === undefined ? 'list' : ids.length === 0 ? 'create' : 'import')
+          if (sub === 'list') return { action, result: { bundles: asArray(await rpc.call('list_bundles')) } }
+          if (name === undefined && ids.length === 0) {
+            throw new Error('bundle ' + sub + ' needs a name or ids.')
+          }
+          if (sub === 'create') {
+            return { action, result: asObject(await rpc.call('create_extension_bundle', { name, repositoryIds: ids })) }
+          }
+          if (sub === 'export') {
+            return { action, result: asObject(await rpc.call('export_bundle', { name })) }
+          }
+          if (sub === 'delete') {
+            return { action, result: asObject(await rpc.call('delete_extension_bundle', { name })) }
+          }
+          return { action, result: asObject(await rpc.call('import_bundle', { name, ids })) }
+        }
+        case 'graph':
+          return { action, result: asObject(await rpc.call('plugin_dependency_graph', { id: needContainer('graphing'), kind: 'container' })) }
+        default:
+          badAction('plugins', action, ['list', 'installed', 'container', 'add', 'import', 'export', 'bundle', 'graph'])
+      }
+    },
+  })
 }
+
+  /** Keep a structured RPC reply an object, so rendering never sees an array. */
+  function asObject(value: unknown): Record<string, unknown> {
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      return value as Record<string, unknown>
+    }
+    return { value }
+  }
+
 
 /**
  * True when this plugin is running inside the container it was asked about.
