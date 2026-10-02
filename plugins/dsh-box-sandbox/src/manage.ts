@@ -745,16 +745,28 @@ export function registerManageTools(ctx: Context): void {
           return { action, result: { plugins: await rpc.call('container_list_plugins', { containerId: needContainer('listing'), profile }) } }
         case 'add': {
           const spec = required(record, 'spec')
-          const task = await runTask('container_plugin_add', { id: needContainer('installing into'), profile, spec })
+          const task = await runTask('container_plugin_add', {
+            containerId: needContainer('installing into'),
+            profile,
+            spec,
+          })
           return { action, result: { kind: task.kind, logPath: task.logPath ?? '' } }
         }
         case 'import': {
-          const spec = required(record, 'spec')
-          const task = await runTask('import_repository_extension', { spec })
+          // The daemon reads `source` here and `containerId` for an add. Two
+          // methods that read nearly the same thing under different names is
+          // exactly the detail a caller should not have to carry, so it lives
+          // here rather than in the action's argument list.
+          const task = await runTask('import_repository_extension', { source: required(record, 'spec') })
           return { action, result: { kind: task.kind, logPath: task.logPath ?? '' } }
         }
         case 'export':
-          return { action, result: asObject(await rpc.call('export_repository_extension', { id: required(record, 'extensionId') })) }
+          return {
+            action,
+            result: asObject(
+              await rpc.call('export_repository_extension', { repositoryId: required(record, 'extensionId') }),
+            ),
+          }
         case 'remove':
           return {
             action,
@@ -805,10 +817,13 @@ export function registerManageTools(ctx: Context): void {
           return { action, result: { kind: task.kind, logPath: task.logPath ?? '' } }
         }
         case 'import-workspace': {
-          const params: Record<string, unknown> = { path: required(record, 'path') }
-          const name = optional(record, 'name')
-          if (name !== undefined) params.name = name
-          const task = await runTask('enqueue_workspace_extension_import', params)
+          // A workspace is a container, and the path is relative to it, so the
+          // two parameters are the container and a path inside it rather than
+          // one absolute path.
+          const task = await runTask('enqueue_workspace_extension_import', {
+            id: needContainer('importing into'),
+            relativePath: required(record, 'path'),
+          })
           return { action, result: { kind: task.kind, logPath: task.logPath ?? '' } }
         }
         case 'install-bundle': {
@@ -825,7 +840,8 @@ export function registerManageTools(ctx: Context): void {
         case 'bundle': {
           const name = optional(record, 'name')
           const ids = Array.isArray(record.ids) ? (record.ids as string[]).filter((e) => typeof e === 'string') : []
-          const sub = optional(record, 'subaction') ?? (name === undefined ? 'list' : ids.length === 0 ? 'create' : 'import')
+          const sub = optional(record, 'subaction')
+            ?? (name === undefined ? 'list' : ids.length === 0 ? 'create' : 'export')
           if (sub === 'list') return { action, result: { bundles: asArray(await rpc.call('list_bundles')) } }
           if (name === undefined && ids.length === 0) {
             throw new Error('bundle ' + sub + ' needs a name or ids.')
@@ -834,12 +850,25 @@ export function registerManageTools(ctx: Context): void {
             return { action, result: asObject(await rpc.call('create_extension_bundle', { name, repositoryIds: ids })) }
           }
           if (sub === 'export') {
-            return { action, result: asObject(await rpc.call('export_bundle', { name })) }
+            return {
+              action,
+              result: asObject(
+                await rpc.call('export_bundle', { bundleId: name, destination: required(record, 'destination'), mode: 'archive' }),
+              ),
+            }
           }
           if (sub === 'delete') {
-            return { action, result: asObject(await rpc.call('delete_extension_bundle', { name })) }
+            return { action, result: asObject(await rpc.call('delete_extension_bundle', { id: name })) }
           }
-          return { action, result: asObject(await rpc.call('import_bundle', { name, ids })) }
+          return {
+            action,
+            result: asObject(
+              await rpc.call('import_bundle', {
+                archive: required(record, 'destination'),
+                conflict: flag(record, 'overwrite') ? 'overwrite' : 'keep',
+              }),
+            ),
+          }
         }
         case 'graph':
           return { action, result: asObject(await rpc.call('plugin_dependency_graph', { id: needContainer('graphing'), kind: 'container' })) }

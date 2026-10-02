@@ -427,9 +427,9 @@ export function applyBoxTools(ctx: Context): void {
   registerTool(ctx, {
     name: 'box_click_at',
     description:
-      'Click a point, in viewport coordinates, on a running dshbox container page. Use it when '
-      + 'the target has no accessible name. Coordinates come from box_page_text or from '
-      + 'box_screenshot. Prefer box_click_element whenever the page listed a name for it.',
+      'Click a viewport point. Use it only when the target has no accessible name: '
+      + 'coordinates come from box_page_text or from '
+      + 'box_screenshot. Prefer box_click_element whenever a name was listed.',
     parameters: {
       type: 'object',
       properties: {
@@ -559,10 +559,10 @@ export function applyBoxTools(ctx: Context): void {
   registerTool(ctx, {
     name: 'box_scroll',
     description:
-      'Report how far a page extends and optionally scroll it. Call it with no coordinates to '
-      + 'learn how many screens are below the fold, which is how you find out that a control '
-      + 'exists but is not reachable yet. Call it with an absolute pixel offset to move. '
-      + 'Coordinates are viewport pixels, so a position from a page listing is used as-is.',
+      'How far a page extends, and optionally scroll it. With no coordinates it '
+      + 'reports how many screens are below the fold, which is how you learn a control '
+      + 'exists but is not reachable yet; an absolute pixel offset moves. '
+      + 'Coordinates are viewport pixels, so a listed position is used as-is.',
     parameters: {
       type: 'object',
       properties: {
@@ -612,10 +612,10 @@ export function applyBoxTools(ctx: Context): void {
   registerTool(ctx, {
     name: 'box_type_text',
     description:
-      'Type text into whatever field currently has focus. Click the field with box_click_element '
-      + 'first, then call this. It reports which element held focus, so a value that landed '
-      + 'nowhere is visible as a failure rather than a silent no-op. For a submit keystroke use '
-      + 'box_press_key with Enter, which is what a form expects.',
+      'Type into whatever has focus. Click the field with box_click_element '
+      + 'first. It reports which element held focus, so a value that landed '
+      + 'nowhere reads as a failure rather than a silent no-op. For a submit use '
+      + 'box_press_key with Enter.',
     parameters: {
       type: 'object',
       properties: {
@@ -665,9 +665,9 @@ export function applyBoxTools(ctx: Context): void {
   registerTool(ctx, {
     name: 'box_press_key',
     description:
-      'Press and release one named key, for a submit or a keyboard shortcut. Enter submits a '
-      + 'form and submits nothing that is not a form, so when a click on the submit control '
-      + 'reports landed:false, try Enter here instead. Names: Enter, Tab, Escape, Backspace, '
+      'Press and release one named key. Enter submits a '
+      + 'form and nothing that is not a form, so when a click on submit '
+      + 'reports landed:false, try Enter. Names: Enter, Tab, Escape, Backspace, '
       + 'Delete, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, Shift, '
       + 'Control, Alt. An unknown name is an error, never a guess.',
     parameters: {
@@ -776,9 +776,9 @@ export function applyBoxTools(ctx: Context): void {
   registerTool(ctx, {
     name: 'box_close',
     description:
-      'Close the headless browser for a container and release it. Call it when a long debugging '
-      + 'session is finished; the next page tool opens a fresh one. Sessions also close on their '
-      + 'own, so this is for tidying up rather than for making something work.',
+      'Release the headless browser. For tidying up after a long debugging '
+      + 'session, not for making something work: sessions also close on their '
+      + 'own, and the next page tool opens a fresh one.',
     parameters: {
       type: 'object',
       properties: {
