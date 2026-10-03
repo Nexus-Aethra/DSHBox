@@ -250,7 +250,9 @@ function nextHint(next: string): string {
  * an empty string, and a schema that says $string alone rejects it — so a
  * click that worked is reported as a failed tool call.
  */
-const nullable = { type: ['string', 'null'] }
+const nullable = {
+  oneOf: [{ type: 'string' }, { type: 'null' }],
+}
 
 interface ClickVerification {
   landed?: boolean
