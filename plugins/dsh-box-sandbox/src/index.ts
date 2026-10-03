@@ -135,7 +135,7 @@ export async function status(config?: Partial<Config>): Promise<Status> {
 
 const WORKFLOW_PROMPT_SECTION = 'dsh-box-sandbox:page-workflow'
 
-const WORKFLOW_PROMPT_ORDER = 3050
+const WORKFLOW_PROMPT_ORDER = 3350
 function pageWorkflowPrompt(): string {
   return [
     'Debugging a page with the box_* tools:',
@@ -152,6 +152,10 @@ function pageWorkflowPrompt(): string {
     'when no editable field holds focus.',
     'If a page tool cannot find a browser, box_set_browser reports which one is in use and pins a',
     'different one.',
+    'When a page looks right but behaves wrongly — a client bundle that never registered, a control',
+    'that does nothing — read box_console. A page that failed to load its own assets says so only',
+    'there; the rest of the surface reports a page that is present, which is exactly what a broken',
+    'one also is.',
   ].join('\n')
 }
 /** Register the plugin against a freshly mounted Cordis context. */

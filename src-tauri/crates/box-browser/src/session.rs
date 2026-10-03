@@ -9,6 +9,7 @@
 //! from the DevToolsActivePort file it writes. Guessing a port and hoping is
 //! how a second Box, or an unrelated service, ends up being driven by mistake.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,12 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap on the DevTools HTTP replies we buffer, so a misbehaving endpoint
 /// cannot make the daemon allocate without bound.
 const HTTP_CAP: usize = 4 * 1024 * 1024;
+/// Cap on buffered DevTools events.
+///
+/// A page left open next to a chatty timer would otherwise grow this without
+/// bound. The cap drops the OLDEST entries, because the newest event is the
+/// one a caller asking "what just happened" is looking for.
+const EVENT_CAP: usize = 512;
 
 /// A running headless browser plus the DevTools connection to one page.
 pub struct BrowserSession {
@@ -36,6 +43,13 @@ pub struct BrowserSession {
     next_id: u64,
     target_id: String,
     url: String,
+    /// Console output and page exceptions, in arrival order.
+    ///
+    /// These arrive on the same socket as command replies, and call() is the
+    /// only thing that reads it, so anything it does not recognise has to be
+    /// kept here rather than dropped -- otherwise a page that threw during load
+    /// is silent by the time anyone asks what it logged.
+    events: VecDeque<Value>,
 }
 
 impl BrowserSession {
@@ -134,12 +148,30 @@ impl BrowserSession {
             next_id: 0,
             target_id: target.id,
             url: url.to_owned(),
+            events: VecDeque::new(),
         };
         // The protocol domains we depend on. Without these, captureScreenshot
         // and Runtime.evaluate fail with 'not enabled'.
         session.call("Page.enable", json!({}))?;
         session.call("Runtime.enable", json!({}))?;
         Ok(session)
+    }
+
+    /// Take everything the page has logged since the last call, and forget it.
+    ///
+    /// Draining rather than peeking is deliberate: a caller that has read the
+    /// console has been told what it said, and reading it twice serves nobody.
+    ///
+    /// The socket is only read while a command is in flight, so a page that
+    /// logged a while ago still has those frames queued. Issuing a no-op
+    /// command first is what pulls them in -- without it a caller that has
+    /// made no other call since the page loaded is told the console is empty
+    /// when it is anything but.
+    pub fn drain_events(&mut self) -> Result<Vec<Value>, String> {
+        // Runtime.evaluate of a literal is the cheapest way to make the
+        // browser flush pending frames back at us.
+        self.call("Runtime.evaluate", json!({ "expression": "0" }))?;
+        Ok(self.events.drain(..).collect())
     }
 
     /// DevTools port this session is attached to.
@@ -192,6 +224,16 @@ impl BrowserSession {
                 Err(_) => continue,
             };
             if value.get("id").and_then(Value::as_u64) != Some(id) {
+                // Not our reply: this is a DevTools event (console output, a
+                // page exception, network noise). It shares the socket, and the
+                // read loop is the only place it can be seen, so it is kept
+                // instead of discarded.
+                if value.get("method").and_then(Value::as_str).is_some() {
+                    if self.events.len() >= EVENT_CAP {
+                        self.events.pop_front();
+                    }
+                    self.events.push_back(value);
+                }
                 continue;
             }
             if let Some(error) = value.get("error") {

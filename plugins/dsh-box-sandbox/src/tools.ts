@@ -678,6 +678,84 @@ export function applyBoxTools(ctx: Context): void {
   })
 
   registerTool(ctx, {
+    name: 'box_console',
+    description:
+      'Read what the page has logged, and clear the buffer — a second call reports only '
+      + 'what arrived since the first. Uncaught errors are included whether or not any '
+      + 'code caught them, which is the point: a client plugin that fails to register '
+      + 'leaves a page that looks fine and says nothing, and this is the only tool that '
+      + 'sees it. Repeated identical lines are collapsed into one entry with a count. '
+      + 'The levels default to error and warning because log-level traffic is usually '
+      + 'dozens of lines per page load; pass levels to ask for the rest when the '
+      + 'failures are not the problem.',
+    parameters: {
+      type: 'object',
+      properties: {
+        containerId: { type: 'string', description: 'Container whose console to read.' },
+        levels: {
+          type: 'array',
+          items: { type: 'string', enum: ['log', 'info', 'debug', 'warning', 'error', 'assert'] },
+          description: "Which severities to return. Defaults to error and warning.",
+        },
+        limit: { type: 'number', description: 'Most recent entries to return. Defaults to 50, capped at 500.' },
+      },
+      required: ['containerId'],
+    },
+    timeoutMs: WARM_BUDGET_MS,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          containerId: { type: 'string' },
+          entries: { type: 'array' },
+          total: { type: 'number' },
+          truncated: { type: 'boolean' },
+        },
+        required: ['containerId', 'entries', 'total', 'truncated'],
+      },
+      render: (_args, value) => {
+        const record = asRecord(value)
+        const entries = Array.isArray(record.entries) ? record.entries : []
+        if (entries.length === 0) {
+          return [{
+            type: 'text',
+            text: 'The page in container ' + String(record.containerId)
+              + ' logged nothing at the levels asked for, and logged nothing since the last read.'
+              + nextHint('if the page was just loaded, try again after the failing step, or widen levels to log'),
+          }]
+        }
+        const lines = entries.map((entry) => {
+          const item = asRecord(entry)
+          const where = item.source ? ' (' + String(item.source) + ')' : ''
+          const times = Number(item.count ?? 1) > 1 ? ' x' + String(item.count) : ''
+          return '[' + String(item.level) + ']' + where + ' ' + String(item.text) + times
+        })
+        return [{
+          type: 'text',
+          text: 'Console of container ' + String(record.containerId) + ' — '
+            + String(record.total) + ' distinct message(s), oldest first'
+            + (record.truncated === true ? ' (truncated to the most recent)' : '')
+            + '. Reading this cleared the buffer.\n' + lines.join('\n'),
+        }]
+      },
+    },
+    async execute(args) {
+      const containerId = containerIdOf(args)
+      const record = asRecord(args)
+      const request: Record<string, unknown> = {}
+      if (Array.isArray(record.levels) && record.levels.length > 0) {
+        request.levels = record.levels
+      }
+      if (typeof record.limit === 'number') request.limit = record.limit
+      const result = await withSession<{ entries: unknown[], total: number, truncated: boolean }>(
+        containerId, 'debug_console', request,
+      )
+      return { containerId, ...result }
+    },
+  })
+
+  registerTool(ctx, {
     name: 'box_press_key',
     description:
       'Press and release one named key. Enter submits a '

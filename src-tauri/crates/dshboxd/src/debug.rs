@@ -206,6 +206,162 @@ pub(crate) fn close_rpc(state: &DaemonState, request: &Value) -> Result<Value, S
     Ok(json!({ "id": id, "closed": existed }))
 }
 
+/**
+ * Console output and page exceptions since the last read, oldest first.
+ *
+ * Two DevTools events carry this and they do not look alike:
+ *
+ *   Runtime.consoleAPICalled  { type, args, timestamp, stackTrace }
+ *   Runtime.exceptionThrown  { exceptionDetails: { text, exception, stackTrace } }
+ *
+ * Both are flattened to { level, text, source, count } because an agent
+ * deciding what to do next wants "what did the page say", not which of the two
+ * shapes it arrived in.
+ */
+pub(crate) fn console_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    // Chrome's own level names, plus the two the console API adds that are not
+    // levels at all but arrive on the same channel.
+    let wanted: Option<Vec<String>> = request
+        .get("levels")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(|level| level.to_owned())
+                .collect()
+        });
+    let limit = request
+        .get("limit")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .unwrap_or(50)
+        .min(500) as usize;
+
+    let events = with_session(state, request, |session| session.drain_events())?;
+    let mut entries: Vec<Value> = Vec::new();
+    for event in &events {
+        let method = event["method"].as_str().unwrap_or("");
+        let params = &event["params"];
+        let (level, text, source) = match method {
+            "Runtime.consoleAPICalled" => {
+                let level = params["type"].as_str().unwrap_or("log").to_owned();
+                let mut parts: Vec<String> = Vec::new();
+                for arg in params["args"].as_array().cloned().unwrap_or_default() {
+                    parts.push(render_remote_object(&arg));
+                }
+                (
+                    level,
+                    parts.join(" "),
+                    first_frame(&params["stackTrace"]),
+                )
+            }
+            "Runtime.exceptionThrown" => {
+                let details = &params["exceptionDetails"];
+                let text = details["exception"]["description"]
+                    .as_str()
+                    .or_else(|| details["exception"]["value"].as_str())
+                    .or_else(|| details["text"].as_str())
+                    .unwrap_or("uncaught error")
+                    .to_owned();
+                (
+                    "error".to_owned(),
+                    text,
+                    first_frame(&details["stackTrace"]),
+                )
+            }
+            // Log.entryAdded and the network family are real, but they are
+            // volume, not signal: a page load emits dozens and an agent reading
+            // them learns nothing it cannot get from box_page_text.
+            _ => continue,
+        };
+        match &wanted {
+            Some(filter) if !filter.iter().any(|want| *want == level) => continue,
+            _ => {}
+        }
+        entries.push(json!({
+            "level": level,
+            "text": text,
+            "source": source,
+        }));
+    }
+
+    // A page that logs the same failure in a loop would otherwise hand back
+    // fifty identical lines and hide the three other things that also happened.
+    let mut counts: Vec<(String, String, Option<String>, u64)> = Vec::new();
+    for entry in entries {
+        let level = entry["level"].as_str().unwrap_or("").to_owned();
+        let text = entry["text"].as_str().unwrap_or("").to_owned();
+        let source = entry["source"].as_str().map(str::to_owned);
+        match counts.iter_mut().find(|(l, t, s, _)| *l == level && *t == text && *s == source) {
+            Some((_, _, _, count)) => *count += 1,
+            None => counts.push((level, text, source, 1)),
+        }
+    }
+    let total = counts.len();
+    let mut out: Vec<Value> = counts
+        .into_iter()
+        .map(|(level, text, source, count)| {
+            json!({
+                "level": level,
+                "text": text,
+                "source": source,
+                "count": count,
+            })
+        })
+        .collect();
+    if out.len() > limit {
+        out.truncate(limit);
+    }
+    // Newest last is how a page logs, and how an agent reads; a tail is the
+    // part that explains what just broke.
+    Ok(json!({
+        "entries": out,
+        "total": total,
+        "truncated": total > limit,
+        // How many DevTools events arrived at all, before level filtering and
+        // before the two families that are dropped as noise. A caller that sees
+        // 0 raw and 0 entries knows the page was quiet; one that sees many raw
+        // and no entries knows the filter or the event shapes are wrong, and
+        // those are very different bugs to chase.
+        "raw": events.len(),
+        "methods": events.iter().filter_map(|e| e["method"].as_str()).collect::<Vec<_>>(),
+    }))
+}
+
+/// One argument of a console call, as text.
+///
+/// CDP carries the value in whichever shape it happens to have: a string is a
+/// string, an error is an Error object, and everything else only exists as a
+/// preview. Falling back to the type name is better than dropping the argument,
+/// because "undefined" where a value was expected is itself the finding.
+fn render_remote_object(arg: &Value) -> String {
+    if let Some(text) = arg["value"].as_str() {
+        return text.to_owned();
+    }
+    if let Some(description) = arg["description"].as_str() {
+        return description.to_owned();
+    }
+    if let Some(text) = arg["value"].as_i64() {
+        return text.to_string();
+    }
+    if let Some(text) = arg["value"].as_f64() {
+        return text.to_string();
+    }
+    arg["type"].as_str().unwrap_or("").to_owned()
+}
+
+/// "file.js:12:5" for the first frame, when the page gave one.
+fn first_frame(trace: &Value) -> Option<String> {
+    let frame = &trace["callFrames"][0];
+    let url = frame["url"].as_str().unwrap_or("");
+    let line = frame["lineNumber"].as_i64().unwrap_or(-1);
+    if url.is_empty() || line < 0 {
+        return None;
+    }
+    let file = url.rsplit('/').next().unwrap_or(url);
+    Some(format!("{file}:{}", line + 1))
+}
+
 /// Run one CDP call against a container's session.
 fn with_session<T>(
     state: &DaemonState,
@@ -259,7 +415,13 @@ fn evaluate(session: &mut BrowserSession, expression: &str) -> Result<Value, Str
         json!({
             "expression": expression,
             "returnByValue": true,
-            "awaitPromise": true
+            "awaitPromise": true,
+            // Off by default. With it on, a page that throws inside the
+            // expression is reported as Runtime.exceptionThrown as well as in
+            // the reply, so debug_console sees it -- which is the whole point
+            // of the console: a caller that ran something into a page error
+            // should be able to find out from one place.
+            "reportExceptions": true,
         }),
     )?;
     // Runtime.evaluate reports page-side failures in exceptionDetails with
