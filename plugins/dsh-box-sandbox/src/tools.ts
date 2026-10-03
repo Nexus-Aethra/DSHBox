@@ -679,10 +679,20 @@ export function applyBoxTools(ctx: Context): void {
       const record = asRecord(args)
       if (typeof record.text !== 'string' || record.text === '')
         throw new Error('text is required and must be non-empty')
-      const result = await withSession<{ inserted: number, focused: string | null, landed: boolean }>(
+      const result = await withSession<{ inserted: number, focused: string | null }>(
         containerId, 'debug_type_text', { text: record.text },
       )
-      return { containerId, ...result }
+      // landed is derived, not returned. The daemon answers inserted: 0 and a
+      // null focused when nothing editable held focus, and that pairing IS the
+      // answer to whether the text went anywhere -- so a field the schema
+      // requires has to be computed here, or it is undefined at runtime and the
+      // host refuses the whole result.
+      return {
+        containerId,
+        inserted: result.inserted,
+        focused: result.focused,
+        landed: result.focused !== null,
+      }
     },
   })
 

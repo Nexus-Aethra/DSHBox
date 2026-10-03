@@ -60,7 +60,24 @@ function daemonKeys(fn) {
       }
     }
   }
+  // Some returns are assembled by a helper: click_at_rpc answers
+  // Ok(click_response(json!({x, y}), hit)) and every field a caller cares
+  // about is set inside click_response as response["landed"] = ... Reading
+  // only the Ok literal sees x and y and misses the rest, which then reads as
+  // a required field nothing returns.
+  for (const m of body.matchAll(/Ok\((\w+)\(/g)) {
+    for (const key of keysOfHelper(m[1])) keys.add(key)
+  }
   return keys
+}
+
+/** Assignment targets inside a helper that builds the answer, like response["x"] = ... */
+function keysOfHelper(fn) {
+  const at = rust.search(new RegExp('fn\\s+' + fn + '\\b'))
+  if (at < 0) return []
+  const stop = rust.indexOf('\nfn ', at + 10)
+  const body = rust.slice(at, stop > 0 ? stop : at + 1200)
+  return [...body.matchAll(/\["([A-Za-z_][A-Za-z0-9_]*)"\]\s*=/g)].map((m) => m[1])
 }
 
 /** Top-level keys of one brace-balanced object literal. */
@@ -105,7 +122,14 @@ function declaredProperties(toolName) {
   }
   const props = new Set()
   for (const m of block.slice(po, pc).matchAll(/^\s+([A-Za-z_][A-Za-z0-9_]*):/gm)) props.add(m[1])
-  return props
+  const ri = block.indexOf('required:')
+  const required = new Set()
+  if (ri >= 0) {
+    const ro = block.indexOf('[', ri)
+    const rc = block.indexOf(']', ro)
+    for (const m of block.slice(ro, rc).matchAll(/'([A-Za-z_][A-Za-z0-9_]*)'/g)) required.add(m[1])
+  }
+  return { props, required }
 }
 
 /** Where a tool's definition starts in the plugin source. */
@@ -156,11 +180,20 @@ for (const m of plugin.matchAll(/name: '(box_[a-z_]+)'/g)) {
   // under a second name, which additionalProperties:false then refuses, so a
   // spread next to a daemon that answers with id is its own finding.
   const seg = plugin.slice(at0(tool), at0(tool) + 4000)
-  const spreads = /\.\.\.result/.test(seg.slice(seg.indexOf('async execute')))
-  const missing = [...returned].filter((k) => k !== 'id' && !declared.has(k))
-  const dragsId = spreads && returned.has('id') && !declared.has('id')
+  const execute = seg.slice(seg.indexOf('async execute'))
+  const spreads = /\.\.\.result/.test(execute)
+  const missing = [...returned].filter((k) => k !== 'id' && !declared.props.has(k))
+  const dragsId = spreads && returned.has('id') && !declared.props.has('id')
+  // A required field the daemon never returns is undefined at runtime, and a
+  // required field that is undefined is how box_type_text failed while its
+  // TypeScript type claimed the field was there. Only a field the execute body
+  // names as its own counts as filled.
+  const derived = new Set([...execute.matchAll(/([A-Za-z_][A-Za-z0-9_]*):/g)].map((x) => x[1]))
+  const unbacked = [...declared.required].filter(
+    (k) => !returned.has(k) && k !== 'containerId' && !derived.has(k),
+  )
   checked++
-  if (missing.length === 0 && !dragsId) {
+  if (missing.length === 0 && !dragsId && unbacked.length === 0) {
     if (verbose) console.log('  ok   ' + tool)
     continue
   }
@@ -168,6 +201,7 @@ for (const m of plugin.matchAll(/name: '(box_[a-z_]+)'/g)) {
   console.log('  BAD  ' + tool + '  (' + method + ' -> ' + rpc + ')')
   if (missing.length) console.log('        daemon returns, schema does not declare: ' + missing.join(', '))
   if (dragsId) console.log('        execute spreads the answer, so the daemon id reaches the output undeclared')
+  if (unbacked.length) console.log('        required, but the daemon never returns it and execute never sets it: ' + unbacked.join(', '))
 }
 
 console.log('\n' + checked + ' tool(s) reconciled, ' + bad + ' mismatch(es)')
