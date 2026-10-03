@@ -541,6 +541,12 @@ export function registerManageTools(ctx: Context): void {
         }
         const title = optional(record, 'title')
         if (title !== undefined) params.title = title
+        // The running host owns its own workspace registry and rewrites it on
+        // boot, so a register has to go through a restart. The parameter was
+        // in the schema and in this tool's own description, and was never read
+        // here — a caller passing it got the daemon's "pass --restart"
+        // refusal instead of the restart it asked for.
+        if (flag(record, 'restart')) params.restart = true
         const added = await rpc.call<{ created?: boolean }>('add_container_workspace', params)
         const listed = await rpc.call<{ workspaces?: unknown[] }>('list_container_workspaces', { id: containerId })
         return {
@@ -943,11 +949,15 @@ export function registerManageTools(ctx: Context): void {
     parameters: {
       type: 'object',
       properties: {
-        action: actionProperty('create', ['from-template', 'from-version', 'describe', 'url', 'browse']),
+        // browse-paths, not browse: beside from-template and url, a bare
+        // "browse" reads as opening a page. It lists the directories inside
+        // the container. "browse" stays accepted as an alias so an existing
+        // caller keeps working.
+        action: actionProperty('create', ['from-template', 'from-version', 'describe', 'url', 'browse-paths']),
         name: { type: 'string', description: 'Name for a new container, or which one to describe.' },
         template: { type: 'string', description: 'Template to create from. Defaults to the one box_templates reports.' },
         version: { type: 'string', description: 'DSH version to create from, for from-version.' },
-        containerId: { type: 'string', description: 'Which container, for describe, url and browse.' },
+        containerId: { type: 'string', description: 'Which container, for describe, url and browse-paths.' },
         profile: { type: 'string', description: 'Profile to create with. Defaults to web.' },
         start: { type: 'boolean', description: 'Start it after creating. Only from-version; from-template always starts.' },
       },
@@ -1000,10 +1010,11 @@ export function registerManageTools(ctx: Context): void {
           const url = await rpc.call<Record<string, unknown>>('container_url', { id: needId() })
           return { action, result: asObject(url) }
         }
+        case 'browse-paths':
         case 'browse':
           return { action, result: asObject(await rpc.call('browse_container_paths', { id: needId() })) }
         default:
-          badAction('create', action, ['from-template', 'from-version', 'describe', 'url', 'browse'])
+          badAction('create', action, ['from-template', 'from-version', 'describe', 'url', 'browse-paths'])
       }
     },
   })

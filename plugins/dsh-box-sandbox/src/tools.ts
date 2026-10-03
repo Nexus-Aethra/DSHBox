@@ -243,6 +243,15 @@ function nextHint(next: string): string {
   return '\nnext: ' + next
 }
 
+/**
+ * A string that may legitimately be absent.
+ *
+ * The daemon reports these as ${Option<String>}: a miss is null, not
+ * an empty string, and a schema that says $string alone rejects it — so a
+ * click that worked is reported as a failed tool call.
+ */
+const nullable = { type: ['string', 'null'] }
+
 interface ClickVerification {
   landed?: boolean
   hitTag?: string
@@ -375,12 +384,12 @@ export function applyBoxTools(ctx: Context): void {
         containerId: { type: 'string' },
         
           name: { type: 'string' },
-          matched: { type: 'string' },
+          matched: nullable,
           landed: { type: 'boolean' },
-          hitTag: { type: 'string' },
-          hitText: { type: 'string' },
-          occludedBy: { type: 'string' },
-          selector: { type: 'string' },
+          hitTag: nullable,
+          hitText: nullable,
+          occludedBy: nullable,
+          selector: nullable,
         
           x: { type: 'number' },
         
@@ -451,8 +460,13 @@ export function applyBoxTools(ctx: Context): void {
           x: { type: 'number' },
         
           y: { type: 'number' },
+        
+          landed: { type: 'boolean' },
+          hitTag: nullable,
+          hitText: nullable,
+          occludedBy: nullable,
       },
-      required: ['containerId', 'x', 'y'],
+      required: ['containerId', 'x', 'y', 'landed'],
       },
       render: (_args, value) => renderClick(value, 'at ('
         + String(asRecord(value).x) + ', ' + String(asRecord(value).y) + ')'),
