@@ -235,17 +235,52 @@ export class DshboxRpc {
    * never retried -- they are answers, not outages.
    */
   async call<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> {
+    let lastStale: unknown = null
     for (let attempt = 0; attempt < 2; attempt++) {
       const record = this.discovery()
       try {
         return await this.send<T>(record, method, params)
       } catch (error) {
-        if (attempt === 0 && isStaleEndpoint(error)) continue
-        throw error
+        if (!isStaleEndpoint(error)) throw error
+        // Stale twice in a row means the daemon is gone, not that discovery
+        // needed a re-read: the record on disk still names a pid that no
+        // longer exists, so a second read returns the same dead endpoint.
+        lastStale = error
+        if (attempt === 0) continue
+        throw this.unreachable(method, lastStale)
       }
     }
-    /* c8 ignore next 2 */
-    throw new DshboxUnavailableError('dshbox daemon unreachable for ' + method)
+    /* c8 ignore next */
+    throw this.unreachable(method, lastStale)
+  }
+
+  /**
+   * The message for "discovery.json names a daemon that is not there".
+   *
+   * Staleness has two causes needing different fixes: the file may be
+   * missing (the daemon was never started) or it may name a pid that has
+   * exited (it crashed, or the machine rebooted). Both arrive here as a
+   * refused connection, so the record is read again to tell them apart.
+   */
+  private unreachable(method: string, cause?: unknown): DshboxUnavailableError {
+    const path = discoveryPath(this.configDir)
+    const record = readDiscovery(this.configDir)
+    if (record === null) {
+      return new DshboxUnavailableError(
+        'dshbox is not running, so ' + method + ' has nothing to talk to. ' +
+        'Start it from the desktop app, or run `dshbox` once, then retry. ' +
+        'No discovery record at ' + path + '.',
+        { cause },
+      )
+    }
+    return new DshboxUnavailableError(
+      'dshbox is not running, so ' + method + ' has nothing to talk to. ' +
+      'The discovery record at ' + path + ' is stale: it names pid ' + record.pid +
+      ' on port ' + record.port + ', and nothing is listening there. ' +
+      'Start the desktop app (or run `dshbox`) to bring up a new ' +
+      'daemon; the stale record is replaced on startup.',
+      { cause },
+    )
   }
 
   /** Liveness probe. Resolves to the daemon's own status frame. */
