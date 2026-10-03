@@ -600,6 +600,11 @@ export function applyBoxTools(ctx: Context): void {
           viewportHeight: { type: 'number' },
           screensBelow: { type: 'number' },
           moved: { type: 'boolean' },
+          // Which element actually moved. A point over an inner scroller
+          // moves that one and not the page, and a caller told only that
+          // something scrolled cannot tell which.
+          scroller: nullable,
+          scrollerIsDocument: { type: 'boolean' },
         },
         required: ['containerId', 'scrollTop', 'scrollHeight', 'viewportHeight', 'screensBelow', 'moved'],
       },
@@ -649,7 +654,9 @@ export function applyBoxTools(ctx: Context): void {
         properties: {
           containerId: { type: 'string' },
           inserted: { type: 'number' },
-          focused: { type: 'string' },
+          // null when nothing editable holds focus, which is the whole
+          // case this verb exists to make visible rather than hide
+          focused: nullable,
           landed: { type: 'boolean' },
         },
         required: ['containerId', 'inserted', 'landed'],
@@ -713,8 +720,14 @@ export function applyBoxTools(ctx: Context): void {
           entries: { type: 'array' },
           total: { type: 'number' },
           truncated: { type: 'boolean' },
+          // Events seen before filtering. 0 here alongside 0 entries means the
+          // page was quiet; many here with none means the level filter or the
+          // event shapes are wrong. Different bugs, and this number is the
+          // only thing that tells them apart.
+          raw: { type: 'number' },
+          methods: { type: 'array' },
         },
-        required: ['containerId', 'entries', 'total', 'truncated'],
+        required: ['containerId', 'entries', 'total', 'truncated', 'raw', 'methods'],
       },
       render: (_args, value) => {
         const record = asRecord(value)
@@ -833,8 +846,9 @@ export function applyBoxTools(ctx: Context): void {
           kind: { type: 'string' },
           path: { type: 'string' },
           configured: { type: 'boolean' },
-          configuredPath: { type: 'string' },
-          problem: { type: 'string' },
+          // no override set is a null path, not an empty one
+          configuredPath: nullable,
+          problem: nullable,
         },
         required: ['available'],
       },
