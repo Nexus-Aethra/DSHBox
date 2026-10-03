@@ -918,7 +918,12 @@ export function applyBoxTools(ctx: Context): void {
     async execute(args) {
       const containerId = containerIdOf(args)
       const result = await getRpc().call<{ closed: boolean }>('debug_close', { id: containerId })
-      return { containerId, ...result }
+      // Picked out rather than spread: debug_close answers with its own { id },
+      // and spreading that lands a second name for the container in the output,
+      // which the schema then has to declare twice. Every other verb in this
+      // file reports the container as containerId; this is the one place the
+      // daemon names it differently.
+      return { containerId, closed: result.closed === true }
     },
   })
 

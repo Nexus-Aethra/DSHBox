@@ -1,62 +1,63 @@
-{
-  "name": "@nexus-aethra/dsh-box-sandbox",
-  "version": "0.1.0",
-  "description": "Host-side bridge from a DSH session to the DSH Box daemon: typed box_* tools an agent can call without a shell.",
-  "keywords": [
-    "dsh",
-    "dsh-box",
-    "cordis",
-    "agent",
-    "box",
-    "tools"
-  ],
-  "homepage": "https://github.com/aethra-tech/DSHBox/tree/main/plugins/dsh-box-sandbox",
-  "bugs": {
-    "url": "https://github.com/aethra-tech/DSHBox/issues"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/aethra-tech/DSHBox.git",
-    "directory": "plugins/dsh-box-sandbox"
-  },
-  "author": "Nexus Aethra",
-  "license": "MIT",
-  "type": "module",
-  "main": "dist/index.mjs",
-  "types": "dist/index.d.mts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.mts",
-      "default": "./dist/index.mjs"
-    },
-    "./rpc": {
-      "types": "./dist/rpc.d.mts",
-      "default": "./dist/rpc.mjs"
-    },
-    "./package.json": "./package.json"
-  },
-  "files": [
-    "dist/",
-    "cordis.patch.yml",
-    "README.md",
-    "LICENSE"
-  ],
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  },
-  "scripts": {
-    "build": "tsdown",
-    "watch": "tsdown --watch",
-    "typecheck": "tsc --noEmit"
-  },
-  "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1"
-  },
-  "devDependencies": {
-    "@types/node": "^22.10.0",
-    "tsdown": "^0.22.2",
-    "typescript": "^5.6.0"
-  }
+﻿{
+    "name":  "@nexus-aethra/dsh-box-sandbox",
+    "version":  "0.1.0",
+    "description":  "Host-side bridge from a DSH session to the DSH Box daemon: typed box_* tools an agent can call without a shell.",
+    "keywords":  [
+                     "dsh",
+                     "dsh-box",
+                     "cordis",
+                     "agent",
+                     "box",
+                     "tools"
+                 ],
+    "homepage":  "https://github.com/aethra-tech/DSHBox/tree/main/plugins/dsh-box-sandbox",
+    "bugs":  {
+                 "url":  "https://github.com/aethra-tech/DSHBox/issues"
+             },
+    "repository":  {
+                       "type":  "git",
+                       "url":  "git+https://github.com/aethra-tech/DSHBox.git",
+                       "directory":  "plugins/dsh-box-sandbox"
+                   },
+    "author":  "Nexus Aethra",
+    "license":  "MIT",
+    "type":  "module",
+    "main":  "dist/index.mjs",
+    "types":  "dist/index.d.mts",
+    "exports":  {
+                    ".":  {
+                              "types":  "./dist/index.d.mts",
+                              "default":  "./dist/index.mjs"
+                          },
+                    "./rpc":  {
+                                  "types":  "./dist/rpc.d.mts",
+                                  "default":  "./dist/rpc.mjs"
+                              },
+                    "./package.json":  "./package.json"
+                },
+    "files":  [
+                  "dist/",
+                  "cordis.patch.yml",
+                  "README.md",
+                  "LICENSE"
+              ],
+    "dsh":  {
+                "bundle":  {
+                               "patch":  "./cordis.patch.yml"
+                           }
+            },
+    "scripts":  {
+                    "build":  "tsdown",
+                    "watch":  "tsdown --watch",
+                    "typecheck":  "tsc --noEmit",
+                    "check:outputs":  "node scripts/check-output-schemas.mjs"
+                },
+    "peerDependencies":  {
+                             "@deepseek-ai/cordis":  "^4.0.1"
+                         },
+    "devDependencies":  {
+                            "@types/node":  "^22.10.0",
+                            "tsdown":  "^0.22.2",
+                            "typescript":  "^5.6.0"
+                        }
 }
