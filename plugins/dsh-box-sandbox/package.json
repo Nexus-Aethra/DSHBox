@@ -1,6 +1,6 @@
 {
   "name": "@nexus-aethra/dsh-box-sandbox",
-  "version": "0.2.0",
+  "version": "0.1.8",
   "description": "Host-side bridge from a DSH session to the DSH Box daemon: typed box_* tools an agent can call without a shell.",
   "keywords": [
     "dsh",

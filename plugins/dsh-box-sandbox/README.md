@@ -102,25 +102,27 @@ but the repository.
 
 ## Releasing
 
-This package has its own version line, separate from the DSH Box app's — the
-app was at 0.1.8 while this was at 0.1.0, and binding it to the app tag would
-force it to 0.1.9 next with the versions between never existing.
+This package's version is the DSH Box app's version. One tag, one release, and
+`release.yml` checks all four manifests against it before anything is built —
+bumping the app and forgetting this one fails the pipeline rather than
+publishing a plugin whose version claims to match a build it was never part of.
 
-So the trigger is its own tag, `dsh-box-sandbox-v<version>`. It does not start
-with `v`, so `release.yml` (which matches `v*`) does not also fire and build
-installers for a plugin push.
+To release:
 
-1. Bump `version` in `package.json`.
+1. Bump `version` in this `package.json`, the root `package.json`,
+   `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml` to the same number.
 2. Run `pnpm check:tools` against a real Box. CI cannot — it has no daemon —
    so this is the only place the live check happens.
-3. Commit, tag `dsh-box-sandbox-v<version>`, push the tag.
+3. Commit, tag `v<version>`, push the tag.
 
-The workflow refuses a tag that disagrees with `package.json`, builds `dist/`
-(which is gitignored, so it is never restored from the commit), runs the type
-check and the schema reconciliation, shows the tarball contents, skips a
-version npm already has, refuses to publish below what npm has, and publishes
-with provenance.
+The `publish-plugin` job runs after the installers are built, so a release
+whose app build failed does not put a version on npm. It typechecks, runs the
+schema reconciliation, builds `dist/` (gitignored, so never restored from the
+commit), prints the tarball contents, skips a version npm already has, refuses
+to publish below what npm has, and publishes with provenance.
 
 Auth is npm trusted publishing over OIDC — there is no long-lived token to
-leak. `secrets.NPM_TOKEN` is read as a fallback; leave it unset if the package
-is configured for trusted publishing.
+leak. One-time setup on npmjs.com, under the package's Settings → Trusted
+Publishers: provider **GitHub Actions**, account `aethra-tech`, repository
+`DSHBox`, workflow filename `release.yml`. Rename that file and npm has to be
+told again.
