@@ -81,8 +81,46 @@ container.
 
     pnpm install
     pnpm typecheck
+    pnpm check:outputs   # static: schema vs what the daemon returns
+    pnpm check:tools     # live: every tool called against a running Box
     pnpm build
-    node smoke.mjs   # 10 checks against a running DSH Box
 
-`smoke.mjs` needs a live daemon: it reads the real discovery record, pings
-it, forces a stale-port failure, and verifies recovery.
+`check:tools` needs a running daemon: it imports the built plugin with a stub
+host context, calls every tool's `execute` for real, and validates each answer
+against that tool's own output schema — the same check the host applies, at the
+moment the answer comes back. It exists because a tool whose schema disagrees
+with its result does not fail at build time; it fails when someone presses the
+button, and the only way to see that is to press it.
+
+`check:tools` is a local check and does not run in CI, which has no daemon.
+The tag pipeline runs `check:outputs` instead, because that one needs nothing
+but the repository.
+
+    node smoke.mjs   # transport-level: ping, stale-port failure, recovery
+
+`smoke.mjs` reads the real discovery record and checks the wire contract.
+
+## Releasing
+
+This package has its own version line, separate from the DSH Box app's — the
+app was at 0.1.8 while this was at 0.1.0, and binding it to the app tag would
+force it to 0.1.9 next with the versions between never existing.
+
+So the trigger is its own tag, `dsh-box-sandbox-v<version>`. It does not start
+with `v`, so `release.yml` (which matches `v*`) does not also fire and build
+installers for a plugin push.
+
+1. Bump `version` in `package.json`.
+2. Run `pnpm check:tools` against a real Box. CI cannot — it has no daemon —
+   so this is the only place the live check happens.
+3. Commit, tag `dsh-box-sandbox-v<version>`, push the tag.
+
+The workflow refuses a tag that disagrees with `package.json`, builds `dist/`
+(which is gitignored, so it is never restored from the commit), runs the type
+check and the schema reconciliation, shows the tarball contents, skips a
+version npm already has, refuses to publish below what npm has, and publishes
+with provenance.
+
+Auth is npm trusted publishing over OIDC — there is no long-lived token to
+leak. `secrets.NPM_TOKEN` is read as a fallback; leave it unset if the package
+is configured for trusted publishing.
