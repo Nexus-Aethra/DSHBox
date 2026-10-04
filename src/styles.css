@@ -597,3 +597,37 @@ dialog .resource-panel { max-height: 70vh; overflow-y: auto; }
   max-width: 560px;
   padding: 8px 12px;
 }
+
+/*
+ * The agent guide pane. Documentation rendered in place, so it follows the
+ * Box's restrained palette rather than a docs site's: same cards, same type
+ * scale, one accent.
+ */
+.agent-guide { display: flex; flex-direction: column; gap: 16px; }
+.agent-guide-lede { color: #4a5560; line-height: 1.65; margin: 0; }
+.agent-guide-note { color: #6b7580; font-size: 13px; line-height: 1.6; margin: 8px 0 0; }
+.agent-guide .label { margin: 0; }
+
+.install-command {
+  align-items: center;
+  background: #f5f7f8;
+  border: 1px solid #e2e6e9;
+  border-radius: 6px;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  margin-top: 10px;
+  padding: 8px 8px 8px 12px;
+}
+.install-command code {
+  color: #1f2a33;
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 13px;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.tool-groups { display: grid; gap: 4px 16px; grid-template-columns: max-content 1fr; margin: 8px 0 0; }
+.tool-groups dt { color: #1f2a33; font-size: 13px; font-weight: 600; }
+.tool-groups dd { margin: 0; }
+.tool-names { color: #6b7580; font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace; font-size: 12px; line-height: 1.7; }

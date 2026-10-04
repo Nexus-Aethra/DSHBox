@@ -11,6 +11,7 @@ import { ContainerDetails } from './features/container-details/ContainerDetails'
 import { ResourcesPage } from './features/resources-page/ResourcesPage'
 import { TaskPanel } from './features/tasks/TaskPanel'
 import { ToolchainRow } from './features/toolchains/ToolchainRow'
+import { AgentGuide } from './features/settings/AgentGuide'
 import { LanguageSwitch } from './shared/ui/LanguageSwitch'
 import { DirectoryCard, Workspace } from './shared/ui/Workspace'
 import { Button } from './ui/Button'
@@ -21,7 +22,7 @@ import { Select } from './ui/Select'
 import { Toolbar } from './ui/Toolbar'
 import { Stack } from './ui/Stack'
 type Section = 'container' | 'resources' | 'settings'
-type SettingsPane = 'general' | 'toolchains'
+type SettingsPane = 'general' | 'toolchains' | 'agent'
 
 /**
  * Startup gate: shows a spinner while the daemon comes up (fresh spawn or
@@ -364,6 +365,7 @@ export function MainApp() {
           <nav className="settings-sidebar" aria-label={text.settings}>
             <Button variant="ghost" size="sm" className={settingsPane === 'general' ? 'active' : ''} onClick={() => { setSettingsPane('general') }}>{text.general}</Button>
             <Button variant="ghost" size="sm" className={settingsPane === 'toolchains' ? 'active' : ''} onClick={() => { setSettingsPane('toolchains'); void settings.refreshToolchains() }}>{text.toolchainSettings}</Button>
+            <Button variant="ghost" size="sm" className={settingsPane === 'agent' ? 'active' : ''} onClick={() => { setSettingsPane('agent') }}>{text.agentGuide}</Button>
           </nav>
           <div className="settings-content">
             {settingsPane === 'general' ? (
@@ -395,6 +397,8 @@ export function MainApp() {
                   <LanguageSwitch language={config.language} onChange={settings.changeLanguage} />
                 </section>
               </div>
+            ) : settingsPane === 'agent' ? (
+              <AgentGuide text={text} />
             ) : (
               <section className="runtime-settings">
                 <div className="workspace-heading">
