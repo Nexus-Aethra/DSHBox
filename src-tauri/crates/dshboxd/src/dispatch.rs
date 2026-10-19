@@ -191,7 +191,9 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
             crate::resources::list_container_resources(state, request).map(Sync)
         }
         Some("list_resources") => crate::resources::list_resources(state, request).map(Sync),
-        Some("list_resource_views") => crate::resources::list_resource_views(state, request).map(Sync),
+        Some("list_resource_views") => {
+            crate::resources::list_resource_views(state, request).map(Sync)
+        }
         Some("list_installed_plugins") => {
             crate::plugins::list_installed_plugins(state, request).map(Sync)
         }
@@ -199,7 +201,9 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("delete_resource_view") => {
             crate::resources::delete_resource_view(state, request).map(Sync)
         }
-        Some("list_resource_type") => crate::resources::list_resource_type(state, request).map(Sync),
+        Some("list_resource_type") => {
+            crate::resources::list_resource_type(state, request).map(Sync)
+        }
         Some("browse_container_paths") => {
             crate::resources::browse_container_paths(state, request).map(Sync)
         }
@@ -210,9 +214,7 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("read_resource_tree") => {
             crate::resources::read_resource_tree(state, request).map(Sync)
         }
-        Some("enqueue_resource_write") => {
-            crate::resources::enqueue_resource_write(state, request)
-        }
+        Some("enqueue_resource_write") => crate::resources::enqueue_resource_write(state, request),
         Some("enqueue_resource_inject") => {
             crate::resources::enqueue_resource_inject(state, request)
         }
@@ -447,7 +449,12 @@ fn list_repository_reference_counts_rpc() -> Result<Value, String> {
 /// `file:` spec has no registry version to read).
 fn split_spec(spec: &str) -> (String, Option<String>) {
     if let Some((name, version)) = spec.rsplit_once('@') {
-        if !name.is_empty() && version.chars().next().is_some_and(|character| character.is_ascii_digit()) {
+        if !name.is_empty()
+            && version
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit())
+        {
             return (name.to_owned(), Some(version.to_owned()));
         }
     }
@@ -562,7 +569,11 @@ fn plugin_dependency_graph_rpc(request: &Value) -> Result<Value, String> {
         // Plugins the recipe pulls in without naming them: the version is the
         // one pnpm resolved, not the one a boxfile guessed.
         for package in locked.iter().filter(|package| package.plugin) {
-            if graph.plugins.iter().any(|plugin| plugin.name == package.name) {
+            if graph
+                .plugins
+                .iter()
+                .any(|plugin| plugin.name == package.name)
+            {
                 continue;
             }
             graph.plugins.push(GraphPlugin {
@@ -579,7 +590,9 @@ fn plugin_dependency_graph_rpc(request: &Value) -> Result<Value, String> {
             graph.recipe_plugins.push(package.name.clone());
         }
         if !locked.is_empty() {
-            graph.diagnostics.push(box_plugin_graph::lockfile::summary(&locked));
+            graph
+                .diagnostics
+                .push(box_plugin_graph::lockfile::summary(&locked));
         }
         let transitive = locked
             .iter()
@@ -1574,6 +1587,7 @@ mod tests {
                     version: "latest".into(),
                     profile: "web".into(),
                     template: Some("dsh-test".into()),
+                    env: std::collections::BTreeMap::new(),
                     directory: directory.to_string_lossy().into_owned(),
                     status: "running".into(),
                 }),

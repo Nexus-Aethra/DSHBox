@@ -325,6 +325,10 @@ pub(crate) fn pull_template_with_cancel(
         base_id: None,
         plugin_artifact_ids: Vec::new(),
         plugin_sources: Vec::new(),
+        // A prepared base is a plain Harness tree: no Boxfile, so no
+        // declared environment. A sealed template built on it fills this
+        // in from its own `ENV` directives.
+        env: BTreeMap::new(),
         harness_digest: record
             .id
             .strip_prefix("base-")
@@ -491,9 +495,7 @@ fn validate_prepared_harness(harness: &Path) -> Result<(), String> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             for (index, prefix) in optional_prefixes.iter().enumerate() {
-                if name.starts_with(prefix)
-                    && entry.path().join("node_modules").is_dir()
-                {
+                if name.starts_with(prefix) && entry.path().join("node_modules").is_dir() {
                     found[index] = true;
                 }
             }
@@ -717,7 +719,10 @@ mod tests {
         fs::write(harness.join("node_modules/tsx/package.json"), "{}").unwrap();
         // Windows-only optional-package check: the fixture needs the esbuild
         // and koffi virtual-store entries before validation can pass.
-        for package in ["@esbuild+win32-x64@0.21.5", "@koromix+koffi-win32-x64@3.1.1"] {
+        for package in [
+            "@esbuild+win32-x64@0.21.5",
+            "@koromix+koffi-win32-x64@3.1.1",
+        ] {
             fs::create_dir_all(
                 harness
                     .join("node_modules/.pnpm")

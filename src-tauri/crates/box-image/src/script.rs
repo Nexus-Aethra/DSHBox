@@ -7,6 +7,7 @@
 //! VERSION <image-version>      # optional (default = "latest")
 //! LABEL key=value              # optional, repeatable
 //! DEF <name> @<path>           # optional, repeatable (path alias)
+//! ENV key=value                # optional, repeatable (container env)
 //!
 //! ADD plugin|skill <source> [@<dest>]   # one or more
 //! CP <source> [@<dest>]                 # alias for `ADD plugin`
@@ -65,6 +66,12 @@ impl AddKind {
 ///
 /// `defs` holds user-defined path aliases (`DEF <name> @<path>`).
 ///
+/// `env` holds container environment declarations (`ENV key=value`). The
+/// builder carries them into the sealed template manifest and the host
+/// spawn applies them on top of the environment whitelist — the
+/// docker-style `-e` equivalent, so a container never depends on the
+/// caller's ambient environment.
+///
 /// `base_template` is set when FROM references a local template name
 /// (e.g. `FROM web-base`) instead of a harness GitHub reference. In that
 /// mode `harness_url`/`harness_ref` are left empty; the builder resolves
@@ -80,6 +87,7 @@ pub struct ImageScript {
     pub profile: String,
     pub labels: BTreeMap<String, String>,
     pub defs: BTreeMap<String, String>,
+    pub env: BTreeMap<String, String>,
     pub ops: Vec<ImageOp>,
 }
 
@@ -93,6 +101,15 @@ impl ImageScript {
         };
         fnv1a64_hex(&raw)
     }
+}
+
+/// Whether `key` is a plausible environment variable name:
+/// `[A-Za-z_][A-Za-z0-9_]*`. Keeps `ENV 1BAD=x` and `ENV A B=c` from
+/// reaching a container as a variable no shell could ever read back.
+fn is_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// fnv1a 64-bit hash, hex-encoded. Same algorithm as `extension_digest` in
@@ -165,6 +182,7 @@ pub fn parse_script(source: &str, base_dir: &Path) -> Result<ImageScript, ImageE
     let mut base_template: Option<String> = None;
     let mut labels: BTreeMap<String, String> = BTreeMap::new();
     let mut defs: BTreeMap<String, String> = BTreeMap::new();
+    let mut env: BTreeMap<String, String> = BTreeMap::new();
     let mut ops: Vec<ImageOp> = Vec::new();
 
     for (index, raw_line) in source.lines().enumerate() {
@@ -238,6 +256,28 @@ pub fn parse_script(source: &str, base_dir: &Path) -> Result<ImageScript, ImageE
                 })?;
                 labels.insert(key.trim().to_string(), value.trim().to_string());
             }
+            "ENV" => {
+                if rest.len() != 1 {
+                    return Err(ImageError::Syntax {
+                        line: line_number,
+                        message: "ENV expects exactly one key=value pair".to_string(),
+                    });
+                }
+                let (key, value) = rest[0].split_once('=').ok_or_else(|| ImageError::Syntax {
+                    line: line_number,
+                    message: "ENV value must use key=value syntax".to_string(),
+                })?;
+                let key = key.trim();
+                if !is_env_key(key) {
+                    return Err(ImageError::Syntax {
+                        line: line_number,
+                        message: format!(
+                            "ENV key `{key}` is not a valid environment variable name"
+                        ),
+                    });
+                }
+                env.insert(key.to_owned(), value.trim().to_owned());
+            }
             "DEF" => {
                 if rest.len() != 2 {
                     return Err(ImageError::Syntax {
@@ -277,10 +317,13 @@ pub fn parse_script(source: &str, base_dir: &Path) -> Result<ImageScript, ImageE
                     "plugin" | "skill" | "data" => (rest[0], 1),
                     _ => ("plugin", 0),
                 };
-                let source_token = rest.get(source_index).copied().ok_or_else(|| ImageError::Syntax {
-                    line: line_number,
-                    message: "ADD expects a source token".to_string(),
-                })?;
+                let source_token =
+                    rest.get(source_index)
+                        .copied()
+                        .ok_or_else(|| ImageError::Syntax {
+                            line: line_number,
+                            message: "ADD expects a source token".to_string(),
+                        })?;
                 let kind = match kind_token {
                     "plugin" => AddKind::Plugin,
                     "skill" => AddKind::Skill,
@@ -307,13 +350,18 @@ pub fn parse_script(source: &str, base_dir: &Path) -> Result<ImageScript, ImageE
     // harness; any other value names a local template whose chain the
     // builder resolves (harness fields are filled in by that pass).
     let (harness_url, harness_ref, base_template) = if base_template.is_none() {
-        let (_, url) = harness_url
-            .ok_or(ImageError::MissingDirective { line: 0, name: "FROM" })?;
+        let (_, url) = harness_url.ok_or(ImageError::MissingDirective {
+            line: 0,
+            name: "FROM",
+        })?;
         (url, harness_ref, None)
     } else {
         (String::new(), None, base_template)
     };
-    let (_, profile) = profile.ok_or(ImageError::MissingDirective { line: 0, name: "PROFILE" })?;
+    let (_, profile) = profile.ok_or(ImageError::MissingDirective {
+        line: 0,
+        name: "PROFILE",
+    })?;
 
     let resolved_name = name.unwrap_or_else(|| "image".to_string());
     let resolved_version = version.unwrap_or_else(|| "latest".to_string());
@@ -327,6 +375,7 @@ pub fn parse_script(source: &str, base_dir: &Path) -> Result<ImageScript, ImageE
         profile,
         labels,
         defs,
+        env,
         ops,
     })
 }
@@ -386,17 +435,22 @@ pub fn parse_source_token(
                 reason: "npm: prefix requires a spec (e.g. `npm:@scope/name@1.2.3`)".to_string(),
             });
         }
-        return Ok(ParsedSource::NpmPrefix { spec: rest.to_owned() });
+        return Ok(ParsedSource::NpmPrefix {
+            spec: rest.to_owned(),
+        });
     }
     if let Some(rest) = token.strip_prefix("git:") {
         if rest.is_empty() {
             return Err(ImageError::InvalidSource {
                 line,
                 source: token.to_string(),
-                reason: "git: prefix requires a ref (e.g. `git:github.com/owner/repo:latest`)".to_string(),
+                reason: "git: prefix requires a ref (e.g. `git:github.com/owner/repo:latest`)"
+                    .to_string(),
             });
         }
-        return Ok(ParsedSource::GitPrefix { ref_: rest.to_owned() });
+        return Ok(ParsedSource::GitPrefix {
+            ref_: rest.to_owned(),
+        });
     }
 
     if token.contains("://") {
@@ -412,7 +466,10 @@ pub fn parse_source_token(
             });
         }
         let local = !(token.starts_with("http://") || token.starts_with("https://"));
-        return Ok(ParsedSource::Tarball { url: token.to_string(), local });
+        return Ok(ParsedSource::Tarball {
+            url: token.to_string(),
+            local,
+        });
     }
 
     if token.starts_with('/') {
@@ -447,8 +504,7 @@ pub fn parse_source_token(
         return Err(ImageError::InvalidSource {
             line,
             source: token.to_string(),
-            reason: "bare name must include a package (use `name` or `@scope/name`)"
-                .to_string(),
+            reason: "bare name must include a package (use `name` or `@scope/name`)".to_string(),
         });
     }
 
@@ -546,10 +602,7 @@ fn is_github_short(token: &str) -> bool {
     if owner.is_empty() {
         return false;
     }
-    let repo_name = repo_segment
-        .split([':', '@'])
-        .next()
-        .unwrap_or("");
+    let repo_name = repo_segment.split([':', '@']).next().unwrap_or("");
     if repo_name.is_empty() {
         return false;
     }
@@ -616,9 +669,9 @@ fn split_scope_token(token: &str) -> (Option<String>, &str) {
 
 fn looks_like_version(value: &str) -> bool {
     !value.is_empty()
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '+'))
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '+')
+        })
 }
 
 #[cfg(test)]
@@ -636,7 +689,10 @@ mod tests {
             &base_dir(),
         )
         .unwrap();
-        assert_eq!(script.harness_url, "https://github.com/deepseek-ai/deepseek-harness");
+        assert_eq!(
+            script.harness_url,
+            "https://github.com/deepseek-ai/deepseek-harness"
+        );
         assert_eq!(script.harness_ref.as_deref(), Some("latest"));
         assert_eq!(script.base_template, None);
         assert_eq!(script.profile, "web");
@@ -657,11 +713,7 @@ mod tests {
         assert_eq!(script.harness_ref, None);
         assert_eq!(script.ops.len(), 1);
         // Scoped names are never mistaken for template references.
-        let script = parse_script(
-            "FROM @scope/base\nPROFILE web\n",
-            &base_dir(),
-        )
-        .unwrap();
+        let script = parse_script("FROM @scope/base\nPROFILE web\n", &base_dir()).unwrap();
         assert_eq!(script.base_template.as_deref(), Some("@scope/base"));
     }
 
@@ -715,7 +767,11 @@ mod tests {
             _ => panic!("expected local dir source"),
         }
         match &script.ops[3].op_for_test() {
-            ParsedSource::BareName { name, scope, version } => {
+            ParsedSource::BareName {
+                name,
+                scope,
+                version,
+            } => {
                 assert_eq!(name, "cordis-plugin-bar");
                 assert!(scope.is_none());
                 assert_eq!(version.as_deref(), Some("1.0.0"));
@@ -738,7 +794,10 @@ PROFILE web
             &base_dir(),
         )
         .unwrap();
-        assert_eq!(script.harness_url, "https://github.com/deepseek-ai/deepseek-harness");
+        assert_eq!(
+            script.harness_url,
+            "https://github.com/deepseek-ai/deepseek-harness"
+        );
         assert_eq!(script.harness_ref.as_deref(), Some("latest"));
     }
 
@@ -837,14 +896,13 @@ PROFILE web
 
     #[test]
     fn bare_name_with_scope_and_version() {
-        let source = parse_source_token(
-            3,
-            "@scope/cordis-plugin-bar:1.2.3",
-            &base_dir(),
-        )
-        .unwrap();
+        let source = parse_source_token(3, "@scope/cordis-plugin-bar:1.2.3", &base_dir()).unwrap();
         match source {
-            ParsedSource::BareName { name, scope, version } => {
+            ParsedSource::BareName {
+                name,
+                scope,
+                version,
+            } => {
                 assert_eq!(scope.as_deref(), Some("scope"));
                 assert_eq!(name, "cordis-plugin-bar");
                 assert_eq!(version.as_deref(), Some("1.2.3"));
@@ -887,6 +945,58 @@ PROFILE web
             ParsedSource::BareName { name, .. } => assert_eq!(name, "cordis-plugin-foo"),
             _ => panic!("expected bare name source"),
         }
+    }
+
+    #[test]
+    fn parse_env_directives() {
+        let script = parse_script(
+            "FROM github.com/deepseek-ai/deepseek-harness:latest\n\
+             PROFILE web\n\
+             ENV OPENAI_API_KEY=sk-test\n\
+             ENV TZ=Asia/Shanghai\n",
+            &base_dir(),
+        )
+        .unwrap();
+        assert_eq!(
+            script.env.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-test")
+        );
+        assert_eq!(
+            script.env.get("TZ").map(String::as_str),
+            Some("Asia/Shanghai")
+        );
+    }
+
+    #[test]
+    fn parse_env_last_declaration_wins() {
+        let script = parse_script(
+            "FROM github.com/deepseek-ai/deepseek-harness:latest\n\
+             PROFILE web\n\
+             ENV TZ=UTC\n\
+             ENV TZ=Asia/Shanghai\n",
+            &base_dir(),
+        )
+        .unwrap();
+        assert_eq!(script.env.len(), 1);
+        assert_eq!(
+            script.env.get("TZ").map(String::as_str),
+            Some("Asia/Shanghai")
+        );
+    }
+
+    #[test]
+    fn parse_env_rejects_malformed_lines() {
+        let from_profile = "FROM github.com/deepseek-ai/deepseek-harness:latest\nPROFILE web\n";
+        // No `=` at all.
+        let error =
+            parse_script(&format!("{from_profile}ENV OPENAI_API_KEY\n"), &base_dir()).unwrap_err();
+        assert!(matches!(error, ImageError::Syntax { .. }), "{error:?}");
+        // Not a variable name.
+        let error = parse_script(&format!("{from_profile}ENV 1BAD=x\n"), &base_dir()).unwrap_err();
+        assert!(matches!(error, ImageError::Syntax { .. }), "{error:?}");
+        // Two pairs on one line.
+        let error = parse_script(&format!("{from_profile}ENV A=1 B=2\n"), &base_dir()).unwrap_err();
+        assert!(matches!(error, ImageError::Syntax { .. }), "{error:?}");
     }
 
     // Test-only accessor for the variant's source. Avoids a `pub` field on

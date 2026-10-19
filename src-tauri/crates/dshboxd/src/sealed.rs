@@ -80,6 +80,7 @@ pub(crate) fn build_sealed_template_from_script(
         &script.profile,
         &plugin_sources,
         &allowed_build_sources,
+        &script.env,
         &script_text,
         task,
     )
@@ -503,6 +504,7 @@ pub(crate) fn create_container_from_sealed(
         "template": template_name,
         "sealedTemplate": sealed_id,
         "source": "container-local",
+        "env": manifest.env.clone(),
     });
     atomic_write_json(&destination.join("container.json"), &metadata)?;
     task.update("Container prepared", 100);
@@ -514,6 +516,7 @@ pub(crate) fn create_container_from_sealed(
         template: Some(template_name),
         directory: destination.to_string_lossy().into_owned(),
         status: "stopped".to_owned(),
+        env: manifest.env,
     })
 }
 
@@ -651,9 +654,15 @@ fn pnpm_ignored_build_keys(log_path: &Path) -> Vec<String> {
 }
 
 fn build_approval_hint(source: &str, required_key: Option<&str>) -> String {
-    let mut entries = vec![source.to_owned()];
-    if let Some(key) = required_key {
-        entries.push(key.to_owned());
+    // A plugin's own build script is the common case, and there the ADD spec
+    // and the key pnpm asks for are the same string. Repeating it made the
+    // suggestion look different from the line the user had already written,
+    // so they pasted it again and the build failed again.
+    let mut entries: Vec<String> = Vec::new();
+    for entry in [Some(source), required_key].into_iter().flatten() {
+        if !entries.iter().any(|stored| stored == entry) {
+            entries.push(entry.to_owned());
+        }
     }
     format!(
         "plugin build scripts require explicit pnpm approval. Add this line to the Boxfile, then build again:\nLABEL dshbox.allow-build={}",
@@ -662,74 +671,105 @@ fn build_approval_hint(source: &str, required_key: Option<&str>) -> String {
 }
 
 /// Idempotently insert `key` into the `pnpm-workspace.yaml` `allowBuilds:`
-/// map. Repeated calls merge into a single section: existing key lines are
-/// preserved, new keys are appended in deterministic (sorted) order, and
-/// the section header is never duplicated. The map body is rewritten
-/// verbatim on every call so callers do not have to reason about parser
-/// quirks for complex YAML — the prepared-base manifest we target is a
-/// fixed shape and any complex YAML should be reported as a separate
-/// feature rather than silently mangled here.
+/// map. Repeated calls merge into a single section: existing approvals are
+/// re-emitted in deterministic (sorted) order, the section header is never
+/// duplicated, and anything else in the file — the sections around it and any
+/// line inside this one that is not an approval — keeps its own text.
 fn add_pnpm_build_approval(workspace_manifest: &Path, key: &str) -> Result<(), String> {
     let existing = fs::read_to_string(workspace_manifest)
         .map_err(|error| format!("cannot read pnpm workspace manifest: {error}"))?;
-    // Split around the first `allowBuilds:` section header; everything
-    // outside the section (package list, imports, comments) stays put.
-    let (before, body, after) = match existing.split_once("allowBuilds:\n") {
-        Some((before, after)) => {
-            // The section body ends at the next non-indented line; we
-            // round-trip whatever the user/source control already had.
-            let body_end = after
-                .find("\n\n")
-                .or_else(|| after.find('\n'))
-                .unwrap_or(after.len());
-            (before, &after[..body_end], &after[body_end..])
+    // `allowBuilds:` is a top-level block mapping, and its body is exactly the
+    // run of indented lines under the header. Reading it by indentation is what
+    // keeps a section that follows it (`minimumReleaseAgeExclude:`, which pnpm
+    // appends right after) out of the body, so the next rewrite cannot drop it;
+    // and lines Box does not own (a comment, an entry someone else wrote) go
+    // back out verbatim instead of vanishing.
+    let lines: Vec<&str> = existing.split('\n').collect();
+    let header_index = lines
+        .iter()
+        .position(|line| line.trim_end() == "allowBuilds:" && !is_indented(line));
+    let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut foreign: Vec<&str> = Vec::new();
+    let body_end = match header_index {
+        Some(index) => {
+            let mut end = index + 1;
+            while end < lines.len() && is_indented(lines[end]) {
+                match allow_build_entry_key(lines[end]) {
+                    Some(key) => {
+                        keys.insert(key);
+                    }
+                    None => foreign.push(lines[end]),
+                }
+                end += 1;
+            }
+            end
+        }
+        None => 0,
+    };
+    keys.insert(key.to_owned());
+    // Keys must be quoted. A scoped package spec starts with `@`, which YAML
+    // reads as a reserved indicator, so the bare form pnpm prints inside its
+    // own error block is not valid YAML for us to write back:
+    //
+    //     allowBuilds:
+    //       @deepseek-ai/dsh-subprocess-local@0.2.1-rc.2: true
+    //
+    // is `bad indentation of a mapping entry`, and the retry that was meant
+    // to approve the key dies on the manifest it just corrupted instead of
+    // getting further. Verified against the bundled pnpm 11.28.5: quoted keys
+    // are accepted and take effect. The read-back above already strips these
+    // quotes, so this round-trips.
+    let rendered: Vec<String> = keys
+        .iter()
+        .map(|existing_key| format!("  \"{existing_key}\": true"))
+        .collect();
+    let mut rebuilt: Vec<String> = Vec::new();
+    match header_index {
+        Some(index) => {
+            rebuilt.extend(lines[..index].iter().map(|line| (*line).to_owned()));
+            rebuilt.push("allowBuilds:".to_owned());
+            rebuilt.extend(foreign.iter().map(|line| (*line).to_owned()));
+            rebuilt.extend(rendered);
+            rebuilt.extend(lines[body_end..].iter().map(|line| (*line).to_owned()));
         }
         None => {
-            let separator = if existing.ends_with('\n') { "" } else { "\n" };
-            (existing.as_str(), "", separator)
+            // No section yet: the whole file is the text before it, and the
+            // section is appended after its last real line.
+            let mut body = lines.clone();
+            while body.last().is_some_and(|line| line.trim_end().is_empty()) {
+                body.pop();
+            }
+            rebuilt.extend(body.iter().map(|line| (*line).to_owned()));
+            rebuilt.push("allowBuilds:".to_owned());
+            rebuilt.extend(rendered);
+            rebuilt.push(String::new());
         }
-    };
-    let mut keys: std::collections::BTreeSet<String> = body
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            trimmed
-                .strip_suffix(": true")
-                .map(str::trim)
-                .filter(|key| !key.is_empty())
-                .map(|key| key.trim_matches('"').to_owned())
-        })
-        .collect();
-    keys.insert(key.to_owned());
-    // pnpm 11.7 emits example keys as bare YAML scalars
-    // (`dsh-better-sidebar@https://codeload.../ab785d...: true`) inside
-    // its error block — without surrounding quotes — and round-trips the
-    // same scalar form back. Older pnpm versions tolerate quoted keys,
-    // but the modern pnpm we bundle requires the unquoted form for the
-    // value to take effect on a retry.
-    let rendered = keys
-        .iter()
-        .map(|existing_key| format!("  {existing_key}: true"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    // Drop the trailing body we borrowed before reassembling so the
-    // final separator layout is deterministic.
-    let body_text = if rendered.is_empty() {
-        String::new()
-    } else {
-        format!("{rendered}\n")
-    };
-    let updated = if body.is_empty() && !after.is_empty() {
-        // Newly created section: `before` is the whole original file and
-        // `after` carries the separator we measured above. Ensure we end
-        // with exactly one trailing newline before the section header.
-        let trailing = if before.ends_with('\n') { "" } else { "\n" };
-        format!("{before}{trailing}allowBuilds:\n{body_text}{after}")
-    } else {
-        format!("{before}allowBuilds:\n{body_text}{after}")
-    };
+    }
+    let updated = rebuilt.join("\n");
     fs::write(workspace_manifest, updated)
         .map_err(|error| format!("cannot write pnpm build approval: {error}"))
+}
+
+/// Whether `line` belongs to the block under a mapping header.
+fn is_indented(line: &str) -> bool {
+    line.starts_with(' ') || line.starts_with('\t')
+}
+
+/// The package spec approved by one `allowBuilds:` map line, if the line is
+/// such an entry. pnpm quotes the specs it writes itself and Box quotes the
+/// ones it writes, so only a matching pair of surrounding quotes is stripped —
+/// a spec that merely contains a quote travels back out unchanged rather than
+/// being rewritten into a different key.
+fn allow_build_entry_key(line: &str) -> Option<String> {
+    let key = line.trim().strip_suffix(": true")?.trim();
+    let unquoted = key
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            key.strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })?;
+    (!unquoted.is_empty()).then(|| unquoted.replace("''", "'"))
 }
 
 fn seed_profile_recipe(
@@ -928,6 +968,7 @@ pub(crate) fn seal_template(
     profile: &str,
     plugin_sources: &[String],
     allowed_build_sources: &[String],
+    env: &BTreeMap<String, String>,
     boxfile_source: &str,
     task: &TaskContext,
 ) -> Result<SealedTemplateRecord, String> {
@@ -952,10 +993,7 @@ pub(crate) fn seal_template(
         let copy_started = std::time::Instant::now();
         copy_source_tree(&base_harness, &staged_harness)
             .map_err(|error| format!("cannot copy prepared base: {error}"))?;
-        task.log(&format!(
-            "copied in {}s",
-            copy_started.elapsed().as_secs()
-        ));
+        task.log(&format!("copied in {}s", copy_started.elapsed().as_secs()));
         fs::write(staged.join("boxfile.dsh"), boxfile_source)
             .map_err(|error| format!("cannot preserve Boxfile source: {error}"))?;
         create_profile_manifest(&staged, profile)?;
@@ -981,11 +1019,15 @@ pub(crate) fn seal_template(
         }
         let created_at = now_seconds();
         let identity = format!(
-            "{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}",
             name,
             base.id,
             profile,
-            plugin_sources.join("\n")
+            plugin_sources.join("\n"),
+            env.iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         let digest = box_dsh_versions::template_content_hash(&identity);
         let id = format!("sealed-{digest}");
@@ -1000,6 +1042,7 @@ pub(crate) fn seal_template(
             base_id: Some(base.id.clone()),
             plugin_artifact_ids: Vec::new(),
             plugin_sources: plugin_sources.to_vec(),
+            env: env.clone(),
             harness_digest: digest.clone(),
             profile_digest: Some(digest.clone()),
             size_bytes: tree_size(&staged)?,
@@ -1254,7 +1297,16 @@ fn run_pnpm_command<const N: usize>(
     const MAX_ATTEMPTS: u32 = 4;
     let mut last_error: Option<String> = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        match run_pnpm_command_once(pnpm, harness, args, log_path, task, label, &dsh_home, &client_commit) {
+        match run_pnpm_command_once(
+            pnpm,
+            harness,
+            args,
+            log_path,
+            task,
+            label,
+            &dsh_home,
+            &client_commit,
+        ) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 let transient = attempt < MAX_ATTEMPTS && log_indicates_transient_io(log_path);
@@ -1528,10 +1580,7 @@ mod tests {
 
         // Case A: no allowBuilds section yet. First call creates the
         // section; second call must keep a single header and merge.
-        write_manifest(
-            &manifest,
-            "packages:\n  - \"apps/*\"\n  - \"packages/*\"\n",
-        );
+        write_manifest(&manifest, "packages:\n  - \"apps/*\"\n  - \"packages/*\"\n");
         add_pnpm_build_approval(&manifest, "node-pty@1.1.0").unwrap();
         add_pnpm_build_approval(&manifest, "sharp@0.33.5").unwrap();
         let body = read_manifest(&manifest);
@@ -1539,9 +1588,10 @@ mod tests {
             body.matches("allowBuilds:").count() == 1,
             "expected exactly one allowBuilds header, got: {body}"
         );
-        // pnpm 11.7 reads keys back as bare YAML scalars — no quotes.
-        assert!(body.contains("  node-pty@1.1.0: true"), "{body}");
-        assert!(body.contains("  sharp@0.33.5: true"), "{body}");
+        // Keys are quoted: a scoped spec's leading `@` is a YAML reserved
+        // indicator, so the bare scalar pnpm prints is not writable back.
+        assert!(body.contains("  \"node-pty@1.1.0\": true"), "{body}");
+        assert!(body.contains("  \"sharp@0.33.5\": true"), "{body}");
         assert!(
             body.contains("packages:\n  - \"apps/*\""),
             "preceding section must be preserved verbatim: {body}"
@@ -1564,12 +1614,12 @@ mod tests {
             "section header must not duplicate: {body_b}"
         );
         assert_eq!(
-            body_b.matches("  left-pad@1.3.0: true").count(),
+            body_b.matches("  \"left-pad@1.3.0\": true").count(),
             1,
-            "existing quoted key line is normalized to a bare scalar on rewrite (still present exactly once): {body_b}"
+            "existing quoted key survives a rewrite (still present exactly once): {body_b}"
         );
         assert_eq!(
-            body_b.matches("  right-pad@2.0.0: true").count(),
+            body_b.matches("  \"right-pad@2.0.0\": true").count(),
             1,
             "new key appended exactly once even after duplicate call: {body_b}"
         );
@@ -1582,12 +1632,116 @@ mod tests {
         add_pnpm_build_approval(&manifest_c, "alpha@1").unwrap();
         add_pnpm_build_approval(&manifest_c, "mu@1").unwrap();
         let body_c = read_manifest(&manifest_c);
-        let alpha_at = body_c.find("  alpha@1: true").unwrap();
-        let mu_at = body_c.find("  mu@1: true").unwrap();
-        let zeta_at = body_c.find("  zeta@1: true").unwrap();
+        let alpha_at = body_c.find("  \"alpha@1\": true").unwrap();
+        let mu_at = body_c.find("  \"mu@1\": true").unwrap();
+        let zeta_at = body_c.find("  \"zeta@1\": true").unwrap();
         assert!(
             alpha_at < mu_at && mu_at < zeta_at,
             "keys must be sorted: {body_c}"
+        );
+    }
+
+    /// What shipped in v0.1.x: pnpm prints the key it wants as a bare scalar
+    /// (`@deepseek-ai/dsh-subprocess-local@0.2.1-rc.2`), and a leading `@` is a
+    /// YAML reserved indicator — writing that back left the whole manifest
+    /// unparseable, so the retry meant to approve the plugin died on
+    /// `[ERROR] bad indentation of a mapping entry` instead of getting further.
+    #[test]
+    fn add_pnpm_build_approval_quotes_a_scoped_key_that_yaml_can_read_back() {
+        let temporary = tempfile::tempdir().unwrap();
+        let manifest = temporary.path().join("pnpm-workspace.yaml");
+        // The exact header Box creates for a profile.
+        write_manifest(
+            &manifest,
+            "packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n",
+        );
+        add_pnpm_build_approval(&manifest, "@deepseek-ai/dsh-subprocess-local@0.2.1-rc.2").unwrap();
+        let body = read_manifest(&manifest);
+        assert!(
+            body.contains("  \"@deepseek-ai/dsh-subprocess-local@0.2.1-rc.2\": true"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("\n  @"),
+            "a scoped spec must never be written as a bare scalar: {body}"
+        );
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["allowBuilds"]["@deepseek-ai/dsh-subprocess-local@0.2.1-rc.2"],
+            serde_yaml::Value::Bool(true)
+        );
+        assert_eq!(
+            parsed["nodeLinker"],
+            serde_yaml::Value::String("hoisted".to_owned())
+        );
+        assert_eq!(parsed["autoInstallPeers"], serde_yaml::Value::Bool(false));
+    }
+
+    #[test]
+    fn add_pnpm_build_approval_keeps_the_lines_it_does_not_own() {
+        let temporary = tempfile::tempdir().unwrap();
+        let manifest = temporary.path().join("pnpm-workspace.yaml");
+        // The real shape after a successful build: pnpm appended
+        // minimumReleaseAgeExclude directly under the section without a blank
+        // line, and a comment documents the approval. Neither is Box's to drop.
+        write_manifest(
+            &manifest,
+            "allowBuilds:\n  # approved by the boxfile LABEL\n  \"node-pty@1.2.0-beta.15\": true\nminimumReleaseAgeExclude:\n  - '@nexus-aethra/dshell-std@0.1.14'\n",
+        );
+        add_pnpm_build_approval(&manifest, "@deepseek-ai/dsh-sandbox-local@0.2.1-rc.2").unwrap();
+        let body = read_manifest(&manifest);
+        assert!(
+            body.contains("  # approved by the boxfile LABEL"),
+            "comment line must survive: {body}"
+        );
+        assert_eq!(
+            body.matches("allowBuilds:").count(),
+            1,
+            "section header must not duplicate: {body}"
+        );
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["minimumReleaseAgeExclude"],
+            serde_yaml::from_str::<serde_yaml::Value>("['@nexus-aethra/dshell-std@0.1.14']")
+                .unwrap()
+        );
+        for key in [
+            "node-pty@1.2.0-beta.15",
+            "@deepseek-ai/dsh-sandbox-local@0.2.1-rc.2",
+        ] {
+            assert_eq!(
+                parsed["allowBuilds"][key],
+                serde_yaml::Value::Bool(true),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_approval_hint_repeats_neither_the_source_nor_the_key() {
+        // A plugin's own build script is the common case: the ADD spec and the
+        // key pnpm asks for are the same string, and listing it twice made the
+        // suggestion look unlike the line the user had already written, so they
+        // pasted it again and the build failed again.
+        let hint = build_approval_hint(
+            "@deepseek-ai/dsh-subprocess-local@0.2.1-rc.2",
+            Some("@deepseek-ai/dsh-subprocess-local@0.2.1-rc.2"),
+        );
+        assert_eq!(
+            hint.matches("@deepseek-ai/dsh-subprocess-local@0.2.1-rc.2")
+                .count(),
+            1,
+            "{hint}"
+        );
+        let both = build_approval_hint(
+            "@deepseek-ai/dsh-ssh@0.2.1-rc.2",
+            Some("node-pty@1.2.0-beta.15"),
+        );
+        assert!(
+            both.contains(
+                "LABEL dshbox.allow-build=@deepseek-ai/dsh-ssh@0.2.1-rc.2,node-pty@1.2.0-beta.15"
+            ),
+            "{both}"
         );
     }
 
@@ -1644,10 +1798,7 @@ mod tests {
         for (body, expected) in cases {
             fs::write(&log_path, body).unwrap();
             let actual: Vec<String> = pnpm_ignored_build_keys(&log_path);
-            let expected: Vec<String> = expected
-                .iter()
-                .map(|key| (*key).to_owned())
-                .collect();
+            let expected: Vec<String> = expected.iter().map(|key| (*key).to_owned()).collect();
             assert_eq!(
                 actual, expected,
                 "pnpm_ignored_build_keys returned wrong keys for log body: {body}"

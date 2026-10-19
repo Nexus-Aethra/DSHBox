@@ -114,7 +114,7 @@ ADD skill team-conventions
 | `PROFILE <name>` | yes (exactly once) | Target DSH profile (`web`, `headless`, …). |
 | `NAME <image-name>` | no | Defaults to the script file's stem. |
 | `VERSION <image-version>` | no | Defaults to `latest`. |
-| `LABEL key=value` | repeatable | Free-form metadata attached to the built template. |
+| `LABEL key=value` | repeatable | Free-form metadata attached to the built template. `dshbox.allow-build` is reserved: a comma-separated list of `package@version` keys allowed to run build scripts. |
 | `DEF <name> @<path>` | repeatable | Defines a path alias usable as `@<name>` in subsequent `ADD` lines. |
 | `ADD plugin\|skill\|data <src> [@<dest>]` | one or more | Resource you want baked into every Container made from this template. |
 | `CP <src> [@<dest>]` | alias for `ADD plugin` | Kept for backward compatibility. |

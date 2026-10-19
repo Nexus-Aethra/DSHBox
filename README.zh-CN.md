@@ -116,7 +116,7 @@ ADD skill team-conventions
 | `PROFILE <name>` | 是（恰好一次） | 目标 DSH profile（`web`、`headless`……）。 |
 | `NAME <image-name>` | 否 | 默认取脚本文件名。 |
 | `VERSION <image-version>` | 否 | 默认 `latest`。 |
-| `LABEL key=value` | 可重复 | 附加到已构建模板上的自由元数据。 |
+| `LABEL key=value` | 可重复 | 附加到已构建模板上的自由元数据。`dshbox.allow-build` 是保留键：以逗号分隔的 `package@version` 列表，允许这些包执行构建脚本。 |
 | `DEF <name> @<path>` | 可重复 | 定义路径别名，供后续 `ADD` 用 `@<name>` 引用。 |
 | `ADD plugin\|skill\|data <src> [@<dest>]` | 至少一条 | 要烤进每个由该模板创建的容器的资源。 |
 | `CP <src> [@<dest>]` | `ADD plugin` 的别名 | 向后兼容保留。 |

@@ -181,8 +181,13 @@ command as done only once the installed app has run it.
   source only**; the daemon auto-derives transitive `package@version` keys
   from pnpm's `[ERR_PNPM_IGNORED_BUILDS]` /
   `[ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED]` markers and retries (multi-round
-  loop in `dshboxd/src/sealed.rs`, `add_pnpm_build_approval` is an idempotent
-  YAML merge producing a single bare-scalar `allowBuilds:` section).
+  loop in `dshboxd/src/sealed.rs`, `add_pnpm_build_approval` merges
+  idempotently into a single `allowBuilds:` section and quotes every key: a
+  scoped spec starts with `@`, a YAML reserved indicator, so the bare scalar
+  pnpm prints inside its own error block is not writable back — writing it
+  unquoted fails the whole manifest with `bad indentation of a mapping
+  entry`, which is how the retry meant to approve the plugin used to die on
+  the file it had just corrupted).
 - **Runtime archive integrity.** Verify SHA-256 (Node) and SHA-512 (pnpm)
   before use; a failed verification aborts startup, no silent fallback.
 - **DSH ≥ `dsh-v0.1.5-alpha.1` cannot be built from source on Linux/macOS with
