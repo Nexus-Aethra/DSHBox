@@ -1,15 +1,18 @@
 #!/bin/sh
-# PATH entry for the dshbox daemon shipped inside the DSH Box resources.
-# The real daemon lives at /usr/lib/dshbox/resources/server/<target>/dshboxd
-# (deb/rpm install it only as a bundled resource), so this wrapper resolves
-# it regardless of the target subdirectory and points the daemon at its
-# bundled runtime via DSHBOX_RESOURCE_DIR.
+# PATH entry for the dshbox daemon shipped inside the DSH Box install.
+# The deb/rpm bundle deploys the daemon at /usr/lib/dshbox/server/<target>/dshboxd
+# (tauri's resource map drops the `resources/` level), so resolve the target
+# subdirectory instead of naming it, and point the daemon at the install root
+# via DSHBOX_RESOURCE_DIR — the Rust side derives <root>/runtime/<target>/ from
+# it and only needs this because a PATH entry carries no exe-relative context.
 
 set -eu
 
-for candidate in /usr/lib/dshbox/resources/server/*/dshboxd; do
+INSTALL_ROOT=/usr/lib/dshbox
+
+for candidate in "$INSTALL_ROOT"/server/*/dshboxd; do
   if [ -x "$candidate" ]; then
-    DSHBOX_RESOURCE_DIR="${candidate%/server/*}"
+    DSHBOX_RESOURCE_DIR="$INSTALL_ROOT"
     export DSHBOX_RESOURCE_DIR
     exec "$candidate" "$@"
   fi

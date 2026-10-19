@@ -325,6 +325,10 @@ pub(crate) fn pull_template_with_cancel(
         base_id: None,
         plugin_artifact_ids: Vec::new(),
         plugin_sources: Vec::new(),
+        // A prepared base is a plain Harness tree: no Boxfile, so no
+        // declared environment. A sealed template built on it fills this
+        // in from its own `ENV` directives.
+        env: BTreeMap::new(),
         harness_digest: record
             .id
             .strip_prefix("base-")
@@ -460,6 +464,10 @@ fn validate_prepared_harness(harness: &Path) -> Result<(), String> {
         "package.json",
         "node_modules/tsx/package.json",
         "apps/cli/src/bin.ts",
+        // The host launches this built entry, so a base without it cannot
+        // start a container at all — see `dshboxd::lifecycle` for why the
+        // source entry is not an acceptable substitute.
+        "apps/cli/lib/bin.js",
         // The client build runs while the base is prepared, so a base without
         // its artifacts is incomplete: containers would silently fall back to
         // building them one by one.
@@ -487,9 +495,7 @@ fn validate_prepared_harness(harness: &Path) -> Result<(), String> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             for (index, prefix) in optional_prefixes.iter().enumerate() {
-                if name.starts_with(prefix)
-                    && entry.path().join("node_modules").is_dir()
-                {
+                if name.starts_with(prefix) && entry.path().join("node_modules").is_dir() {
                     found[index] = true;
                 }
             }
@@ -713,7 +719,10 @@ mod tests {
         fs::write(harness.join("node_modules/tsx/package.json"), "{}").unwrap();
         // Windows-only optional-package check: the fixture needs the esbuild
         // and koffi virtual-store entries before validation can pass.
-        for package in ["@esbuild+win32-x64@0.21.5", "@koromix+koffi-win32-x64@3.1.1"] {
+        for package in [
+            "@esbuild+win32-x64@0.21.5",
+            "@koromix+koffi-win32-x64@3.1.1",
+        ] {
             fs::create_dir_all(
                 harness
                     .join("node_modules/.pnpm")
@@ -729,6 +738,11 @@ mod tests {
         fs::write(harness.join("apps/web/dist/index.html"), "").unwrap();
         assert!(validate_prepared_harness(&harness).is_err());
         crate::sealed::write_client_artifact_marker(&harness, "abc").unwrap();
+        // The host starts the built CLI entry, so a base whose build stopped
+        // before producing it cannot serve a container.
+        assert!(validate_prepared_harness(&harness).is_err());
+        fs::create_dir_all(harness.join("apps/cli/lib")).unwrap();
+        fs::write(harness.join("apps/cli/lib/bin.js"), "").unwrap();
         validate_prepared_harness(&harness).unwrap();
     }
 
@@ -738,10 +752,17 @@ mod tests {
         let harness = temporary.path().join("harness");
         fs::create_dir_all(harness.join("apps/web/dist")).unwrap();
         fs::write(harness.join("apps/web/dist/index.html"), "").unwrap();
+        fs::create_dir_all(harness.join("apps/cli/lib")).unwrap();
+        fs::write(harness.join("apps/cli/lib/bin.js"), "").unwrap();
         // No marker: an old template, or one that lost it. Build, do not trust.
         assert!(!crate::sealed::client_artifacts_present(&harness, "abc"));
         crate::sealed::write_client_artifact_marker(&harness, "abc").unwrap();
         assert!(crate::sealed::client_artifacts_present(&harness, "abc"));
+        // A marker that claims artifacts the tree does not carry — the entry
+        // the host starts is missing — must not be trusted either.
+        fs::remove_file(harness.join("apps/cli/lib/bin.js")).unwrap();
+        assert!(!crate::sealed::client_artifacts_present(&harness, "abc"));
+        fs::write(harness.join("apps/cli/lib/bin.js"), "").unwrap();
         // A template imported from another machine carries that machine's
         // native addon, so its artifacts are not this platform's.
         assert!(!crate::sealed::client_artifacts_present(&harness, "def"));

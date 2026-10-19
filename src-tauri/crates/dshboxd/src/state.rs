@@ -4,7 +4,10 @@
 //! construct their own copies.
 
 use box_foundation::{read_config, BoxConfig, BoxPaths, BoxResult};
-use box_runtime::{bundled::ResolvedBundledRuntime, process::{self, TrackedChild}};
+use box_runtime::{
+    bundled::ResolvedBundledRuntime,
+    process::{self, TrackedChild},
+};
 use box_scheduler::{TaskManager, TaskNotifier};
 use box_state::ResourceStateManager;
 use std::{
@@ -70,17 +73,22 @@ pub(crate) fn bundled_target() -> &'static str {
 }
 
 /// Locate the resource directory (parent of `runtime/<target>/`) that
-/// ships the bundled Node/pnpm. The daemon binary is deployed at
-/// `resources/server/<target>/dshboxd`, so the resource root is two
-/// directories up from the executable; developer builds fall back to
-/// `src-tauri/resources` relative to this crate.
+/// ships the bundled Node/pnpm. The deb/rpm bundle deploys the daemon at
+/// `<install>/server/<target>/dshboxd` (tauri's resource map drops the
+/// `resources/` level), so the resource root is three directories up from
+/// the executable; developer builds fall back to `src-tauri/resources`
+/// relative to this crate.
 pub(crate) fn resource_directory() -> Result<PathBuf, String> {
     if let Some(root) = std::env::var_os("DSHBOX_RESOURCE_DIR") {
         return Ok(PathBuf::from(root));
     }
     if let Ok(exe) = std::env::current_exe() {
         // exe: resources/server/<target>/dshboxd
-        if let Some(parent) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+        if let Some(parent) = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
             if parent.join("runtime").is_dir() {
                 return Ok(parent.to_path_buf());
             }
@@ -242,7 +250,10 @@ pub(crate) fn initialize_bundled_plugins() -> Result<(), String> {
     let mut updated = config;
     updated.plugins_manifest_digest = Some(digest);
     write_config(&updated)?;
-    eprintln!("dshboxd vendored bundled plugins into {}", cache_root.display());
+    eprintln!(
+        "dshboxd vendored bundled plugins into {}",
+        cache_root.display()
+    );
     Ok(())
 }
 
@@ -360,11 +371,12 @@ impl TaskNotifier for DaemonNotifier {
             self.resources.apply_task_update(task);
         }
         let _ = self.manager.persist();
-        self.events.broadcast(crate::events::DaemonEvent::TaskStage {
-            task_id: task_id.to_owned(),
-            stage: stage.to_owned(),
-            progress,
-        });
+        self.events
+            .broadcast(crate::events::DaemonEvent::TaskStage {
+                task_id: task_id.to_owned(),
+                stage: stage.to_owned(),
+                progress,
+            });
     }
 
     fn log(&self, task_id: &str, line: &str) {
@@ -376,20 +388,16 @@ impl TaskNotifier for DaemonNotifier {
         });
     }
 
-    fn finished(
-        &self,
-        task_id: &str,
-        status: &str,
-        error: Option<&str>,
-    ) {
+    fn finished(&self, task_id: &str, status: &str, error: Option<&str>) {
         if let Ok(task) = self.manager.task(task_id) {
             self.resources.apply_task_update(task);
         }
         let _ = self.manager.persist();
-        self.events.broadcast(crate::events::DaemonEvent::TaskFinished {
-            task_id: task_id.to_owned(),
-            status: status.to_owned(),
-            error: error.map(str::to_owned),
-        });
+        self.events
+            .broadcast(crate::events::DaemonEvent::TaskFinished {
+                task_id: task_id.to_owned(),
+                status: status.to_owned(),
+                error: error.map(str::to_owned),
+            });
     }
 }

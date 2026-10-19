@@ -74,6 +74,13 @@ pub struct TemplateManifest {
     /// template.
     #[serde(default)]
     pub plugin_sources: Vec<String>,
+    /// Container environment declared by the Boxfile's `ENV` directives.
+    /// Applied on top of the host's environment whitelist at spawn time,
+    /// so a container never depends on the caller's ambient environment.
+    /// `#[serde(default)]` keeps manifests written before ENV existed
+    /// readable (they simply declare nothing).
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     pub harness_digest: String,
     #[serde(default)]
     pub profile_digest: Option<String>,
@@ -373,10 +380,10 @@ pub struct BoxConfig {
     /// /opt/myteam/bin/git) without exporting PATH globally.
     #[serde(default)]
     pub git_path: Option<String>,
-    /// When false (the default), DSH Box inherits the host's
-    /// HTTP/HTTPS/NO_PROXY variables into the clean-room package-manager
-    /// child so developers behind a corporate mirror can still reach
-    /// GitHub and the npm registry. Set to true to force a fully
+    /// When true (the default), DSH Box inherits the host's
+    /// HTTP/HTTPS/ALL/NO_PROXY variables into the clean-room
+    /// package-manager child so developers behind a corporate mirror can
+    /// still reach GitHub and the npm registry. Set to false for a fully
     /// hermetic child (no proxy of any kind).
     #[serde(default = "default_true")]
     pub inherit_proxy: bool,
@@ -736,6 +743,7 @@ mod tests {
             base_id: None,
             plugin_artifact_ids: Vec::new(),
             plugin_sources: Vec::new(),
+            env: BTreeMap::from([("TZ".to_owned(), "Asia/Shanghai".to_owned())]),
             harness_digest: "digest".to_owned(),
             profile_digest: Some("profile".to_owned()),
             size_bytes: 1,
@@ -751,6 +759,11 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(staged.join("manifest.json")).unwrap())
                 .unwrap();
         assert_eq!(reread, valid);
+        // Declared ENV survives the round-trip.
+        assert_eq!(
+            reread.env.get("TZ").map(String::as_str),
+            Some("Asia/Shanghai")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

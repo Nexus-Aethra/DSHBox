@@ -506,6 +506,7 @@ mod tests {
             version: "test".to_owned(),
             profile: "web".to_owned(),
             template: None,
+            env: BTreeMap::new(),
             directory: directory.to_string_lossy().into_owned(),
             status: "stopped".to_owned(),
         };

@@ -94,7 +94,32 @@ pub(crate) fn pnpm_policy(
         config.npm_registry.as_deref(),
         bundled_git,
         host_git_dir.as_deref(),
+        config.inherit_proxy,
     )
+}
+
+/// What a registry fetch failure looks like in a pnpm log. `fetch failed` is
+/// the line undici leaves behind — Node prints the generic `TypeError` message
+/// and keeps the real reason (`ECONNREFUSED`, `UND_ERR_SOCKET`, …) on the
+/// `cause` that pnpm never writes out — so a build against a private registry
+/// that simply cannot be reached logged only
+/// `GET http://10.4.87.128:4875/pnpm: fetch failed` and matched none of the
+/// other markers, which is how the mirror warning below stayed silent.
+const NETWORK_FAILURE_MARKERS: [&str; 7] = [
+    "ECONNRESET",
+    "ETIMEDOUT",
+    "UND_ERR_SOCKET",
+    "error (23)",
+    "ENOTFOUND",
+    "ECONNREFUSED",
+    "fetch failed",
+];
+
+fn network_failure_count(log: &str) -> usize {
+    NETWORK_FAILURE_MARKERS
+        .iter()
+        .map(|marker| log.matches(marker).count())
+        .sum()
 }
 
 /// Add an actionable explanation when pnpm failed after repeatedly losing its
@@ -108,19 +133,7 @@ pub(crate) fn pnpm_network_failure_hint(log_path: &Path) -> Option<String> {
         return None;
     }
     let log = fs::read_to_string(log_path).ok()?;
-    let network_errors = [
-        "ECONNRESET",
-        "ETIMEDOUT",
-        "UND_ERR_SOCKET",
-        "error (23)",
-        "ENOTFOUND",
-        "ECONNREFUSED",
-    ];
-    let count = network_errors
-        .iter()
-        .map(|marker| log.matches(marker).count())
-        .sum::<usize>();
-    (count >= 2).then(|| {
+    (network_failure_count(&log) >= 2).then(|| {
         " The configured npm mirror had repeated network failures while downloading packages. \
          Switch the npm registry to the official registry or configure a Box-managed proxy, then retry; \
          pnpm will reuse packages already cached in this storage directory."
@@ -164,7 +177,7 @@ pub(crate) fn run_logged(spec: &ProcessSpec, description: &str) -> Result<Logged
 
 #[cfg(test)]
 mod tests {
-    use super::is_official_npm_registry;
+    use super::{is_official_npm_registry, network_failure_count};
 
     #[test]
     fn recognizes_the_official_npm_registry() {
@@ -173,5 +186,19 @@ mod tests {
         assert!(!is_official_npm_registry(
             "https://repo.huaweicloud.com/repository/npm/"
         ));
+    }
+
+    /// The log a build against an unreachable private registry actually leaves
+    /// behind: pnpm prints undici's generic message, not the errno.
+    #[test]
+    fn counts_undici_fetch_failures_as_network_failures() {
+        let log = "[ERROR] GET http://10.4.87.128:4875/pnpm: fetch failed\n\
+                   For help, run: pnpm help run\n\
+                   [ERROR] GET http://10.4.87.128:4875/@pnpm%2Fexe: fetch failed\n";
+        assert_eq!(network_failure_count(log), 2, "{log}");
+        assert_eq!(
+            network_failure_count("Done in 3.2s using pnpm v11.28.5\n"),
+            0
+        );
     }
 }

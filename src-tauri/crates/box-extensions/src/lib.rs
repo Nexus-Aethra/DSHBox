@@ -95,37 +95,95 @@ pub fn scan_workspace_extensions(workspace: &Path) -> Vec<WorkspaceExtension> {
     let mut found = Vec::new();
     let mut pending = vec![workspace.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        let Ok(entries) = fs::read_dir(&directory) else { continue; };
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
         let kind = detect_extension_kind(&directory).ok();
         if let Some(kind) = kind {
             let metadata = workspace_extension_metadata(&kind, &directory);
-            let relative_path = directory.strip_prefix(workspace).ok().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
+            let relative_path = directory
+                .strip_prefix(workspace)
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
             match metadata {
-                Ok((name, version, description)) => found.push(WorkspaceExtension { kind, name, version, description, relative_path, content_digest: extension_digest(&directory).unwrap_or_else(|error| format!("unavailable:{error}")), diagnostic: None }),
-                Err(error) => found.push(WorkspaceExtension { kind, name: directory.file_name().and_then(|item| item.to_str()).unwrap_or("extension").to_owned(), version: None, description: None, relative_path, content_digest: String::new(), diagnostic: Some(error) }),
+                Ok((name, version, description)) => found.push(WorkspaceExtension {
+                    kind,
+                    name,
+                    version,
+                    description,
+                    relative_path,
+                    content_digest: extension_digest(&directory)
+                        .unwrap_or_else(|error| format!("unavailable:{error}")),
+                    diagnostic: None,
+                }),
+                Err(error) => found.push(WorkspaceExtension {
+                    kind,
+                    name: directory
+                        .file_name()
+                        .and_then(|item| item.to_str())
+                        .unwrap_or("extension")
+                        .to_owned(),
+                    version: None,
+                    description: None,
+                    relative_path,
+                    content_digest: String::new(),
+                    diagnostic: Some(error),
+                }),
             }
             continue;
         }
         for entry in entries.filter_map(Result::ok) {
             let name = entry.file_name();
-            if matches!(name.to_str(), Some(".git" | "node_modules" | "dist" | "build" | ".cache" | ".dsh")) { continue; }
-            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) { pending.push(entry.path()); }
+            if matches!(
+                name.to_str(),
+                Some(".git" | "node_modules" | "dist" | "build" | ".cache" | ".dsh")
+            ) {
+                continue;
+            }
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                pending.push(entry.path());
+            }
         }
     }
     found.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     found
 }
 
-fn workspace_extension_metadata(kind: &ExtensionKind, source: &Path) -> Result<(String, Option<String>, Option<String>), String> {
+fn workspace_extension_metadata(
+    kind: &ExtensionKind,
+    source: &Path,
+) -> Result<(String, Option<String>, Option<String>), String> {
     match kind {
         ExtensionKind::Skill => {
-            let content = fs::read_to_string(source.join("SKILL.md")).map_err(|error| error.to_string())?;
-            let field = |key: &str| content.lines().find_map(|line| line.strip_prefix(key).map(str::trim)).map(|value| value.trim_matches(['\'', '"']).to_owned());
-            Ok((field("name:").ok_or("skill frontmatter has no name")?, None, field("description:")))
+            let content =
+                fs::read_to_string(source.join("SKILL.md")).map_err(|error| error.to_string())?;
+            let field = |key: &str| {
+                content
+                    .lines()
+                    .find_map(|line| line.strip_prefix(key).map(str::trim))
+                    .map(|value| value.trim_matches(['\'', '"']).to_owned())
+            };
+            Ok((
+                field("name:").ok_or("skill frontmatter has no name")?,
+                None,
+                field("description:"),
+            ))
         }
         ExtensionKind::Plugin => {
-            let value: Value = serde_json::from_str(&fs::read_to_string(source.join("package.json")).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
-            Ok((value["name"].as_str().ok_or("plugin package.json has no name")?.to_owned(), value["version"].as_str().map(str::to_owned), value["description"].as_str().map(str::to_owned)))
+            let value: Value = serde_json::from_str(
+                &fs::read_to_string(source.join("package.json"))
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok((
+                value["name"]
+                    .as_str()
+                    .ok_or("plugin package.json has no name")?
+                    .to_owned(),
+                value["version"].as_str().map(str::to_owned),
+                value["description"].as_str().map(str::to_owned),
+            ))
         }
     }
 }
@@ -275,17 +333,26 @@ pub fn scan_repository(runtime: &Path) -> Vec<RepositoryExtension> {
         } else if let Err(error) = detect_extension_kind(source) {
             entry.diagnostic = Some(error);
         } else {
-            entry.content_digest = extension_digest(source).unwrap_or_else(|error| format!("unavailable:{error}"));
+            entry.content_digest =
+                extension_digest(source).unwrap_or_else(|error| format!("unavailable:{error}"));
         }
     }
     entries.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
     entries
 }
 
-pub fn write_repository_index(runtime: &Path, entries: &[RepositoryExtension]) -> Result<(), String> {
+pub fn write_repository_index(
+    runtime: &Path,
+    entries: &[RepositoryExtension],
+) -> Result<(), String> {
     let path = repository_index_path(runtime);
-    fs::create_dir_all(path.parent().ok_or("repository index has no parent")?).map_err(|error| error.to_string())?;
-    fs::write(path, serde_json::to_string_pretty(entries).map_err(|error| error.to_string())?).map_err(|error| error.to_string())
+    fs::create_dir_all(path.parent().ok_or("repository index has no parent")?)
+        .map_err(|error| error.to_string())?;
+    fs::write(
+        path,
+        serde_json::to_string_pretty(entries).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
 }
 
 // ── Owner-id references ───────────────────────────────────────────────────
@@ -540,7 +607,12 @@ pub fn unused_repository_ids(runtime: &Path) -> Vec<String> {
     let entries = scan_repository(runtime);
     entries
         .into_iter()
-        .filter(|entry| references.get(&entry.id).map(|count| count.is_empty()).unwrap_or(true))
+        .filter(|entry| {
+            references
+                .get(&entry.id)
+                .map(|count| count.is_empty())
+                .unwrap_or(true)
+        })
         .map(|entry| entry.id)
         .collect()
 }
@@ -614,8 +686,13 @@ pub fn read_bundles(runtime: &Path) -> Vec<ExtensionBundle> {
 
 pub fn write_bundles(runtime: &Path, bundles: &[ExtensionBundle]) -> Result<(), String> {
     let path = bundles_path(runtime);
-    fs::create_dir_all(path.parent().ok_or("bundle state has no parent")?).map_err(|error| error.to_string())?;
-    fs::write(path, serde_json::to_string_pretty(bundles).map_err(|error| error.to_string())?).map_err(|error| error.to_string())
+    fs::create_dir_all(path.parent().ok_or("bundle state has no parent")?)
+        .map_err(|error| error.to_string())?;
+    fs::write(
+        path,
+        serde_json::to_string_pretty(bundles).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Total size of a directory tree in bytes, skipping the same noisy folders
@@ -653,22 +730,37 @@ pub fn directory_size(root: &Path) -> u64 {
 /// Stable content digest excluding dependency and VCS directories.
 pub fn extension_digest(root: &Path) -> Result<String, String> {
     fn visit(root: &Path, current: &Path, bytes: &mut Vec<u8>) -> Result<(), String> {
-        let mut entries = fs::read_dir(current).map_err(|error| error.to_string())?.filter_map(Result::ok).collect::<Vec<_>>();
+        let mut entries = fs::read_dir(current)
+            .map_err(|error| error.to_string())?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
             let name = entry.file_name();
-            if matches!(name.to_str(), Some(".git" | "node_modules")) { continue; }
+            if matches!(name.to_str(), Some(".git" | "node_modules")) {
+                continue;
+            }
             let path = entry.path();
             let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
             bytes.extend_from_slice(relative.to_string_lossy().as_bytes());
-            if entry.file_type().map_err(|error| error.to_string())?.is_dir() { visit(root, &path, bytes)?; }
-            else if path.is_file() { bytes.extend_from_slice(&fs::read(&path).map_err(|error| error.to_string())?); }
+            if entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_dir()
+            {
+                visit(root, &path, bytes)?;
+            } else if path.is_file() {
+                bytes.extend_from_slice(&fs::read(&path).map_err(|error| error.to_string())?);
+            }
         }
         Ok(())
     }
-    let mut bytes = Vec::new(); visit(root, root, &mut bytes)?;
+    let mut bytes = Vec::new();
+    visit(root, root, &mut bytes)?;
     let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes { hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3); }
+    for byte in bytes {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
     Ok(format!("fnv1a64:{hash:016x}"))
 }
 
@@ -1015,6 +1107,7 @@ mod tests {
             version: "latest".to_owned(),
             profile: "web".to_owned(),
             template: None,
+            env: Default::default(),
             directory: root.to_string_lossy().into_owned(),
             status: "stopped".to_owned(),
         }
@@ -1111,25 +1204,25 @@ mod tests {
         let raw = std::fs::read_to_string(references_path(&root)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["img-a"]["templates"], serde_json::json!(["tpl-x"]));
-        assert!(parsed["img-a"].get("containers").is_none()
-            || parsed["img-a"]["templates"].as_array().unwrap().len() == 1);
+        assert!(
+            parsed["img-a"].get("containers").is_none()
+                || parsed["img-a"]["templates"].as_array().unwrap().len() == 1
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn reconcile_rebuilds_owner_map_from_canonical_sources() {
-        let root = std::env::temp_dir().join(format!(
-            "dshbox-reconcile-test-{}",
-            now_seconds()
-        ));
+        let root = std::env::temp_dir().join(format!("dshbox-reconcile-test-{}", now_seconds()));
         let home = std::env::temp_dir().join(format!("dshbox-reconcile-home-{}", now_seconds()));
         fs::create_dir_all(repository_root(&root)).unwrap();
         fs::create_dir_all(home.join(".dsh-box")).unwrap();
         fs::write(
             home.join(".dsh-box/config.json"),
             serde_json::json!({ "runtimeDirectory": root.to_string_lossy() }).to_string(),
-        ).unwrap();
+        )
+        .unwrap();
         let prev_home = std::env::var("HOME").ok();
         // SAFETY: single-threaded test, restored on drop.
         unsafe { std::env::set_var("HOME", &home) };
@@ -1157,26 +1250,27 @@ mod tests {
             kind: ExtensionKind::Plugin,
             name: "@scope/repo-plugin".to_owned(),
             source_kind: "repository".to_owned(),
-                source: "img-real".to_owned(),
-                profile: Some("web".to_owned()),
-                path: "/repo/path".to_owned(),
-                installed_at: now_seconds(),
-                repository_id: Some("img-real".to_owned()),
-                content_digest: None,
-            };
-            write_extension_record(
-                &DshContainer {
-                    id: "container-alpha".to_owned(),
-                    name: "alpha".to_owned(),
-                    version: "v1".to_owned(),
-                    profile: "web".to_owned(),
-                    template: None,
-                    directory: container_root.to_string_lossy().into_owned(),
-                    status: "stopped".to_owned(),
-                },
-                record,
-            )
-            .unwrap();
+            source: "img-real".to_owned(),
+            profile: Some("web".to_owned()),
+            path: "/repo/path".to_owned(),
+            installed_at: now_seconds(),
+            repository_id: Some("img-real".to_owned()),
+            content_digest: None,
+        };
+        write_extension_record(
+            &DshContainer {
+                id: "container-alpha".to_owned(),
+                name: "alpha".to_owned(),
+                version: "v1".to_owned(),
+                profile: "web".to_owned(),
+                template: None,
+                env: Default::default(),
+                directory: container_root.to_string_lossy().into_owned(),
+                status: "stopped".to_owned(),
+            },
+            record,
+        )
+        .unwrap();
 
         // Pre-seed references.json with stale entries that disagree with
         // the canonical sources.
@@ -1232,7 +1326,14 @@ mod tests {
     fn derived_entries_mirror_the_install_and_spare_owned_rows() {
         let root = std::env::temp_dir().join(format!("dshbox-derived-test-{}", now_seconds()));
         fs::create_dir_all(repository_root(&root)).unwrap();
-        upsert_reference_entry(&root, ExtensionKind::Plugin, "hand-made", Some("1.0.0"), "npm:hand-made@1.0.0").unwrap();
+        upsert_reference_entry(
+            &root,
+            ExtensionKind::Plugin,
+            "hand-made",
+            Some("1.0.0"),
+            "npm:hand-made@1.0.0",
+        )
+        .unwrap();
         write_repository_index(
             &root,
             &[
@@ -1262,12 +1363,19 @@ mod tests {
         }];
         // The user's own row for `hand-made` is left as it is, and the mirror
         // does not add a second row for the same name.
-        assert_eq!(sync_derived_entries(&root, ExtensionKind::Plugin, &wanted).unwrap(), 1);
+        assert_eq!(
+            sync_derived_entries(&root, ExtensionKind::Plugin, &wanted).unwrap(),
+            1
+        );
 
         // A second pass changes nothing: the row is keyed by its spec.
-        assert_eq!(sync_derived_entries(&root, ExtensionKind::Plugin, &wanted).unwrap(), 0);
+        assert_eq!(
+            sync_derived_entries(&root, ExtensionKind::Plugin, &wanted).unwrap(),
+            0
+        );
         let entries = scan_repository(&root);
-        let derived: Vec<&RepositoryExtension> = entries.iter().filter(|entry| entry.derived).collect();
+        let derived: Vec<&RepositoryExtension> =
+            entries.iter().filter(|entry| entry.derived).collect();
         assert_eq!(derived.len(), 1);
         assert_eq!(derived[0].name, "@scope/plugin");
         assert_eq!(derived[0].source.as_deref(), Some("@scope/plugin@1.2.3"));
@@ -1281,12 +1389,18 @@ mod tests {
             version: "2.0.0".to_owned(),
             spec: "npm:hand-made@2.0.0".to_owned(),
         }];
-        assert_eq!(sync_derived_entries(&root, ExtensionKind::Plugin, &only_user).unwrap(), 0);
-        let rows: Vec<(String, bool)> = scan_repository(&root).into_iter().map(|entry| (entry.name, entry.derived)).collect();
-        assert_eq!(rows, vec![
-            ("hand-made".to_owned(), false),
-            ("owned".to_owned(), false),
-        ]);
+        assert_eq!(
+            sync_derived_entries(&root, ExtensionKind::Plugin, &only_user).unwrap(),
+            0
+        );
+        let rows: Vec<(String, bool)> = scan_repository(&root)
+            .into_iter()
+            .map(|entry| (entry.name, entry.derived))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("hand-made".to_owned(), false), ("owned".to_owned(), false),]
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

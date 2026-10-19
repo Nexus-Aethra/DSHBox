@@ -150,6 +150,7 @@ ADD plugin github.com/zhu1090093659/dsh-web-ui:latest
 | `VERSION <ver>` | 否 | template 自己的版本号(语义化字符串) | `VERSION 1.0.0` |
 | `LABEL key=value` | 否(可重复) | 元信息,注入 manifest.labels | `LABEL maintainer=alice@example.com` |
 | `DEF <name> @<path>` | 否(可重复) | 路径别名(`@profile` = DSH profile 根) | `DEF skill @profile/skills` |
+| `ENV key=value` | 否(可重复) | 容器环境变量,host 启动时注入(环境白名单之上,`DSH_HOME` 除外) | `ENV TZ=Asia/Shanghai` |
 
 **`DEF` 三个内置默认值**(没写 DEF 也能用):
 
@@ -605,6 +606,9 @@ pub(crate) fn create_dsh_container_sync(
         version: version.to_owned(),
         profile: profile.to_owned(),
         template: None,
+        // This path creates a container straight from a DSH version — no
+        // Boxfile, so nothing is declared.
+        env: std::collections::BTreeMap::new(),
         directory: directory.to_string_lossy().into_owned(),
         status: "stopped".to_owned(),
     })

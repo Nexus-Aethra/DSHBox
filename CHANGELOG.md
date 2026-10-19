@@ -193,6 +193,31 @@ builds from ever showing it.
   no longer sorts `0.1.10` before `0.1.9`.
 - **Reading a published package** falls back to `lib/` when it has no sources,
   and looks for a client entry where the manifest says it is.
+- **No agent could run a single tool in a Container.** The host was launched as
+  `node --import tsx/esm apps/cli/src/bin.ts`, which splits the Harness tree
+  into two module worlds: `tsconfig.base.json` maps every first-party package to
+  `src`, so a package imported by name loads from `src` while the plugin row
+  loader — following `package.json` `exports` — loads the same package from
+  `lib`. Each copy creates its own `Symbol`, so the `dsh-tools` scheduler was
+  stored under one and looked up under the other: every tool call died ~1 ms
+  after `tool/call` with `Cannot read properties of undefined (reading
+  'prepare')`, which the UI showed as a one-second interruption. The host now
+  starts the entry `apps/cli` actually declares (`bin: lib/bin.js`), with no
+  transpiler in the process; that entry is part of the artifact check, so a tree
+  without it is rebuilt rather than launched the broken way. Verified on a real
+  `dsh-v0.1.7-alpha.1` container: `tool/call → tool/result → turn/end
+  reason=completed`.
+- **Provider credentials stopped arriving on Harness 0.1.7.** A key is two parts
+  — the ref in `.credentials.yaml` and the route that names its environment
+  variable — and 0.1.7 moved the second one: `llm-pi-ai` is no longer a section
+  of `profile/settings.yaml` but a layer item (`- id: llm-pi-ai / config:`) in
+  `profile/profiles/<profile>/cordis.patch.yml`, with the old file archived as
+  `settings.yaml.imported`. A kind part now declares a version-bounded slot
+  (`slot` + `since`/`until`, `{profile}` in the path, and a `#<id>` section step
+  that travels a layer item's `config`), so the same kind resolves per container
+  — and a copy records its slot and re-resolves it against the **destination**,
+  so carrying routes from 0.1.7 into 0.1.6 writes `settings.yaml` and not the
+  source's path. Plugin `dshbox.resources` declarations take the same fields.
 - **The resource page worked in the browser and failed in the installed app.**
   The resource layer — the type tabs, the copies, the storage browser, the YAML
   editor, the extract and inject verbs, the installed-plugin list — was

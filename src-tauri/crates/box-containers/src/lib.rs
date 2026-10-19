@@ -15,6 +15,11 @@ pub struct DshContainer {
     /// container.json so the UI and CLI can display/validate the binding.
     #[serde(default)]
     pub template: Option<String>,
+    /// Environment declared by the Boxfile's `ENV` directives, copied into
+    /// container.json at creation and applied on top of the host spawn's
+    /// environment whitelist.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     pub directory: String,
     pub status: String,
 }
@@ -39,7 +44,9 @@ pub fn container_directory(root: &str, id: &str) -> PathBuf {
 /// plus a live `kill -0` / `tasklist` probe to decide whether the host is
 /// still running, instead of trusting an in-memory map it cannot see.
 pub fn host_pid_path(container: &DshContainer) -> PathBuf {
-    PathBuf::from(&container.directory).join("state").join("host.pid")
+    PathBuf::from(&container.directory)
+        .join("state")
+        .join("host.pid")
 }
 
 #[cfg(unix)]
@@ -140,6 +147,16 @@ pub fn scan_containers(root: &str) -> BoxResult<BTreeMap<String, DshContainer>> 
             version: version.to_owned(),
             profile: value["profile"].as_str().unwrap_or("web").to_owned(),
             template: value["template"].as_str().map(str::to_owned),
+            env: value["env"]
+                .as_object()
+                .map(|map| {
+                    map.iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|value| (key.clone(), value.to_owned()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             directory: entry.path().to_string_lossy().into_owned(),
             status: "stopped".to_owned(),
         };
@@ -182,6 +199,7 @@ mod tests {
             version: "latest".to_owned(),
             profile: "web".to_owned(),
             template: None,
+            env: BTreeMap::new(),
             directory: instance.to_string_lossy().into_owned(),
             status: "stopped".to_owned(),
         }

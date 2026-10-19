@@ -1,0 +1,88 @@
+# DSH Box boxfile — dshell 0.1.5 plus the unreleased `dshell-usage` row
+#
+#   dshbox build ./examples/boxfile-dshell-usage.dsh --name dshell-usage
+#   dshbox run dshell-usage --name usage
+#
+# This is `boxfile-dshell.dsh` with one extra line: `@nexus-aethra/dshell-usage`,
+# the per-model token index, which is built in this checkout and is not on the
+# registry yet. Everything else — the FROM line, the bundle pin, the seven
+# upstream rows — is the proven dshell recipe, so what follows is about that one
+# row and nothing else.
+#
+# The usage row is packed from the checkout, not pulled from npm:
+#
+#   mkdir -p /tmp/dshell-box
+#   pnpm --filter @nexus-aethra/dshell-usage exec pnpm pack \
+#     --pack-destination /tmp/dshell-box
+#
+# A directory source would keep `workspace:^` in its manifest, which is not a
+# protocol a profile can install; `pnpm pack` rewrites it to `^0.1.5`, and the
+# package that range names is already in this profile from the bundle's own
+# dependency on it. So the tarball below adds no second copy of anything.
+#
+# Two things the build cannot do, and the container has to be told by hand. Both
+# are gaps that close when 0.1.6 publishes, and they are the reason this template
+# is an experiment rather than an install recipe:
+#
+# 1. `DSHELL_USAGE_PATH` lives in `dshell-std`'s contracts, as every dshell route
+#    path does. The published 0.1.5 std predates it, so usage's route would
+#    register under `undefined`. The std file the container actually loads needs
+#    the one exported const added to it — added in place, not replaced, because
+#    every other dshell row resolves the same file and a second copy of std would
+#    give it a second copy of its service symbols.
+#
+# 2. A plugin is composed only if a bundle names it. The published bundle's patch
+#    lists eleven rows and does not know about usage, so the row has to be
+#    appended to the patch file the container installed.
+#
+# Both edits land under `<runtime>/instances/<container>/profile`, which survives
+# `container restart` and `container stop`/`start` but not `container rm`.
+#
+# Expected tool calls, until one world is arranged: an agent turn in this
+# container dies about a millisecond after it is announced, with `Cannot read
+# properties of undefined (reading 'prepare')`. That is dsh's own module-resolution
+# split (a package's rows load from `lib/` while package-to-package imports resolve
+# to `src/` through the checkout's tsconfig paths, so one package is two instances
+# and its service symbols are not the same symbol), and it has nothing to do with
+# dshell or with how fresh this template is.
+#
+# A Boxfile cannot fix it, because the daemon builds the host's argv itself —
+# `node --import tsx/esm <container>/harness/apps/cli/src/bin.ts` — so there is no
+# `--import` to pass and no `NODE_OPTIONS` to inherit. The container's own harness
+# copy can be pinned to `lib` instead, which needs no launch flag. After
+# `dshbox run`, once per container:
+#
+#   node <dshell-checkout>/scripts/dsh-harness-one-world.mjs \
+#     ~/.dsh-cache/instances/<container>/harness
+#   dshbox container restart <container>
+#
+# Verified this way: `bash` ran `echo one-world-ok` and the turn ended
+# `{kind: completed}` with a `tool/result`, where the same session had been ending
+# `tool/call` -> `turn/end {kind: error}`. See `docs/dshell-setup.md` in the dshell
+# checkout for why the rule is as narrow as it is.
+
+FROM github.com/deepseek-ai/deepseek-harness:dsh-v0.1.6-alpha.2
+PROFILE web
+NAME dshell-usage
+VERSION 1.0.0
+
+# The bundle reaches `node-pty`, whose install script compiles a native binding,
+# and pnpm blocks lifecycle scripts until they are named.
+LABEL dshbox.allow-build=@nexus-aethra/dshell-bundle@0.1.5,node-pty@1.2.0-beta.15
+
+# ── dshell itself ────────────────────────────────────────────────────────
+ADD plugin npm:@nexus-aethra/dshell-bundle@0.1.5
+
+# ── the token-usage page, from this checkout ─────────────────────────────
+ADD plugin /tmp/dshell-box/nexus-aethra-dshell-usage-0.1.5.tgz
+
+# ── the optional dsh providers dshell's rows import ──────────────────────
+ADD plugin npm:@deepseek-ai/dsh-ssh@0.1.6-alpha.2
+ADD plugin npm:@deepseek-ai/dsh-browser-use@0.1.6-alpha.2
+
+# ── the rows dshell's bundle patch names that the base seed omits ────────
+ADD plugin npm:@deepseek-ai/dsh-tool-terminal@0.1.6-alpha.2
+ADD plugin npm:@deepseek-ai/dsh-client-store@0.1.6-alpha.2
+ADD plugin npm:@deepseek-ai/dsh-client-ui-slots@0.1.6-alpha.2
+ADD plugin npm:@deepseek-ai/dsh-client-ui-primitives@0.1.6-alpha.2
+ADD plugin npm:@deepseek-ai/dsh-client-ui-dockkit@0.1.6-alpha.2

@@ -1,0 +1,88 @@
+# DSH Box boxfile — dshell on DSH 0.2.1-rc.2
+#
+#   dshbox pull template github.com/deepseek-ai/deepseek-harness:dsh-v0.2.1-rc.2
+#   dshbox build ./examples/boxfile-dshell-021.dsh --name dshell-021
+#   dshbox run dshell-021
+#
+# This is the 0.2.1-rc.2 acceptance of the local dshell tree. It differs from
+# boxfile-dshell.dsh (the 0.2.0-rc.2 one) in two ways:
+#
+# 1. Every dsh row is pinned to 0.2.1-rc.2.
+# 2. The dshell packages are ADDed as local tarballs rather than
+#    `npm:@nexus-aethra/dshell-*@<published version>`. 0.1.14 is the working
+#    tree's version — its peer union is what carries the 0.2.1-rc.2 line, and
+#    it is on no registry yet, so a stock install of 0.1.13 would be refused by
+#    the peer check and the bundle skipped. Adding the local packs exercises
+#    the real packages without publishing a release.
+#
+# Pack them first — `pnpm pack` is also what rewrites `workspace:^` into a real
+# range; `npm publish` would not, and the install would die with
+# EUNSUPPORTEDPROTOCOL:
+#
+#   for d in packages/dshell/*/; do (cd "$d" && pnpm pack --pack-destination /tmp/dshell-packs); done
+#
+# Do NOT point `dshbox config set mirror.npm` at a local registry to serve
+# them. The base pins `packageManager: pnpm@11.28.5` while runtime-lock ships
+# pnpm 11.7.0, so every build's first network action is pnpm downloading
+# itself from the configured registry — and that download refuses to go
+# through a registry that is not the canonical one:
+#
+#   [ERROR] The packageManager dependency "pnpm@11.28.5" in pnpm-lock.yaml
+#   must use a registry package path and an integrity-only resolution
+#
+# Local tarball paths keep the registry out of the dshell half entirely.
+FROM github.com/deepseek-ai/deepseek-harness:dsh-v0.2.1-rc.2
+PROFILE web
+NAME dshell
+VERSION 1.0.0
+
+# The bundle reaches `node-pty`, whose install script compiles a native binding,
+# and pnpm blocks lifecycle scripts until they are named. Same key list as the
+# 0.2.0-rc.2 boxfile, moved onto this line's version. A key equal to an ADD
+# spec is not written ahead of time — dshbox approves those reactively from
+# pnpm's own error output, then retries.
+LABEL dshbox.allow-build=node-pty@1.2.0-beta.15,@deepseek-ai/dsh-sandbox-local@0.2.1-rc.2,koffi@3.1.1
+
+# ── dshell itself, from the working tree ──────────────────────────────────
+# Dependency order: std and storage are depended on by everything else, and the
+# bundle is the patch layer that pulls in the remaining eight.
+ADD plugin /tmp/dshell-packs/nexus-aethra-dshell-std-0.1.14.tgz
+ADD plugin /tmp/dshell-packs/nexus-aethra-dshell-storage-0.1.14.tgz
+ADD plugin /tmp/dshell-packs/nexus-aethra-dshell-buffer-0.1.14.tgz
+ADD plugin /tmp/dshell-packs/nexus-aethra-dshell-commands-0.1.14.tgz
+ADD plugin /tmp/dshell-packs/nexus-aethra-dshell-conversation-0.1.14.tgz
+ADD plugin /tmp/dshell-packs/nexus-aethra-dshell-files-0.1.14.tgz
+ADD plugin /tmp/dshell-packs/nexus-aethra-dshell-mode-0.1.14.tgz
+ADD plugin /tmp/dshell-packs/nexus-aethra-dshell-ssh-0.1.14.tgz
+ADD plugin /tmp/dshell-packs/nexus-aethra-dshell-terminal-bridge-0.1.14.tgz
+ADD plugin /tmp/dshell-packs/nexus-aethra-dshell-usage-0.1.14.tgz
+ADD plugin /tmp/dshell-packs/nexus-aethra-dshell-bundle-0.1.14.tgz
+
+# ── the optional dsh provider dshell's rows import ───────────────────────
+# Not optional in practice: a plugin installed from npm into the profile
+# resolves its imports through THE PROFILE, where dsh's own packages come from
+# the harness checkout rather than the profile. dshell-ssh imports this one.
+ADD plugin npm:@deepseek-ai/dsh-ssh@0.2.1-rc.2
+
+# ── the bundle's peer union the base seed omits ──────────────────────────
+ADD plugin npm:@deepseek-ai/dsh-client-store@0.2.1-rc.2
+ADD plugin npm:@deepseek-ai/dsh-client-ui-conversation@0.2.1-rc.2
+ADD plugin npm:@deepseek-ai/dsh-sandbox-local@0.2.1-rc.2
+ADD plugin npm:@deepseek-ai/dsh-sandbox-policy@0.2.1-rc.2
+ADD plugin npm:@deepseek-ai/dsh-subprocess-local@0.2.1-rc.2
+# ── the subprocess runner's own module graph ─────────────────────────────
+# dsh-subprocess-local's built runner spawns as a plain node process and
+# resolves its imports from THE PROFILE, not from the harness checkout the
+# host itself runs on. Its runtime graph — dsh-subprocess (a devDependency
+# there that a full install gets from dsh-base/dsh-web-app, which this
+# boxfile's minimal list omits), that package's peers cordis and
+# dsh-http-proxy, and dsh-timeout — is therefore absent, and every
+# `ctx.subprocess.spawn` dies with LinuxScopeNotStartedError: the scope's
+# runner crashes on import before it can consume its launch request. The
+# device card's 测试 button is the first thing that needs this.
+ADD plugin npm:@deepseek-ai/dsh-subprocess@0.2.1-rc.2
+ADD plugin npm:@deepseek-ai/dsh-http-proxy@0.2.1-rc.2
+ADD plugin npm:@deepseek-ai/dsh-timeout@0.2.1-rc.2
+ADD plugin npm:@deepseek-ai/cordis@4.0.5
+ADD plugin npm:@deepseek-ai/dsh-terminal@0.2.1-rc.2
+ADD plugin npm:@deepseek-ai/dsh-terminal-bash@0.2.1-rc.2

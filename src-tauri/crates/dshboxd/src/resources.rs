@@ -248,6 +248,45 @@ fn payload_parts_of(kind: &ResolvedKind) -> Vec<transfer::PayloadPart> {
         .map(|part| transfer::PayloadPart {
             path: part.path,
             section: part.section,
+            slot: part.slot,
+        })
+        .collect()
+}
+
+/// Re-pick the destination's own part for every slot the payload names.
+///
+/// A payload describes itself so an injection never guesses from the kind
+/// installed now — but a *slot* is a statement about a version, not about the
+/// copy. Carrying provider routes out of a 0.1.7 container has to land in
+/// `settings.yaml` on a 0.1.6 one, not in the Cordis layer file its source used.
+/// A part with no slot, or one the destination no longer declares, keeps the
+/// path it was extracted with.
+fn retarget_parts(
+    target: &Path,
+    profile: &str,
+    kind_id: &str,
+    recorded: Vec<transfer::PayloadPart>,
+) -> Vec<transfer::PayloadPart> {
+    if !recorded.iter().any(|part| part.slot.is_some()) {
+        return recorded;
+    }
+    let version = discover::harness_version(target);
+    let Ok(resolved) = resolve_kind(target, profile, None, kind_id, None, None) else {
+        return recorded;
+    };
+    let fresh = payload_parts_of(&resolved);
+    recorded
+        .into_iter()
+        .map(|part| match &part.slot {
+            Some(slot) => match fresh.iter().find(|candidate| candidate.slot.as_deref() == Some(slot.as_str())) {
+                Some(matched) => transfer::PayloadPart {
+                    path: matched.path.clone(),
+                    section: matched.section.clone(),
+                    slot: Some(slot.clone()),
+                },
+                None => part,
+            },
+            None => part,
         })
         .collect()
 }
@@ -870,6 +909,11 @@ pub(crate) fn enqueue_resource_inject(
                     return Err("expected a resource kind or a destination".to_owned())
                 }
             };
+            let kind_for_parts = record
+                .as_ref()
+                .map(|entry| entry.kind.clone())
+                .or_else(|| kind_id.clone())
+                .unwrap_or_default();
 
             // Writing into a live container is refused: plugins cache their
             // state, and a half-written session file is worse than a refusal.
@@ -890,8 +934,16 @@ pub(crate) fn enqueue_resource_inject(
 
             task.update("Writing the payload", 70);
             // The payload says what it holds when it holds more than one part;
-            // otherwise it is the single path this injection was told to use.
-            let parts = transfer::payload_parts(&payload, &path);
+            // otherwise it is the single path this injection was told to use. A
+            // part that came from a version slot is re-picked for *this*
+            // container, so a copy crosses versions to where the destination
+            // keeps that state.
+            let parts = retarget_parts(
+                &container,
+                &profile,
+                &kind_for_parts,
+                transfer::payload_parts(&payload, &path),
+            );
             let injected = transfer::inject_parts(&payload, &container, &parts, conflict, shape, depth, secret)?;
             task.log(&format!(
                 "{}: +{} files, replaced {}",
@@ -954,6 +1006,60 @@ mod tests {
             plugin: None,
             created_at: 0,
         }
+    }
+
+    /// A copy taken from one Harness layout has to land where the destination
+    /// keeps that state, not where its source kept it.
+    #[test]
+    fn a_slotted_part_retargets_to_the_destinations_layout() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("container-1");
+        std::fs::create_dir_all(target.join("profile/profiles/web")).unwrap();
+        let write_version = |version: &str| {
+            std::fs::create_dir_all(target.join("harness")).unwrap();
+            std::fs::write(
+                target.join("harness/package.json"),
+                format!(r#"{{"name":"@deepseek-ai/dsh","version":"{version}"}}"#),
+            )
+            .unwrap();
+        };
+        let part = |path: &str, section: &[&str]| transfer::PayloadPart {
+            path: path.to_owned(),
+            section: section.iter().map(|step| (*step).to_owned()).collect(),
+            slot: Some("provider-route".to_owned()),
+        };
+
+        write_version("0.1.6-alpha.2");
+        let parts = retarget_parts(
+            &target,
+            "web",
+            "credentials",
+            vec![
+                transfer::PayloadPart {
+                    path: "profile/.credentials.yaml".to_owned(),
+                    section: Vec::new(),
+                    slot: None,
+                },
+                part("profile/profiles/web/cordis.patch.yml", &["#llm-pi-ai"]),
+            ],
+        );
+        assert_eq!(
+            parts[0].path,
+            "profile/.credentials.yaml",
+            "an unslotted part keeps the path it was extracted with"
+        );
+        assert_eq!(parts[1].path, "profile/settings.yaml");
+        assert_eq!(parts[1].section, ["llm-pi-ai"]);
+
+        write_version("0.1.7-alpha.1");
+        let parts = retarget_parts(
+            &target,
+            "web",
+            "credentials",
+            vec![part("profile/settings.yaml", &["llm-pi-ai"])],
+        );
+        assert_eq!(parts[0].path, "profile/profiles/web/cordis.patch.yml");
+        assert_eq!(parts[0].section, ["#llm-pi-ai"]);
     }
 
     #[test]

@@ -181,8 +181,13 @@ command as done only once the installed app has run it.
   source only**; the daemon auto-derives transitive `package@version` keys
   from pnpm's `[ERR_PNPM_IGNORED_BUILDS]` /
   `[ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED]` markers and retries (multi-round
-  loop in `dshboxd/src/sealed.rs`, `add_pnpm_build_approval` is an idempotent
-  YAML merge producing a single bare-scalar `allowBuilds:` section).
+  loop in `dshboxd/src/sealed.rs`, `add_pnpm_build_approval` merges
+  idempotently into a single `allowBuilds:` section and quotes every key: a
+  scoped spec starts with `@`, a YAML reserved indicator, so the bare scalar
+  pnpm prints inside its own error block is not writable back — writing it
+  unquoted fails the whole manifest with `bad indentation of a mapping
+  entry`, which is how the retry meant to approve the plugin used to die on
+  the file it had just corrupted).
 - **Runtime archive integrity.** Verify SHA-256 (Node) and SHA-512 (pnpm)
   before use; a failed verification aborts startup, no silent fallback.
 - **DSH ≥ `dsh-v0.1.5-alpha.1` cannot be built from source on Linux/macOS with
@@ -196,6 +201,29 @@ command as done only once the installed app has run it.
   headers by hand makes the same container build and start, so this is the only
   blocker — but it also needs a host C compiler, which the runtime bundle
   otherwise never requires.
+- **A container starts the built entry, never the source one.** `apps/cli` ships
+  `bin: { dsh: lib/bin.js }` and Box launches exactly that. Launching
+  `apps/cli/src/bin.ts` under `tsx` splits the process into two module worlds:
+  `tsconfig.base.json` maps every first-party package to `src`, so a package
+  imported by name loads from `src`, while the plugin row loader — which follows
+  `package.json` `exports` — loads the same package from `lib`. Each copy creates
+  its own `Symbol`, so a seam keyed by one misses: the `dsh-tools` scheduler is
+  stored under the `lib` symbol and looked up with the `src` one, and every agent
+  tool call dies ~1 ms after `tool/call`, which the UI renders as a one-second
+  interruption rather than a crash. `apps/cli/lib/bin.js` is therefore part of the
+  artifact check (`client_artifacts_present`, `validate_prepared_harness`): a tree
+  without it is rebuilt, not launched the broken way.
+- **A resource slot is version-scoped, and a copy re-resolves it.** `KindPart`
+  carries `path` (which may contain `{profile}`), `section` (a `#<id>` step names
+  one Cordis layer item and travels its `config`), and optional
+  `slot`/`since`/`until`. `credentials` needs it because the provider route
+  moved: `settings.yaml#llm-pi-ai` up to 0.1.6, `profiles/<p>/cordis.patch.yml`
+  from 0.1.7, where DSH archives the old file as `settings.yaml.imported`.
+  Extraction records the slot in `parts.json`; injection re-picks the
+  **destination's** part for that slot (`retarget_parts`), so a copy crosses
+  versions to where that container keeps the state instead of cloning its
+  source's path. Plugin `dshbox.resources` entries take the same fields — declare
+  the same id twice with different bounds.
 - **Prepared/sealed templates.** Pulling a root Harness template prepares a
   complete tree: `pnpm install` **and** the client build (native addon, host and
   client libraries, web frontend) — `validate_prepared_harness` requires

@@ -86,7 +86,9 @@ fn is_transient_loopback_bind_failure(output: &[u8]) -> bool {
 /// only loopback URLs are trusted.
 fn parse_announced_host_url(log_tail: &str) -> Option<String> {
     log_tail.lines().rev().find_map(|line| {
-        let candidate = line.trim().strip_prefix("dsh web: ")?
+        let candidate = line
+            .trim()
+            .strip_prefix("dsh web: ")?
             .split_whitespace()
             .next()?
             .to_owned();
@@ -99,6 +101,26 @@ fn parse_announced_host_url(log_tail: &str) -> Option<String> {
 /// Start the DSH host for `id` and wait until its frontend answers.
 /// The running map is the daemon-owned registry; containers already
 /// running return their existing URL.
+/// Container environment declared by the Boxfile's `ENV` directives and
+/// copied into `container.json` at creation time. Applied on top of the
+/// host policy's whitelist, so a container's declared environment never
+/// depends on the caller's ambient environment — the docker-style `-e`
+/// equivalent. Non-string entries are ignored rather than failing the
+/// start: the file is Box-written state, and a bad entry should not cost
+/// the user a container.
+fn declared_env_from_metadata(value: &serde_json::Value) -> BTreeMap<String, String> {
+    value["env"]
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn start_dsh_container_inner(
     id: &str,
     running: &Mutex<BTreeMap<String, ManagedHost>>,
@@ -132,6 +154,7 @@ pub(crate) fn start_dsh_container_inner(
     let profile = value["profile"].as_str().unwrap_or("web");
     let name = value["name"].as_str().unwrap_or(id).to_owned();
     let template = value["template"].as_str().map(str::to_owned);
+    let declared_env = declared_env_from_metadata(&value);
     repair_known_profile_template(&directory, profile)?;
     let _workspace = ensure_container_workspace(&directory)?;
     let dshbox_home =
@@ -213,12 +236,26 @@ pub(crate) fn start_dsh_container_inner(
         // before we get here.
         wait_for_pnpm_links(&source, std::time::Duration::from_secs(15))
             .map_err(|error| format!("DSH runtime not ready ({error})"))?;
-        // Launch the DSH host directly via `node --import tsx/esm` instead of
-        // going through `pnpm dsh`.  pnpm's lifecycle runner wraps the exit
-        // code in `[ELIFECYCLE]` and swallows the actual error message,
-        // making it impossible to diagnose startup failures.  Running the
-        // script directly lets the node process's stderr propagate to the
-        // host.log unmodified.
+        // Launch the built CLI entry (`apps/cli` declares `bin: { dsh:
+        // lib/bin.js }`), never the source one. The Harness tree carries both
+        // `src/` and the `lib/` built from it, and `tsx` honours
+        // `tsconfig.base.json`'s `paths`, which map every first-party package
+        // to `src` — so a host started through `tsx + src/bin.ts` loads such a
+        // package twice, once from `src` (paths) and once from `lib` (the
+        // manifest `exports` the plugin row loader follows). Each copy creates
+        // its own `Symbol`, and the agent loop then looks up
+        // `ctx.tools[TOOL_RUNTIME_SCHEDULER]` under a different symbol than the
+        // one `ToolRuntime` stored it under: every tool call dies ~1 ms after
+        // it is appended, which the UI renders as a very short interruption.
+        let entry = source.join("apps/cli/lib/bin.js");
+        if !entry.is_file() {
+            return Err(format!(
+                "DSH host cannot start: {} has no built CLI entry at \
+                 apps/cli/lib/bin.js — rebuild this container's template so the \
+                 client artifacts are produced",
+                source.display()
+            ));
+        }
         let node = resolve_toolchain("node")?;
         // The pnpm tree hangs off the runtime root (<root>/pnpm) as a
         // sibling of node/ on every platform. Take it from the manifest
@@ -235,7 +272,7 @@ pub(crate) fn start_dsh_container_inner(
             &runtime_root.join("pnpm"),
             &plugins_node_modules,
         );
-        let policy = policy.task_override(
+        let policy = policy.declared_env(&declared_env).task_override(
             "DSH_HOME",
             directory.join("profile").to_string_lossy().into_owned(),
         );
@@ -254,12 +291,7 @@ pub(crate) fn start_dsh_container_inner(
         }
         let spec = ProcessSpec::new(node.path.clone())
             .args([
-                "--import",
-                "tsx/esm",
-                source
-                    .join("apps/cli/src/bin.ts")
-                    .to_string_lossy()
-                    .as_ref(),
+                entry.to_string_lossy().as_ref(),
                 "--profile",
                 profile,
                 "--patch",
@@ -333,9 +365,8 @@ pub(crate) fn start_dsh_container_inner(
             }
             if announced_url.is_none() {
                 if let Ok(text) = fs::read_to_string(&log_path) {
-                    announced_url = parse_announced_host_url(
-                        text.get(log_offset as usize..).unwrap_or(""),
-                    );
+                    announced_url =
+                        parse_announced_host_url(text.get(log_offset as usize..).unwrap_or(""));
                 }
             }
             let available = if let Some(authenticated) = announced_url.as_deref() {
@@ -1046,6 +1077,34 @@ mod dependency_ready_tests {
     use std::fs;
 
     #[test]
+    fn declared_env_reads_string_entries_and_ignores_the_rest() {
+        let value = serde_json::json!({
+            "id": "container-1",
+            "env": {
+                "OPENAI_API_KEY": "sk-test",
+                "TZ": "Asia/Shanghai",
+                "PORT": 8080,
+            },
+        });
+        let declared = declared_env_from_metadata(&value);
+        assert_eq!(
+            declared.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-test")
+        );
+        assert_eq!(
+            declared.get("TZ").map(String::as_str),
+            Some("Asia/Shanghai")
+        );
+        assert!(
+            !declared.contains_key("PORT"),
+            "non-string entry kept: {declared:?}"
+        );
+        // A container written before ENV existed simply declares nothing.
+        let legacy = serde_json::json!({"id": "container-1"});
+        assert!(declared_env_from_metadata(&legacy).is_empty());
+    }
+
+    #[test]
     fn parses_the_announced_authenticated_url_from_the_log_tail() {
         let log = "\
 dsh web: http://127.0.0.1:40413/?token=3xqhaJFec8uZFUxRsyzL0lXRqfVxpi-li-F93sBnqdE
@@ -1053,13 +1112,17 @@ dsh web: opening the default browser; pass --no-open to disable
 ";
         assert_eq!(
             parse_announced_host_url(log),
-            Some("http://127.0.0.1:40413/?token=3xqhaJFec8uZFUxRsyzL0lXRqfVxpi-li-F93sBnqdE".to_owned())
+            Some(
+                "http://127.0.0.1:40413/?token=3xqhaJFec8uZFUxRsyzL0lXRqfVxpi-li-F93sBnqdE"
+                    .to_owned()
+            )
         );
     }
 
     #[test]
     fn parse_takes_the_url_token_and_ignores_the_lan_suffix() {
-        let log = "dsh web: http://127.0.0.1:3080/?token=abc (LAN: http://192.168.1.4:3080/?token=abc)\n";
+        let log =
+            "dsh web: http://127.0.0.1:3080/?token=abc (LAN: http://192.168.1.4:3080/?token=abc)\n";
         assert_eq!(
             parse_announced_host_url(log),
             Some("http://127.0.0.1:3080/?token=abc".to_owned())
