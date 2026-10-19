@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { boxApi } from './shared/api/box-api'
+import type { DaemonBuildNotice } from './shared/api/box-api'
 import type { Language } from './shared/types/domain'
 import { pickText } from './i18n'
 import { NPM_REGISTRY_PRESETS, useSettings } from './state/useSettings'
@@ -10,6 +11,7 @@ import { ContainerDetails } from './features/container-details/ContainerDetails'
 import { ResourcesPage } from './features/resources-page/ResourcesPage'
 import { TaskPanel } from './features/tasks/TaskPanel'
 import { ToolchainRow } from './features/toolchains/ToolchainRow'
+import { AgentGuide } from './features/settings/AgentGuide'
 import { LanguageSwitch } from './shared/ui/LanguageSwitch'
 import { DirectoryCard, Workspace } from './shared/ui/Workspace'
 import { Button } from './ui/Button'
@@ -20,7 +22,7 @@ import { Select } from './ui/Select'
 import { Toolbar } from './ui/Toolbar'
 import { Stack } from './ui/Stack'
 type Section = 'container' | 'resources' | 'settings'
-type SettingsPane = 'general' | 'toolchains'
+type SettingsPane = 'general' | 'toolchains' | 'agent'
 
 /**
  * Startup gate: shows a spinner while the daemon comes up (fresh spawn or
@@ -87,6 +89,18 @@ export function MainApp() {
   const [error, setError] = useState<string | null>(null)
   const [section, setSection] = useState<Section>('resources')
   const [settingsPane, setSettingsPane] = useState<SettingsPane>('general')
+  // Whether the running daemon is from another build. Read once: the answer is
+  // decided at startup and cannot change while this window is open, and the
+  // command only reports a value the check already computed.
+  const [staleDaemon, setStaleDaemon] = useState<DaemonBuildNotice>({ stale: false })
+
+  useEffect(() => {
+    let cancelled = false
+    void boxApi.getDaemonBuildNotice()
+      .then((notice) => { if (!cancelled) setStaleDaemon(notice) })
+      .catch(() => { /* a build that cannot answer this is not worth an error */ })
+    return () => { cancelled = true }
+  }, [])
 
   const settings = useSettings(setError)
   const { config, setConfig } = settings
@@ -219,6 +233,11 @@ export function MainApp() {
   return <main className="app-shell">
     <header className="topbar">
       <div className="brand">DSH Box</div>
+      {staleDaemon.stale && (
+        <p className="stale-daemon" role="status">
+          {text.daemonBuildStale(staleDaemon.runningStamp, staleDaemon.clientStamp)}
+        </p>
+      )}
       <nav className="navigation" aria-label="Workspace sections">
         {(['resources', 'container'] as const).map((item) => (
           <Button
@@ -346,6 +365,7 @@ export function MainApp() {
           <nav className="settings-sidebar" aria-label={text.settings}>
             <Button variant="ghost" size="sm" className={settingsPane === 'general' ? 'active' : ''} onClick={() => { setSettingsPane('general') }}>{text.general}</Button>
             <Button variant="ghost" size="sm" className={settingsPane === 'toolchains' ? 'active' : ''} onClick={() => { setSettingsPane('toolchains'); void settings.refreshToolchains() }}>{text.toolchainSettings}</Button>
+            <Button variant="ghost" size="sm" className={settingsPane === 'agent' ? 'active' : ''} onClick={() => { setSettingsPane('agent') }}>{text.agentGuide}</Button>
           </nav>
           <div className="settings-content">
             {settingsPane === 'general' ? (
@@ -377,6 +397,8 @@ export function MainApp() {
                   <LanguageSwitch language={config.language} onChange={settings.changeLanguage} />
                 </section>
               </div>
+            ) : settingsPane === 'agent' ? (
+              <AgentGuide text={text} />
             ) : (
               <section className="runtime-settings">
                 <div className="workspace-heading">

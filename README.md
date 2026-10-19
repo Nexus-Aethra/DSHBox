@@ -16,6 +16,7 @@ DSH Box is a lightweight desktop shell built with [Tauri 2](https://tauri.app) t
 - **Plugin dependency graph** — what loads, in what order, why: depth bands, halves apart, fold a depth away.
 - **Resources: extract, inject, edit** — conversations, keys and plugin state as named copies; any YAML block editable by key path.
 - **An agent surface** — `dshbox apply -f` configures resources from one document; every verb answers `--json`.
+- **An agent inside a container** — the `dsh-box-sandbox` plugin gives an agent running inside a container typed `box_*` tools, so it drives the box that contains it with no shell and nothing to install.
 - **Zero-dependency install** — bundled Node, npm, pnpm and Git (Windows), in a clean room.
 - **Version manager** — install any Harness tag and pin a version per container.
 - **Boxfiles** — `FROM` + `ADD` describes a template; build once, run many.
@@ -23,6 +24,7 @@ DSH Box is a lightweight desktop shell built with [Tauri 2](https://tauri.app) t
 - **Bundles** — group plugins and skills, then export quick (URLs kept) or full (one archive).
 - **Tasks you can watch** — queued, logged with timings, cancellable, with history.
 - **A slow daemon never freezes the window** — commands run off the main thread and every RPC is bounded.
+- **An older server is kept, and said so** — a service from a previous build keeps running, with a topbar line naming both.
 - **RPC + events** — one `POST /rpc` and one SSE stream serve the UI, the CLI and agents alike.
 - **Network-friendly** — GitHub mirror, npm registry mirror, automatic proxy detection.
 - **Tray and background service** — `dshboxd` keeps working with the window closed.
@@ -62,6 +64,25 @@ No runtime prerequisites on Windows — the bundled Node/npm/pnpm/Git runtime tr
 
 The app minimizes to the system tray on close. Use the tray menu to open the window or start/stop/restart the `dshboxd` background service.
 
+### When the server is from an older build
+
+The box is a background service, so it often outlives the app that installed
+it. After you install a newer DSH Box while the previous one is still running,
+the two do not match — and the running server is **kept**. The RPC only grows,
+so the client falls back for anything the older daemon cannot do, and the cost
+of stopping it would be a container start or a build you asked for a moment
+earlier. A line in the topbar says so, naming both builds, so the difference is
+visible instead of something you have to find in a log file.
+
+Nothing is broken while it is there. Features that need the newer server show up
+once you restart the service from the tray menu — at a moment you chose, not one
+the app picked for you.
+
+![The topbar reporting that the background server is from an older build, with both stamps in the text](docs/images/stale-daemon.png)
+
+---
+
+
 ---
 
 ## Architecture
@@ -77,7 +98,7 @@ DSH Box separates a Tauri **desktop shell**, a framework-free Rust workspace, a 
 | Frontend (React 18 + Vite, `src/`) | Pages, components, `useTaskQueue`/`useContainers`/`useResources`/`useSettings` hooks. **No business logic** — pages fire RPC requests and react to daemon SSE events. | Keeps the Box UI thin and lets any client (UI/CLI/agent) share the same code path. |
 | Desktop shell (Tauri 2, `src-tauri/src/`) | Browser window, tray, Tauri IPC adapters. Listens on `127.0.0.1` to the daemon's loopback HTTP server. All real work is delegated to `dshboxd` over HTTP RPC. | One source of truth for state changes — UI and CLI cannot drift. |
 | Daemon (`src-tauri/crates/dshboxd`) | Long-lived background service. Owns the queue, the data store, the template index, container registry, and the SSE event bus. Single HTTP entry point (`POST /rpc`) plus `GET /events?token=…`. | Background work (installs, rebuilds, uninstalls) survives the desktop window closing. |
-| Crate workspace (`src-tauri/crates/`) | Framework-free Rust crates: `box-foundation`, `box-runtime`, `box-scheduler`, `box-state`, `box-toolchains`, `box-dsh-versions`, `box-containers`, `box-extensions`, `box-image`, `box-template-core`, `box-data-scheduler`, `box-logger`, `box-dsh-context`, `box-server-core`, `box-api`, `box-client`. | Pure functions + unit tests; only the top-level `dshbox` binary and `dshboxd` link Tauri/HTTP. |
+| Crate workspace (`src-tauri/crates/`) | Framework-free Rust crates: `box-foundation`, `box-runtime`, `box-scheduler`, `box-state`, `box-toolchains`, `box-dsh-versions`, `box-containers`, `box-extensions`, `box-image`, `box-template-core`, `box-data-scheduler`, `box-logger`, `box-dsh-context`, `box-server-core`, `box-browser`, `box-api`, `box-client`. | Pure functions + unit tests; only the top-level `dshbox` binary and `dshboxd` link Tauri/HTTP. |
 
 The dependency direction is one-way: `foundation / runtime / scheduler / state` → functional crates → Tauri/desktop adapters. Feature crates do not depend on Tauri or one another's mutable state.
 
@@ -222,7 +243,7 @@ dshbox container resource write <id> profile/settings.yaml --section llm-pi-ai.p
 
 ### Driving it from an agent
 
-The CLI is the agent surface and the UI is the human one, so the verbs an agent needs are non-interactive and machine-readable.
+There are two surfaces, because there are two kinds of agent. One has a shell and drives the box from outside; the other runs *inside* a container and has no shell at all. The CLI is the first one's surface and the UI is the human one, so the verbs an agent needs are non-interactive and machine-readable.
 
 `dshbox apply -f <file>` takes one document and makes the resource layer match it:
 
@@ -248,6 +269,20 @@ dshbox container resource read <id> profile/settings.yaml --json
 ```
 
 `dshbox help`, `dshbox container resource help`, and `dshbox apply help` describe every verb without needing the UI.
+
+#### The plugin, for an agent inside a container
+
+`@nexus-aethra/dsh-box-sandbox` is a host-side plugin that registers 21 `box_*` tools on the DSH host it runs in. An agent inside a container therefore drives the box that contains it — no shell, no second connection, nothing installed inside the container. Import it from the repository under **Resources → Plugins**, or install it straight into a profile:
+
+```bash
+pnpm add @nexus-aethra/dsh-box-sandbox
+```
+
+or install it per container from the repository with `dshbox plugin install <container> @nexus-aethra/dsh-box-sandbox`.
+
+It finds the background server through the discovery record the box writes at startup: the port and the token are minted per launch, so a restart is invisible to the plugin. Everything crosses the same loopback `POST /rpc` the CLI and the UI use, and task progress arrives on the same SSE stream.
+
+Eleven tools drive the box — `box_overview`, `box_lifecycle`, `box_build`, `box_create`, `box_templates`, `box_plugins`, `box_resources`, `box_workspace`, `box_settings`, `box_task`, `box_set_viewport`. Ten more debug a page in a headless browser — `box_page_text` to list what is on screen, `box_click_element`, `box_type_text`, `box_press_key`, `box_scroll`, `box_click_at`, `box_close`, `box_screenshot`, `box_set_browser`, `box_console`. The Settings pane carries the same list, so an agent's author and the person reading it see one description.
 
 ### Persistence and reference counts
 
@@ -339,9 +374,11 @@ src-tauri/                 Rust workspace + Tauri shell
     box-logger             tracing init + daily-rolled log files
     box-dsh-context        dsh-box-context plugin (paths.dshboxHome/dshboxCli)
     box-server-core        dshboxd helpers + service install
+    box-browser            headless Chromium + DevTools sessions
     box-api, box-client    RPC surface + client adapter
   src/desktop/app/         domain modules (containers, extensions, tasks, …)
   tools/runtime-packager   bundled Node/pnpm/Git runtime packager
+plugins/                   dsh-box-sandbox — the agent tool plugin
 examples/                  boxfile.dsh + plugin-chains example
 docs/                      template-system.md, specs/, design/, notes/,
                            releases/, images/

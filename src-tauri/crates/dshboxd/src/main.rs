@@ -6,9 +6,11 @@
 //! Transport: TCP on `127.0.0.1:0` (OS-assigned ephemeral port), HTTP/1.1
 //! over `std::net`. Zero external dependencies. Single POST route: `/rpc`.
 
+mod apply;
 mod bundles;
 mod containers;
 mod data;
+mod debug;
 mod dispatch;
 mod events;
 mod extensions;
@@ -22,6 +24,7 @@ mod state;
 mod test_support;
 mod toolchains;
 mod versions;
+mod workspaces;
 
 use box_runtime::process;
 use box_server_core::{read_discovery, remove_discovery, write_discovery, ServerDiscovery};
@@ -144,6 +147,20 @@ fn remove_discovery_with(_discovery: &ServerDiscovery) {
 /// then a 5 s grace window, then a forced kill. Stale state records are
 /// cleared so the next daemon start doesn't try to resume dead hosts.
 fn graceful_shutdown(state: &DaemonState) {
+    // Close out anything still running before the hosts go, and say why. A
+    // task whose daemon disappears is not a task that failed, and the
+    // difference is the whole diagnosis: the log used to stop mid-line and
+    // the next start found a task that was neither running nor finished, which
+    // is indistinguishable from a hang.
+    match state.manager.interrupt_running(
+        "the DSH Box daemon shut down while this task was running",
+    ) {
+        Ok(ids) if !ids.is_empty() => {
+            tracing::info!(count = ids.len(), "interrupted in-flight tasks on shutdown");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "cannot mark in-flight tasks as interrupted"),
+    }
     let hosts = match state.containers.running.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),

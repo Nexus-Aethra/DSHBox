@@ -138,6 +138,11 @@ const COMMANDS = {
       return false
     }
   },
+  // The stale-server notice is desktop state, not daemon state: the daemon has no
+  // idea which build the client thinks it is, and a browser has no client build.
+  // Answering {stale:false} keeps the banner off a path where it cannot be true,
+  // and keeps this table in step with `command_surface`.
+  get_daemon_build_notice: async () => ({ stale: false }),
   load_config: async () => readConfig(),
   save_language: async ({ language }) => writeConfig({ language }),
   save_runtime_directory: async ({ directory }) => writeConfig({ runtimeDirectory: directory }),

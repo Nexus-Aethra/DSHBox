@@ -7,8 +7,9 @@ platforms and publishes them on the
 
 ## 0.1.9
 
-A container declares its own environment, the host speaks one module world, and
-a resource copy resolves against the version it is landing in.
+A container declares its own environment, the host speaks one module world, a
+resource copy resolves against the version it is landing in, and an agent inside
+a container can drive the box that contains it.
 
 ### Added
 
@@ -26,6 +27,28 @@ a resource copy resolves against the version it is landing in.
   `profiles/<p>/cordis.patch.yml`) injects into a 0.1.6 container as
   `settings.yaml#llm-pi-ai`, merging beside the route already there. Plugin
   `dshbox.resources` entries take the same fields.
+- **An agent surface inside a container.** `@nexus-aethra/dsh-box-sandbox` is a
+  host-side plugin registering 21 typed `box_*` tools on the DSH host it runs in,
+  so an agent inside a container drives the box that contains it with no shell,
+  no second connection and nothing installed in the container. Eleven drive the
+  box (`box_overview`, `box_lifecycle`, `box_build`, `box_create`,
+  `box_templates`, `box_plugins`, `box_resources`, `box_workspace`,
+  `box_settings`, `box_task`, `box_set_viewport`); ten debug a page in a headless
+  browser (`box_page_text`, `box_click_element`, `box_type_text`,
+  `box_press_key`, `box_scroll`, `box_click_at`, `box_close`, `box_screenshot`,
+  `box_set_browser`, `box_console`). The plugin reaches the daemon through the
+  discovery record the box writes at startup — port and token minted per launch —
+  over the same loopback `POST /rpc` the CLI and the UI use.
+- **`box-browser`, and page-debugging RPCs.** A new framework-free crate drives
+  a headless Chromium over DevTools, with a discovery order that prefers
+  Program Files over per-user installs and a `browser_path` config override for a
+  build the probe does not know. Debug sessions are scoped to a container and
+  closed when it stops.
+- **A stale daemon is kept, and reported.** A background server from an older
+  build keeps running rather than being killed, with a topbar line naming both
+  builds and a `get_daemon_build_notice` command behind it.
+- **CLI read verbs answer `--json` and reject unknown flags**, and a workspace
+  can be added to a container by path with no file dialog.
 
 ### Fixed
 
@@ -57,12 +80,24 @@ a resource copy resolves against the version it is landing in.
 - **A mirror that cannot be reached now says so.** undici's `fetch failed` was
   not among the network markers the hint looks for, so a build against an
   unreachable private registry produced no mirror warning at all.
+- **A container start no longer opens the user's browser.** The host is spawned
+  with `--no-open`; a box is a server, and the UI it serves is a webview the
+  user asks for.
+- **Scoped packages install and uninstall from the plugin surface**, and a task
+  poll no longer matches nothing — the wire spells task states in lower case
+  while the Rust enum spells PascalCase, so a client written against the source
+  spelling never recognised a finished task.
 
 ### Infrastructure
 
 - Release notes live in the repository (`docs/releases/<tag>.md`, both
   languages) and the release job reads them instead of falling back to
   generated notes.
+- The sandbox plugin is published from the app's release tag, in step with its
+  version, with npm trusted publishing (OIDC, no long-lived token) and guards
+  against re-publishing or downgrading a version.
+- `.gitattributes` pins `* text=auto eol=lf`, so a CRLF-writing editor can no
+  longer turn a 60-line change into a 900-line rewrite.
 - `docs/notes/2026-09-22-dsh-dual-module-world-tool-call-crash.md` records the
   tool-call incident; `examples/boxfile-dshell-021.dsh` and
   `examples/boxfile-dshell-usage.dsh` show accepting local, unpublished builds

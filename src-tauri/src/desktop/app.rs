@@ -75,7 +75,6 @@ pub(crate) struct BundledRuntime {
     node: PathBuf,
     npm: PathBuf,
     pnpm: PathBuf,
-    git_dir: Option<PathBuf>,
 }
 
 static BUNDLED_RUNTIME: OnceLock<BundledRuntime> = OnceLock::new();
@@ -273,7 +272,7 @@ fn run_inner() -> Result<(), String> {
                 }
                 // Protocol handshake: restart a daemon built in a different
                 // build batch (stale binary left over from before an upgrade).
-                reconcile_daemon_build(&server);
+                reconcile_daemon_build();
             } else {
                 write_startup_log(&format!("dshboxd sidecar is missing: {}", server.display()));
             }
@@ -346,6 +345,7 @@ fn run_inner() -> Result<(), String> {
             commands::config::save_mirror_settings,
             get_server_service_status,
             get_daemon_status,
+            get_daemon_build_notice,
             restart_server_service,
             start_server_service,
             stop_server_service,

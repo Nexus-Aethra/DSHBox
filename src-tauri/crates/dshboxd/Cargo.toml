@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 box-resources = { path = "../box-resources" }
 box-api = { path = "../box-api" }
+box-browser = { path = "../box-browser" }
 box-containers = { path = "../box-containers" }
 box-dsh-context = { path = "../box-dsh-context" }
 box-dsh-versions = { path = "../box-dsh-versions" }
@@ -32,6 +33,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 tar = "0.4"
+uuid = { version = "1.18", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3.13"

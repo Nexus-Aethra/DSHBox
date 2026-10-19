@@ -12,6 +12,10 @@ on:
 
 permissions:
   contents: write
+  # npm trusted publishing: the job's OIDC identity is the credential, so no
+  # long-lived npm token exists to leak. Without this the publish step cannot
+  # mint one and the job falls back to secrets.NPM_TOKEN, which is unset.
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -103,6 +107,11 @@ jobs:
           check package.json "$(node -p "require('./package.json').version")"
           check src-tauri/tauri.conf.json "$(node -p "require('./src-tauri/tauri.conf.json').version")"
           check src-tauri/Cargo.toml "$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)"
+          # The sandbox plugin is published from this same tag, so it moves in
+          # step with the app. A release that bumped one and not the other would
+          # publish a plugin whose version claims to match a build it was never
+          # part of.
+          check plugins/dsh-box-sandbox/package.json "$(node -p "require('./plugins/dsh-box-sandbox/package.json').version")"
           exit $fail
 
       # The three bundle scripts are the same ones a developer runs locally;
@@ -116,6 +125,115 @@ jobs:
           name: ${{ matrix.artifact }}
           if-no-files-found: error
           path: ${{ matrix.paths }}
+
+  publish-plugin:
+    name: Publish the sandbox plugin
+    # After the installers: a release whose app build failed should not put
+    # a matching version on npm, because the two are meant to be the same
+    # release. needs: build also waits for all three platforms, which is the
+    # point -- a broken macOS bundle is a failed release, not a partial one.
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      # The plugin's devDependencies are self-contained (tsdown, typescript,
+      # @types/node), so a filtered install skips the app's tree.
+      - name: Install the plugin's dependencies
+        run: pnpm install --filter @nexus-aethra/dsh-box-sandbox --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: plugins/dsh-box-sandbox
+        run: pnpm run typecheck
+
+      # Reconciles every tool's output schema against the keys dshboxd
+      # actually returns. Six tools shipped with a schema that disagreed with
+      # their own result; the host refuses those calls at runtime and nothing
+      # fails at build time, so without this gate the tag pipeline is just
+      # build-and-upload.
+      #
+      # check:tools is deliberately not run here: it calls every tool against
+      # a live daemon, which a runner cannot provide. It is a local check, for
+      # the change about to be tagged.
+      - name: Reconcile tool output schemas
+        working-directory: plugins/dsh-box-sandbox
+        run: pnpm run check:outputs
+
+      # dist/ is gitignored, so the tarball is built here rather than restored
+      # from the commit. Publishing without this ships whatever stale dist/ is
+      # in the workspace.
+      - name: Build
+        working-directory: plugins/dsh-box-sandbox
+        run: pnpm run build
+
+      - name: Show what would be published
+        working-directory: plugins/dsh-box-sandbox
+        run: npm pack --dry-run
+
+      - name: Read the local and published versions
+        id: meta
+        working-directory: plugins/dsh-box-sandbox
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          published="$(npm view @nexus-aethra/dsh-box-sandbox version 2>/dev/null || echo '')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+          echo "local=$version  npm=${published:-none}"
+
+      # Re-running a tag must not fail on a version already out. Publishing an
+      # existing version is a hard npm error, and a failed workflow on a tag
+      # that already built hides a real failure behind it.
+      - name: Skip a version that is already published
+        id: skip
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          PUBLISHED: ${{ steps.meta.outputs.published }}
+        run: |
+          if [ -n "$PUBLISHED" ] && [ "$PUBLISHED" = "$VERSION" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$VERSION is already on npm; nothing to do"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A version below what npm already has is nearly always a mistake.
+      # npm would accept it, and a fresh install would silently downgrade.
+      - name: Refuse to publish below what npm has
+        if: steps.skip.outputs.changed == 'true' && steps.meta.outputs.published != ''
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          PUBLISHED: ${{ steps.meta.outputs.published }}
+        run: |
+          lowest="$(printf '%s\n%s\n' "$PUBLISHED" "$VERSION" | sort -V | head -1)"
+          if [ "$lowest" != "$PUBLISHED" ]; then
+            echo "::error::refusing to publish $VERSION when npm already has $PUBLISHED"
+            exit 1
+          fi
+
+      - name: Publish to npm
+        if: steps.skip.outputs.changed == 'true'
+        working-directory: plugins/dsh-box-sandbox
+        run: npm publish --provenance --access public
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Sandbox plugin"
+            echo ""
+            echo "- version: ${{ steps.meta.outputs.version }}"
+            echo "- published: ${{ steps.skip.outputs.changed }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   release:
     name: Publish the release

@@ -165,6 +165,24 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("delete_extension_bundle") => delete_extension_bundle_rpc(request).map(Sync),
         Some("stop_container") => stop_container_rpc(state, request).map(Sync),
         Some("container_url") => container_url_rpc(state, request).map(Sync),
+    // Page-debugging surface. browser_status and set_browser_path take no
+    // container; the rest address one running container's headless session.
+    Some("debug_browser_status") => crate::debug::browser_status_rpc().map(Sync),
+    Some("debug_set_browser_path") => crate::debug::set_browser_path_rpc(request).map(Sync),
+    Some("debug_open") => crate::debug::open_rpc(state, request).map(Sync),
+    Some("debug_close") => crate::debug::close_rpc(state, request).map(Sync),
+    Some("debug_capture_screenshot") => crate::debug::screenshot_rpc(state, request).map(Sync),
+    Some("debug_query_elements") => crate::debug::query_elements_rpc(state, request).map(Sync),
+    Some("debug_click_element") => crate::debug::click_element_rpc(state, request).map(Sync),
+    Some("debug_click_at") => crate::debug::click_at_rpc(state, request).map(Sync),
+    Some("debug_click_by_name") => crate::debug::click_by_name_rpc(state, request).map(Sync),
+    Some("debug_type_text") => crate::debug::type_text_rpc(state, request).map(Sync),
+    Some("debug_press_key") => crate::debug::press_key_rpc(state, request).map(Sync),
+    Some("debug_page_text") => crate::debug::page_text_rpc(state, request).map(Sync),
+    Some("debug_scroll") => crate::debug::scroll_rpc(state, request).map(Sync),
+    Some("debug_set_viewport") => crate::debug::set_viewport_rpc(state, request).map(Sync),
+    Some("debug_console") => crate::debug::console_rpc(state, request).map(Sync),
+    Some("apply_document") => crate::apply::apply_document_rpc(state, request).map(Sync),
         Some("save_mirror_settings") => save_mirror_settings_rpc(request).map(Sync),
         Some("save_runtime_directory") => save_runtime_directory_rpc(state, request).map(Sync),
         Some("refresh_dsh_catalog") => enqueue_dsh_catalog_refresh(state),
@@ -187,7 +205,13 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
             prune_sealed_template_snapshots().map(|removed| Sync(json!({ "removed": removed })))
         }
         Some("plugin_dependency_graph") => plugin_dependency_graph_rpc(request).map(Sync),
-        Some("list_container_resources") => {
+        Some("list_container_workspaces") => {
+        crate::workspaces::list_container_workspaces_rpc(state, request).map(Sync)
+    }
+    Some("add_container_workspace") => {
+        crate::workspaces::add_container_workspace_rpc(state, request).map(Sync)
+    }
+    Some("list_container_resources") => {
             crate::resources::list_container_resources(state, request).map(Sync)
         }
         Some("list_resources") => crate::resources::list_resources(state, request).map(Sync),
@@ -354,7 +378,7 @@ fn get_info() -> Result<Value, String> {
     Ok(info)
 }
 
-fn list_containers(state: &DaemonState) -> Result<Value, String> {
+pub(crate) fn list_containers(state: &DaemonState) -> Result<Value, String> {
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
@@ -678,7 +702,7 @@ fn spawn_task_worker(
     let task_id = task.id.clone();
     let events = state.events.clone();
     std::thread::spawn(move || {
-        let notifier = DaemonNotifier::from_paths(manager.clone(), paths.clone(), events);
+        let notifier = DaemonNotifier::from_paths(manager.clone(), events);
         run_queued(
             &manager,
             &paths,
@@ -1024,6 +1048,62 @@ fn stop_container_rpc(state: &DaemonState, request: &Value) -> Result<Value, Str
 
 fn container_url_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
+    container_url(state, &id).map(|url| json!({ "id": id, "url": url }))
+}
+
+/// The URL a caller may actually open, or why there is not one yet.
+///
+/// A `Starting` record with no authenticated URL is a host that has not
+/// finished booting. An old runtime that serves the bare URL is a different
+/// thing, and it is never `Starting` without one, so the state tells the two
+/// apart -- not the absence of the field.
+///
+/// Handing out the bare URL during that window is what makes this a trap: DSH
+/// 0.1.2+ answers every tokenless request with 401, so the webview and the
+/// headless browser both land on "authentication required". That reads like a
+/// permission problem rather than "not yet", and nothing in the reply tells
+/// the caller to wait, so an agent opens it once, sees a wall, and concludes
+/// the container is broken.
+fn usable_url(record: &host::ContainerHostRecord) -> Result<String, String> {
+    match (&record.authenticated_url, record.state) {
+        (Some(url), _) => Ok(url.clone()),
+        (None, host::HostState::Starting) => Err(format!(
+            "container {} is still starting; its URL cannot be opened until the host announces one (retry in a moment)",
+            record.id
+        )),
+        (None, _) => Ok(record.host_url.clone()),
+    }
+}
+/// Resolve a running container's authenticated loopback URL.
+///
+/// Whether a container still has a running host, read without daemon state.
+///
+/// `container_url` needs the in-memory registry because a live host is served
+/// from there. Liveness cleanup does not: it walks the session map on a call
+/// that may have no registry entry for the container at all, and taking a
+/// `DaemonState` would force that call to borrow state it otherwise never
+/// touches. The durable host record plus a pid check answers the same question
+/// for every container that is not being started this very instant.
+pub(crate) fn container_url_probe(id: &str) -> Result<String, String> {
+    let record =
+        host::read_host_record(id).map_err(|error| format!("cannot read host record: {error}"))?;
+    match record.filter(|record| {
+        matches!(
+            record.state,
+            HostState::Starting | HostState::Ready | HostState::Running
+        ) && box_containers::is_host_pid_alive(record.host_pid)
+    }) {
+        Some(record) => usable_url(&record),
+        None => Err(format!("container is not running: {id}")),
+    }
+}
+
+/// DSH 0.1.2+ answers every tokenless request with 401, so callers that open
+/// a browser at this URL need the per-launch capability form, not the bare
+/// host URL. Shared by the webview (`container_url_rpc`) and the headless
+/// debug browser, which must both present a usable URL.
+pub(crate) fn container_url(state: &DaemonState, id: &str) -> Result<String, String> {
+    let id = id.to_owned();
     let running = state
         .containers
         .running
@@ -1032,11 +1112,14 @@ fn container_url_rpc(state: &DaemonState, request: &Value) -> Result<Value, Stri
     if let Some(host) = running.get(&id) {
         // DSH 0.1.2+ rejects tokenless requests with 401, so prefer the
         // authenticated URL when the start path parsed one.
-        let url = host
-            .authenticated_url
-            .clone()
-            .unwrap_or_else(|| host.url.clone());
-        return Ok(json!({ "id": id, "url": url }));
+        if let Some(url) = &host.authenticated_url {
+            return Ok(url.clone());
+        }
+        // No token in the in-memory entry is ambiguous -- the host has not
+        // announced one yet, or the runtime does not use them -- and only the
+        // record can tell those apart, because it carries the state. It is
+        // written before the readiness probe begins, so it covers the whole
+        // window this registry entry lives in.
     }
     drop(running);
     let record =
@@ -1047,13 +1130,7 @@ fn container_url_rpc(state: &DaemonState, request: &Value) -> Result<Value, Stri
             HostState::Starting | HostState::Ready | HostState::Running
         ) && box_containers::is_host_pid_alive(record.host_pid)
     }) {
-        Some(record) => {
-            // DSH 0.1.2+ rejects tokenless requests with 401, so hand the
-            // webview the authenticated URL whenever the start path parsed
-            // one from the host log.
-            let url = record.authenticated_url.unwrap_or(record.host_url);
-            Ok(json!({ "id": id, "url": url }))
-        }
+        Some(record) => usable_url(&record),
         None => Err(format!("container is not running: {id}")),
     }
 }
@@ -1610,6 +1687,7 @@ mod tests {
             containers: Arc::new(ContainerManager::default()),
             resources: box_state::ResourceStateManager::default(),
             events: Arc::new(crate::events::DaemonEvents::new()),
+            browser: std::sync::Mutex::new(crate::debug::Sessions::new()),
         };
         (state, id, home, runtime)
     }
@@ -1797,5 +1875,69 @@ mod tests {
             plugin_dependency_graph_rpc(&json!({ "kind": "template", "id": "nope" })).unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
         cleanup(&home, &runtime);
+    }
+}
+
+#[cfg(test)]
+mod usable_url_tests {
+    use super::*;
+
+    fn record(state: host::HostState, authenticated: Option<&str>) -> host::ContainerHostRecord {
+        host::ContainerHostRecord {
+            id: "container-test".to_owned(),
+            name: "test".to_owned(),
+            template: None,
+            profile: "web".to_owned(),
+            host_pid: 1,
+            host_pgid: 0,
+            host_port: 1234,
+            host_url: "http://127.0.0.1:1234".to_owned(),
+            authenticated_url: authenticated.map(str::to_owned),
+            started_at: 0,
+            last_seen: 0,
+            state,
+            generation: 0,
+            exit_status: None,
+            exit_signal: None,
+            unhealthy_count: 0,
+            probe_count: 0,
+        }
+    }
+
+    /// A booting host has no token yet. Handing out the bare URL there sends
+    /// every caller into the 401 fence, which reads as "broken" rather than
+    /// "not yet" -- so the reply must name the wait instead.
+    #[test]
+    fn starting_without_a_token_refuses_and_says_to_wait() {
+        let error = usable_url(&record(host::HostState::Starting, None)).unwrap_err();
+        assert!(error.contains("still starting"), "{error}");
+        assert!(error.contains("retry"), "{error}");
+        assert!(!error.contains("http"), "{error}");
+    }
+
+    /// The same absence, once the host is up, means an old runtime that never
+    /// had a token. Refusing there would break it for no reason.
+    #[test]
+    fn ready_without_a_token_is_an_older_runtime_and_keeps_its_bare_url() {
+        for state in [host::HostState::Ready, host::HostState::Running] {
+            assert_eq!(
+                usable_url(&record(state, None)).unwrap(),
+                "http://127.0.0.1:1234"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_is_preferred_in_every_state() {
+        for state in [
+            host::HostState::Starting,
+            host::HostState::Ready,
+            host::HostState::Running,
+        ] {
+            assert_eq!(
+                usable_url(&record(state, Some("http://127.0.0.1:1234/?token=t"))).unwrap(),
+                "http://127.0.0.1:1234/?token=t"
+            );
+        }
     }
 }

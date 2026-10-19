@@ -104,9 +104,68 @@ impl RpcClient {
         }
     }
 
-    /// Best-effort spawn of the daemon from `PATH`.
+    /// The platform directory name the installer lays the sidecar out under.
+    ///
+    /// Shared with the desktop side so both agree on where a bundled daemon
+    /// lives; a second spelling here is how a launcher ends up looking for a
+    /// file the installer never wrote.
+    pub fn bundled_target() -> &'static str {
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "linux-x64",
+            ("linux", "aarch64") => "linux-arm64",
+            ("windows", "x86_64") => "win-x64",
+            ("windows", "aarch64") => "win-arm64",
+            ("macos", "x86_64") => "macos-x64",
+            ("macos", "aarch64") => "macos-arm64",
+            _ => "unsupported",
+        }
+    }
+
+    /// Where the sidecar sits next to an installed launcher.
+    ///
+    /// The installer writes the daemon to `<install>/server/<target>/dshboxd`
+    /// and puts only `<install>` on `PATH`, so `Command::new("dshboxd")` cannot
+    /// find it. That is not a corner case, it is every installed copy: the CLI
+    /// reports "cannot start dshboxd" while the daemon is sitting beside it.
+    pub fn bundled_server_path() -> Option<std::path::PathBuf> {
+        let executable = if cfg!(windows) { "dshboxd.exe" } else { "dshboxd" };
+        std::env::current_exe()
+            .ok()?
+            .parent()
+            .map(|directory| {
+                directory
+                    .join("server")
+                    .join(Self::bundled_target())
+                    .join(executable)
+            })
+    }
+
+    /// Start the daemon: from `PATH` first, then from the bundled sidecar.
+    ///
+    /// `PATH` stays first because it is how a developer runs the tree they are
+    /// editing. The bundled path is the fallback that makes an installed CLI
+    /// work at all, and it is tried rather than preferred so a developer's own
+    /// build still wins.
+    ///
+    /// Both attempts are named on failure: reporting only the `PATH` one sends
+    /// the reader to fix their shell profile when the real problem is that the
+    /// sidecar beside the binary is missing.
     pub fn spawn_daemon() -> Result<(), String> {
-        let mut command = std::process::Command::new("dshboxd");
+        let path_error = match Self::spawn_named("dshboxd") {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let Some(bundled) = Self::bundled_server_path() else {
+            return Err(format!("cannot start dshboxd: {path_error}"));
+        };
+        Self::spawn_named(&bundled.to_string_lossy()).map_err(|bundled_error| {
+            format!("cannot start dshboxd: not on PATH ({path_error}); beside the binary: {bundled_error} at {}", bundled.display())
+        })
+    }
+
+    /// Spawn one daemon by name or path, applying the platform's spawn rules.
+    fn spawn_named(program: &str) -> Result<(), String> {
+        let mut command = std::process::Command::new(program);
         #[cfg(windows)]
         box_foundation::suppress_console_window(&mut command);
         #[cfg(unix)]
@@ -114,10 +173,7 @@ impl RpcClient {
             use std::os::unix::process::CommandExt;
             let _ = command.process_group(0);
         }
-        command
-            .spawn()
-            .map_err(|error| format!("cannot start dshboxd: {error}"))?;
-        Ok(())
+        command.spawn().map(|_| ()).map_err(|error| error.to_string())
     }
 
     /// Send one JSON request via HTTP POST /rpc; returns the parsed response frame.
@@ -252,8 +308,9 @@ impl RpcClient {
 }
 #[cfg(test)]
 mod tests {
+    // `Read` arrives with `super::*`: the module already imports it for
+    // BufReader, so repeating it here only earns an unused-import warning.
     use super::*;
-    use std::io::Read as _;
     use std::net::TcpListener;
 
     /// A daemon that accepts the connection and then says nothing must not hold

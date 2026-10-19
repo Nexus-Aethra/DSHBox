@@ -19,13 +19,17 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         return Ok(());
     }
     match action {
-        "show" => show_config(),
+        "show" => show_config(&arguments[1..]),
         "set" => set_value(&arguments[1..]),
         _ => Err(format!("unknown config action: {action}")),
     }
 }
 
-fn show_config() -> Result<(), String> {
+/// Prints the machine's config, which is already JSON -- so the only thing
+/// missing was refusing an argument, which is what would otherwise make a typo
+/// look like a call that worked.
+fn show_config(rest: &[String]) -> Result<(), String> {
+    super::read_flags(rest, &[])?;
     let config = read_config()?;
     println!(
         "{}",

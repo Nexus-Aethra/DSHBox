@@ -3,7 +3,9 @@
 //! Mirrors the desktop's `extensions.rs` paths without Tauri deps.
 
 use crate::bundles::{install_container_plugin, install_container_skill};
-use crate::toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel};
+use crate::toolchains::{
+    pnpm_network_failure_hint, pnpm_policy, resolve_toolchain, run_logged, TaskCancel,
+};
 use box_extensions::transfer::{
     append_plugin_archive, archive_content_root, copy_extension_source, extract_extension_tarball,
 };
@@ -778,7 +780,25 @@ pub(crate) fn container_plugin_add(
         )
         .map_err(|error| format!("dsh plugin add: {error}"))?;
     if !status.success() {
-        return Err(format!("dsh plugin add exited with {status}"));
+        // The child's stdout and stderr are both forwarded into the task log
+        // (see ExecutionKind::Logged above), so pnpm's actual complaint lives
+        // in that file rather than in this string. A bare exit status named
+        // neither the log nor the container, which left every genuine failure
+        // needing a manual hunt through the task list before it could be
+        // diagnosed. The template path has always pointed at the log
+        // (`sealed.rs`); this is its container-side twin.
+        let mut message = format!(
+            "dsh plugin add exited with {status}; inspect {}",
+            task_record.log_path
+        );
+        // A third-party mirror with flaky connectivity makes pnpm report a
+        // misleading downstream lifecycle error, so translate that pattern when
+        // the log shows it. The helper is crate-internal and already used by
+        // the DSH version installer, so this adds no second log parser.
+        if let Some(hint) = pnpm_network_failure_hint(Path::new(&task_record.log_path)) {
+            message.push_str(&hint);
+        }
+        return Err(message);
     }
     task.update("Plugin installed", 95);
     Ok(())
@@ -786,7 +806,34 @@ pub(crate) fn container_plugin_add(
 
 /// Copy a container-safe package name check (mirrors the desktop's).
 pub(crate) fn is_safe_package_name(name: &str) -> bool {
-    !name.is_empty() && !name.contains("..") && name.split('/').all(is_safe_identifier)
+    if name.is_empty() || name.contains("..") {
+        return false;
+    }
+    // An npm name is an optional `@scope/` prefix followed by the name. The
+    // scope is part of what npm accepts, so a check that applies the plain
+    // identifier rules to it rejects every scoped package -- and scoped
+    // packages are most of what a container holds, so a removal validated this
+    // way could never succeed on any of them.
+    //
+    // Only the leading `@` is exempt. `@` is not a character npm allows inside
+    // either part, so admitting it there would admit a path component nothing
+    // else would accept. The exemption is positional and the `/` is consumed
+    // by the split, so a second separator is rejected rather than quietly
+    // treated as a third component.
+    let (scope, body) = match name.strip_prefix('@') {
+        Some(rest) => match rest.split_once('/') {
+            Some((scope, body)) => (Some(scope), body),
+            None => return false,
+        },
+        None => (None, name),
+    };
+    if body.contains('/') {
+        return false;
+    }
+    match scope {
+        Some(scope) => is_safe_identifier(scope) && is_safe_identifier(body),
+        None => is_safe_identifier(body),
+    }
 }
 
 /// Install an extension (GitHub URL, repository path, or tarball) into a
@@ -1280,5 +1327,33 @@ mod import_source_tests {
             Err(error) => error,
         };
         assert!(error.contains("boxfile"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod package_name_tests {
+    use super::is_safe_package_name;
+
+    #[test]
+    fn accepts_scoped_and_unscoped_names() {
+        // A scoped name is the ordinary case: rejecting `@scope/name` means a
+        // container can never have a plugin removed from it.
+        assert!(is_safe_package_name("@nexus-aethra/dsh-box-sandbox"));
+        assert!(is_safe_package_name("@deepseek-ai/dsh-base"));
+        assert!(is_safe_package_name("dsh-box-sandbox"));
+        assert!(is_safe_package_name("my.plugin_v2"));
+    }
+
+    #[test]
+    fn rejects_traversal_and_odd_shapes() {
+        assert!(!is_safe_package_name(""));
+        assert!(!is_safe_package_name("../etc"));
+        assert!(!is_safe_package_name("@scope/../etc"));
+        assert!(!is_safe_package_name("@scope"));
+        assert!(!is_safe_package_name("a/b/c"));
+        assert!(!is_safe_package_name("@/name"));
+        assert!(!is_safe_package_name("@sc@ope/name"));
+        assert!(!is_safe_package_name("@scope/na@me"));
+        assert!(!is_safe_package_name("@scope\\name"));
     }
 }

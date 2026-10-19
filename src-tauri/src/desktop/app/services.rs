@@ -6,6 +6,67 @@ use tauri::{
     Manager,
 };
 
+/// What the startup check found, for the UI to ask about later.
+///
+/// The check runs once, before the window exists, so its one result is kept
+/// here: `None` means the running daemon belongs to this build. A mismatch is
+/// reported rather than acted on, and the person who can act on it is the one
+/// looking at the window -- which is the only place the answer is useful.
+static DAEMON_BUILD: std::sync::OnceLock<std::sync::Mutex<Option<(String, String)>>> =
+    std::sync::OnceLock::new();
+
+/// `None` when the running daemon matches this desktop binary; otherwise the
+/// stamps, running first.
+pub(crate) fn daemon_build_status() -> Option<(String, String)> {
+    let cell = DAEMON_BUILD.get()?;
+    let guard = cell.lock().ok()?;
+    guard.clone()
+}
+
+/// The notice a compared pair of stamps earns, or `None` when they agree.
+///
+/// Pure, and separate from the cell, because "equal stamps produce no notice"
+/// is the entire contract and it is the half that went missing: the first
+/// version recorded the pair on both paths and let the *presence* of a record
+/// stand in for the verdict, so a matching daemon came back `stale: true` and
+/// the window told the user their server was older than the app while quoting
+/// two identical stamps. The log said "matches" the whole time -- a log line is
+/// what the first version of this feature checked, and it agreed.
+fn build_notice(running: &str, client: &str) -> Option<(String, String)> {
+    if running == client {
+        return None;
+    }
+    Some((running.to_owned(), client.to_owned()))
+}
+
+fn record_daemon_build(running: &str, client: &str) {
+    // `get_or_init`, not `get`: an uninitialised `OnceLock` reads as `None`
+    // forever, which is indistinguishable from "no mismatch" and so reports a
+    // stale daemon as current -- the notice silently never appears.
+    let cell = DAEMON_BUILD.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut inner) = cell.lock() {
+        *inner = build_notice(running, client);
+    }
+}
+
+#[cfg(test)]
+mod build_notice_tests {
+    use super::build_notice;
+
+    #[test]
+    fn equal_stamps_earn_no_notice() {
+        assert!(build_notice("1790858088", "1790858088").is_none());
+    }
+
+    #[test]
+    fn different_stamps_earn_a_notice_carrying_both_in_order() {
+        assert_eq!(
+            build_notice("1790858088", "1790900000"),
+            Some((String::from("1790858088"), String::from("1790900000"))),
+        );
+    }
+}
+
 /// Writes diagnostics before Tauri logging is available.
 pub(crate) fn write_startup_log(message: &str) {
     let root = dirs::data_local_dir()
@@ -16,9 +77,6 @@ pub(crate) fn write_startup_log(message: &str) {
     let line = format!("[{}] {message}\n", now_seconds());
     let _ = fs::OpenOptions::new().create(true).append(true).open(root.join("desktop.log")).and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
 }
-
-pub(crate) const DEFAULT_NODE_VERSION: &str = "v24.11.1";
-pub(crate) const DEFAULT_PNPM_VERSION: &str = "11.21.0";
 
 pub(crate) fn bundled_target() -> &'static str {
     match (env::consts::OS, env::consts::ARCH) {
@@ -85,7 +143,7 @@ fn wait_for_daemon(timeout: Duration) -> Option<box_client::RpcClient> {
 /// different build batch than this desktop binary (a stale daemon left
 /// over from before an upgrade), stop it and start the daemon shipped with
 /// this install. Failures are logged but never block startup.
-pub(crate) fn reconcile_daemon_build(server: &Path) {
+pub(crate) fn reconcile_daemon_build() {
     let Some(client) = wait_for_daemon(Duration::from_secs(5)) else {
         write_startup_log("daemon did not become reachable; skipping build stamp check");
         return;
@@ -96,69 +154,49 @@ pub(crate) fn reconcile_daemon_build(server: &Path) {
         .and_then(|info| info["buildStamp"].as_str().map(str::to_owned))
         .unwrap_or_default();
     if remote_stamp == CLIENT_BUILD_STAMP {
+        record_daemon_build(&remote_stamp, CLIENT_BUILD_STAMP);
         write_startup_log(&format!("daemon build stamp matches ({remote_stamp})"));
         return;
     }
+    // Log it, and do not act on it.
+    //
+    // This used to stop the daemon and start the one from this install, and
+    // the reason it no longer does is that the hammer was aimed at a rare
+    // case. A daemon left over from a previous build is a version behind on
+    // a loopback RPC that only grows; the client falls back for the calls it
+    // cannot make, and the cost of being wrong is a feature that needs a
+    // newer server. The cost of stopping it is a container start, a build, or
+    // a bundle export the user asked for a second earlier -- because the
+    // desktop starts routinely, so merely opening the app was enough to end
+    // whatever the daemon was doing. That trade was backwards, and "the
+    // daemon is busy" was only one of the reasons it fired.
+    //
+    // So: report, and let the server stand. A restart stays available to the
+    // user as one they chose, rather than one that happened to them.
+    record_daemon_build(&remote_stamp, CLIENT_BUILD_STAMP);
     write_startup_log(&format!(
-        "daemon build stamp {remote_stamp:?} != client {CLIENT_BUILD_STAMP:?}; restarting daemon"
+        "daemon build stamp {remote_stamp:?} != client {CLIENT_BUILD_STAMP:?}; keeping the running daemon"
     ));
-    let _ = client.call("shutdown", serde_json::json!({}));
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while daemon_alive() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(120));
-    }
-    // Bring the freshly-installed daemon up: through the user service when
-    // one exists, otherwise by spawning the bundled sidecar directly.
-    #[cfg(unix)]
-    {
-        if let Err(error) = restart_user_service() {
-            write_startup_log(&format!(
-                "daemon restart via service failed ({error}); spawning directly"
-            ));
-            spawn_daemon_fallback(server);
-        }
-    }
-    #[cfg(windows)]
-    {
-        // Windows uses a per-user scheduled task (dshboxd) for the daemon,
-        // but schtasks /RL LIMITED is fragile: it silently fails when the
-        // task hasn't been created yet, when the user lacks rights, or
-        // when the desktop session is detached. Without a fallback the UI
-        // hangs on "Starting DSH Box server…" forever, because no
-        // discovery.json ever gets written. So on Windows we always run
-        // the scheduled task AND, if it didn't bring the daemon up,
-        // spawn the sidecar directly. The single-instance check in
-        // dshboxd keeps the duplicate from clobbering the live process.
-        match restart_user_service() {
-            Ok(()) => write_startup_log("daemon restart via scheduled task"),
-            Err(error) => write_startup_log(&format!(
-                "daemon restart via scheduled task failed ({error}); spawning directly"
-            )),
-        }
-        // Give the task a moment to start before we decide to fall back.
-        // If the task succeeded, the fallback is a no-op (daemon_alive
-        // returns true and spawn_daemon_fallback skips itself).
-        if !daemon_alive() {
-            spawn_daemon_fallback(server);
-        }
-    }
-    if let Some(client) = wait_for_daemon(Duration::from_secs(5)) {
-        let stamp = client
-            .call("get_info", serde_json::json!({}))
-            .ok()
-            .and_then(|info| info["buildStamp"].as_str().map(str::to_owned))
-            .unwrap_or_default();
-        let message = if stamp == CLIENT_BUILD_STAMP {
-            format!("daemon restarted with matching build stamp ({stamp})")
-        } else {
-            "daemon restarted but build stamp still does not match".to_owned()
-        };
-        write_startup_log(&message);
-    } else {
-        write_startup_log("daemon did not come back after restart");
-    }
 }
 
+
+/// Whether the running daemon is from a different build than this one.
+///
+/// A plain read of a value the startup check already computed, so it costs
+/// nothing and cannot itself disturb the daemon. `stale` false means the two
+/// match; true means the server is left running on purpose and the person who
+/// can decide what to do about it is looking at this window.
+#[tauri::command(async)]
+pub fn get_daemon_build_notice() -> serde_json::Value {
+    match daemon_build_status() {
+        Some((running, client)) => serde_json::json!({
+            "stale": true,
+            "runningStamp": running,
+            "clientStamp": client,
+        }),
+        None => serde_json::json!({ "stale": false }),
+    }
+}
 /// Fallback launcher for platforms without a per-user service manager
 /// (macOS) and for environments where service installation failed: spawns
 /// the bundled daemon directly unless one is already reachable, so the
@@ -276,7 +314,6 @@ pub(crate) fn initialize_bundled_runtime(resource_directory: PathBuf) -> Result<
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .and_then(|text| text.lines().next().map(str::trim).map(str::to_owned))
         .unwrap_or_else(|| "unknown".to_owned());
-    let git_dir = runtime.git_dir();
     BUNDLED_RUNTIME
         .set(BundledRuntime {
             node_version: runtime.manifest.node_version,
@@ -285,7 +322,6 @@ pub(crate) fn initialize_bundled_runtime(resource_directory: PathBuf) -> Result<
             node,
             npm,
             pnpm,
-            git_dir,
         })
         .map_err(|_| "bundled runtime was initialized twice".to_owned())
 }
