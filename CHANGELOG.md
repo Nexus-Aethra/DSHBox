@@ -5,6 +5,71 @@ platforms and publishes them on the
 [Releases page](https://github.com/Nexus-Aethra/DSHBox/releases) — see
 [Releasing](README.md#releasing).
 
+## 0.1.9
+
+A container declares its own environment, the host speaks one module world, and
+a resource copy resolves against the version it is landing in.
+
+### Added
+
+- **Container environment in the boxfile.** `ENV key=value` is parsed with the
+  script (keys must look like shell variable names; the last declaration wins),
+  carried into the sealed template's `env` field, and applied on top of the
+  clean-room whitelist when the host starts — so a container no longer depends
+  on the ambient environment of whoever started the daemon. Declared values beat
+  inherited ones; Box's own variables are applied after and win.
+- **Version-bounded resource slots.** A kind part may declare `slot`, `since`
+  and `until`, a `{profile}` placeholder in its path, and a `#<id>` section step
+  that travels a layer item's `config`. Extraction records the slot in
+  `parts.json` and injection re-picks the destination's part, so a credentials
+  copy extracted from a 0.1.7 container (whose provider route moved into
+  `profiles/<p>/cordis.patch.yml`) injects into a 0.1.6 container as
+  `settings.yaml#llm-pi-ai`, merging beside the route already there. Plugin
+  `dshbox.resources` entries take the same fields.
+
+### Fixed
+
+- **Agent tool calls no longer die a millisecond after `tool/call`.** The host
+  started as `node --import tsx/esm apps/cli/src/bin.ts`, which loads first-party
+  packages from `src` by name while the plugin row loader — following
+  `package.json` `exports` — loads the same packages from `lib`; each copy
+  creates its own `Symbol`, so the `dsh-tools` scheduler was stored under one
+  and looked up under the other. The host now launches `apps/cli`'s declared
+  entry (`bin: lib/bin.js`) with no transpiler in the process, and that entry is
+  part of the artifact checks so a tree without it is rebuilt rather than
+  launched the broken way.
+- **A build approval no longer corrupts the manifest it is written to.** Box
+  wrote the spec pnpm prints back into `pnpm-workspace.yaml` unquoted; a scoped
+  spec starts with `@`, a YAML reserved indicator, so the whole manifest stopped
+  parsing (`bad indentation of a mapping entry`) and the retry meant to approve
+  the plugin died on the file it had just corrupted — after which the build
+  asked for the LABEL line the boxfile already had. The section is now read by
+  indentation, lines Box does not own are preserved, only a matching pair of
+  quotes is stripped on read-back, and keys are quoted on write.
+- **`dshboxd` on PATH works.** The wrapper looked for the daemon under
+  `<install>/resources/server/<target>/`, a level tauri's resource map never
+  creates, so it always answered "bundled daemon is missing"; it now resolves
+  the real layout and sets `DSHBOX_RESOURCE_DIR` to the install root.
+- **`inherit_proxy` does something.** It was a config field with no consumer;
+  it now gates the eight proxy aliases reaching the clean-room
+  package-manager child, and its doc comment no longer claims the opposite of
+  its default.
+- **A mirror that cannot be reached now says so.** undici's `fetch failed` was
+  not among the network markers the hint looks for, so a build against an
+  unreachable private registry produced no mirror warning at all.
+
+### Infrastructure
+
+- Release notes live in the repository (`docs/releases/<tag>.md`, both
+  languages) and the release job reads them instead of falling back to
+  generated notes.
+- `docs/notes/2026-09-22-dsh-dual-module-world-tool-call-crash.md` records the
+  tool-call incident; `examples/boxfile-dshell-021.dsh` and
+  `examples/boxfile-dshell-usage.dsh` show accepting local, unpublished builds
+  through a packed tarball; `box-runtime/tests/host_env_policy.rs` spawns a real
+  child under the real host policy so the asserted environment is the one the
+  host would receive.
+
 ## 0.1.8
 
 The plugin dependency graph, plus the two packaging faults that kept earlier

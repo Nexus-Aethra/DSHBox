@@ -132,6 +132,7 @@ ADD skill team-conventions
 | `VERSION <image-version>` | 否 | 默认 `latest`。 |
 | `LABEL key=value` | 可重复 | 附加到已构建模板上的自由元数据。`dshbox.allow-build` 是保留键：以逗号分隔的 `package@version` 列表，允许这些包执行构建脚本。 |
 | `DEF <name> @<path>` | 可重复 | 定义路径别名，供后续 `ADD` 用 `@<name>` 引用。 |
+| `ENV key=value` | 可重复 | 声明一个容器环境变量（见下文）。 |
 | `ADD plugin\|skill\|data <src> [@<dest>]` | 至少一条 | 要烤进每个由该模板创建的容器的资源。 |
 | `CP <src> [@<dest>]` | `ADD plugin` 的别名 | 向后兼容保留。 |
 
@@ -143,6 +144,10 @@ ADD skill team-conventions
 5. **显式前缀** —— `git:…`（用 libgit2 克隆，不做猜测）与 `npm:…`（把 registry spec 交给 pnpm）。
 
 `:latest` 与显式 `latest` 关键字等价，都指向 harness 仓库主分支。
+
+### 容器环境变量
+
+`ENV key=value` 是 docker `-e` 的等价物：该变量被烤进封存模板，并在宿主启动时覆写它本来会继承的环境，于是容器不再依赖调用方当时恰好 export 了什么。键名必须像 shell 变量名（`[A-Za-z_][A-Za-z0-9_]*`）；同一个键后声明者胜。声明值会盖过宿主继承值，但 Box 自己的变量（`DSH_HOME`、loopback 端口与 token、工具链路径）仍然优先 —— boxfile 无法把 daemon 引去别处。
 
 每条 `ADD` 的存储方式很重要：
 - `ADD plugin` —— 来源作为不可变的本地 `artifact.tgz` 导入共享**资源库**，由封存模板记录，只在最终路径准备容器时才加入。运行中的容器不含任何资源库绝对路径，也不会跑插件依赖安装。

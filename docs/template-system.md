@@ -24,6 +24,19 @@ Template identity is digest-addressed and includes the exact base revision, bund
 
 The reusable trees are source-only and link-free. Windows pnpm workspace junctions are created only during the final instance's offline install, so they cannot point back to staging, a repository cache, or another container.
 
+## Container environment
+
+A boxfile may declare `ENV key=value` lines. They are parsed with the rest of the
+script (a key that is not `[A-Za-z_][A-Za-z0-9_]*` is rejected at parse time, and
+the last declaration of a key wins), carried into the sealed template's `env`
+field, and read back from the container's metadata when the host is started.
+`EnvironmentPolicy::declared_env` applies them on top of the clean-room
+whitelist, so a declared value beats what the host would have inherited while
+Box's own variables — `DSH_HOME`, the loopback port and capability token, the
+toolchain paths — are applied after and cannot be redirected by a boxfile. The
+point is that a container's environment is a property of its template rather
+than of whichever shell happened to start the daemon.
+
 ## Breaking storage change
 
 This model requires storage schema 10. Box does not support or mutate legacy metadata-only templates and `runtimes/<version>/source` directories. Users of an old data root must choose a new root after preserving any data they need.

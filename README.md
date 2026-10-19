@@ -137,6 +137,7 @@ ADD skill team-conventions
 | `VERSION <image-version>` | no | Defaults to `latest`. |
 | `LABEL key=value` | repeatable | Free-form metadata attached to the built template. `dshbox.allow-build` is reserved: a comma-separated list of `package@version` keys allowed to run build scripts. |
 | `DEF <name> @<path>` | repeatable | Defines a path alias usable as `@<name>` in subsequent `ADD` lines. |
+| `ENV key=value` | repeatable | Declares a container environment variable (see below). |
 | `ADD plugin\|skill\|data <src> [@<dest>]` | one or more | Resource you want baked into every Container made from this template. |
 | `CP <src> [@<dest>]` | alias for `ADD plugin` | Kept for backward compatibility. |
 
@@ -148,6 +149,16 @@ ADD skill team-conventions
 5. **Explicit prefixes** — `git:…` (clones via libgit2, no guessing) and `npm:…` (registry spec forwarded to pnpm).
 
 The `:latest` tag and the explicit `latest` keyword are interchangeable; both pin the harness repository's main branch.
+
+### Container environment
+
+`ENV key=value` is the docker-style `-e` equivalent: the variable is baked into the
+sealed template and applied on top of the environment the host would otherwise
+inherit, so a Container never depends on whatever the caller happened to have
+exported. The key must look like a shell variable name (`[A-Za-z_][A-Za-z0-9_]*`);
+a later declaration of the same key wins. Declared values override what the host
+would have inherited, but Box's own variables (`DSH_HOME`, the loopback port and
+token, the toolchain paths) still win — a boxfile cannot redirect the daemon.
 
 How each `ADD` is stored matters:
 - `ADD plugin` — the source is imported into the shared **Repository** as an immutable local `artifact.tgz`, recorded by the sealed recipe, then added only while preparing a Container at its final path. No running Container has an absolute repository path or runs a plugin dependency install.
