@@ -261,10 +261,11 @@ fn register_plugin_directly(
     }
 
     // --- Step 2: Physically copy the plugin into the profile ---
-    // Scoped packages are installed under `<scope>/<name>/`, unscoped
-    // ones directly under `<name>/`. The plugin_name arg is always the
-    // canonical package name from the plugin's own package.json, so the
-    // split is well-defined.
+    // A scoped package lives at `node_modules/@scope/name/` and an unscoped
+    // one at `node_modules/name/`. The plugin_name arg is always the canonical
+    // package name from the plugin's own package.json, so the split is
+    // well-defined, and split_package_name returns the scope WITH its `@`
+    // because that is the directory Node resolution actually looks for.
     let (scope, package) = split_package_name(plugin_name)
         .ok_or_else(|| format!("plugin name `{plugin_name}` is not a valid package name"))?;
     let plugin_target = profile_dir.join("node_modules").join(scope).join(package);
@@ -275,7 +276,10 @@ fn register_plugin_directly(
     ensure_local_pnpm_workspace(&workspace_manifest)
         .map_err(|error| format!("cannot update pnpm-workspace.yaml: {error}"))?;
 
-    // --- Step 4: Run pnpm install in profile dir ---
+    // --- Step 4: done ---
+    // No `pnpm install` runs here, and none is needed: the payload was copied
+    // straight into node_modules, and the profile is a single-package pnpm
+    // workspace, so Node resolution finds the directory as it stands.
     task.log(&format!(
         "registered physical plugin payload for {plugin_name}"
     ));
@@ -327,12 +331,18 @@ pub(crate) fn prepare_materialized_profile(
 /// Split a package name (`@scope/foo` or `foo`) into `(scope, name)`.
 /// Returns `None` when the name is malformed.
 pub(crate) fn split_package_name(name: &str) -> Option<(&str, &str)> {
-    if let Some(rest) = name.strip_prefix('@') {
-        let (scope, package) = rest.split_once('/')?;
+    if name.starts_with('@') {
+        let (scope, package) = name[1..].split_once('/')?;
         if scope.is_empty() || package.is_empty() {
             return None;
         }
-        Some((scope, package))
+        // The first segment is the on-disk directory, and node_modules spells
+        // a scoped package as `@scope/name` -- the `@` is part of the path, not
+        // decoration. Returning the bare scope here is what put a scoped plugin
+        // in `node_modules/<scope>/`, where Node never looks and
+        // require.resolve fails with MODULE_NOT_FOUND: the plugin is registered
+        // in the profile's bundle list but can never be loaded.
+        Some((&name[..1 + scope.len()], package))
     } else {
         if name.is_empty() || name.contains('/') {
             return None;
@@ -938,7 +948,7 @@ mod tests {
     fn split_package_name_handles_scoped_and_unscoped() {
         assert_eq!(
             split_package_name("@deepseek-ai/dsh-box-context"),
-            Some(("deepseek-ai", "dsh-box-context"))
+            Some(("@deepseek-ai", "dsh-box-context"))
         );
         assert_eq!(split_package_name("foo"), Some(("", "foo")));
         assert_eq!(split_package_name(""), None);

@@ -380,6 +380,14 @@ pub struct BoxConfig {
     /// /opt/myteam/bin/git) without exporting PATH globally.
     #[serde(default)]
     pub git_path: Option<String>,
+    /// Optional absolute path to a Chromium-family browser executable used by
+    /// the debug surface (screenshot, element query, clicks). When unset,
+    /// `box-browser` probes the well-known install locations for Edge, Chrome,
+    /// Brave and Chromium. Box drives the browser headless, so a headless-capable
+    /// build is required; this override exists for a portable or custom Chromium
+    /// the discovery probe does not know about.
+    #[serde(default)]
+    pub browser_path: Option<String>,
     /// When true (the default), DSH Box inherits the host's
     /// HTTP/HTTPS/ALL/NO_PROXY variables into the clean-room
     /// package-manager child so developers behind a corporate mirror can
@@ -420,6 +428,7 @@ impl Default for BoxConfig {
             github_mirror: None,
             npm_registry: None,
             git_path: None,
+        browser_path: None,
             inherit_proxy: default_true(),
             plugins_manifest_digest: None,
             defender_exclusions_for: None,
@@ -549,7 +558,7 @@ pub fn normalize_runtime_directory(directory: &str) -> BoxResult<String> {
 /// True for drive-relative roots like `D:`, where a bare trailing colon makes
 /// every joined path resolve against the drive's current directory.
 #[cfg(windows)]
-fn drive_root(path: &PathBuf) -> bool {
+fn drive_root(path: &Path) -> bool {
     let bytes = path.to_string_lossy();
     let bytes = bytes.as_bytes();
     bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'

@@ -1,0 +1,29 @@
+# The repository stores LF for every text file.
+#
+# Without this, line endings depend on each checkout's core.autocrlf, so a
+# single editor that writes CRLF turns a 26-line change into a whole-file
+# rewrite -- which is how src/i18n.ts and src/styles.css arrived at a 900-line
+# diff that was really 60 lines. Pinned here, the normalisation is the same
+# on every machine and the clean filter no longer depends on local config.
+* text=auto eol=lf
+
+# These are not text: a diff of them is noise, and a CRLF-looking byte is
+# part of the file.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.msi   binary
+*.deb   binary
+*.rpm   binary
+*.dmg   binary
+*.exe   binary
+
+# Lockfiles are LF in the tree and CRLF-sensitively parsed by nothing here,
+# but keep the rule explicit so a Windows checkout does not rewrite them.
+pnpm-lock.yaml text eol=lf

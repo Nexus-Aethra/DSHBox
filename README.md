@@ -23,6 +23,7 @@ DSH Box is a lightweight desktop shell built with [Tauri 2](https://tauri.app) t
 - **Bundles** — group plugins and skills, then export quick (URLs kept) or full (one archive).
 - **Tasks you can watch** — queued, logged with timings, cancellable, with history.
 - **A slow daemon never freezes the window** — commands run off the main thread and every RPC is bounded.
+- **An older server is kept, and said so** — a service from a previous build keeps running, with a topbar line naming both.
 - **RPC + events** — one `POST /rpc` and one SSE stream serve the UI, the CLI and agents alike.
 - **Network-friendly** — GitHub mirror, npm registry mirror, automatic proxy detection.
 - **Tray and background service** — `dshboxd` keeps working with the window closed.
@@ -61,6 +62,25 @@ No runtime prerequisites on Windows — the bundled Node/npm/pnpm/Git runtime tr
 ### Tray
 
 The app minimizes to the system tray on close. Use the tray menu to open the window or start/stop/restart the `dshboxd` background service.
+
+### When the server is from an older build
+
+The box is a background service, so it often outlives the app that installed
+it. After you install a newer DSH Box while the previous one is still running,
+the two do not match — and the running server is **kept**. The RPC only grows,
+so the client falls back for anything the older daemon cannot do, and the cost
+of stopping it would be a container start or a build you asked for a moment
+earlier. A line in the topbar says so, naming both builds, so the difference is
+visible instead of something you have to find in a log file.
+
+Nothing is broken while it is there. Features that need the newer server show up
+once you restart the service from the tray menu — at a moment you chose, not one
+the app picked for you.
+
+![The topbar reporting that the background server is from an older build, with both stamps in the text](docs/images/stale-daemon.png)
+
+---
+
 
 ---
 

@@ -1,3 +1,6 @@
+export type DaemonBuildNotice =
+  | { stale: false }
+  | { stale: true; runningStamp: string; clientStamp: string }
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
@@ -83,6 +86,7 @@ export const boxApi = {
   saveMirrorSettings: (githubMirror: string | null, npmRegistry: string | null) => ipc<BoxConfig>('save_mirror_settings', { githubMirror, npmRegistry }),
   getServerServiceStatus: () => ipc<ServerServiceStatus>('get_server_service_status'),
   getDaemonStatus: () => ipc<boolean>('get_daemon_status'),
+  getDaemonBuildNotice: () => ipc<DaemonBuildNotice>('get_daemon_build_notice'),
   restartServerService: () => ipc<void>('restart_server_service'),
   detectToolchains: async () => (await ipc<ToolchainPayload[]>('detect_toolchains')).map(({ id, name, managedVersion }) => ({ id, name, version: managedVersion })),
   listDshVersions: () => ipc<DshVersion[]>('list_dsh_versions'),

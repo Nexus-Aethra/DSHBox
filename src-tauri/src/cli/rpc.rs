@@ -115,6 +115,13 @@ pub(crate) fn run_task(client: &RpcClient, method: &str, params: Value) -> Resul
 pub(crate) fn wait_task(client: &RpcClient, task_id: &str) -> Result<(), String> {
     let mut last_stage = String::new();
     let mut log_offset = 0usize;
+    // Whether the log has ever been read successfully. A missing log before
+    // that point is the normal "the task has not written yet" state, not a
+    // problem worth interrupting the user for.
+    let mut log_ever_read = false;
+    // One-shot guard: a read failure is reported once, not on every 150 ms
+    // poll for the life of the task.
+    let mut log_problem_reported = false;
     loop {
         let value = client.call("task_status", json!({ "id": task_id }))?;
         let task: TaskRecord = serde_json::from_value(value)
@@ -123,13 +130,44 @@ pub(crate) fn wait_task(client: &RpcClient, task_id: &str) -> Result<(), String>
             eprintln!("[{:>3}%] {}", task.progress, task.stage);
             last_stage = task.stage.clone();
         }
-        if let Ok(content) = std::fs::read_to_string(&task.log_path) {
-            if content.len() > log_offset {
-                for line in content[log_offset..].lines() {
-                    eprintln!("  {line}");
+        // A log that cannot be read is indistinguishable from a task that
+        // produced no output, so the failure is surfaced instead of dropped:
+        // a wrong path, a locked file or non-UTF-8 bytes would otherwise look
+        // exactly like silence. The wait still continues either way, because
+        // the task still settles and its final status is the one thing the
+        // caller must not lose.
+        match std::fs::read_to_string(&task.log_path) {
+            Ok(content) => {
+                log_ever_read = true;
+                if content.len() > log_offset {
+                    for line in content[log_offset..].lines() {
+                        eprintln!("  {line}");
+                    }
+                    log_offset = content.len();
                 }
-                log_offset = content.len();
             }
+            Err(error) => {
+                let not_written_yet =
+                    error.kind() == std::io::ErrorKind::NotFound && !log_ever_read;
+                if !log_problem_reported && !not_written_yet {
+                    eprintln!(
+                        "  (task log {} could not be read: {error}; later read errors are not repeated)",
+                        task.log_path
+                    );
+                    log_problem_reported = true;
+                }
+            }
+        }
+        // Settled without the log ever having been readable: a silent task
+        // and an unreadable log produce the same output, so say which one
+        // this was. The returned error is left untouched — this is extra
+        // context on stderr, not a change to the contract callers match on.
+        if !log_ever_read
+            && !log_problem_reported
+            && matches!(task.status.as_str(), "succeeded" | "cancelled" | "failed")
+        {
+            eprintln!("  (no readable task log at {})", task.log_path);
+            log_problem_reported = true;
         }
         match task.status.as_str() {
             "succeeded" => return Ok(()),
