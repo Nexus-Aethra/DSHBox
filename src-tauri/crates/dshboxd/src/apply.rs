@@ -108,8 +108,7 @@ pub(crate) fn apply_document_rpc(state: &DaemonState, request: &Value) -> Result
                 .filter(|path| !path.is_empty())
                 .ok_or("apply_document needs a document or a file path")?;
             source = file.to_owned();
-            std::fs::read_to_string(file)
-                .map_err(|error| format!("cannot read {file}: {error}"))?
+            std::fs::read_to_string(file).map_err(|error| format!("cannot read {file}: {error}"))?
         }
     };
     // A UTF-8 BOM is what a Windows editor writes without being asked, and
@@ -138,9 +137,7 @@ pub(crate) fn apply_document_rpc(state: &DaemonState, request: &Value) -> Result
         let label = spec
             .label
             .clone()
-            .unwrap_or_else(|| {
-                spec.path.clone().unwrap_or_else(|| spec.kind.clone())
-            });
+            .unwrap_or_else(|| spec.path.clone().unwrap_or_else(|| spec.kind.clone()));
         let target = format!("type {label} ({})", spec.kind);
         if dry_run {
             outcomes.push(Outcome {
@@ -261,10 +258,7 @@ fn extract_and_wait(state: &DaemonState, request: &Value) -> Result<String, Stri
             .map_err(|error| format!("cannot read the extract task: {error}"))?;
         let value = serde_json::to_value(&record)
             .map_err(|error| format!("cannot serialize the extract task: {error}"))?;
-        let status = value
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let status = value.get("status").and_then(Value::as_str).unwrap_or("");
         // Same rule as the agent side: a failed task may still be rolling back,
         // and only a failed rollback ends it. Stopping at Failed would report a
         // copy as done while the store is still being unwound.
@@ -273,8 +267,7 @@ fn extract_and_wait(state: &DaemonState, request: &Value) -> Result<String, Stri
             .and_then(Value::as_str)
             .map(|error| !error.is_empty())
             .unwrap_or(false);
-        let terminal = ["Succeeded", "Cancelled", "Interrupted", "RolledBack"]
-            .contains(&status);
+        let terminal = ["Succeeded", "Cancelled", "Interrupted", "RolledBack"].contains(&status);
         if terminal || (status == "Failed" && rollback) {
             if status == "Succeeded" {
                 return Ok(id);
@@ -286,7 +279,9 @@ fn extract_and_wait(state: &DaemonState, request: &Value) -> Result<String, Stri
             return Err(format!("extract ended {status}: {detail}"));
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("extract is still {status} after ten minutes; task {id}"));
+            return Err(format!(
+                "extract is still {status} after ten minutes; task {id}"
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(150));
     }
@@ -327,11 +322,15 @@ fn resolve_container(containers: &[(String, String)], name: &str) -> Result<Stri
         .collect::<Vec<_>>()
         .join(", ");
     if known.is_empty() {
-        Err(format!("no container named {name:?}, and there are no containers"))
+        Err(format!(
+            "no container named {name:?}, and there are no containers"
+        ))
     } else {
         // Naming what does exist is the difference between a typo being obvious
         // and a document that quietly applies to nothing.
-        Err(format!("no container named {name:?}; the containers are: {known}"))
+        Err(format!(
+            "no container named {name:?}; the containers are: {known}"
+        ))
     }
 }
 

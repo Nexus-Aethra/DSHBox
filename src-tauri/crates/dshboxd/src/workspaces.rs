@@ -20,8 +20,8 @@
 //! and the caller is told exactly which flag to pass.
 
 use serde_json::{json, Value};
-use uuid::Uuid;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 /// The registry document's own version, as the document records it.
 const REGISTRY_VERSION: u64 = 2;
@@ -31,7 +31,10 @@ const UNIT_NAME: &str = "workspace";
 
 /// Locate one container's workspace registry.
 fn registry_path(container: &Path) -> PathBuf {
-    container.join("profile").join("storages").join("workspace.json")
+    container
+        .join("profile")
+        .join("storages")
+        .join("workspace.json")
 }
 
 /// Read the registry, answering a first run with an empty one rather than an
@@ -87,7 +90,10 @@ pub(crate) fn list_workspaces(container: &Path) -> Result<Value, String> {
     // Order by the display list first, then anything the table holds but the
     // list forgot. A workspace missing from the list is a registry the UI
     // wrote in two halves; hiding it would be worse than showing it out of order.
-    let mut ordered: Vec<&String> = order.iter().filter(|id| map.contains_key(id.as_str())).collect();
+    let mut ordered: Vec<&String> = order
+        .iter()
+        .filter(|id| map.contains_key(id.as_str()))
+        .collect();
     let mut orphans: Vec<&String> = map.keys().filter(|id| !order.contains(id)).collect();
     orphans.sort();
     ordered.extend(orphans);
@@ -125,7 +131,11 @@ fn default_title(path: &str) -> String {
 /// able to ask it without first checking whether it already is -- otherwise the
 /// idempotent case needs a separate list-and-compare, which is the kind of
 /// ceremony a caller gets wrong.
-pub(crate) fn add_workspace(container: &Path, path: &str, title: Option<&str>) -> Result<Value, String> {
+pub(crate) fn add_workspace(
+    container: &Path,
+    path: &str,
+    title: Option<&str>,
+) -> Result<Value, String> {
     let requested = Path::new(path.trim());
     if path.trim().is_empty() {
         return Err("a workspace needs a path".to_owned());
@@ -249,7 +259,11 @@ fn civil_from_unix(seconds: i64) -> (i64, u32, u32, u32, u32, u32) {
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let shifted_month = (5 * day_of_year + 2) / 153;
     let day = (day_of_year - (153 * shifted_month + 2) / 5 + 1) as u32;
-    let month = if shifted_month < 10 { shifted_month + 3 } else { shifted_month - 9 } as u32;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    } as u32;
     let year = if month <= 2 { year + 1 } else { year };
     (
         year,
@@ -275,8 +289,7 @@ fn write_registry(path: &Path, registry: &Value) -> Result<(), String> {
     let mut text = serde_json::to_string_pretty(registry)
         .map_err(|error| format!("cannot encode the workspace registry: {error}"))?;
     text.push('\n');
-    std::fs::write(path, text)
-        .map_err(|error| format!("cannot write {}: {error}", path.display()))
+    std::fs::write(path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
 /// `add_container_workspace` — register a directory, with the host stopped.
@@ -290,18 +303,19 @@ pub(crate) fn add_container_workspace(
         // Said here rather than inferred: the symptom otherwise is a workspace
         // that vanished some minutes later, with no error anywhere near the
         // moment it was added.
-        return Err(
-            String::from(
-                "this container is running, and the running host rewrites its own "
-            )
-            + "workspace registry; stop it first (dshbox container stop <id>), "
-            + "or pass --restart to do both in order",
-        );
-    }    let title = request["title"].as_str();
+        return Err(String::from(
+            "this container is running, and the running host rewrites its own ",
+        ) + "workspace registry; stop it first (dshbox container stop <id>), "
+            + "or pass --restart to do both in order");
+    }
+    let title = request["title"].as_str();
     add_workspace(container, &path, title)
 }
 /// Resolve one container's directory the way the daemon stores it.
-fn container_dir(state: &crate::state::DaemonState, id: &str) -> Result<std::path::PathBuf, String> {
+fn container_dir(
+    state: &crate::state::DaemonState,
+    id: &str,
+) -> Result<std::path::PathBuf, String> {
     let root = state
         .paths
         .read()
@@ -394,7 +408,10 @@ mod tests {
         assert_eq!(second["created"], json!(false));
         assert_eq!(first["id"], second["id"]);
         assert_eq!(
-            list_workspaces(&root).unwrap()["workspaces"].as_array().unwrap().len(),
+            list_workspaces(&root).unwrap()["workspaces"]
+                .as_array()
+                .unwrap()
+                .len(),
             1,
         );
     }

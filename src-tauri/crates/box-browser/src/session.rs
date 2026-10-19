@@ -87,10 +87,10 @@ impl BrowserSession {
 
         let child = Command::new(browser)
             .arg("--headless=new")
-        // An explicit size, because the default folds pages that are not
-        // folded on a real screen and every listing built on this viewport then
-        // under-reports what the caller can see.
-        .arg(format!("--window-size={},{}", viewport.0, viewport.1))
+            // An explicit size, because the default folds pages that are not
+            // folded on a real screen and every listing built on this viewport then
+            // under-reports what the caller can see.
+            .arg(format!("--window-size={},{}", viewport.0, viewport.1))
             // 0 lets the OS pick a free port; we read it back from the file.
             .arg("--remote-debugging-port=0")
             .arg(format!("--user-data-dir={}", user_data_dir.display()))
@@ -215,7 +215,9 @@ impl BrowserSession {
                 .map_err(|error| format!("cannot read reply for {method}: {error}"))?;
             let text = match message {
                 Message::Text(text) => text,
-                Message::Close(_) => return Err(format!("browser closed the socket during {method}")),
+                Message::Close(_) => {
+                    return Err(format!("browser closed the socket during {method}"))
+                }
                 // Binary frames and pings carry no command reply.
                 _ => continue,
             };
@@ -310,7 +312,11 @@ fn wait_for_port(user_data_dir: &Path, child: &mut Child) -> Result<u16, String>
             return Err(format!("browser exited during startup ({status})"));
         }
         if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Some(port) = text.lines().next().and_then(|line| line.trim().parse().ok()) {
+            if let Some(port) = text
+                .lines()
+                .next()
+                .and_then(|line| line.trim().parse().ok())
+            {
                 return Ok(port);
             }
         }
@@ -462,11 +468,8 @@ fn read_chunked(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
         reader
             .read_line(&mut line)
             .map_err(|error| format!("cannot read chunk size: {error}"))?;
-        let size = usize::from_str_radix(
-            line.trim().split(';').next().unwrap_or("0").trim(),
-            16,
-        )
-        .map_err(|error| format!("bad chunk size {:?}: {error}", line.trim()))?;
+        let size = usize::from_str_radix(line.trim().split(';').next().unwrap_or("0").trim(), 16)
+            .map_err(|error| format!("bad chunk size {:?}: {error}", line.trim()))?;
         if size == 0 {
             break;
         }

@@ -83,6 +83,7 @@ frontend. Manual `cargo build` for release needs it explicitly.
 | `box-data-scheduler`       | Resource map and the durable removal queue |
 | `box-dsh-context`          | Patch YAML / context snapshot rendering |
 | `box-server-core`          | `dshboxd` helpers, service install |
+| `box-browser`              | Headless Chromium + DevTools sessions (page-debugging RPCs) |
 | `box-api`, `box-client`    | IPC + client adapter layer |
 | `dshboxd`                  | Sidecar binary (own crate) |
 

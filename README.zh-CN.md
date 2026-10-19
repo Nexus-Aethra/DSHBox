@@ -18,6 +18,7 @@ DSH Box 是一个用 [Tauri 2](https://tauri.app) 写的轻量桌面外壳，负
 - **插件依赖图** —— 加载了什么、按什么顺序、为什么：深度分层、宿主与浏览器半身分开绘制、可以把某一层折叠掉。
 - **资源：提取、注入、编辑** —— 会话、provider 密钥、插件状态，都是具名副本；一个 kind 可以跨文件，任意 YAML 片段按 key 路径编辑。
 - **面向 agent** —— `dshbox apply -f` 用一份文档配置资源，所有动词支持 `--json`，容器文件可按 key 路径树读取。
+- **容器里的 agent** —— `dsh-box-sandbox` 插件给容器内的 agent 一组带类型的 `box_*` 工具，让它驱动装着自己的那个 box，不需要 shell，也不需要往里装东西。
 - **零依赖安装** —— 自带 Node、npm、pnpm 与 Git（Windows），运行在干净环境里。
 - **内置版本管理** —— 安装任意 Harness tag，按容器固定版本。
 - **boxfile** —— `FROM` + `ADD` 描述一个模板；构建一次，多次运行。
@@ -92,7 +93,7 @@ DSH Box 拆成 Tauri **桌面外壳**、一个不依赖框架的 Rust workspace�
 | 前端（React 18 + Vite，`src/`） | 页面、组件、`useTaskQueue`/`useContainers`/`useResources`/`useSettings` 等 hook。**没有业务逻辑**——页面只发 RPC 并对 daemon 的 SSE 事件做出反应。 | 让 Box 界面保持轻薄，并让任何客户端（界面/CLI/agent）共用同一条代码路径。 |
 | 桌面外壳（Tauri 2，`src-tauri/src/`） | 浏览器窗口、托盘、Tauri IPC 适配层。通过 loopback HTTP 与 daemon 通信。所有实际工作都交给 `dshboxd`。 | 状态变更只有一个源头，界面与 CLI 不会各自漂移。 |
 | Daemon（`src-tauri/crates/dshboxd`） | 常驻后台服务。拥有任务队列、文档存储、模板索引、容器注册表和 SSE 事件总线。单一 HTTP 入口（`POST /rpc`）加 `GET /events?token=…`。 | 安装、重建、卸载等后台工作不会随窗口关闭而中断。 |
-| Crate workspace（`src-tauri/crates/`） | 不依赖框架的 Rust crate：`box-foundation`、`box-runtime`、`box-scheduler`、`box-state`、`box-toolchains`、`box-dsh-versions`、`box-containers`、`box-extensions`、`box-image`、`box-template-core`、`box-data-scheduler`、`box-logger`、`box-dsh-context`、`box-server-core`、`box-api`、`box-client`。 | 纯函数 + 单元测试；只有顶层 `dshbox` 与 `dshboxd` 链接 Tauri/HTTP。 |
+| Crate workspace（`src-tauri/crates/`） | 不依赖框架的 Rust crate：`box-foundation`、`box-runtime`、`box-scheduler`、`box-state`、`box-toolchains`、`box-dsh-versions`、`box-containers`、`box-extensions`、`box-image`、`box-template-core`、`box-data-scheduler`、`box-logger`、`box-dsh-context`、`box-server-core`、`box-browser`、`box-api`、`box-client`。 | 纯函数 + 单元测试；只有顶层 `dshbox` 与 `dshboxd` 链接 Tauri/HTTP。 |
 
 依赖方向是单向的：`foundation / runtime / scheduler / state` → 功能 crate → Tauri/桌面适配层。功能 crate 不依赖 Tauri，也不依赖彼此的易变状态。
 
@@ -213,7 +214,7 @@ dshbox container resource write <id> profile/settings.yaml --section llm-pi-ai.p
 
 ### 用 agent 驱动
 
-CLI 是给 agent 的界面，界面是给人的界面，所以 agent 需要的动词都是非交互、可机读的。
+有两个界面，因为 agent 有两种。一种有 shell，从外面驱动 box；另一种跑在容器**里面**，根本没有 shell。CLI 是前一种的界面，界面是给人的界面，所以 agent 需要的动词都是非交互、可机读的。
 
 `dshbox apply -f <file>` 吃一份文档，让资源层与之一致：
 
@@ -239,6 +240,20 @@ dshbox container resource read <id> profile/settings.yaml --json
 ```
 
 `dshbox help`、`dshbox container resource help`、`dshbox apply help` 不需要界面就能说明每个动词。
+
+#### 给容器内 agent 的插件
+
+`@nexus-aethra/dsh-box-sandbox` 是一个宿主侧插件，在它运行的 DSH 宿主上注册 21 个 `box_*` 工具。于是容器里的 agent 就能驱动装着自己的那个 box——不需要 shell、不需要第二条连接、不需要在容器里装任何东西。从**资源 → 插件**的资源库导入，或直接装进 profile：
+
+```bash
+pnpm add @nexus-aethra/dsh-box-sandbox
+```
+
+也可以按容器从资源库安装：`dshbox plugin install <container> @nexus-aethra/dsh-box-sandbox`。
+
+它通过 box 启动时写下的 discovery 记录找到后台服务：端口和 token 每次启动重新生成，所以重启对插件是透明的。所有调用都走 CLI 和界面共用的那条 loopback `POST /rpc`，任务进度来自同一条 SSE 流。
+
+其中 11 个工具驱动 box 本身——`box_overview`、`box_lifecycle`、`box_build`、`box_create`、`box_templates`、`box_plugins`、`box_resources`、`box_workspace`、`box_settings`、`box_task`、`box_set_viewport`。另外 10 个在无头浏览器里调试页面——`box_page_text` 列出屏幕上有什么，`box_click_element`、`box_type_text`、`box_press_key`、`box_scroll`、`box_click_at`、`box_close`、`box_screenshot`、`box_set_browser`、`box_console`。设置面板里挂着同一份清单，写 agent 的人和读它看到的是同一套描述。
 
 ### 持久化与引用计数
 
@@ -330,9 +345,11 @@ src-tauri/                 Rust workspace + Tauri 外壳
     box-logger             tracing 初始化与按天滚动日志
     box-dsh-context        dsh-box-context 插件（paths.dshboxHome/dshboxCli）
     box-server-core        dshboxd 辅助 + 服务安装
+    box-browser            无头 Chromium + DevTools 会话
     box-api, box-client    RPC 面 + 客户端适配
   src/desktop/app/         领域模块（containers、extensions、tasks……）
   tools/runtime-packager   捆绑 Node/pnpm/Git 运行时打包器
+plugins/                   dsh-box-sandbox —— agent 工具插件
 examples/                  boxfile.dsh + plugin-chains 示例
 docs/                      template-system.md、specs/、design/、notes/、
                            releases/、images/

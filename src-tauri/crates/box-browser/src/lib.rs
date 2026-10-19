@@ -71,6 +71,7 @@ pub struct BrowserCandidate {
 /// `\\` and `/`. It resolves correctly, but these paths are handed to agents
 /// over RPC and pasted back into commands, so they are normalised here
 /// instead of leaking mixed separators into every diagnostic.
+#[cfg(windows)]
 fn sub(root: &Path, relative: &str) -> PathBuf {
     let mut path = root.to_path_buf();
     for part in relative.split('/').filter(|part| !part.is_empty()) {
@@ -79,6 +80,7 @@ fn sub(root: &Path, relative: &str) -> PathBuf {
     path
 }
 
+#[cfg(windows)]
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key)
         .filter(|value| !value.is_empty())
@@ -146,9 +148,15 @@ fn well_known() -> Vec<(BrowserKind, PathBuf)> {
             PathBuf::from("/usr/bin/microsoft-edge-stable"),
         ),
         (BrowserKind::Chrome, PathBuf::from("/usr/bin/google-chrome")),
-        (BrowserKind::Chrome, PathBuf::from("/opt/google/chrome/chrome")),
+        (
+            BrowserKind::Chrome,
+            PathBuf::from("/opt/google/chrome/chrome"),
+        ),
         (BrowserKind::Chromium, PathBuf::from("/usr/bin/chromium")),
-        (BrowserKind::Chromium, PathBuf::from("/usr/bin/chromium-browser")),
+        (
+            BrowserKind::Chromium,
+            PathBuf::from("/usr/bin/chromium-browser"),
+        ),
         (
             BrowserKind::Chrome,
             PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
@@ -214,9 +222,7 @@ pub fn validate_browser_path(path: &str) -> Result<PathBuf, String> {
     }
     let candidate = PathBuf::from(trimmed);
     if !candidate.is_absolute() {
-        return Err(format!(
-            "browser path must be absolute, got {trimmed}"
-        ));
+        return Err(format!("browser path must be absolute, got {trimmed}"));
     }
     if !candidate.is_file() {
         return Err(format!("no browser executable at {trimmed}"));
@@ -241,10 +247,7 @@ pub fn resolve(configured: Option<&str>) -> Result<BrowserCandidate, String> {
     }
 
     let found = discover();
-    found
-        .into_iter()
-        .next()
-        .ok_or_else(no_browser_message)
+    found.into_iter().next().ok_or_else(no_browser_message)
 }
 
 fn no_browser_message() -> String {
@@ -263,7 +266,9 @@ mod tests {
     #[test]
     fn classifies_by_file_name() {
         assert_eq!(
-            classify(Path::new(r"C:Program Files (x86)MicrosoftEdgeApplicationmsedge.exe")),
+            classify(Path::new(
+                r"C:Program Files (x86)MicrosoftEdgeApplicationmsedge.exe"
+            )),
             BrowserKind::Edge
         );
         assert_eq!(
@@ -287,7 +292,10 @@ mod tests {
 
     #[test]
     fn missing_configured_path_is_an_error_not_a_fallback() {
-        let err = resolve(Some("C:/definitely/not/a/browser.exe")).unwrap_err();
+        // A path that is absolute on every platform, so the test exercises the
+        // missing-file branch rather than the absolute-path one.
+        let absent = std::env::temp_dir().join("definitely-not-a-browser.exe");
+        let err = resolve(Some(&absent.display().to_string())).unwrap_err();
         assert!(err.contains("no browser executable"), "unexpected: {err}");
     }
 

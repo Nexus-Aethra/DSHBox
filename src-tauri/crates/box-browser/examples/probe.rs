@@ -30,7 +30,11 @@ fn evaluate(session: &mut BrowserSession, expression: &str) -> String {
 fn main() {
     let browser = match resolve(None) {
         Ok(candidate) => {
-            println!("browser: {} ({})", candidate.path.display(), candidate.kind.as_str());
+            println!(
+                "browser: {} ({})",
+                candidate.path.display(),
+                candidate.kind.as_str()
+            );
             candidate.path
         }
         Err(error) => {
@@ -46,31 +50,56 @@ fn main() {
     let url = format!("file:///{}", page.display().to_string().replace('\\', "/"));
 
     println!("launching headless on {url}");
-    let mut session = match BrowserSession::launch(&browser, &url, scratch.join("profile"), BrowserSession::DEFAULT_VIEWPORT) {
+    let mut session = match BrowserSession::launch(
+        &browser,
+        &url,
+        scratch.join("profile"),
+        BrowserSession::DEFAULT_VIEWPORT,
+    ) {
         Ok(session) => session,
         Err(error) => {
             eprintln!("FAIL launch: {error}");
             std::process::exit(1);
         }
     };
-    println!("attached on devtools port {} target {}", session.port(), session.target_id());
+    println!(
+        "attached on devtools port {} target {}",
+        session.port(),
+        session.target_id()
+    );
 
     println!("1) query  : {}", evaluate(&mut session, "document.title"));
-    println!("        : {}", evaluate(&mut session, "document.querySelectorAll('.row').length + ' rows'"));
+    println!(
+        "        : {}",
+        evaluate(
+            &mut session,
+            "document.querySelectorAll('.row').length + ' rows'"
+        )
+    );
 
-    let shot = session.call("Page.captureScreenshot", json!({ "format": "png" })).expect("shot");
-    println!("2) shot   : {} bytes base64 png", shot["data"].as_str().unwrap_or("").len());
+    let shot = session
+        .call("Page.captureScreenshot", json!({ "format": "png" }))
+        .expect("shot");
+    println!(
+        "2) shot   : {} bytes base64 png",
+        shot["data"].as_str().unwrap_or("").len()
+    );
 
-    let rect_json = evaluate(&mut session, "JSON.stringify(document.getElementById('btn').getBoundingClientRect())");
+    let rect_json = evaluate(
+        &mut session,
+        "JSON.stringify(document.getElementById('btn').getBoundingClientRect())",
+    );
     let rect: serde_json::Value = serde_json::from_str(&rect_json).expect("rect");
     let cx = rect["x"].as_f64().unwrap_or(0.0) + rect["width"].as_f64().unwrap_or(0.0) / 2.0;
     let cy = rect["y"].as_f64().unwrap_or(0.0) + rect["height"].as_f64().unwrap_or(0.0) / 2.0;
     println!("3) click  : element centre ({cx}, {cy})");
     for kind in ["mousePressed", "mouseReleased"] {
-        session.call(
-            "Input.dispatchMouseEvent",
-            json!({ "type": kind, "x": cx, "y": cy, "button": "left", "clickCount": 1 }),
-        ).expect("element click");
+        session
+            .call(
+                "Input.dispatchMouseEvent",
+                json!({ "type": kind, "x": cx, "y": cy, "button": "left", "clickCount": 1 }),
+            )
+            .expect("element click");
     }
 
     println!("4) click  : coordinate (7, 7)");

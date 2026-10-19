@@ -19,7 +19,11 @@ fn main() {
     }
 
     match box_browser::resolve(None) {
-        Ok(chosen) => println!("\nresolved -> {} ({})", chosen.path.display(), chosen.kind.as_str()),
+        Ok(chosen) => println!(
+            "\nresolved -> {} ({})",
+            chosen.path.display(),
+            chosen.kind.as_str()
+        ),
         Err(error) => println!("\nresolve failed: {error}"),
     }
 }

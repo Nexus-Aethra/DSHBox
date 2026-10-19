@@ -34,9 +34,7 @@ const MAX_TEXT: usize = 160;
 /// Per-container browser sessions, keyed by container id.
 pub(crate) type Sessions = BTreeMap<String, BrowserSession>;
 
-fn lock_sessions(
-    state: &DaemonState,
-) -> Result<std::sync::MutexGuard<'_, Sessions>, String> {
+fn lock_sessions(state: &DaemonState) -> Result<std::sync::MutexGuard<'_, Sessions>, String> {
     state
         .browser
         .lock()
@@ -177,8 +175,14 @@ pub(crate) fn open_rpc(state: &DaemonState, request: &Value) -> Result<Value, St
     // A caller may ask for a size on open; otherwise the browser's default
     // 800x600 applies, which folds pages that are not folded on a real screen.
     let viewport = (
-        request["width"].as_u64().filter(|value| *value > 0).unwrap_or(BrowserSession::DEFAULT_VIEWPORT.0 as u64),
-        request["height"].as_u64().filter(|value| *value > 0).unwrap_or(BrowserSession::DEFAULT_VIEWPORT.1 as u64),
+        request["width"]
+            .as_u64()
+            .filter(|value| *value > 0)
+            .unwrap_or(BrowserSession::DEFAULT_VIEWPORT.0 as u64),
+        request["height"]
+            .as_u64()
+            .filter(|value| *value > 0)
+            .unwrap_or(BrowserSession::DEFAULT_VIEWPORT.1 as u64),
     );
     let session = BrowserSession::launch(
         &browser.path,
@@ -221,15 +225,12 @@ pub(crate) fn close_rpc(state: &DaemonState, request: &Value) -> Result<Value, S
 pub(crate) fn console_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
     // Chrome's own level names, plus the two the console API adds that are not
     // levels at all but arrive on the same channel.
-    let wanted: Option<Vec<String>> = request
-        .get("levels")
-        .and_then(Value::as_array)
-        .map(|list| {
-            list.iter()
-                .filter_map(Value::as_str)
-                .map(|level| level.to_owned())
-                .collect()
-        });
+    let wanted: Option<Vec<String>> = request.get("levels").and_then(Value::as_array).map(|list| {
+        list.iter()
+            .filter_map(Value::as_str)
+            .map(|level| level.to_owned())
+            .collect()
+    });
     let limit = request
         .get("limit")
         .and_then(Value::as_u64)
@@ -249,11 +250,7 @@ pub(crate) fn console_rpc(state: &DaemonState, request: &Value) -> Result<Value,
                 for arg in params["args"].as_array().cloned().unwrap_or_default() {
                     parts.push(render_remote_object(&arg));
                 }
-                (
-                    level,
-                    parts.join(" "),
-                    first_frame(&params["stackTrace"]),
-                )
+                (level, parts.join(" "), first_frame(&params["stackTrace"]))
             }
             "Runtime.exceptionThrown" => {
                 let details = &params["exceptionDetails"];
@@ -292,7 +289,10 @@ pub(crate) fn console_rpc(state: &DaemonState, request: &Value) -> Result<Value,
         let level = entry["level"].as_str().unwrap_or("").to_owned();
         let text = entry["text"].as_str().unwrap_or("").to_owned();
         let source = entry["source"].as_str().map(str::to_owned);
-        match counts.iter_mut().find(|(l, t, s, _)| *l == level && *t == text && *s == source) {
+        match counts
+            .iter_mut()
+            .find(|(l, t, s, _)| *l == level && *t == text && *s == source)
+        {
             Some((_, _, _, count)) => *count += 1,
             None => counts.push((level, text, source, 1)),
         }
@@ -527,10 +527,7 @@ fn parse_elements(value: Value) -> Result<Vec<Value>, String> {
 }
 
 /// List the page elements matching a CSS selector.
-pub(crate) fn query_elements_rpc(
-    state: &DaemonState,
-    request: &Value,
-) -> Result<Value, String> {
+pub(crate) fn query_elements_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
     let selector = request["selector"].as_str().unwrap_or("body").to_owned();
     if selector.trim().is_empty() {
         return Err("selector must not be empty".to_owned());
@@ -602,7 +599,9 @@ pub(crate) fn click_element_rpc(state: &DaemonState, request: &Value) -> Result<
     // Hit-test first: a click dispatched onto whatever covers the target is
     // not the click the caller asked for, and reporting it as one is how an
     // agent spends a turn wondering why the page did not change.
-    let hit = with_session(state, request, |session| run_hit_test(session, x, y, Some(&selector)))?;
+    let hit = with_session(state, request, |session| {
+        run_hit_test(session, x, y, Some(&selector))
+    })?;
     with_session(state, request, |session| dispatch_click(session, x, y))?;
     Ok(click_response(
         json!({
@@ -638,7 +637,10 @@ fn scroll_node_into_view(
     session: &mut BrowserSession,
     backend_node_id: i64,
 ) -> Result<(f64, f64, f64, f64), String> {
-    let resolved = session.call("DOM.resolveNode", json!({ "backendNodeId": backend_node_id }))?;
+    let resolved = session.call(
+        "DOM.resolveNode",
+        json!({ "backendNodeId": backend_node_id }),
+    )?;
     let Some(object) = resolved["object"]["objectId"].as_str().map(str::to_owned) else {
         return backend_node_rect(session, backend_node_id);
     };
@@ -732,7 +734,11 @@ fn near_miss_names(tree: &Value, wanted: &str, limit: usize) -> Vec<String> {
     }
     close.sort_by(|a, b| a.0.cmp(&b.0));
     close.dedup_by(|a, b| a.1 == b.1);
-    close.into_iter().take(limit).map(|(_, entry)| entry).collect()
+    close
+        .into_iter()
+        .take(limit)
+        .map(|(_, entry)| entry)
+        .collect()
 }
 /// Click the control identified by the role and name a page listing reported.
 ///
@@ -757,7 +763,10 @@ pub(crate) fn click_by_name_rpc(state: &DaemonState, request: &Value) -> Result<
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase);
-    let nth = request.get("nth").and_then(Value::as_u64).map(|n| n as usize);
+    let nth = request
+        .get("nth")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
     // Same scoping page_text offers, so a name that exists twice can still be
     // acted on without counting matches by hand.
     let within_name = request
@@ -769,7 +778,9 @@ pub(crate) fn click_by_name_rpc(state: &DaemonState, request: &Value) -> Result<
     let (x, y, matched) = with_session(state, request, |session| {
         let tree = session
             .call("Accessibility.getFullAXTree", json!({}))
-            .map_err(|error| format!("accessibility tree is unavailable on this target: {error}"))?;
+            .map_err(|error| {
+                format!("accessibility tree is unavailable on this target: {error}")
+            })?;
         let mut parent_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         for node in tree["nodes"].as_array().into_iter().flatten() {
             if let (Some(id), Some(parent)) = (node["nodeId"].as_str(), node["parentId"].as_str()) {
@@ -799,7 +810,10 @@ pub(crate) fn click_by_name_rpc(state: &DaemonState, request: &Value) -> Result<
                 .flatten()
                 .filter_map(|node| {
                     let id = node["nodeId"].as_str()?;
-                    let node_name = node["name"]["value"].as_str().unwrap_or("").to_ascii_lowercase();
+                    let node_name = node["name"]["value"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
                     (node_name == wanted).then(|| chain_of(id))
                 })
                 .min_by_key(Vec::len)
@@ -883,7 +897,11 @@ pub(crate) fn click_by_name_rpc(state: &DaemonState, request: &Value) -> Result<
                 unplaceable.push(node_role.clone());
                 continue;
             }
-            found.push((rx + width / 2.0, ry + height / 2.0, format!("{} {:?}", node_role, node_name)));
+            found.push((
+                rx + width / 2.0,
+                ry + height / 2.0,
+                format!("{} {:?}", node_role, node_name),
+            ));
         }
         if found.is_empty() {
             // Distinguish "no such control" from "it is not in the scope you
@@ -922,14 +940,18 @@ pub(crate) fn click_by_name_rpc(state: &DaemonState, request: &Value) -> Result<
             let measured: Value = serde_json::from_str(text)
                 .map_err(|error| format!("cannot parse dom probe result: {error}"))?;
             if !measured.is_null() {
-                let cx = measured["x"].as_f64().unwrap_or(0.0) + measured["w"].as_f64().unwrap_or(0.0) / 2.0;
-                let cy = measured["y"].as_f64().unwrap_or(0.0) + measured["h"].as_f64().unwrap_or(0.0) / 2.0;
+                let cx = measured["x"].as_f64().unwrap_or(0.0)
+                    + measured["w"].as_f64().unwrap_or(0.0) / 2.0;
+                let cy = measured["y"].as_f64().unwrap_or(0.0)
+                    + measured["h"].as_f64().unwrap_or(0.0) / 2.0;
                 return Ok((
                     cx,
                     cy,
-                    format!("{} {:?} (found by text, absent from the accessibility tree)",
+                    format!(
+                        "{} {:?} (found by text, absent from the accessibility tree)",
                         measured["tag"].as_str().unwrap_or("element"),
-                        name),
+                        name
+                    ),
                 ));
             }
             // Offer the near misses with the failure. A caller who typed a
@@ -955,7 +977,11 @@ pub(crate) fn click_by_name_rpc(state: &DaemonState, request: &Value) -> Result<
                     "{:?} matches {} things: {} -- pass nth to pick one, or within to scope it",
                     name,
                     found.len(),
-                    found.iter().map(|entry| entry.2.clone()).collect::<Vec<_>>().join(", ")
+                    found
+                        .iter()
+                        .map(|entry| entry.2.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
         };
@@ -1009,22 +1035,102 @@ struct KeySpec {
 
 fn key_spec(name: &str) -> Option<KeySpec> {
     let spec = match name {
-        "Enter" | "submit" | "return" => KeySpec { key: "Enter", code: "Enter", key_code: 13, text: Some("\r") },
-        "Tab" => KeySpec { key: "Tab", code: "Tab", key_code: 9, text: Some("\t") },
-        "Escape" | "esc" => KeySpec { key: "Escape", code: "Escape", key_code: 27, text: None },
-        "Backspace" => KeySpec { key: "Backspace", code: "Backspace", key_code: 8, text: None },
-        "Delete" | "del" => KeySpec { key: "Delete", code: "Delete", key_code: 46, text: None },
-        "ArrowUp" | "up" => KeySpec { key: "ArrowUp", code: "ArrowUp", key_code: 38, text: None },
-        "ArrowDown" | "down" => KeySpec { key: "ArrowDown", code: "ArrowDown", key_code: 40, text: None },
-        "ArrowLeft" => KeySpec { key: "ArrowLeft", code: "ArrowLeft", key_code: 37, text: None },
-        "ArrowRight" => KeySpec { key: "ArrowRight", code: "ArrowRight", key_code: 39, text: None },
-        "Home" => KeySpec { key: "Home", code: "Home", key_code: 36, text: None },
-        "End" => KeySpec { key: "End", code: "End", key_code: 35, text: None },
-        "PageUp" => KeySpec { key: "PageUp", code: "PageUp", key_code: 33, text: None },
-        "PageDown" => KeySpec { key: "PageDown", code: "PageDown", key_code: 34, text: None },
-        "Shift" => KeySpec { key: "Shift", code: "ShiftLeft", key_code: 16, text: None },
-        "Control" | "ctrl" => KeySpec { key: "Control", code: "ControlLeft", key_code: 17, text: None },
-        "Alt" => KeySpec { key: "Alt", code: "AltLeft", key_code: 18, text: None },
+        "Enter" | "submit" | "return" => KeySpec {
+            key: "Enter",
+            code: "Enter",
+            key_code: 13,
+            text: Some("\r"),
+        },
+        "Tab" => KeySpec {
+            key: "Tab",
+            code: "Tab",
+            key_code: 9,
+            text: Some("\t"),
+        },
+        "Escape" | "esc" => KeySpec {
+            key: "Escape",
+            code: "Escape",
+            key_code: 27,
+            text: None,
+        },
+        "Backspace" => KeySpec {
+            key: "Backspace",
+            code: "Backspace",
+            key_code: 8,
+            text: None,
+        },
+        "Delete" | "del" => KeySpec {
+            key: "Delete",
+            code: "Delete",
+            key_code: 46,
+            text: None,
+        },
+        "ArrowUp" | "up" => KeySpec {
+            key: "ArrowUp",
+            code: "ArrowUp",
+            key_code: 38,
+            text: None,
+        },
+        "ArrowDown" | "down" => KeySpec {
+            key: "ArrowDown",
+            code: "ArrowDown",
+            key_code: 40,
+            text: None,
+        },
+        "ArrowLeft" => KeySpec {
+            key: "ArrowLeft",
+            code: "ArrowLeft",
+            key_code: 37,
+            text: None,
+        },
+        "ArrowRight" => KeySpec {
+            key: "ArrowRight",
+            code: "ArrowRight",
+            key_code: 39,
+            text: None,
+        },
+        "Home" => KeySpec {
+            key: "Home",
+            code: "Home",
+            key_code: 36,
+            text: None,
+        },
+        "End" => KeySpec {
+            key: "End",
+            code: "End",
+            key_code: 35,
+            text: None,
+        },
+        "PageUp" => KeySpec {
+            key: "PageUp",
+            code: "PageUp",
+            key_code: 33,
+            text: None,
+        },
+        "PageDown" => KeySpec {
+            key: "PageDown",
+            code: "PageDown",
+            key_code: 34,
+            text: None,
+        },
+        "Shift" => KeySpec {
+            key: "Shift",
+            code: "ShiftLeft",
+            key_code: 16,
+            text: None,
+        },
+        "Control" | "ctrl" => KeySpec {
+            key: "Control",
+            code: "ControlLeft",
+            key_code: 17,
+            text: None,
+        },
+        "Alt" => KeySpec {
+            key: "Alt",
+            code: "AltLeft",
+            key_code: 18,
+            text: None,
+        },
         _ => return None,
     };
     Some(spec)
@@ -1037,7 +1143,8 @@ fn key_spec(name: &str) -> Option<KeySpec> {
 /// for the form to hear about it.
 pub(crate) fn press_key_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
     let name = request["key"].as_str().unwrap_or("").trim().to_owned();
-    let spec = key_spec(&name).ok_or_else(|| format!("press_key does not know the key {name:?}"))?;
+    let spec =
+        key_spec(&name).ok_or_else(|| format!("press_key does not know the key {name:?}"))?;
     with_session(state, request, |session| {
         let mut down = json!({
             "type": "keyDown",
@@ -1148,10 +1255,7 @@ fn viewport_metrics(session: &mut BrowserSession) -> Result<Viewport, String> {
     let visual = &metrics["cssVisualViewport"];
     let layout = &metrics["cssLayoutViewport"];
     let number = |value: &Value, fallback: &Value| -> f64 {
-        value
-            .as_f64()
-            .or_else(|| fallback.as_f64())
-            .unwrap_or(0.0)
+        value.as_f64().or_else(|| fallback.as_f64()).unwrap_or(0.0)
     };
     Ok(Viewport {
         width: number(&visual["clientWidth"], &layout["clientWidth"]),
@@ -1392,11 +1496,7 @@ pub(crate) fn page_text_rpc(state: &DaemonState, request: &Value) -> Result<Valu
         // text that repeats nothing is a message in its own right.
         let control_names: Vec<String> = elements
             .iter()
-            .filter(|entry| {
-                entry["role"]
-                    .as_str()
-                    .is_some_and(is_clickable_role)
-            })
+            .filter(|entry| entry["role"].as_str().is_some_and(is_clickable_role))
             .filter_map(|entry| entry["name"].as_str().map(str::to_ascii_lowercase))
             .collect();
         if !control_names.is_empty() {
@@ -1430,9 +1530,9 @@ pub(crate) fn page_text_rpc(state: &DaemonState, request: &Value) -> Result<Valu
             let scope_node = named_chain
                 .iter()
                 .find(|candidate| {
-                    ancestry.iter().any(|chain| {
-                        chain.iter().skip(1).any(|ancestor| ancestor == *candidate)
-                    })
+                    ancestry
+                        .iter()
+                        .any(|chain| chain.iter().skip(1).any(|ancestor| ancestor == *candidate))
                 })
                 .cloned()
                 .unwrap_or_else(|| named_chain[0].clone());
@@ -1572,18 +1672,13 @@ struct HitTest {
 /// click, while an overlay on top of it is a different one.
 fn hit_test_js(x: f64, y: f64, selector: Option<&str>) -> String {
     let target_check = match selector {
-        Some(_) => {
-            "var target = document.querySelector(SELECTOR);"
-                .to_owned()
-        }
+        Some(_) => "var target = document.querySelector(SELECTOR);".to_owned(),
         None => "var target = null;".to_owned(),
     };
     let comparison = match selector {
-        Some(_) => {
-            r#"out.landed = !!hit && !!target
+        Some(_) => r#"out.landed = !!hit && !!target
                  && (target === hit || target.contains(hit) || hit.contains(target));"#
-                .to_owned()
-        }
+            .to_owned(),
         None => "out.landed = !!hit;".to_owned(),
     };
     let selector_literal = match selector {
@@ -1706,7 +1801,11 @@ mod tests {
     fn standalone_text_is_listed_but_a_controls_own_label_is_not() {
         // A validation message is the only thing on screen explaining why a
         // button did nothing, so it has to survive as text of its own.
-        assert!(is_listable_text("StaticText", "at least one model is required", false));
+        assert!(is_listable_text(
+            "StaticText",
+            "at least one model is required",
+            false
+        ));
         // The same words inside a button are already carried by the button's
         // name; listing them again just buries everything else.
         assert!(!is_listable_text("StaticText", "Save", true));
@@ -1728,9 +1827,16 @@ mod tests {
             ]
         });
         let near = near_miss_names(&tree, "Model ID", 8);
-        assert_eq!(near.first().map(String::as_str), Some("textbox \"Model ID 1\""), "{near:?}");
+        assert_eq!(
+            near.first().map(String::as_str),
+            Some("textbox \"Model ID 1\""),
+            "{near:?}"
+        );
         // Unrelated names stay out of the answer entirely.
-        assert!(!near.iter().any(|entry| entry.contains("Provider ID")), "{near:?}");
+        assert!(
+            !near.iter().any(|entry| entry.contains("Provider ID")),
+            "{near:?}"
+        );
     }
 
     #[test]
@@ -1750,7 +1856,10 @@ mod tests {
         }
         // Chrome emits "Button"; a lowercase compare would report every
         // button on the page as unclickable.
-        assert!(!is_clickable_role("Button"), "canonical case is not matched");
+        assert!(
+            !is_clickable_role("Button"),
+            "canonical case is not matched"
+        );
         for role in ["heading", "paragraph", "image", "list"] {
             assert!(!is_clickable_role(role), "{role} must not be clickable");
         }
@@ -1803,7 +1912,10 @@ mod tests {
         assert_eq!(quad_bounds(&[]), None);
         // A non-finite coordinate would poison the min/max and poison every
         // click derived from it.
-        assert_eq!(quad_bounds(&[f64::NAN, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0]), None);
+        assert_eq!(
+            quad_bounds(&[f64::NAN, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0]),
+            None
+        );
     }
     #[test]
     fn hit_test_js_never_splices_a_selector_into_script() {
@@ -1818,7 +1930,6 @@ mod tests {
         // A click with no intended element must not smuggle a selector in.
         assert!(!hit_test_js(1.0, 2.0, None).contains("querySelector(\\\""));
     }
-
 }
 /// `debug_set_viewport` — resize a session's page, and report the size now in effect.
 ///

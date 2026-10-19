@@ -13,8 +13,8 @@ const COPY = {
     agentGuideCopy: 'Copy',
     agentGuideCopied: 'Copied',
     agentGuideToolsTitle: 'What the agent gets',
-    agentGuideToolsPage: 'Debugging a page (9)',
-    agentGuideToolsPageNote: 'box_page_text, box_click_element, box_type_text, box_press_key, box_scroll, box_click_at, box_screenshot, box_set_browser, box_close',
+    agentGuideToolsPage: 'Debugging a page (10)',
+    agentGuideToolsPageNote: 'box_page_text, box_click_element, box_type_text, box_press_key, box_scroll, box_click_at, box_screenshot, box_set_browser, box_close, box_console',
     agentGuideToolsManage: 'Driving the box (11)',
     agentGuideToolsManageNote: 'box_lifecycle, box_overview, box_resources, box_build, box_workspace, box_set_viewport, box_task, box_plugins, box_create, box_templates, box_settings',
     daemonBuildStale: (running: string, client: string) =>
@@ -249,8 +249,8 @@ const COPY = {
     agentGuideCopy: '复制',
     agentGuideCopied: '已复制',
     agentGuideToolsTitle: '装上之后 agent 拿到什么',
-    agentGuideToolsPage: '调试一个页面(9 个)',
-    agentGuideToolsPageNote: 'box_page_text、box_click_element、box_type_text、box_press_key、box_scroll、box_click_at、box_screenshot、box_set_browser、box_close',
+    agentGuideToolsPage: '调试一个页面(10 个)',
+    agentGuideToolsPageNote: 'box_page_text、box_click_element、box_type_text、box_press_key、box_scroll、box_click_at、box_screenshot、box_set_browser、box_close、box_console',
     agentGuideToolsManage: '驱动 box 本身(11 个)',
     agentGuideToolsManageNote: 'box_lifecycle、box_overview、box_resources、box_build、box_workspace、box_set_viewport、box_task、box_plugins、box_create、box_templates、box_settings',
     daemonBuildStale: (running: string, client: string) =>

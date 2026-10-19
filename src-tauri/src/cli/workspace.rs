@@ -102,7 +102,10 @@ fn list(id: &str, flags: &Flags) -> Result<(), String> {
     let client = rpc::connect()?;
     let value = rpc::call(&client, "list_container_workspaces", json!({ "id": id }))?;
     if flags.has("json") {
-        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        );
         return Ok(());
     }
     let rows = value["workspaces"].as_array().cloned().unwrap_or_default();
@@ -151,7 +154,10 @@ fn add(id: &str, flags: &Flags) -> Result<(), String> {
         rpc::run_task(&client, "enqueue_container_start", json!({ "id": id }))?;
     }
     if flags.has("json") {
-        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        );
         return Ok(());
     }
     let verb = if value["created"].as_bool().unwrap_or(false) {

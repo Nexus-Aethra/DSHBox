@@ -4,6 +4,7 @@
 //! terminated, preventing zombies/orphans on both Windows and Unix.
 
 use std::{
+    io::Read,
     process::{Child, ExitStatus},
     sync::OnceLock,
     thread,
