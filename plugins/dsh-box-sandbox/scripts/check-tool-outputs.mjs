@@ -168,6 +168,7 @@ const ARGS = {
   box_workspace: { action: 'list', containerId },
   box_set_browser: {},
   box_page_text: { containerId, limit: 3 },
+  box_screenshot: { containerId },
   box_scroll: { containerId },
   box_type_text: { containerId, text: 'probe' },
   box_console: { containerId },
@@ -177,13 +178,17 @@ const ARGS = {
   box_close: { containerId },
 }
 
-// These two cannot be driven from outside the host, and pretending otherwise
-// turns a harness limitation into a reported tool failure. box_screenshot
-// writes through the Tauri IPC bridge, which does not exist in a bare node
-// process. box_click_element needs a control the page currently shows, and a
+// A tool listed here is one this harness cannot drive, and pretending
+// otherwise turns a harness limitation into a reported tool failure.
+// box_click_element needs a control the page is currently showing, and a
 // previous run may have opened the settings dialog that owns the name.
+//
+// box_screenshot used to be here as well: it wrote the PNG through the Tauri
+// IPC attachment bridge, which a bare node process has no way to provide. It
+// now asks the daemon to write a file and reports the path, so it runs here
+// like any other tool -- and the one tool nobody could check stopped being the
+// one tool nobody checked.
 const SKIP = new Map([
-  ['box_screenshot', 'writes through the Tauri IPC bridge, which a bare node process has no way to provide'],
   ['box_click_element', 'needs a control the page is currently showing; probe by hand if you need this one'],
 ])
 

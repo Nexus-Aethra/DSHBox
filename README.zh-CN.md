@@ -258,7 +258,7 @@ pnpm add @nexus-aethra/dsh-box-sandbox
 
 它通过 box 启动时写下的 discovery 记录找到后台服务：端口和 token 每次启动重新生成，所以重启对插件是透明的。所有调用都走 CLI 和界面共用的那条 loopback `POST /rpc`，任务进度来自同一条 SSE 流。
 
-其中 11 个工具驱动 box 本身——`box_overview`、`box_lifecycle`、`box_build`、`box_create`、`box_templates`、`box_plugins`、`box_resources`、`box_workspace`、`box_settings`、`box_task`、`box_set_viewport`。另外 10 个在无头浏览器里调试页面——`box_page_text` 列出屏幕上有什么，`box_click_element`、`box_type_text`、`box_press_key`、`box_scroll`、`box_click_at`、`box_close`、`box_screenshot`、`box_set_browser`、`box_console`。设置面板里挂着同一份清单，写 agent 的人和读它看到的是同一套描述。
+其中 11 个工具驱动 box 本身——`box_overview`、`box_lifecycle`、`box_build`、`box_create`、`box_templates`、`box_plugins`、`box_resources`、`box_workspace`、`box_settings`、`box_task`、`box_set_viewport`。另外 10 个在无头浏览器里调试页面——`box_page_text` 列出屏幕上有什么，`box_click_element`、`box_type_text`、`box_press_key`、`box_scroll`、`box_click_at`、`box_close`、`box_screenshot`、`box_set_browser`、`box_console`。`box_screenshot` 把 PNG 写进 runtime 目录并回报路径：tool result 在模型那侧只有文本，所以文件是给人打开的，路径才是给 agent 传递的。设置面板里挂着同一份清单，写 agent 的人和读它看到的是同一套描述。
 
 ### 持久化与引用计数
 

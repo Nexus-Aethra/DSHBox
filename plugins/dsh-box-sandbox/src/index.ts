@@ -34,11 +34,11 @@ import { applyBoxTools, hostServices } from './tools'
 export const name = 'dsh-box-sandbox'
 
 /**
- * Services this plugin depends on. Empty for now: the client is pure
- * transport and needs no host service. Tools built on top of it will
- * declare their own.
+ * Services this plugin depends on. `tools` to register the box_* surface and
+ * `systemPrompt` for the cross-tool workflow section; the client itself is
+ * pure transport and needs nothing.
  */
-export const inject: string[] = ['tools', 'attachments', 'systemPrompt']
+export const inject: string[] = ['tools', 'systemPrompt']
 
 /**
  * Plugin config. Both fields carry defaults, so the mount works with an

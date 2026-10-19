@@ -67,6 +67,20 @@ function daemonKeys(fn) {
   // a required field nothing returns.
   for (const m of body.matchAll(/Ok\((\w+)\(/g)) {
     for (const key of keysOfHelper(m[1])) keys.add(key)
+    // The literal handed to the helper is part of the answer too. Without it
+    // click_by_name_rpc reads as returning only what click_response assigns,
+    // and box_click_element's x and y look unbacked when the daemon sends
+    // both.
+    const rest = body.slice(m.index + m[0].length, m.index + m[0].length + 400)
+    const open = rest.indexOf('json!({')
+    if (open < 0) continue
+    const from = open + 'json!({'.length - 1
+    let depth = 0
+    for (let i = from; i < rest.length; i++) {
+      const c = rest[i]
+      if (c === '{') { depth++; continue }
+      if (c === '}') { depth--; if (!depth) { collectTopLevel(rest.slice(from, i + 1), keys); break } }
+    }
   }
   return keys
 }
@@ -137,7 +151,30 @@ function at0(toolName) {
   return plugin.indexOf("name: '" + toolName + "'")
 }
 
-/** Which daemon method each tool calls, read from its own execute body. */
+/**
+ * One tool's execute body and nothing else.
+ *
+ * Bounded by the end of its own registerTool call, because an unbounded slice
+ * runs on into the next tool and reads that one's schema keys as fields this
+ * tool sets -- which is how a required field nothing populates passes.
+ */
+function executeBody(toolName) {
+  const at = at0(toolName)
+  if (at < 0) return ''
+  const seg = plugin.slice(at)
+  const from = seg.indexOf('async execute')
+  if (from < 0) return ''
+  const end = seg.indexOf('\n  })', from)
+  return seg.slice(from, end > 0 ? end : from + 1200)
+}
+
+/**
+ * Which daemon method each tool calls, read from its own execute body.
+ *
+ * Only the first match counts: a tool that branches between two methods (a
+ * status query and a write, say) is reconciled against the one it always
+ * reaches, and the other is covered by the entry it shares.
+ */
 function methodOf(toolName) {
   const at = at0(toolName)
   if (at < 0) return null
@@ -149,46 +186,62 @@ function methodOf(toolName) {
   return m ? m[0].slice(1, -1) : null
 }
 
+// Keys are the method names the tools in tools.ts actually call. A key that
+// matches nothing is dead, and a method with no key is a tool nobody checks --
+// both used to pass in silence, which is how box_screenshot sat outside this
+// gate for as long as the plugin existed: the map said debug_screenshot while
+// the tool called debug_capture_screenshot.
 const METHOD_TO_RPC = {
   debug_page_text: 'page_text_rpc',
-  debug_screenshot: 'screenshot_rpc',
-  debug_click_element: 'click_element_rpc',
+  debug_capture_screenshot: 'screenshot_rpc',
+  debug_click_by_name: 'click_by_name_rpc',
   debug_click_at: 'click_at_rpc',
   debug_type_text: 'type_text_rpc',
   debug_press_key: 'press_key_rpc',
   debug_scroll: 'scroll_rpc',
-  debug_set_viewport: 'set_viewport_rpc',
   debug_close: 'close_rpc',
   debug_console: 'console_rpc',
+  debug_browser_status: 'browser_status_rpc',
 }
 
 const verbose = process.argv.includes('--verbose')
 let checked = 0
 let bad = 0
+const usedMethods = new Set()
 
 for (const m of plugin.matchAll(/name: '(box_[a-z_]+)'/g)) {
   const tool = m[1]
   const method = methodOf(tool)
-  if (!method || !METHOD_TO_RPC[method]) continue
+  if (!method) continue
+  usedMethods.add(method)
+  if (!METHOD_TO_RPC[method]) {
+    bad++
+    console.log('  BAD  ' + tool + '  calls ' + method + ', which this check does not map to a daemon rpc')
+    continue
+  }
   const rpc = METHOD_TO_RPC[method]
   const declared = declaredProperties(tool)
   const returned = daemonKeys(rpc)
-  if (!declared || !returned) continue
+  if (!declared || !returned) {
+    bad++
+    console.log('  BAD  ' + tool + '  (' + method + ' -> ' + rpc + ') cannot be read: '
+      + (!declared ? 'no output schema' : 'no such rpc in debug.rs'))
+    continue
+  }
   // The plugin renames the daemon's id to containerId on the way out.
   // The plugin renames the daemon's id to containerId on the way out -- but
   // only if it picks the fields. Spreading the whole answer drags that id in
   // under a second name, which additionalProperties:false then refuses, so a
   // spread next to a daemon that answers with id is its own finding.
   const seg = plugin.slice(at0(tool), at0(tool) + 4000)
-  const execute = seg.slice(seg.indexOf('async execute'))
-  const spreads = /\.\.\.result/.test(execute)
+  const spreads = /\.\.\.result/.test(executeBody(tool))
   const missing = [...returned].filter((k) => k !== 'id' && !declared.props.has(k))
   const dragsId = spreads && returned.has('id') && !declared.props.has('id')
   // A required field the daemon never returns is undefined at runtime, and a
   // required field that is undefined is how box_type_text failed while its
   // TypeScript type claimed the field was there. Only a field the execute body
   // names as its own counts as filled.
-  const derived = new Set([...execute.matchAll(/([A-Za-z_][A-Za-z0-9_]*):/g)].map((x) => x[1]))
+  const derived = new Set([...executeBody(tool).matchAll(/([A-Za-z_][A-Za-z0-9_]*):/g)].map((x) => x[1]))
   const unbacked = [...declared.required].filter(
     (k) => !returned.has(k) && k !== 'containerId' && !derived.has(k),
   )
@@ -205,4 +258,9 @@ for (const m of plugin.matchAll(/name: '(box_[a-z_]+)'/g)) {
 }
 
 console.log('\n' + checked + ' tool(s) reconciled, ' + bad + ' mismatch(es)')
+for (const method of Object.keys(METHOD_TO_RPC)) {
+  if (!usedMethods.has(method)) {
+    console.log('  note  ' + method + ' is mapped but no tool in tools.ts calls it; the entry is dead')
+  }
+}
 process.exit(bad > 0 ? 1 : 0)

@@ -127,6 +127,33 @@ cannot hit the wrong control, since a CSS selector is a guess and a guess that
 happens to match still reports success. Takes optional `within` to scope the
 search when the same name appears in a dialog and the page behind it.
 
+### debug_capture_screenshot
+
+Writes a PNG of what the container renders and answers with where it went.
+Takes optional `fullPage` to capture the whole scrollable document instead of
+the viewport, which needs the clip widened from `Page.getLayoutMetrics` because
+`captureBeyondViewport` alone still returns the viewport.
+
+  id         the container whose session is used
+  path       absolute path of the file written
+  width      image width in pixels, read from the PNG's own header
+  height     image height in pixels
+  bytes      size of the file written
+
+PNG only, and that is a contract rather than a limitation: the dimensions are
+read out of the PNG header, which is a few bytes of arithmetic, where jpeg and
+webp each want a parser of their own. The image itself is never returned.
+Base64 across the RPC boundary is the one shape no caller can use -- a tool
+result is assistant-side content and the model routes are text-only, so the
+bytes arrive nowhere -- and a path is the one thing every caller can act on,
+whether that is a person opening the file or an agent naming it in an answer.
+The dimensions come from the file that was written rather than from the capture
+request, so a reply claiming 1920x1080 describes a PNG that exists.
+
+Files land in `<runtime>/debug-screenshots/<container id>/`, named by capture
+time, with the oldest beyond fifty per container dropped. A debugging session
+takes one per step and nothing else in the box ever deletes these.
+
 ### debug_query_elements
 
 A narrow CSS-selector query, kept for what `debug_page_text` cannot express.
@@ -154,7 +181,7 @@ mechanism summaries:
   box_click_at        the same, by coordinate
   box_type_text       types into the focused field and reports focus
   box_press_key       presses a named key
-  box_screenshot      stores a PNG; the image does not reach the model
+  box_screenshot      writes a PNG and reports its path; the image does not reach the model
   box_close           releases the browser
 
 Eleven more cover the box itself (`box_lifecycle`, `box_overview`,

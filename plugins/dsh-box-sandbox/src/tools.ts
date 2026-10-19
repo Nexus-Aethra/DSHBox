@@ -36,15 +36,6 @@ import { getRpc } from './rpc'
  * is the single place that notices, and the tools fail loudly at registration
  * rather than silently going missing.
  */
-interface ImageAttachmentRef {
-  attachmentId: string
-  mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
-  bytes: number
-  width: number
-  height: number
-  name?: string
-}
-
 export interface HostToolDefinition {
   name: string
   description: string
@@ -61,13 +52,6 @@ export interface HostToolDefinition {
 
 interface HostServices {
   tools: { register(definition: HostToolDefinition): () => void }
-  attachments: {
-    saveImage(input: {
-      data: Uint8Array
-      mediaType: ImageAttachmentRef['mediaType']
-      name?: string
-    }): Promise<ImageAttachmentRef>
-  }
   /** One prompt section carrying the cross-tool workflow. */
   systemPrompt: {
     section(section: {
@@ -139,13 +123,6 @@ interface ClickResult {
   y: number
   tag: string
   text: string
-}
-
-
-function base64Of(value: unknown): string {
-  const data = asRecord(value).data
-  if (typeof data !== 'string') throw new Error('screenshot result carried no image data')
-  return data
 }
 
 /**
@@ -296,13 +273,11 @@ export function applyBoxTools(ctx: Context): void {
     name: 'box_screenshot',
     description:
       'Save what a running dshbox container currently renders as a PNG, and report where.' +
-      'This is the one tool whose picture you do not get: a tool result is assistant-side content' +
-      'and the host sends text only on that side, so you receive the dimensions and nothing else.' +
-      'Asking yourself to look at the image asks for something that cannot arrive, and re-reading' +
-      'the file path does not change that. So take one to leave something a person can look at,' +
-      'and use box_page_text to find out what is on the page. In practice: describe the page in' +
-      'your answer, and save a PNG when the layout or a rendering is what is worth showing' +
-      'rather than describing.',
+      'You get the file path and the image size, not the picture: a tool result is assistant-side' +
+      'content and the host sends text only on that side, so an image cannot arrive. Hand the path' +
+      'to a person to look at, and use box_page_text to find out what is on the page. In practice:' +
+      'describe the page in your answer from box_page_text, and take a screenshot when the layout' +
+      'or a rendering is what is worth showing rather than describing.',
     parameters: {
       type: 'object',
       properties: {
@@ -317,41 +292,45 @@ export function applyBoxTools(ctx: Context): void {
         type: 'object',
         additionalProperties: false,
         properties: {
-        containerId: { type: 'string' },
-        
-          attachment: { type: 'object' },
-      },
-      required: ['containerId', 'attachment'],
+          containerId: { type: 'string' },
+          path: { type: 'string' },
+          width: { type: 'number' },
+          height: { type: 'number' },
+          bytes: { type: 'number' },
+        },
+        required: ['containerId', 'path', 'width', 'height', 'bytes'],
       },
       render: (_args, value) => {
         const record = asRecord(value)
-        const shot = asRecord(record.attachment)
         return [
           {
             type: 'text',
             text: 'Screenshot of container ' + String(record.containerId)
-              + ' at ' + String(shot.width) + 'x' + String(shot.height) + '.',
+              + ' (' + String(record.width) + 'x' + String(record.height) + ', '
+              + String(record.bytes) + ' bytes) saved to ' + String(record.path) + '.',
           },
-          { type: 'image', attachment: record.attachment as ImageAttachmentRef },
         ]
       },
     },
     async execute(args) {
       const containerId = containerIdOf(args)
       const record = asRecord(args)
-      const raw = await withSession(containerId, 'debug_capture_screenshot', {
-        format: 'png',
-        fullPage: record.fullPage === true,
-      })
-      // Image bytes cannot ride back on a tool result: the attachment store
-      // owns validation and normalization, and every model route sends a
-      // placeholder naming the image rather than its bytes.
-      const data = Buffer.from(base64Of(raw), 'base64')
-      const attachment = await hostServices(ctx).attachments.saveImage({
-        data: new Uint8Array(data),
-        mediaType: 'image/png',
-      })
-      return { containerId, attachment }
+      const result = await withSession<Record<string, unknown>>(
+        containerId,
+        'debug_capture_screenshot',
+        { fullPage: record.fullPage === true },
+      )
+      const path = result.path
+      if (typeof path !== 'string' || path === '') {
+        throw new Error('screenshot result carried no file path')
+      }
+      return {
+        containerId,
+        path,
+        width: result.width,
+        height: result.height,
+        bytes: result.bytes,
+      }
     },
   })
 

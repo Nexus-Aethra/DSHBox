@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use base64::Engine as _;
 use box_browser::{resolve, validate_browser_path, BrowserCandidate, BrowserSession};
 use box_foundation::read_config;
 use serde_json::{json, Value};
@@ -443,13 +444,134 @@ fn evaluate(session: &mut BrowserSession, expression: &str) -> Result<Value, Str
 }
 
 /// Screenshot the page as a base64 image.
+/// Where one container's screenshots are written.
+///
+/// A sibling of the browser profile rather than a directory inside it: the
+/// profile belongs to Chrome and a debugging artefact does not, and Chrome is
+/// free to tidy its own user-data-dir.
+fn screenshot_dir(state: &DaemonState, id: &str) -> Result<PathBuf, String> {
+    let root = state
+        .paths
+        .read()
+        .map_err(|_| "daemon paths lock failed".to_owned())?;
+    let runtime = root
+        .runtime
+        .as_ref()
+        .ok_or_else(|| "no runtime directory configured".to_owned())?;
+    Ok(runtime.join("debug-screenshots").join(id))
+}
+
+/// Screenshots kept per container before the oldest are dropped.
+///
+/// A debugging session can take one per step and nothing else in the box ever
+/// deletes these, so an unbounded directory is the default otherwise. The cap
+/// keeps the newest -- the ones a human is most likely to still be opening --
+/// and lets the rest go.
+const MAX_SCREENSHOTS: usize = 50;
+
+fn prune_screenshots(directory: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "png"))
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect();
+    let excess = files.len().saturating_sub(keep);
+    if excess == 0 {
+        return;
+    }
+    files.sort_by_key(|(modified, _)| *modified);
+    for (_, path) in files.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Width and height out of a PNG's IHDR, without pulling in an image decoder.
+///
+/// The eight-byte signature, a four-byte chunk length, the four bytes "IHDR",
+/// then width and height as big-endian u32 -- so the whole header is the first
+/// 24 bytes and nothing after it has to be read.
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let header = bytes.get(..24)?;
+    if &header[..8] != b"\x89PNG\r\n\x1a\n" || &header[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes([header[16], header[17], header[18], header[19]]);
+    let height = u32::from_be_bytes([header[20], header[21], header[22], header[23]]);
+    Some((width, height))
+}
+
+/// One screenshot that has been decoded, measured and written.
+struct WrittenShot {
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    bytes: usize,
+}
+
+impl std::fmt::Debug for WrittenShot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WrittenShot")
+            .field("path", &self.path)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+/// Turn what Chrome sent into a file, and say what landed where.
+///
+/// Everything a caller is told about the image comes out of the bytes rather
+/// than out of the request, so a reply claiming 1920x1080 describes a PNG that
+/// exists on disk with that size.
+fn write_screenshot(directory: &PathBuf, encoded: &str) -> Result<WrittenShot, String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .map_err(|error| format!("screenshot carried undecodable base64: {error}"))?;
+    // A file that cannot be measured is a file nobody asked for, so this is an
+    // error rather than a null: Chrome answered with something that is not the
+    // PNG it was asked for.
+    let (width, height) = png_dimensions(&bytes)
+        .ok_or_else(|| "screenshot is not a PNG the daemon can measure".to_owned())?;
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    let path = directory.join(format!("{stamp}.png"));
+    std::fs::write(&path, &bytes)
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    prune_screenshots(directory, MAX_SCREENSHOTS);
+    Ok(WrittenShot {
+        path,
+        width,
+        height,
+        bytes: bytes.len(),
+    })
+}
+
 pub(crate) fn screenshot_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
-    let format = request["format"].as_str().unwrap_or("png").to_owned();
-    if !matches!(format.as_str(), "png" | "jpeg" | "webp") {
-        return Err(format!("unsupported screenshot format {format}"));
+    // PNG only, and that is a contract rather than a limitation: the answer
+    // carries a path and the image's size, and reading a PNG header for its
+    // dimensions is a few bytes of arithmetic where jpeg and webp each want a
+    // parser of their own. A caller that needs another format converts the file
+    // that was written.
+    let format = request["format"].as_str().unwrap_or("png");
+    if format != "png" {
+        return Err(
+            "screenshots are written as png; convert the file for another format".to_owned(),
+        );
     }
     let full_page = request["fullPage"].as_bool().unwrap_or(false);
-    let mut params = json!({ "format": format, "captureBeyondViewport": full_page });
+    let mut params = json!({ "format": "png", "captureBeyondViewport": full_page });
     if full_page {
         // captureBeyondViewport only produces a full-page image when the clip
         // is widened; without this the result is the viewport anyway.
@@ -469,6 +591,7 @@ pub(crate) fn screenshot_rpc(state: &DaemonState, request: &Value) -> Result<Val
             });
         }
     }
+    let id = request["id"].as_str().unwrap_or("").to_owned();
     let data = with_session(state, request, |session| {
         let result = session.call("Page.captureScreenshot", params)?;
         result
@@ -477,7 +600,14 @@ pub(crate) fn screenshot_rpc(state: &DaemonState, request: &Value) -> Result<Val
             .map(str::to_owned)
             .ok_or_else(|| "Page.captureScreenshot returned no image".to_owned())
     })?;
-    Ok(json!({ "format": format, "encoding": "base64", "data": data }))
+    let shot = write_screenshot(&screenshot_dir(state, &id)?, &data)?;
+    Ok(json!({
+        "id": id,
+        "path": shot.path,
+        "width": shot.width,
+        "height": shot.height,
+        "bytes": shot.bytes,
+    }))
 }
 /// Build the JS that describes every element matching a selector.
 ///
@@ -1929,6 +2059,119 @@ mod tests {
         assert!(!expression.contains("= alert(1)"));
         // A click with no intended element must not smuggle a selector in.
         assert!(!hit_test_js(1.0, 2.0, None).contains("querySelector(\\\""));
+    }
+
+    #[test]
+    fn png_dimensions_read_the_header_chrome_does_not_send() {
+        // Page.captureScreenshot answers with base64 and no size, so the size
+        // has to come out of the file: the eight-byte signature, the IHDR
+        // chunk length, "IHDR", then the two dimensions as big-endian u32.
+        let one_by_one: Vec<u8> = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        ]
+        .to_vec();
+        assert_eq!(png_dimensions(&one_by_one), Some((1, 1)));
+
+        let wide: Vec<u8> = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x07, 0x80, 0x00, 0x00, 0x04, 0x38,
+        ]
+        .to_vec();
+        assert_eq!(png_dimensions(&wide), Some((1920, 1080)));
+
+        // A file that is not a PNG must be refused rather than measured as
+        // zero: a reply claiming 0x0 describes a capture nobody wants, and the
+        // caller would have no way to tell it from a blank page.
+        assert_eq!(png_dimensions(b"not a png at all, but long enough"), None);
+        // A truncated header is the same answer.
+        assert_eq!(png_dimensions(&[0x89, 0x50, 0x4E, 0x47]), None);
+    }
+
+    #[test]
+    fn prune_screenshots_keeps_the_newest_and_leaves_what_is_not_a_png() {
+        let dir = std::env::temp_dir().join(format!(
+            "dshbox-prune-{}-{}",
+            std::process::id(),
+            "png_dimensions_read_the_header_chrome_does_not_send"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // Written oldest first, so which files survive is decided by mtime
+        // rather than by name.
+        for index in 0..5 {
+            std::fs::write(dir.join(format!("{index}.png")), b"x").expect("write");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::write(dir.join("notes.txt"), b"keep me").expect("write");
+
+        prune_screenshots(&dir, 2);
+
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        // The two newest survive, and something that is not a PNG is none of
+        // this function's business.
+        assert_eq!(
+            left,
+            vec![
+                "3.png".to_owned(),
+                "4.png".to_owned(),
+                "notes.txt".to_owned()
+            ]
+        );
+
+        // Fewer files than the cap is a no-op, not a reason to delete anything.
+        prune_screenshots(&dir, 50);
+        assert_eq!(std::fs::read_dir(&dir).expect("read dir").count(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_screenshot_turns_what_chrome_sent_into_a_measured_file() {
+        // A real 4x3 PNG, base64 as Page.captureScreenshot returns it. Using a
+        // genuine image rather than a hand-built header is the point: the whole
+        // path under test is decode -> measure -> write, and a header-only
+        // fixture would prove none of the decoding.
+        let encoded = "iVBORw0KGgoAAAANSUhEUgAAAAQAAAADCAYAAAC09K7GAAAAEklEQVR4nGMQMgn7j4wZCAoAANoSE0XZSPwFAAAAAElFTkSuQmCC";
+        let dir = std::env::temp_dir().join(format!(
+            "dshbox-shot-{}-{}",
+            std::process::id(),
+            "write_screenshot_turns_what_chrome_sent_into_a_measured_file"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let shot = write_screenshot(&dir, encoded).expect("a real PNG should be written");
+
+        assert_eq!((shot.width, shot.height), (4, 3));
+        assert_eq!(shot.bytes, 75);
+        assert!(shot.path.starts_with(&dir), "{:?}", shot.path);
+        assert_eq!(
+            shot.path.extension().and_then(|ext| ext.to_str()),
+            Some("png")
+        );
+        // The file is the image, not a placeholder: reading it back decodes to
+        // the same bytes Chrome sent.
+        let written = std::fs::read(&shot.path).expect("read back");
+        assert_eq!(written.len(), 75);
+        assert_eq!(png_dimensions(&written), Some((4, 3)));
+
+        // Something that is not base64 of a PNG is refused, and refuses
+        // loudly: the caller is told the capture failed rather than handed a
+        // path to a file that is not what was asked for.
+        assert!(write_screenshot(&dir, "not base64 at all!!").is_err());
+        let jpeg_like = base64::engine::general_purpose::STANDARD.encode([
+            0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        let error = write_screenshot(&dir, &jpeg_like).expect_err("a JPEG must be refused");
+        assert!(error.contains("not a PNG"), "{error}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 /// `debug_set_viewport` — resize a session's page, and report the size now in effect.

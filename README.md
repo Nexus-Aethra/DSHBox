@@ -282,7 +282,7 @@ or install it per container from the repository with `dshbox plugin install <con
 
 It finds the background server through the discovery record the box writes at startup: the port and the token are minted per launch, so a restart is invisible to the plugin. Everything crosses the same loopback `POST /rpc` the CLI and the UI use, and task progress arrives on the same SSE stream.
 
-Eleven tools drive the box — `box_overview`, `box_lifecycle`, `box_build`, `box_create`, `box_templates`, `box_plugins`, `box_resources`, `box_workspace`, `box_settings`, `box_task`, `box_set_viewport`. Ten more debug a page in a headless browser — `box_page_text` to list what is on screen, `box_click_element`, `box_type_text`, `box_press_key`, `box_scroll`, `box_click_at`, `box_close`, `box_screenshot`, `box_set_browser`, `box_console`. The Settings pane carries the same list, so an agent's author and the person reading it see one description.
+Eleven tools drive the box — `box_overview`, `box_lifecycle`, `box_build`, `box_create`, `box_templates`, `box_plugins`, `box_resources`, `box_workspace`, `box_settings`, `box_task`, `box_set_viewport`. Ten more debug a page in a headless browser — `box_page_text` to list what is on screen, `box_click_element`, `box_type_text`, `box_press_key`, `box_scroll`, `box_click_at`, `box_close`, `box_screenshot`, `box_set_browser`, `box_console`. `box_screenshot` writes a PNG under the runtime directory and reports the path: a tool result is text-only on the model's side, so the file is what a person opens and the path is what the agent passes on. The Settings pane carries the same list, so an agent's author and the person reading it see one description.
 
 ### Persistence and reference counts
 

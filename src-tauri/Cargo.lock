@@ -1011,6 +1011,7 @@ dependencies = [
 name = "dshboxd"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "box-api",
  "box-browser",
  "box-containers",
