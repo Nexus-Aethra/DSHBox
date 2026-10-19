@@ -443,7 +443,6 @@ fn evaluate(session: &mut BrowserSession, expression: &str) -> Result<Value, Str
         .unwrap_or(Value::Null))
 }
 
-/// Screenshot the page as a base64 image.
 /// Where one container's screenshots are written.
 ///
 /// A sibling of the browser profile rather than a directory inside it: the
