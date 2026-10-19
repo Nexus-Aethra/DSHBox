@@ -1,6 +1,6 @@
 {
   "name": "@nexus-aethra/dsh-box-sandbox",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Host-side bridge from a DSH session to the DSH Box daemon: typed box_* tools an agent can call without a shell.",
   "keywords": [
     "dsh",
@@ -10,13 +10,13 @@
     "box",
     "tools"
   ],
-  "homepage": "https://github.com/aethra-tech/DSHBox/tree/main/plugins/dsh-box-sandbox",
+  "homepage": "https://github.com/Nexus-Aethra/DSHBox/tree/main/plugins/dsh-box-sandbox",
   "bugs": {
-    "url": "https://github.com/aethra-tech/DSHBox/issues"
+    "url": "https://github.com/Nexus-Aethra/DSHBox/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/aethra-tech/DSHBox.git",
+    "url": "git+https://github.com/Nexus-Aethra/DSHBox.git",
     "directory": "plugins/dsh-box-sandbox"
   },
   "author": "Nexus Aethra",
