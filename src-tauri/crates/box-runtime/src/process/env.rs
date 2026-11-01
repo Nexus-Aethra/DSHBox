@@ -625,7 +625,7 @@ fn find_map_value<'a>(map: &'a BTreeMap<String, OsString>, key: &str) -> Option<
 
 /// Rules for the bundled Node/npm/pnpm environment. When `host` is true the
 /// NODE_PATH inherited from the parent is preserved (the DSH Host needs it to
-/// resolve the vendored `@deepseek-ai/dsh-box-context` plugin tree); for
+/// resolve the vendored `@nexus-aethra/dsh-box-sandbox` plugin tree); for
 /// toolchain commands we strip it to avoid leaking the host machine's
 /// global Node.js install into the child.
 ///

@@ -4,12 +4,11 @@
 //! the child processes and the running registry.
 
 use crate::containers::{
-    ensure_container_workspace, repair_known_profile_template, write_dshbox_context_snapshot,
+    ensure_container_workspace, install_box_skill, repair_known_profile_template,
 };
 use crate::state::{bundled_runtime, ContainerManager, ManagedHost};
 use crate::toolchains::{resolve_toolchain, run_logged};
 use box_containers::container_directory;
-use box_dsh_context::PLUGIN_ID;
 use box_foundation::{is_safe_identifier, read_config};
 use box_runtime::process::{self, ExecutionKind, ProcessSpec, TrackedChild};
 use box_scheduler::TaskContext;
@@ -40,8 +39,10 @@ fn dsh_dependencies_ready(source: &Path) -> bool {
 
 const HOST_BIND_ATTEMPTS: u32 = 3;
 const HOST_READY_PROBES: usize = 240;
-const CONTEXT_PLUGIN_COPY_TIMEOUT: Duration = Duration::from_secs(45);
-const CONTEXT_PLUGIN_MARKER: &str = ".dshbox-materialized";
+const SANDBOX_PLUGIN_PACKAGE: &str = "@nexus-aethra/dsh-box-sandbox";
+const SANDBOX_PLUGIN_ID: &str = "dsh-box-sandbox";
+const PLUGIN_COPY_TIMEOUT: Duration = Duration::from_secs(45);
+const PLUGIN_COPY_MARKER: &str = ".dshbox-materialized";
 
 /// HTTP client for probing loopback DSH web servers. It must never
 /// consult proxy environment variables: a developer's `HTTP_PROXY`
@@ -159,14 +160,14 @@ pub(crate) fn start_dsh_container_inner(
     let _workspace = ensure_container_workspace(&directory)?;
     let dshbox_home =
         crate::state::dshbox_install_directory().unwrap_or_else(|_| PathBuf::from("."));
-    let context_files = write_dshbox_context_snapshot(&directory, &value, profile, &dshbox_home)?;
+    // Every container gets the sandbox plugin at start; see materialize_bundled_sandbox_plugin.
     // DSH's Cordis loader imports loader entries through Node's ESM
     // machinery, which never consults NODE_PATH; expose the vendored
     // plugin as a real node_modules entry next to the profile.
     if let Some(task) = task {
-        task.update("Verifying DSH Box context plugin", 20);
+        task.update("Installing DSH Box sandbox plugin", 20);
     }
-    materialize_bundled_context_plugin(&directory, profile, task)?;
+    materialize_bundled_sandbox_plugin(&directory, profile, task)?;
     let source = directory.join("harness");
     if !source.join("package.json").is_file() {
         return Err("DSH source is incomplete".to_owned());
@@ -294,8 +295,6 @@ pub(crate) fn start_dsh_container_inner(
                 entry.to_string_lossy().as_ref(),
                 "--profile",
                 profile,
-                "--patch",
-                context_files.patch_path.to_string_lossy().as_ref(),
                 "--patch",
                 patch.to_string_lossy().as_ref(),
                 // Without this the host opens the user's real default browser
@@ -534,9 +533,9 @@ pub(crate) fn rebuild_dsh_container_with_task(
     start_dsh_container_inner(&id, &manager.running, task).map(|_| ())
 }
 
-/// Expose the vendored `@deepseek-ai/dsh-box-context` bundle to the DSH
-/// loader as a real `node_modules` entry under the container's profile.
-pub(crate) fn materialize_bundled_context_plugin(
+/// Expose the bundled `@nexus-aethra/dsh-box-sandbox` plugin to the DSH loader
+/// as a real `node_modules` entry under the container's profile.
+pub(crate) fn materialize_bundled_sandbox_plugin(
     directory: &Path,
     profile: &str,
     task: Option<&TaskContext>,
@@ -548,7 +547,7 @@ pub(crate) fn materialize_bundled_context_plugin(
         .join("plugins")
         .join("node_modules")
         .join("@deepseek-ai")
-        .join(PLUGIN_ID);
+        .join(SANDBOX_PLUGIN_PACKAGE);
     if !vendored.join("package.json").is_file() {
         // Self-heal before giving up: the config's manifest digest may
         // predate the current storage root (the vendoring copy never
@@ -568,16 +567,19 @@ pub(crate) fn materialize_bundled_context_plugin(
         .join(profile)
         .join("node_modules");
     if let Some(task) = task {
-        task.log("verifying DSH Box context plugin");
+        task.log("installing the sandbox plugin into the container profile");
     }
-    let copied = ensure_vendored_plugin_copied(&vendored, &profile_node_modules)?;
+    let copied = ensure_vendored_plugin_copied(&vendored, &profile_node_modules, SANDBOX_PLUGIN_PACKAGE)?;
     if let Some(task) = task {
         task.log(if copied {
-            "materialized DSH Box context plugin"
+            "installed the sandbox plugin"
         } else {
-            "DSH Box context plugin is already materialized"
+            "sandbox plugin is already installed"
         });
     }
+    // The skill ships inside the vendored package, so this reads the copy that
+    // was just published rather than a second source of truth.
+    install_box_skill(directory, &vendored.join("skills").join(SANDBOX_PLUGIN_ID), task)?;
     Ok(())
 }
 
@@ -591,11 +593,17 @@ pub(crate) fn materialize_bundled_context_plugin(
 fn ensure_vendored_plugin_copied(
     vendored: &Path,
     profile_node_modules: &Path,
+    package: &str,
 ) -> Result<bool, String> {
-    let scoped = profile_node_modules.join("@deepseek-ai");
+    // A scoped package resolves from its own scope directory; hardcoding one
+    // is how a plugin lands where Node never looks.
+    let (scope, plugin_id) = package
+        .split_once('/')
+        .ok_or_else(|| format!("bundled plugin name is not scoped: {package}"))?;
+    let scoped = profile_node_modules.join(scope);
     fs::create_dir_all(&scoped)
         .map_err(|error| format!("cannot create {}: {error}", scoped.display()))?;
-    let target = scoped.join(PLUGIN_ID);
+    let target = scoped.join(plugin_id);
     // Already a plain directory whose contents match the source — leave it.
     if target.is_dir()
         && !fs::symlink_metadata(&target)
@@ -634,7 +642,7 @@ fn materialized_package_matches(first: &Path, second: &Path) -> Result<bool, Str
         .map_err(|error| format!("cannot read {}/package.json: {error}", first.display()))?;
     let b = fs::read(second.join("package.json"))
         .map_err(|error| format!("cannot read {}/package.json: {error}", second.display()))?;
-    let marker = fs::read(second.join(CONTEXT_PLUGIN_MARKER)).unwrap_or_default();
+    let marker = fs::read(second.join(PLUGIN_COPY_MARKER)).unwrap_or_default();
     Ok(a == b && a == marker)
 }
 
@@ -647,39 +655,45 @@ fn copy_vendored_plugin_with_timeout(source: &Path, target: &Path) -> Result<(),
     let copy_target = target.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::Builder::new()
-        .name("dshbox-context-copy".to_owned())
+        .name("dshbox-plugin-copy".to_owned())
         .spawn(move || {
             let result = copy_vendored_plugin_atomically(&source, &copy_target);
             let _ = sender.send(result);
         })
-        .map_err(|error| format!("cannot start context plugin copy: {error}"))?;
-    receiver.recv_timeout(CONTEXT_PLUGIN_COPY_TIMEOUT).map_err(|error| match error {
+        .map_err(|error| format!("cannot start the plugin copy: {error}"))?;
+    receiver.recv_timeout(PLUGIN_COPY_TIMEOUT).map_err(|error| match error {
         mpsc::RecvTimeoutError::Timeout => format!(
-            "DSH Box context plugin copy exceeded {} seconds; retry the container start (a filesystem or antivirus lock may be blocking {})",
-            CONTEXT_PLUGIN_COPY_TIMEOUT.as_secs(),
+            "DSH Box plugin copy exceeded {} seconds; retry the container start (a filesystem or antivirus lock may be blocking {})",
+            PLUGIN_COPY_TIMEOUT.as_secs(),
             target.display()
         ),
-        mpsc::RecvTimeoutError::Disconnected => "DSH Box context plugin copy worker stopped unexpectedly".to_owned(),
+        mpsc::RecvTimeoutError::Disconnected => "DSH Box plugin copy worker stopped unexpectedly".to_owned(),
     })?
 }
 
 fn copy_vendored_plugin_atomically(source: &Path, target: &Path) -> Result<(), String> {
     let parent = target
         .parent()
-        .ok_or("context plugin target has no parent")?;
+        .ok_or("plugin copy target has no parent")?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let staging = parent.join(format!(".{PLUGIN_ID}.copy-{}-{nonce}", std::process::id()));
+    // Name the staging tree after the destination so a leftover from an
+    // interrupted copy is attributable to the plugin it belongs to.
+    let leaf = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "plugin".to_owned());
+    let staging = parent.join(format!(".{leaf}.copy-{}-{nonce}", std::process::id()));
     copy_tree_following(source, &staging)
         .map_err(|error| format!("cannot copy vendored plugin into staging: {error}"))?;
     let package = fs::read(source.join("package.json"))
         .map_err(|error| format!("cannot read {}/package.json: {error}", source.display()))?;
-    fs::write(staging.join(CONTEXT_PLUGIN_MARKER), package)
-        .map_err(|error| format!("cannot mark materialized context plugin: {error}"))?;
+    fs::write(staging.join(PLUGIN_COPY_MARKER), package)
+        .map_err(|error| format!("cannot mark the materialized plugin: {error}"))?;
     fs::rename(&staging, target)
-        .map_err(|error| format!("cannot publish materialized context plugin: {error}"))
+        .map_err(|error| format!("cannot publish the materialized plugin: {error}"))
 }
 
 /// Recursive directory copy with `cp -rL` semantics: any symlinks
@@ -1262,29 +1276,80 @@ mod copy_tree_following_tests {
     }
 
     #[test]
-    fn context_plugin_requires_a_completion_marker() {
+    fn plugin_copy_requires_a_completion_marker() {
         let source = sandbox("context-source");
         let target = sandbox("context-target");
         fs::write(source.join("package.json"), "{\"version\":1}").unwrap();
         fs::write(target.join("package.json"), "{\"version\":1}").unwrap();
 
         assert!(!materialized_package_matches(&source, &target).unwrap());
-        fs::write(target.join(CONTEXT_PLUGIN_MARKER), "{\"version\":1}").unwrap();
+        fs::write(target.join(PLUGIN_COPY_MARKER), "{\"version\":1}").unwrap();
         assert!(materialized_package_matches(&source, &target).unwrap());
     }
 
     #[test]
-    fn context_plugin_copy_is_complete_before_it_is_reused() {
+    fn plugin_copy_is_complete_before_it_is_reused() {
         let source = sandbox("context-copy-source");
         let profile_modules = sandbox("context-copy-profile");
         fs::write(source.join("package.json"), "{\"version\":1}").unwrap();
         fs::create_dir_all(source.join("node_modules/example")).unwrap();
         fs::write(source.join("node_modules/example/index.js"), "export {};").unwrap();
 
-        assert!(ensure_vendored_plugin_copied(&source, &profile_modules).unwrap());
-        let target = profile_modules.join("@deepseek-ai").join(PLUGIN_ID);
-        assert!(target.join(CONTEXT_PLUGIN_MARKER).is_file());
+        assert!(ensure_vendored_plugin_copied(&source, &profile_modules, SANDBOX_PLUGIN_PACKAGE).unwrap());
+        let target = profile_modules.join("@nexus-aethra").join(SANDBOX_PLUGIN_ID);
+        assert!(target.join(PLUGIN_COPY_MARKER).is_file());
         assert!(target.join("node_modules/example/index.js").is_file());
-        assert!(!ensure_vendored_plugin_copied(&source, &profile_modules).unwrap());
+        assert!(!ensure_vendored_plugin_copied(&source, &profile_modules, SANDBOX_PLUGIN_PACKAGE).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod sandbox_plugin_install_tests {
+    use super::*;
+
+    fn scratch(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("dshbox-install-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_scoped_plugin_lands_under_its_own_scope() {
+        let source = scratch("scope-src");
+        let profile_modules = scratch("scope-profile");
+        fs::write(source.join("package.json"), "{\"version\":1}").unwrap();
+
+        assert!(ensure_vendored_plugin_copied(&source, &profile_modules, SANDBOX_PLUGIN_PACKAGE).unwrap());
+
+        let (scope, id) = SANDBOX_PLUGIN_PACKAGE.split_once('/').unwrap();
+        let target = profile_modules.join(scope).join(id);
+        assert!(target.is_dir(), "plugin must exist at {}", target.display());
+        assert!(target.join("package.json").is_file());
+        assert!(!profile_modules.join("@deepseek-ai").join("dsh-box-sandbox").exists());
+    }
+
+    #[test]
+    fn the_skill_lands_in_the_container_skill_root() {
+        let container = scratch("skill-container");
+        let bundled = scratch("skill-bundled");
+        fs::write(bundled.join("SKILL.md"), "v1").unwrap();
+
+        install_box_skill(&container, &bundled, None).unwrap();
+        let installed = container.join("profile/skills").join("dsh-box-tools").join("SKILL.md");
+        assert!(installed.is_file(), "skill must be at {}", installed.display());
+        assert_eq!(fs::read_to_string(&installed).unwrap(), "v1");
+
+        fs::write(bundled.join("SKILL.md"), "v2").unwrap();
+        install_box_skill(&container, &bundled, None).unwrap();
+        assert_eq!(fs::read_to_string(&installed).unwrap(), "v2");
+    }
+
+    #[test]
+    fn a_missing_bundled_skill_is_skipped_not_fatal() {
+        let container = scratch("skill-missing");
+        let bundled = scratch("skill-missing-src");
+        install_box_skill(&container, &bundled, None).unwrap();
+        assert!(!container.join("profile/skills/dsh-box-tools/SKILL.md").exists());
     }
 }

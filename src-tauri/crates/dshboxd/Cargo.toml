@@ -12,7 +12,6 @@ box-resources = { path = "../box-resources" }
 box-api = { path = "../box-api" }
 box-browser = { path = "../box-browser" }
 box-containers = { path = "../box-containers" }
-box-dsh-context = { path = "../box-dsh-context" }
 box-dsh-versions = { path = "../box-dsh-versions" }
 box-extensions = { path = "../box-extensions" }
 box-foundation = { path = "../box-foundation" }

@@ -213,14 +213,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "box-dsh-context"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "box-dsh-versions"
 version = "0.1.0"
 dependencies = [
@@ -974,7 +966,6 @@ dependencies = [
  "box-client",
  "box-containers",
  "box-data-scheduler",
- "box-dsh-context",
  "box-dsh-versions",
  "box-extensions",
  "box-foundation",
@@ -1015,7 +1006,6 @@ dependencies = [
  "box-api",
  "box-browser",
  "box-containers",
- "box-dsh-context",
  "box-dsh-versions",
  "box-extensions",
  "box-foundation",

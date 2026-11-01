@@ -98,7 +98,7 @@ DSH Box separates a Tauri **desktop shell**, a framework-free Rust workspace, a 
 | Frontend (React 18 + Vite, `src/`) | Pages, components, `useTaskQueue`/`useContainers`/`useResources`/`useSettings` hooks. **No business logic** — pages fire RPC requests and react to daemon SSE events. | Keeps the Box UI thin and lets any client (UI/CLI/agent) share the same code path. |
 | Desktop shell (Tauri 2, `src-tauri/src/`) | Browser window, tray, Tauri IPC adapters. Listens on `127.0.0.1` to the daemon's loopback HTTP server. All real work is delegated to `dshboxd` over HTTP RPC. | One source of truth for state changes — UI and CLI cannot drift. |
 | Daemon (`src-tauri/crates/dshboxd`) | Long-lived background service. Owns the queue, the data store, the template index, container registry, and the SSE event bus. Single HTTP entry point (`POST /rpc`) plus `GET /events?token=…`. | Background work (installs, rebuilds, uninstalls) survives the desktop window closing. |
-| Crate workspace (`src-tauri/crates/`) | Framework-free Rust crates: `box-foundation`, `box-runtime`, `box-scheduler`, `box-state`, `box-toolchains`, `box-dsh-versions`, `box-containers`, `box-extensions`, `box-image`, `box-template-core`, `box-data-scheduler`, `box-logger`, `box-dsh-context`, `box-server-core`, `box-browser`, `box-api`, `box-client`. | Pure functions + unit tests; only the top-level `dshbox` binary and `dshboxd` link Tauri/HTTP. |
+| Crate workspace (`src-tauri/crates/`) | Framework-free Rust crates: `box-foundation`, `box-runtime`, `box-scheduler`, `box-state`, `box-toolchains`, `box-dsh-versions`, `box-containers`, `box-extensions`, `box-image`, `box-template-core`, `box-data-scheduler`, `box-logger`, `box-server-core`, `box-browser`, `box-api`, `box-client`. | Pure functions + unit tests; only the top-level `dshbox` binary and `dshboxd` link Tauri/HTTP. |
 
 The dependency direction is one-way: `foundation / runtime / scheduler / state` → functional crates → Tauri/desktop adapters. Feature crates do not depend on Tauri or one another's mutable state.
 
@@ -163,7 +163,7 @@ token, the toolchain paths) still win — a boxfile cannot redirect the daemon.
 How each `ADD` is stored matters:
 - `ADD plugin` — the source is imported into the shared **Repository** as an immutable local `artifact.tgz`, recorded by the sealed recipe, then added only while preparing a Container at its final path. No running Container has an absolute repository path or runs a plugin dependency install.
 - `ADD skill` and `ADD data` — snapshotted into the data store (`<runtime>/data/<digest>/`), materialised in the built template, and copied into the Container profile.
-- The bundled `dsh-box-context` plugin (`@deepseek-ai/dsh-box-context`) is copied automatically — you do not need to `ADD` it.
+- The bundled `dsh-box-sandbox` plugin (`@nexus-aethra/dsh-box-sandbox`) is installed into every container on start — you do not need to `ADD` it. It registers the `box_*` tools an agent uses to drive the box from inside, and ships with the `dsh-box-tools` skill so the agent knows how to use them.
 
 `dshbox build` writes a digest-addressed sealed template. `dshbox run <name>` then:
 1. Resolves the template's `FROM` chain (max depth 4),
@@ -377,7 +377,7 @@ src-tauri/                 Rust workspace + Tauri shell
     box-template-core      root/common template install/uninstall core
     box-data-scheduler     soft-delete + dual-queue async hard-delete
     box-logger             tracing init + daily-rolled log files
-    box-dsh-context        dsh-box-context plugin (paths.dshboxHome/dshboxCli)
+    box-containers         container metadata + active host registry
     box-server-core        dshboxd helpers + service install
     box-browser            headless Chromium + DevTools sessions
     box-api, box-client    RPC surface + client adapter

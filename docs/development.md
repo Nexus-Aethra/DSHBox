@@ -102,7 +102,7 @@ box-resources      container resource kinds, extraction, injection
 box-plugin-graph   cordis service graph, read from source and lockfiles
 box-template-core  template resources on top of the data scheduler
 box-data-scheduler resource map + durable task queue
-box-dsh-context    patch YAML / context snapshot rendering
+box-containers     container metadata + active host registry
 box-state          ResourceStateManager read model
 box-server-core    dshboxd helpers and user-service install
 box-client         RPC client used by the desktop and the CLI

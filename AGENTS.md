@@ -81,7 +81,6 @@ frontend. Manual `cargo build` for release needs it explicitly.
 | `box-plugin-graph`         | cordis service graph, read from source + lockfiles |
 | `box-template-core`        | Template ops shared by CLI, desktop and daemon |
 | `box-data-scheduler`       | Resource map and the durable removal queue |
-| `box-dsh-context`          | Patch YAML / context snapshot rendering |
 | `box-server-core`          | `dshboxd` helpers, service install |
 | `box-browser`              | Headless Chromium + DevTools sessions (page-debugging RPCs) |
 | `box-api`, `box-client`    | IPC + client adapter layer |
@@ -274,11 +273,32 @@ command as done only once the installed app has run it.
   "not yet" instead of holding a thread. The frontend polls one request at a
   time for the same reason: overlapping polls against a busy daemon pile up.
 - **An agent inside a container talks to the box through a plugin, not the CLI.**
-  The DSH-side plugin registers `box_*` tools on the host it runs in, so an agent
-  can drive the box that contains it without a shell, a second connection, or
-  anything to install. That plugin is the agent surface now; `dshbox` and the UI
-  remain for a person. Two things it absorbs on a caller's behalf, because the
-  daemon is not consistent about them: the same argument is named differently
+  The DSH-side plugin (`@nexus-aethra/dsh-box-sandbox`, `plugins/dsh-box-sandbox`)
+  registers `box_*` tools on the host it runs in, so an agent can drive the box
+  that contains it without a shell, a second connection, or anything to install.
+  That plugin is the agent surface now; `dshbox` and the UI remain for a person.
+
+  **Every container gets it at start, and it is the only bundled plugin Box ships.**
+  `materialize_bundled_sandbox_plugin` (`dshboxd/src/lifecycle.rs`) vendors it from
+  `<runtime>/plugins/` into `profile/profiles/<p>/node_modules/@nexus-aethra/`
+  on each start, then `install_box_skill` writes the `dsh-box-tools` skill under
+  `<container>/profile/skills/`. Installing at start rather than declaring it in a
+  boxfile is what lets a container created before the plugin pick it up, and what
+  makes a plugin update land on the next start instead of the next rebuild.
+  The skill travels inside the plugin package (`skills/`), so "plugin without its
+  documentation" cannot happen.
+
+  This replaced `@deepseek-ai/dsh-box-context` (the `box-dsh-context` crate), a
+  prompt-section plugin that rendered a container-metadata snapshot. It never
+  loaded in a prepared/sealed container — every `host.log` carried
+  `Cannot find package '@deepseek-ai/dsh-box-context'` — and its one useful job
+  (telling the agent which paths it owned) now belongs to the plugin the box
+  actually wants mounted. Do not reintroduce a second bundled plugin without
+  proving it resolves from the profile's `node_modules`; the loader follows
+  `package.json` `exports`, not `NODE_PATH`.
+
+  Two things the plugin absorbs on a caller's behalf, because the daemon is
+  not consistent about them: the same argument is named differently
   per method (`id` for the graph, `containerId` for a container's plugin list,
   `container` for others), and task states are serialised in lower case
   (`#[serde(rename_all = "lowercase"]`) while the enum spells PascalCase in

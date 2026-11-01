@@ -23,7 +23,6 @@ members = [
   "crates/box-state",
   "crates/box-server-core",
   "crates/box-client",
-  "crates/box-dsh-context",
   "crates/box-data-scheduler",
   "crates/box-store",
   "crates/box-logger",
@@ -82,7 +81,6 @@ box-resources = { path = "crates/box-resources" }
 box-state = { path = "crates/box-state" }
 box-server-core = { path = "crates/box-server-core" }
 box-client = { path = "crates/box-client" }
-box-dsh-context = { path = "crates/box-dsh-context" }
 box-data-scheduler = { path = "crates/box-data-scheduler" }
 box-logger = { path = "crates/box-logger" }
 box-template-core = { path = "crates/box-template-core" }

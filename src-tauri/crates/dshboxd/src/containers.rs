@@ -1,14 +1,10 @@
 //! Container creation for daemon-run tasks. Mirrors the desktop's
 //! `containers.rs` shareable core (`create_dsh_container_sync` and the
 //! profile scaffolding it needs) plus the startup helpers the daemon
-//! lifecycle uses (workspace, context snapshot, profile preflight).
+//! lifecycle uses (workspace, bundled plugin install, profile preflight).
 
 use crate::toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel};
 use box_containers::DshContainer;
-use box_dsh_context::{
-    render_patch_yml, render_snapshot, DshContextFiles, DEFAULT_ORDER, PATCH_FILENAME,
-    SNAPSHOT_FILENAME,
-};
 use box_dsh_versions::version_directory as dsh_version_directory;
 use box_foundation::{is_safe_identifier, read_config};
 use box_runtime::process::{ExecutionKind, ProcessSpec};
@@ -632,6 +628,50 @@ fn write_boxfile_guide_skill(container_directory: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot write boxfile-guide skill: {error}"))
 }
 
+/// Name of the skill that documents the sandbox plugin's `box_*` tools.
+const BOX_TOOLS_SKILL_NAME: &str = "dsh-box-tools";
+
+/// Install the bundled `box_*` tools skill into a container's DSH skill root.
+///
+/// The skill travels inside the plugin package (`skills/`) that the start path
+/// already vendors, so "install the plugin" and "install its documentation"
+/// cannot drift apart: a build that ships the plugin without its skill leaves
+/// an agent holding tools it was never told how to use.
+///
+/// This file is Box's to own, unlike the guide skill next to it, so a changed
+/// bundled copy replaces the installed one on the next start. A user who wants
+/// their own version should copy it under a different name.
+pub(crate) fn install_box_skill(
+    container_directory: &Path,
+    bundled_skill: &Path,
+    task: Option<&TaskContext>,
+) -> Result<(), String> {
+    let source = bundled_skill.join("SKILL.md");
+    if !source.is_file() {
+        if let Some(task) = task {
+            task.log("box tools skill is not bundled in this build; skipping it");
+        }
+        return Ok(());
+    }
+    let destination = container_directory
+        .join("profile/skills")
+        .join(BOX_TOOLS_SKILL_NAME);
+    let skill_md = destination.join("SKILL.md");
+    let wanted = fs::read(&source)
+        .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+    if fs::read(&skill_md).map(|current| current == wanted).unwrap_or(false) {
+        return Ok(());
+    }
+    fs::create_dir_all(&destination)
+        .map_err(|error| format!("cannot create skill directory: {error}"))?;
+    fs::write(&skill_md, &wanted)
+        .map_err(|error| format!("cannot write the box tools skill: {error}"))?;
+    if let Some(task) = task {
+        task.log("installed the box_* tools skill");
+    }
+    Ok(())
+}
+
 pub(crate) fn create_profile_manifest(
     container_directory: &Path,
     profile: &str,
@@ -685,112 +725,6 @@ pub(crate) fn ensure_container_workspace(directory: &Path) -> Result<PathBuf, St
     fs::create_dir_all(&workspace)
         .map_err(|error| format!("cannot create container workspace: {error}"))?;
     Ok(workspace)
-}
-
-/// Render the per-container JSON snapshot Box writes on every container start.
-/// The snapshot becomes a `dsh-box:container` PromptContext section (order
-/// 130) that the agent receives as a user-role history snapshot.
-///
-/// `dshbox_home` is the absolute path to the dshbox installation directory
-/// (e.g. `D:\dshbox\`), resolved by the caller so the snapshot carries the
-/// install location for the in-container agent.
-pub(crate) fn write_dshbox_context_snapshot(
-    directory: &Path,
-    container: &serde_json::Value,
-    profile: &str,
-    dshbox_home: &Path,
-) -> Result<DshContextFiles, String> {
-    let workspace = ensure_container_workspace(directory)?;
-    let container_name = container["name"].as_str().unwrap_or("DSH Container");
-    let container_id = container["id"].as_str().unwrap_or("unknown");
-    let version = container["version"].as_str().unwrap_or("unknown");
-    let profile_home = directory.join("profile");
-    let plugins_root = directory.join("extensions/plugins");
-    let skills_root = directory.join("profile/skills");
-    let logs_root = directory.join("logs");
-
-    // Read the env-var names Box already wrote into the container's
-    // .credentials.yaml via the DSH settings UI; only the names ship.
-    let api_key_envs = read_credentials_env_names(&profile_home);
-
-    let state_dir = directory.join("state");
-    fs::create_dir_all(&state_dir)
-        .map_err(|error| format!("cannot create {}: {error}", state_dir.display()))?;
-    let snapshot_path = state_dir.join(SNAPSHOT_FILENAME);
-    let patch_path = state_dir.join(PATCH_FILENAME);
-
-    // Compute the dshbox CLI binary path. On Windows the binary has `.exe`
-    // extension; on Unix it's bare. The agent uses this path when `dshbox`
-    // is not in PATH (e.g. DSH subprocesses that inherit a sanitised env).
-    let dshbox_cli = {
-        let mut binary = dshbox_home.to_path_buf();
-        binary.push("dshbox");
-        // EXE_SUFFIX includes the leading dot (".exe"); set_extension
-        // adds its own dot, so strip the prefix.
-        binary.set_extension(
-            std::env::consts::EXE_SUFFIX
-                .strip_prefix('.')
-                .unwrap_or("exe"),
-        );
-        binary
-    };
-    let snapshot_body = render_snapshot(
-        container_id,
-        container_name,
-        version,
-        profile,
-        &workspace,
-        &profile_home,
-        &plugins_root,
-        &skills_root,
-        &logs_root,
-        dshbox_home,
-        &dshbox_cli,
-        &api_key_envs,
-    );
-    // Atomic write: stage to .tmp then rename so a racing read never sees a
-    // half-written snapshot.
-    let snapshot_tmp = snapshot_path.with_extension("json.tmp");
-    fs::write(&snapshot_tmp, snapshot_body.as_bytes())
-        .map_err(|error| format!("cannot write {}: {error}", snapshot_tmp.display()))?;
-    fs::rename(&snapshot_tmp, &snapshot_path)
-        .map_err(|error| format!("cannot rename {}: {error}", snapshot_tmp.display()))?;
-
-    let patch_body = render_patch_yml(&snapshot_path, DEFAULT_ORDER);
-    let patch_tmp = patch_path.with_extension("yml.tmp");
-    fs::write(&patch_tmp, patch_body.as_bytes())
-        .map_err(|error| format!("cannot write {}: {error}", patch_tmp.display()))?;
-    fs::rename(&patch_tmp, &patch_path)
-        .map_err(|error| format!("cannot rename {}: {error}", patch_tmp.display()))?;
-
-    Ok(DshContextFiles {
-        snapshot_path,
-        patch_path,
-    })
-}
-
-/// Extract the `apiKeyEnv` names that the DSH settings UI wrote into
-/// `<DSH_HOME>/.credentials.yaml`. Tolerant of missing or malformed files.
-fn read_credentials_env_names(profile_home: &Path) -> Vec<String> {
-    let path = profile_home.join(".credentials.yaml");
-    let body = match fs::read_to_string(&path) {
-        Ok(body) => body,
-        Err(_) => return Vec::new(),
-    };
-    let value: serde_yaml::Value = match serde_yaml::from_str(&body) {
-        Ok(value) => value,
-        Err(_) => return Vec::new(),
-    };
-    let mut names = Vec::new();
-    if let Some(map) = value.as_mapping() {
-        for (key, _) in map {
-            if let Some(key) = key.as_str() {
-                names.push(key.to_owned());
-            }
-        }
-    }
-    names.sort();
-    names
 }
 
 /// Repairs Box-created, empty named profiles from builds before profile

@@ -178,12 +178,12 @@ pub(crate) fn bundled_runtime() -> Result<&'static BundledRuntime, String> {
 }
 
 /// Vendor the bundled Cordis plugin tree (`resources/plugins/<target>/`,
-/// carrying `@deepseek-ai/dsh-box-context`) into
+/// carrying `@nexus-aethra/dsh-box-sandbox`) into
 /// `<runtimeDirectory>/plugins/`, mirroring the desktop's
 /// `initialize_bundled_plugins`. Without this the container-start path
-/// (`ensure_bundled_context_plugin`) finds no vendored tree, the profile
+/// (`materialize_bundled_sandbox_plugin`) finds no vendored tree, the profile
 /// symlink is skipped, and the DSH host dies with
-/// `Cannot find package '@deepseek-ai/dsh-box-context'` — exactly the
+/// `Cannot find package '@nexus-aethra/dsh-box-sandbox'` — exactly the
 /// failure mode every CLI-driven container start used to hit because the
 /// daemon never ran the desktop-only copy.
 ///
@@ -235,7 +235,7 @@ pub(crate) fn initialize_bundled_plugins() -> Result<(), String> {
     // (`config set runtime` / onboarding). Short-circuit only when the
     // vendored tree itself exists in the CURRENT runtime directory —
     // otherwise every container start dies with ERR_MODULE_NOT_FOUND for
-    // @deepseek-ai/dsh-box-context while the daemon believes it is done.
+    // @nexus-aethra/dsh-box-sandbox while the daemon believes it is done.
     let digest_matches = config.plugins_manifest_digest.as_deref() == Some(digest.as_str());
     if digest_matches && cache_root.join("plugins-manifest.json").is_file() {
         return Ok(());

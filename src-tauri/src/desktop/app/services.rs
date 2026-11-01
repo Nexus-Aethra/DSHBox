@@ -573,13 +573,13 @@ mod bundled_plugins_tests {
     /// A minimal manifest ships one Cordis plugin directory tree.
     fn fixture(source_root: &Path, target: &str) {
         let dir = source_root.join("plugins").join(target);
-        fs::create_dir_all(dir.join("node_modules").join("@deepseek-ai").join("dsh-box-context")).unwrap();
+        fs::create_dir_all(dir.join("node_modules").join("@nexus-aethra").join("dsh-box-sandbox")).unwrap();
         fs::write(
             dir.join("plugins-manifest.json"),
-            format!("{{\"target\":\"{}\",\"pluginPackage\":\"@deepseek-ai/dsh-box-context\",\"pluginVersion\":\"0.1.0\",\"builtAt\":\"2026-08-15\"}}", target),
+            format!("{{\"target\":\"{}\",\"pluginPackage\":\"@nexus-aethra/dsh-box-sandbox\",\"pluginVersion\":\"0.1.0\",\"builtAt\":\"2026-08-15\"}}", target),
         ).unwrap();
         fs::write(
-            dir.join("node_modules").join("@deepseek-ai").join("dsh-box-context").join("index.js"),
+            dir.join("node_modules").join("@nexus-aethra").join("dsh-box-sandbox").join("index.js"),
             "export default {}\n",
         ).unwrap();
     }
@@ -597,7 +597,7 @@ mod bundled_plugins_tests {
         // First call copies everything into the target.
         copy_dir_recursive(&resource.join("plugins").join(target), &copy_target).unwrap();
         assert!(copy_target.join("plugins-manifest.json").is_file());
-        assert!(copy_target.join("node_modules").join("@deepseek-ai").join("dsh-box-context").join("index.js").is_file());
+        assert!(copy_target.join("node_modules").join("@nexus-aethra").join("dsh-box-sandbox").join("index.js").is_file());
 
         // Second call with an unchanged source is a no-op for the copy
         // (manifest body is byte-identical, so the digest matches).

@@ -1,7 +1,3 @@
-use box_dsh_context::{
-    render_patch_yml, render_snapshot, DshContextFiles, DEFAULT_ORDER, PATCH_FILENAME,
-    SNAPSHOT_FILENAME,
-};
 use box_containers::{
     container_directory, scan_containers, CreateDshContainerRequest, DshContainer,
 };

@@ -93,7 +93,7 @@ DSH Box 拆成 Tauri **桌面外壳**、一个不依赖框架的 Rust workspace�
 | 前端（React 18 + Vite，`src/`） | 页面、组件、`useTaskQueue`/`useContainers`/`useResources`/`useSettings` 等 hook。**没有业务逻辑**——页面只发 RPC 并对 daemon 的 SSE 事件做出反应。 | 让 Box 界面保持轻薄，并让任何客户端（界面/CLI/agent）共用同一条代码路径。 |
 | 桌面外壳（Tauri 2，`src-tauri/src/`） | 浏览器窗口、托盘、Tauri IPC 适配层。通过 loopback HTTP 与 daemon 通信。所有实际工作都交给 `dshboxd`。 | 状态变更只有一个源头，界面与 CLI 不会各自漂移。 |
 | Daemon（`src-tauri/crates/dshboxd`） | 常驻后台服务。拥有任务队列、文档存储、模板索引、容器注册表和 SSE 事件总线。单一 HTTP 入口（`POST /rpc`）加 `GET /events?token=…`。 | 安装、重建、卸载等后台工作不会随窗口关闭而中断。 |
-| Crate workspace（`src-tauri/crates/`） | 不依赖框架的 Rust crate：`box-foundation`、`box-runtime`、`box-scheduler`、`box-state`、`box-toolchains`、`box-dsh-versions`、`box-containers`、`box-extensions`、`box-image`、`box-template-core`、`box-data-scheduler`、`box-logger`、`box-dsh-context`、`box-server-core`、`box-browser`、`box-api`、`box-client`。 | 纯函数 + 单元测试；只有顶层 `dshbox` 与 `dshboxd` 链接 Tauri/HTTP。 |
+| Crate workspace（`src-tauri/crates/`） | 不依赖框架的 Rust crate：`box-foundation`、`box-runtime`、`box-scheduler`、`box-state`、`box-toolchains`、`box-dsh-versions`、`box-containers`、`box-extensions`、`box-image`、`box-template-core`、`box-data-scheduler`、`box-logger`、`box-server-core`、`box-browser`、`box-api`、`box-client`。 | 纯函数 + 单元测试；只有顶层 `dshbox` 与 `dshboxd` 链接 Tauri/HTTP。 |
 
 依赖方向是单向的：`foundation / runtime / scheduler / state` → 功能 crate → Tauri/桌面适配层。功能 crate 不依赖 Tauri，也不依赖彼此的易变状态。
 
@@ -152,7 +152,7 @@ ADD skill team-conventions
 每条 `ADD` 的存储方式很重要：
 - `ADD plugin` —— 来源作为不可变的本地 `artifact.tgz` 导入共享**资源库**，由封存模板记录，只在最终路径准备容器时才加入。运行中的容器不含任何资源库绝对路径，也不会跑插件依赖安装。
 - `ADD skill` 与 `ADD data` —— 快照进数据存储（`<runtime>/data/<digest>/`），在已构建模板中物化，并复制进容器 profile。
-- 捆绑的 `dsh-box-context` 插件（`@deepseek-ai/dsh-box-context`）会自动复制，不需要 `ADD`。
+- 捆绑的 `dsh-box-sandbox` 插件（`@nexus-aethra/dsh-box-sandbox`）会在启动时装进每个容器——不需要 `ADD`。它注册 `box_*` 工具，让容器里的 agent 能驱动 box，并自带 `dsh-box-tools` skill，agent 因此知道该怎么用这些工具。
 
 各步骤的分工是刻意的：
 
@@ -353,7 +353,7 @@ src-tauri/                 Rust workspace + Tauri 外壳
     box-template-core      根/通用模板安装卸载核心
     box-data-scheduler     软删除 + 双队列异步硬删除
     box-logger             tracing 初始化与按天滚动日志
-    box-dsh-context        dsh-box-context 插件（paths.dshboxHome/dshboxCli）
+    box-containers         容器元数据 + 运行中的 host 注册表
     box-server-core        dshboxd 辅助 + 服务安装
     box-browser            无头 Chromium + DevTools 会话
     box-api, box-client    RPC 面 + 客户端适配

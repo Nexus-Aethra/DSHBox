@@ -4,6 +4,16 @@ import { delimiter, dirname, join, relative } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { hashInputs, isFresh } from './mtime.mjs'
 
+// Bundle the sandbox plugin (the one the agent inside a container drives the
+// box through) into `resources/plugins/<target>/`, which Tauri ships with the
+// app and the daemon vendors into `<runtime>/plugins/` at startup.
+//
+// This used to bundle `@deepseek-ai/dsh-box-context`, a plugin that rendered a
+// container-metadata prompt section. It never loaded in a prepared/sealed
+// container (`Cannot find package '@deepseek-ai/dsh-box-context'` in every
+// host.log) and its one real job -- telling the agent which paths it owns --
+// is better carried by the plugin the box actually wants mounted.
+
 // Resolve the target triple, mirroring scripts/prepare-runtime.mjs.
 const target = process.argv.includes('--target')
   ? process.argv[process.argv.indexOf('--target') + 1]
@@ -11,8 +21,10 @@ const target = process.argv.includes('--target')
       ?? `${process.platform === 'win32' ? 'win' : process.platform === 'darwin' ? 'macos' : 'linux'}-${process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch}`
 
 const root = process.cwd()
-const pluginSource = join(root, 'src-tauri/crates/box-dsh-context/dsh-box-context')
-const pluginPackage = '@deepseek-ai/dsh-box-context'
+// The plugin source is the workspace package, not a vendored copy: it is the
+// same tree `pnpm build` and `check:outputs` run against.
+const pluginSource = join(root, 'plugins', 'dsh-box-sandbox')
+const pluginPackage = '@nexus-aethra/dsh-box-sandbox'
 const output = join(root, 'src-tauri/resources/plugins', target)
 
 if (!existsSync(pluginSource)) {
@@ -22,24 +34,29 @@ if (!existsSync(pluginSource)) {
 
 const force = process.argv.includes('--force')
 
-// Skip rebuilding while the vendored plugin tree is newer than every
-// tracked source file under the plugin package. Pass --force to rebuild.
-const sources = [join(root, 'src-tauri/crates/box-dsh-context/dsh-box-context')]
+// Skip rebuilding while the built tree is newer than every tracked source
+// file of the plugin (src/, plus the manifest and patch that ship with it).
+const sources = [
+  join(pluginSource, 'src'),
+  join(pluginSource, 'package.json'),
+  join(pluginSource, 'cordis.patch.yml'),
+  join(pluginSource, 'skills'),
+]
 if (isFresh(output, sources, force)) {
   console.log(`plugins already prepared at ${output}; pass --force to rebuild`)
   process.exit(0)
 }
 
-// Stronger hash-cache: hash the plugin's package.json + the lockfile so
-// `pnpm build` only runs when the plugin's declared dependencies or
-// version actually changed. Without this, every workspace mtime drift
-// (Cargo.lock, sibling crates, etc.) wastes a full pnpm install + build.
+// Stronger hash-cache: hash the plugin's package.json + the lockfile so the
+// plugin build only runs when its declared dependencies or version actually
+// changed. Without this, every workspace mtime drift (Cargo.lock, sibling
+// crates) wastes a full pnpm install + build.
 const cacheRoot = join(root, '.cache', 'dsh-box', 'plugin')
 mkdirSync(cacheRoot, { recursive: true })
 const cacheFile = join(cacheRoot, `${target}.sha256`)
 const hashInputs_ = [
   join(pluginSource, 'package.json'),
-  join(pluginSource, 'pnpm-lock.yaml'),
+  join(root, 'pnpm-lock.yaml'),
   join(pluginSource, 'tsconfig.json'),
 ]
 if (hashInputs(cacheFile, hashInputs_, force)) {
@@ -61,7 +78,15 @@ function findCommand(cmd, extraDirs = []) {
   const dirs = (process.env.PATH || '').split(delimiter).filter(Boolean)
   for (const dir of [...dirs, ...extraDirs]) {
     for (const name of names) {
-      if (existsSync(join(dir, name))) return join(dir, name)
+      const candidate = join(dir, name)
+      // A directory is not a command. Box's install directory sits on PATH and
+      // holds a `pnpm/` data directory, so existsSync alone picks that and
+      // spawnSync then fails with ENOENT on something that was never a file.
+      try {
+        if (statSync(candidate).isFile()) return candidate
+      } catch {
+        // Missing or unreadable: not a candidate.
+      }
     }
   }
   return null
@@ -100,15 +125,31 @@ function resolvePnpmInvocation() {
 
 const pnpm = resolvePnpmInvocation()
 const build = spawnSync(pnpm.cmd, pnpm.args, { stdio: 'inherit', shell: pnpm.shell })
-if (build.status !== 0) process.exit(build.status ?? 1)
+if (build.status !== 0) {
+  // Say WHY. A bundler invoked through a shell that cannot find it exits 1
+  // with nothing on either stream, and "the plugin did not build" with no
+  // message send the reader looking for a TypeScript error that never existed.
+  if (build.error) console.error(`cannot run ${pnpm.cmd}: ${build.error.message}`)
+  console.error(
+    `the plugin build failed (exit ${build.status ?? 'signal ' + build.signal}); ` +
+    `run "pnpm --dir ${pluginSource} build" to see the compiler output`,
+  )
+  process.exit(build.status ?? 1)
+}
 
-// 2. Clean the destination and copy the package skeleton.
+// 2. Clean the destination and copy the package skeleton. `skills/` travels
+//    with the package because the container-start path installs them into the
+//    container's DSH skill root.
 rmSync(output, { recursive: true, force: true })
 mkdirSync(output, { recursive: true })
 const pkgDir = join(output, 'node_modules', pluginPackage)
 mkdirSync(pkgDir, { recursive: true })
 
-for (const entry of ['dist', 'cordis.patch.yml', 'README.md', 'package.json']) {
+for (const entry of ['dist', 'cordis.patch.yml', 'README.md', 'package.json', 'skills']) {
+  if (!existsSync(join(pluginSource, entry))) {
+    if (entry === 'skills') continue
+    throw new Error(`plugin source is missing ${entry}`)
+  }
   cpSync(join(pluginSource, entry), join(pkgDir, entry), { recursive: true })
 }
 
@@ -177,7 +218,7 @@ function walk(dir) {
 const manifest = {
   target,
   pluginPackage,
-  pluginVersion: '0.1.0',
+  pluginVersion: pluginPkgJson.version,
   builtAt: new Date().toISOString(),
   files: {},
 }
@@ -187,5 +228,5 @@ for (const file of walk(pkgDir)) {
 }
 
 const manifestPath = join(output, 'plugins-manifest.json')
-createWriteStream(manifestPath).end(JSON.stringify(manifest, null, 2))
+writeFileSync(manifestPath, JSON.stringify(manifest, null, 2))
 console.log(`wrote ${relative(root, manifestPath)} (${Object.keys(manifest.files).length} files)`)
