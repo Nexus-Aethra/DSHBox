@@ -177,6 +177,7 @@ const COMMANDS = {
   list_resource_views: () => callDaemon('list_resource_views', {}),
   add_resource_view: (request) => callDaemon('add_resource_view', request),
   delete_resource_view: ({ viewId }) => callDaemon('delete_resource_view', { viewId }),
+  set_resource_view_enabled: ({ viewId, enabled }) => callDaemon('set_resource_view_enabled', { viewId, enabled }),
   list_resource_type: ({ kind, path }) => callDaemon('list_resource_type', { kind, path }),
   enqueue_resource_extract: (request) => callDaemon('enqueue_resource_extract', request),
   enqueue_resource_inject: (request) => callDaemon('enqueue_resource_inject', request),

@@ -28,6 +28,7 @@ type Text = PluginGraphText & AddResourceTypeText & ResourceTypeText & {
   githubOnly: string; importBundle: string; conflictOverwrite: string; conflictKeep: string
   bundleRefNote: string; bundleRefDelete: string
   resources: string; harnessTab: string; templateTab: string; bundleTab: string; addResource: string
+  resourceTabsOverflow: string
   resourceBuiltinSessions: string; resourceBuiltinCredentials: string
   importSourceHint: string
   storageReference: string; storageOwned: string
@@ -156,6 +157,11 @@ export function ResourcesPage({
     }
   }
 
+  // The tab list and the container names are two independent reads, and the
+  // container one is the slow half: it walks the runtime directory and probes
+  // every host's PID. Awaiting them together made the Resources page paint an
+  // empty tab bar until that finished. `listContainers` also rejects outright
+  // when storage is unconfigured, which used to blank the list entirely.
   useEffect(() => {
     void reloadViews()
     boxApi.listContainers().then(setContainers).catch(() => { setContainers([]) })
@@ -238,12 +244,14 @@ export function ResourcesPage({
     { id: 'view:builtin-sessions', label: text.resourceBuiltinSessions },
     { id: 'view:builtin-credentials', label: text.resourceBuiltinCredentials },
     // Resource types the user pinned: one tab each, its content is every
-    // container's copy of that type plus what has been extracted.
-    ...views.map((view) => ({ id: `view:${view.id}`, label: view.label })),
+    // container's copy of that type plus what has been extracted. A type the
+    // user closed in Settings keeps its row but is no longer a tab, which is
+    // what stops the navigation from growing past the width of the window.
+    ...views.filter((view) => view.enabled).map((view) => ({ id: `view:${view.id}`, label: view.label })),
   ]
   const builtinViews: ResourceView[] = [
-    { id: 'builtin-sessions', label: text.resourceBuiltinSessions, kind: 'sessions', container: '', path: 'profile/sessions', secret: false, shape: 'entries', entryDepth: 2, createdAt: 0 },
-    { id: 'builtin-credentials', label: text.resourceBuiltinCredentials, kind: 'credentials', container: '', path: 'profile/.credentials.yaml', secret: true, shape: 'opaque', entryDepth: 1, createdAt: 0 },
+    { id: 'builtin-sessions', label: text.resourceBuiltinSessions, kind: 'sessions', container: '', path: 'profile/sessions', secret: false, shape: 'entries', entryDepth: 2, enabled: true, createdAt: 0 },
+    { id: 'builtin-credentials', label: text.resourceBuiltinCredentials, kind: 'credentials', container: '', path: 'profile/.credentials.yaml', secret: true, shape: 'opaque', entryDepth: 1, enabled: true, createdAt: 0 },
   ]
   const activeView = tab.startsWith('view:')
     ? [...builtinViews, ...views].find((view) => `view:${view.id}` === tab) ?? null
@@ -259,6 +267,7 @@ export function ResourcesPage({
         value={tab}
         onChange={setTab}
         ariaLabel={text.resources}
+        overflowLabel={text.resourceTabsOverflow}
         action={(
           <span className="ui-tab-action">
             <Button variant="ghost" size="sm" onClick={() => { setAddTypeOpen(true) }}>{text.resourceAddType}</Button>
@@ -272,7 +281,10 @@ export function ResourcesPage({
             text={text}
             removable={!activeIsBuiltin}
             onRemove={async () => {
-              await boxApi.deleteResourceView(activeView.id)
+              // Closing, not deleting: the type keeps its row and the copies
+              // already taken under it. Settings has the delete if that is what
+              // the user meant.
+              await boxApi.setResourceViewEnabled(activeView.id, false)
               await reloadViews()
               setTab('harness')
             }}

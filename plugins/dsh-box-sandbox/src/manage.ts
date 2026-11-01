@@ -278,7 +278,7 @@ export function registerManageTools(ctx: Context): void {
       properties: {
         action: actionProperty(
           'resources',
-          ['list', 'read', 'write', 'extract', 'inject', 'rm', 'rm-view', 'prune', 'types', 'views'],
+          ['list', 'read', 'write', 'extract', 'inject', 'rm', 'rm-view', 'view-on', 'view-off', 'prune', 'types', 'views'],
         ),
         containerId: { type: 'string', description: 'Container to act on.' },
         path: {
@@ -297,7 +297,12 @@ export function registerManageTools(ctx: Context): void {
         },
         text: { type: 'string', description: 'The YAML block to place at --section.' },
         resourceId: { type: 'string', description: 'Which stored resource to inject or remove.' },
-        viewId: { type: 'string', description: 'Which resource view to remove.' },
+        viewId: {
+          type: 'string',
+          description:
+            'Which resource view to act on: the type a Resources tab stands for. Required by '
+            + 'rm-view, view-on and view-off.',
+        },
         name: { type: 'string', description: 'Name for an extracted resource.' },
         merge: { type: 'boolean', description: 'Merge into an existing destination instead of refusing.' },
         overwrite: { type: 'boolean', description: 'Replace the destination first.' },
@@ -385,13 +390,33 @@ export function registerManageTools(ctx: Context): void {
             ),
           }
         case 'rm-view':
+          // The daemon reads this as `viewId`, not `id`: the request key is
+          // the one the method was written for, and a caller that guesses
+          // `id` gets "expected a view id" back instead of a removal.
           return {
             action,
             containerId,
             result: asObject(
-              await rpc.call('delete_resource_view', { id: required(record, 'viewId') }),
+              await rpc.call('delete_resource_view', { viewId: required(record, 'viewId') }),
             ),
           }
+        case 'view-on':
+        case 'view-off': {
+          // Closing a type and showing it again are the same flag, so one
+          // request does both; a disabled type keeps its row and its stored
+          // copies and only stops being offered as a tab.
+          const enabled = action === 'view-on'
+          return {
+            action,
+            containerId,
+            result: asObject(
+              await rpc.call('set_resource_view_enabled', {
+                viewId: required(record, 'viewId'),
+                enabled,
+              }),
+            ),
+          }
+        }
         case 'prune':
           return { action, containerId, result: { removed: await rpc.call('prune_orphaned_data') } }
         case 'types': {
@@ -412,7 +437,7 @@ export function registerManageTools(ctx: Context): void {
           badAction(
             'resources',
             action,
-            ['list', 'read', 'write', 'extract', 'inject', 'rm', 'rm-view', 'prune', 'types', 'views'],
+            ['list', 'read', 'write', 'extract', 'inject', 'rm', 'rm-view', 'view-on', 'view-off', 'prune', 'types', 'views'],
           )
       }
     },

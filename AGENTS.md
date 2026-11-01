@@ -324,6 +324,23 @@ command as done only once the installed app has run it.
   `dshboxd/src/resources.rs`): taking a copy again adds `<name>-2` instead of
   replacing the one the user already has, since taking a copy is an explicit act
   — the same kind from two containers must not land on one row.
+- **A resource type is a tab, and closing it is not deleting it.** `ResourceView`
+  (`box-resources/src/record.rs`) carries `enabled`, defaulting to true so a row
+  written before the field existed stays visible. `list_resource_views` returns
+  **every** row; the navigation filters by `enabled`, which is what keeps the
+  Settings pane able to show and re-open a type the user hid. `set_resource_view_enabled`
+  flips the flag and answers `changed` so a repeat toggle is a no-op rather than
+  an error; `delete_resource_view` removes the row and leaves the stored copies
+  alone. Both halves exist in the CLI (`container resource type on|off|rm`) and
+  in the agent plugin (`box_resources` `view-on`/`view-off`/`rm-view`), because
+  a flag only the UI can set is a flag a script cannot reproduce.
+- **The tab strip scrolls, and hides what does not fit behind an overflow menu.**
+  `src/ui/Tabs.tsx` measures each tab's right edge against the strip's
+  `clientWidth`; a tab past that edge goes into the `More` menu. Do not measure
+  the cutoff as `scrollWidth - clientWidth` — that is the width *hidden*, not the
+  width *visible*, and using it hides tabs that are in plain sight. Moving a tab
+  back out of the menu needs `MENU_SLACK_PX` of real room, because showing the
+  menu itself narrows the strip and a zero-margin comparison flaps forever.
 - **A resource is one or more parts, and a part may be a YAML section.** A kind
   declares `parts` (`KindPart`): a container-relative path, optionally with a
   `section` key path. `credentials` is two parts — `.credentials.yaml` plus
@@ -381,6 +398,16 @@ command as done only once the installed app has run it.
   `state/sealed-templates.json`. Never resolve one by a flat `<name>.dsh` path: that
   legacy filename lookup misses sealed recipes and reports `template not found` for a
   container that was materialised correctly moments earlier.
+- **`ADD skill` is advertised but refused.** `box-image` parses
+  `AddKind::Skill`, and its `.dshimage`/`compile_manifest` path can describe it,
+  but the production sealed manifest (`box-foundation::TemplateManifest`) has no
+  `adds` list and `build_sealed_template_from_script` rejects every non-plugin
+  op ("sealed-template build currently supports ADD plugin only; import
+  skills/data after the container-copy migration"). A skill reaches a container only through
+  `install_container_skill` (repository import → `plugin install`/`plugin copy`/
+  bundle load); the bundled guide skill is written by `create_dsh_container_sync`
+  under the name `dshbox-guide` and only on that path, not on the sealed one.
+  Details in `docs/template-system.md`.
 - **Workspace extension scan** detects plugins/skills under
   `<container>/workspace` for the UI to import into the repo (recently added;
   review alongside related changes before committing).
@@ -407,7 +434,7 @@ command as done only once the installed app has run it.
 | Architecture, runtime model, crate map | `docs/development.md`, `handoff.md` (repo root) |
 | Prepared base / sealed template design | `docs/specs/prepared-template-runtime.md` |
 | Document store and storage layers | `docs/specs/storage-abstraction.md` |
-| Template system behavior | `docs/template-system.md` |
+| Template system behavior, container skills | `docs/template-system.md` |
 | Plugin pnpm install flow | `docs/design/pnpm-managed-plugin-install.md` |
 | Past incidents, kept as history | `docs/notes/` — a fixed bug is context, not a live warning |
 | Linux host-git passthrough / Windows pnpm base | `docs/notes/2026-08-21-*.md` |

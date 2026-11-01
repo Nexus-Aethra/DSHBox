@@ -41,61 +41,32 @@ pub fn container_directory(root: &str, id: &str) -> PathBuf {
 
 /// Path to the PID file dropped by the desktop app when a container host
 /// is launched. The CLI (and any other read-only consumer) checks this file
-/// plus a live `kill -0` / `tasklist` probe to decide whether the host is
-/// still running, instead of trusting an in-memory map it cannot see.
+/// plus a direct process query to decide whether the host is still running,
+/// instead of trusting an in-memory map it cannot see.
 pub fn host_pid_path(container: &DshContainer) -> PathBuf {
     PathBuf::from(&container.directory)
         .join("state")
         .join("host.pid")
 }
 
-#[cfg(unix)]
+/// True when the PID names a live process.
+///
+/// This delegates to `box_runtime::process::probe_pid`, which asks the OS
+/// directly (a `/proc` read on Linux, an `OpenProcess`/`GetExitCodeProcess`
+/// pair on Windows). The previous implementation shelled out to `tasklist`
+/// on Windows, which cost ~450 ms per call, and this runs once per container
+/// on every `list_containers` -- so opening a two-row page waited half a
+/// second on process-spawning, for every row, before it could draw anything.
+///
+/// A PID we cannot query is reported as "not alive": `Recycled` and
+/// `Unknown` both mean the host record cannot be trusted, and the caller
+/// falls back to "stopped" -- which a later `dshbox start` repairs by
+/// recreating the record.
 fn pid_is_alive(pid: u32) -> bool {
-    // Use kill -0 to probe the process without sending a signal. ESRCH
-    // ("No such process") exits with status 1; a successful probe exits
-    // with 0. We deliberately treat EPERM (also status 1) as "unknown"
-    // rather than "alive" because the practical impact is identical: the
-    // PID file is stale and dshbox ps reports "stopped". A subsequent
-    // dshbox start recreates the file, so any false negative is
-    // recoverable on the next user action.
-    let output = std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output();
-    match output {
-        Ok(out) => out.status.success(),
-        Err(_) => false,
-    }
-}
-
-#[cfg(windows)]
-fn pid_is_alive(pid: u32) -> bool {
-    // `tasklist` ships with every Windows install; `/NH` suppresses the
-    // header so we only have to look for the PID literal in the body. Any
-    // error (missing tool, denied permission, etc.) is treated as "unknown"
-    // and the caller will fall back to "stopped".
-    let output = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output();
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            // `/FO CSV` quotes every field, including the PID: the first
-            // data row is e.g. `"node.exe","1234",...`.  Looking for an
-            // unquoted `,1234,` therefore reports every healthy Windows
-            // host as stopped.
-            let expected = pid.to_string();
-            stdout.lines().any(|line| {
-                line.split(',')
-                    .nth(1)
-                    .map(|field| field.trim().trim_matches('"') == expected)
-                    .unwrap_or(false)
-            })
-        }
-        Err(_) => false,
-    }
+    matches!(
+        box_runtime::process::probe_pid(pid),
+        box_runtime::process::PidState::Alive
+    )
 }
 
 /// Returns true when the host PID file exists and the process it points at

@@ -223,6 +223,8 @@ Kinds come from three places: Box ships `sessions` and `credentials`; a plugin p
 
 In the UI, a resource type is a **tab in the Resources navigation**. `Chat history` and `API keys` ship as tabs, and **+ Resource type** adds one more: pick a container, then either a kind Box detected there, a **plugin to scan** (every package installed in the profile is offered, filtered as you type), or a path you pick in a **tree of the container's storage area**. Taking a copy is one button that opens a card — which container the state comes out of, and what to call the copy:
 
+Once there are more types than the navigation is wide, the strip scrolls and the tabs that do not fit move into a **More** menu beside it, so a type is never unreachable and the bar never grows past the window. **Settings → Resource types** is where a type is managed: *Close* hides its tab and keeps the row and every copy already taken under it, *Show* brings it back, and *Delete* removes the type itself — closing is not deletion, because a user who stops looking at a tab has not asked for their copies to be thrown away.
+
 ![Taking a copy: pick the container and name the copy](docs/images/resource-copy.png)
 
 Any YAML block of a container file can be edited by its key path, in the same model: the document is a tree, picking a node loads that block, and a path that does not exist yet is how a block is added. Writing goes through the same merge-or-replace policy an injected copy uses.
@@ -231,7 +233,10 @@ Any YAML block of a container file can be edited by its key path, in the same mo
 
 ```bash
 dshbox container resource list <id> [--plugin @scope/name]      # kinds, locations, sizes
-dshbox container resource types [--json]                        # resource types (UI tabs)
+dshbox container resource types [--json]                        # resource types (shown or hidden)
+dshbox container resource type off <view-id>                    # hide the tab, keep the row
+dshbox container resource type on <view-id>                     # show it again
+dshbox container resource type rm <view-id>                     # remove the type itself
 dshbox container resource extract <id> credentials --name prod
 dshbox container resource stored                                # what the Box store holds
 dshbox container resource inject <id> credentials-prod --merge --restart

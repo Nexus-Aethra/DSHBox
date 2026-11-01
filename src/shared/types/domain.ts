@@ -303,6 +303,8 @@ export type ResourceView = {
   secret: boolean
   shape: ResourceShape
   entryDepth: number
+  /** Whether the type is offered as a tab. A closed type keeps its copies. */
+  enabled: boolean
   createdAt: number
 }
 

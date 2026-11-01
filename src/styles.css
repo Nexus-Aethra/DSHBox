@@ -288,12 +288,25 @@ code.missing { color: #b42318; }
 .ui-toolbar > .ui-input { flex: 1; min-width: 200px; }
 
 .ui-tabs { display: flex; flex-direction: column; gap: var(--space-5); }
-.ui-tab-list { border-bottom: 1px solid var(--color-border); display: flex; gap: var(--space-4); }
-.ui-tab { background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--color-text-muted); cursor: pointer; font-size: 13px; padding: 9px 2px; transition: color 120ms ease, border-color 120ms ease; }
+.ui-tab-list { align-items: center; border-bottom: 1px solid var(--color-border); display: flex; gap: var(--space-4); min-width: 0; }
+/* The strip scrolls when there are more tabs than fit. The scrollbar stays out
+   of the way, and the overflow menu beside it holds the tabs that are cut off,
+   so a tab is never unreachable just because the window is narrow. */
+.ui-tab-strip { display: flex; flex: 1 1 auto; gap: var(--space-4); min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.ui-tab-strip::-webkit-scrollbar { display: none; }
+.ui-tab { background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--color-text-muted); cursor: pointer; flex: 0 0 auto; font-size: 13px; padding: 9px 2px; transition: color 120ms ease, border-color 120ms ease; }
 .ui-tab:hover { color: var(--color-text); }
 .ui-tab.active { border-bottom-color: var(--color-primary); color: var(--color-text); font-weight: 600; }
 .ui-tab:focus-visible { outline: 2px solid #dbe7ff; outline-offset: 2px; border-radius: 4px; }
 .ui-tab-panel { display: flex; flex-direction: column; gap: var(--space-4); }
+.ui-tab-overflow { flex: 0 0 auto; position: relative; }
+.ui-tab-overflow > summary { background: transparent; border: 1px solid var(--color-border-strong); border-radius: 7px; color: var(--color-text-muted); cursor: pointer; font-size: 13px; list-style: none; padding: 6px 10px; white-space: nowrap; }
+.ui-tab-overflow > summary::-webkit-details-marker { display: none; }
+.ui-tab-overflow > summary:hover { color: var(--color-text); }
+.ui-tab-overflow-menu { background: #fff; border: 1px solid var(--color-border-strong); border-radius: 10px; box-shadow: 0 10px 28px rgba(16, 24, 40, .12); display: grid; gap: 2px; margin-top: 6px; min-width: 180px; padding: 6px; position: absolute; right: 0; top: 100%; z-index: 20; }
+.ui-tab-overflow-item { background: transparent; border: 0; border-radius: 7px; color: var(--color-text); cursor: pointer; font-size: 13px; padding: 7px 10px; text-align: left; white-space: nowrap; }
+.ui-tab-overflow-item:hover { background: #f5f6f7; }
+.ui-tab-overflow-item.active { background: #eef3ff; font-weight: 650; }
 
 .ui-checkbox { align-items: center; cursor: pointer; display: inline-flex; gap: 10px; min-height: 24px; }
 .ui-checkbox input { appearance: none; -webkit-appearance: none; background: var(--color-bg); border: 1px solid var(--color-border-strong); border-radius: 4px; cursor: pointer; height: 16px; margin: 0; padding: 0; position: relative; transition: background 120ms ease, border-color 120ms ease; width: 16px; flex-shrink: 0; }

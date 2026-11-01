@@ -103,7 +103,19 @@ pub struct ResourceView {
     pub shape: crate::kinds::Shape,
     #[serde(default = "default_depth")]
     pub entry_depth: u8,
+    /// Whether the type shows up in the Resources navigation. A disabled type
+    /// keeps its row and its stored copies; it is just not offered as a tab.
+    ///
+    /// `default` is "enabled", because a view written before this field
+    /// existed was a visible tab, and reading it as disabled would hide a
+    /// type the user pinned on purpose.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     pub created_at: u64,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 pub fn view_key(view: &ResourceView) -> &str {

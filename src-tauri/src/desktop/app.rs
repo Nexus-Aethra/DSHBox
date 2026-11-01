@@ -396,6 +396,7 @@ fn run_inner() -> Result<(), String> {
             list_resource_views,
             add_resource_view,
             delete_resource_view,
+            set_resource_view_enabled,
             list_resource_type,
             browse_container_paths,
             read_resource_tree,

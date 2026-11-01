@@ -409,6 +409,10 @@ pub(crate) fn delete_resource(state: &DaemonState, request: &Value) -> Result<Va
 }
 
 /// The resource types the user pinned to the navigation.
+///
+/// Every row is returned, enabled or not: the Settings pane has to show a
+/// disabled type so it can be switched back on, and the navigation is what
+/// filters by `enabled`, not this call.
 pub(crate) fn list_resource_views(state: &DaemonState, _request: &Value) -> Result<Value, String> {
     let paths = state
         .paths
@@ -418,6 +422,44 @@ pub(crate) fn list_resource_views(state: &DaemonState, _request: &Value) -> Resu
     let mut views = collection.load_all()?;
     views.sort_by(|left, right| left.created_at.cmp(&right.created_at));
     Ok(json!({ "views": views }))
+}
+
+/// Switch a resource type on or off.
+///
+/// A disabled type keeps its row, its label and the copies taken under it;
+/// only the navigation stops offering it as a tab. That is what "closing" a
+/// type has to mean — the stored copies are the user's state, and dropping them
+/// because a tab was closed would make the switch destructive.
+pub(crate) fn set_resource_view_enabled(
+    state: &DaemonState,
+    request: &Value,
+) -> Result<Value, String> {
+    let id = request["viewId"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or("expected a view id")?
+        .to_owned();
+    let enabled = request["enabled"]
+        .as_bool()
+        .ok_or("expected an enabled flag")?;
+    let paths = state
+        .paths
+        .read()
+        .map_err(|_| "daemon paths lock failed".to_owned())?;
+    let collection = record::view_collection(box_store::open_document_store_for_paths(&paths)?);
+    let mut view = collection
+        .load_all()?
+        .into_iter()
+        .find(|view| view.id == id)
+        .ok_or("resource view not found")?;
+    if view.enabled == enabled {
+        // Already in that state: report it and change nothing, so a repeated
+        // toggle is not an error and does not rewrite the row.
+        return Ok(json!({ "view": view, "changed": false }));
+    }
+    view.enabled = enabled;
+    collection.upsert(&[view.clone()])?;
+    Ok(json!({ "view": view, "changed": true }))
 }
 
 /// Pin a resource type: the container is what the kind resolves against, and
@@ -467,6 +509,10 @@ pub(crate) fn add_resource_view(state: &DaemonState, request: &Value) -> Result<
         secret: kind_info.secret,
         shape: kind_info.shape,
         entry_depth: kind_info.entry_depth,
+        // Re-adding a type the user had switched off brings it back: the
+        // gesture is "I want this type", and a hidden tab would read as the
+        // add having failed.
+        enabled: true,
         created_at: existing,
     };
     collection.upsert(&[view.clone()])?;
@@ -1084,6 +1130,56 @@ mod tests {
             free_record_id(&collection, "credentials-hello").unwrap(),
             "credentials-hello"
         );
+    }
+
+    /// A view written before the `enabled` field existed was a visible tab,
+    /// so reading it as disabled would hide a type the user pinned on purpose.
+    #[test]
+    fn a_view_without_an_enabled_flag_reads_as_enabled() {
+        let stored = serde_json::json!({
+            "id": "sessions-container-1",
+            "label": "Chat history",
+            "kind": "sessions",
+            "container": "container-1",
+            "path": "profile/sessions",
+            "secret": false,
+            "shape": "entries",
+            "entryDepth": 2,
+            "createdAt": 0,
+        });
+        let view: box_resources::ResourceView = serde_json::from_value(stored).unwrap();
+        assert!(view.enabled, "an older view must not disappear from the navigation");
+    }
+
+    /// Closing a type is not deleting it: the row and the copies taken under
+    /// it survive, and only the navigation stops offering the tab.
+    #[test]
+    fn closing_a_view_keeps_the_row() {
+        let collection = Collection::memory("resource_views", record::view_key);
+        let view = box_resources::ResourceView {
+            id: "sessions-container-1".to_owned(),
+            label: "Chat history".to_owned(),
+            kind: "sessions".to_owned(),
+            container: "container-1".to_owned(),
+            path: Some("profile/sessions".to_owned()),
+            secret: false,
+            shape: Shape::Entries,
+            entry_depth: 2,
+            enabled: true,
+            created_at: 7,
+        };
+        collection.upsert(&[view.clone()]).unwrap();
+
+        // The switch only changes the flag.
+        let mut closed = view.clone();
+        closed.enabled = false;
+        collection.upsert(&[closed]).unwrap();
+
+        let stored = collection.load_all().unwrap();
+        assert_eq!(stored.len(), 1, "closing a type must not remove its row");
+        assert!(!stored[0].enabled);
+        assert_eq!(stored[0].label, "Chat history", "the label is the user's");
+        assert_eq!(stored[0].created_at, 7, "closing does not reorder the type");
     }
 
     #[test]

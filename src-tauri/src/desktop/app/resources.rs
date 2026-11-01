@@ -77,6 +77,22 @@ pub(crate) fn delete_resource_view(view_id: String) -> Result<serde_json::Value,
     forward("delete_resource_view", serde_json::json!({ "viewId": view_id }))
 }
 
+/// Switch a resource type on or off: a closed type keeps its row and its
+/// copies, it just stops being offered as a tab.
+#[tauri::command(async)]
+pub(crate) fn set_resource_view_enabled(
+    view_id: String,
+    enabled: bool,
+) -> Result<serde_json::Value, String> {
+    if !is_safe_identifier(&view_id) {
+        return Err("invalid resource view id".to_owned());
+    }
+    forward(
+        "set_resource_view_enabled",
+        serde_json::json!({ "viewId": view_id, "enabled": enabled }),
+    )
+}
+
 #[tauri::command(async)]
 pub(crate) fn list_resource_type(
     kind: String,

@@ -45,9 +45,14 @@ dshbox container resource write <id> <path> [options] [--json]
         --overwrite      replace that block
         --restart        a running container is stopped, written, then started
 dshbox container resource types [--json]
-        the resource types Box shows as tabs (kind, container, path, label)
+        the resource types Box shows as tabs (kind, container, path, label,
+        shown or hidden)
 dshbox container resource type rm <view-id>
         remove one of those types (the state itself is untouched)
+dshbox container resource type off <view-id> [--json]
+        hide the type's tab; its row and the copies taken under it stay
+dshbox container resource type on <view-id> [--json]
+        show a type that was closed again
 dshbox container resource rm <resource-id> [--json]
         delete an extracted resource and its payload
 
@@ -72,7 +77,12 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         "types" => types(rest),
         "type" => match rest.first().map(String::as_str) {
             Some("rm" | "remove") => type_remove(&rest[1..]),
-            _ => Err("expected resource type rm <view-id>".to_owned()),
+            // Closing a type and showing it again are one flag, so one helper
+            // decides both directions; a pair of near-identical verbs would
+            // drift the moment either grew an option.
+            Some("off") => type_enabled(&rest[1..], false),
+            Some("on") => type_enabled(&rest[1..], true),
+            _ => Err("expected resource type rm|on|off <view-id>".to_owned()),
         },
         "read" => read(rest),
         "write" => write(rest),
@@ -273,10 +283,13 @@ fn types(arguments: &[String]) -> Result<(), String> {
     }
     for view in views {
         println!(
-            "{:<24} {:<14} {:<28} {}",
+            "{:<24} {:<14} {:<28} {:<7} {}",
             view["id"].as_str().unwrap_or("?"),
             view["kind"].as_str().unwrap_or("?"),
             view["path"].as_str().unwrap_or("—"),
+            // A closed type is still listed, so say which it is: the row exists
+            // and the tab does not, and a plain listing cannot tell you that.
+            if view["enabled"].as_bool().unwrap_or(true) { "shown" } else { "hidden" },
             view["label"].as_str().unwrap_or("?"),
         );
     }
@@ -296,6 +309,35 @@ fn type_remove(arguments: &[String]) -> Result<(), String> {
         println!("{}", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?);
     } else {
         println!("removed resource type {id}");
+    }
+    Ok(())
+}
+
+/// Show or hide a resource type — the two halves of one flag.
+fn type_enabled(arguments: &[String], enabled: bool) -> Result<(), String> {
+    let id = arguments
+        .first()
+        .filter(|id| !id.starts_with('-'))
+        .ok_or("expected a resource type id")?
+        .clone();
+    let flags = Flags::parse(&arguments[1..])?;
+    let client = rpc::connect()?;
+    let value = rpc::call(
+        &client,
+        "set_resource_view_enabled",
+        json!({ "viewId": id, "enabled": enabled }),
+    )?;
+    if flags.has("json") {
+        println!("{}", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?);
+    } else if value["changed"].as_bool().unwrap_or(false) {
+        println!("{} resource type {id}", if enabled { "showing" } else { "hid" });
+    } else {
+        // Reporting an unchanged row as a change is the one answer a script
+        // cannot act on: it would treat a no-op as a successful switch.
+        println!(
+            "resource type {id} is already {}",
+            if enabled { "shown" } else { "hidden" }
+        );
     }
     Ok(())
 }

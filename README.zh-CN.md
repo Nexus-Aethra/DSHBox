@@ -199,6 +199,8 @@ kind 有三个来源：Box 内置 `sessions` 与 `credentials`；插件包可以
 
 界面上，一个资源类型就是**资源导航里的一个标签页**。`会话历史` 与 `API Key` 内置，**+ 资源类型** 可以再加一个：选一个容器，然后选 Box 在那里检测到的 kind、要**扫描的插件**（profile 里装过的包都会列出并支持输入过滤），或者在**容器存储区文件树**里选一个路径。取一份副本是一个按钮，点开是一张卡片——状态从哪个容器来，以及这份副本叫什么：
 
+类型多到导航一排放不下时，标签条会横向滚动，放不下的标签收进旁边的 **更多** 菜单，所以每种类型都点得到，顶栏也不会被顶爆。**设置 → 资源类型** 是管理类型的地方：*关闭* 只隐藏它的标签、保留这一行以及已经取出的每一份副本，*显示* 再放回来，*删除* 才把类型本身删掉——关闭不是删除，因为不想再看某个标签的人并没有要求把副本丢掉。
+
 ![取一份副本：选择容器并为副本命名](docs/images/resource-copy.png)
 
 容器文件里的任意 YAML 片段都能按 key 路径编辑，用的是同一套模型：文档是一棵树，点节点载入那一段，路径不存在就是新增那一段。写回走与注入完全相同的「合并或替换」策略。
@@ -207,7 +209,10 @@ kind 有三个来源：Box 内置 `sessions` 与 `credentials`；插件包可以
 
 ```bash
 dshbox container resource list <id> [--plugin @scope/name]      # 类型、位置、大小
-dshbox container resource types [--json]                        # 资源类型（界面的标签页）
+dshbox container resource types [--json]                        # 资源类型（已显示或已隐藏）
+dshbox container resource type off <view-id>                    # 隐藏标签，保留那一行
+dshbox container resource type on <view-id>                     # 再显示出来
+dshbox container resource type rm <view-id>                     # 删掉类型本身
 dshbox container resource extract <id> credentials --name prod  # 取一份副本并命名
 dshbox container resource stored                                # 资源库里存了什么
 dshbox container resource inject <id> credentials-prod --merge --restart

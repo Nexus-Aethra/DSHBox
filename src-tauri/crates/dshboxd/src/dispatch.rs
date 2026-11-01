@@ -225,6 +225,9 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("delete_resource_view") => {
             crate::resources::delete_resource_view(state, request).map(Sync)
         }
+        Some("set_resource_view_enabled") => {
+            crate::resources::set_resource_view_enabled(state, request).map(Sync)
+        }
         Some("list_resource_type") => {
             crate::resources::list_resource_type(state, request).map(Sync)
         }

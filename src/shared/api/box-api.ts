@@ -133,6 +133,8 @@ export const boxApi = {
   listResourceViews: () => ipc<{ views: ResourceView[] }>('list_resource_views', {}),
   addResourceView: (request: { kind: string; container: string; label?: string; path?: string }) => ipc<{ view: ResourceView }>('add_resource_view', request),
   deleteResourceView: (viewId: string) => ipc<void>('delete_resource_view', { viewId }),
+  /** Show a resource type as a tab again, or take it out of the navigation. */
+  setResourceViewEnabled: (viewId: string, enabled: boolean) => ipc<{ view: ResourceView; changed: boolean }>('set_resource_view_enabled', { viewId, enabled }),
   listResourceType: (kind: string, path?: string) => ipc<ResourceTypeSummary>('list_resource_type', { kind, path }),
   enqueueResourceExtract: (request: { id: string; kind: string; entry?: string; name?: string; plugin?: string; dest?: string; out?: string }) => ipc<TaskRecord>('enqueue_resource_extract', request),
   enqueueResourceInject: (request: { id: string; resource?: string; from?: string; input?: string; kind?: string; dest?: string; entry?: string; conflict?: string; restart?: boolean }) => ipc<TaskRecord>('enqueue_resource_inject', request),
