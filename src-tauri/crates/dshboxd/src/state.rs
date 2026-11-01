@@ -240,10 +240,35 @@ pub(crate) fn initialize_bundled_plugins() -> Result<(), String> {
     if digest_matches && cache_root.join("plugins-manifest.json").is_file() {
         return Ok(());
     }
-    if cache_root.exists() {
-        std::fs::remove_dir_all(&cache_root)
-            .map_err(|error| format!("cannot clean {}: {error}", cache_root.display()))?;
+    // Clean ONLY the two entries this function writes.
+    //
+    // In a developer checkout the resource directory is `src-tauri/resources`,
+    // so the source (`.../resources/plugins/<target>`) and the destination
+    // (`<runtime>/plugins`) are unrelated trees. In an INSTALLED layout the
+    // daemon sits at `<install>/server/<target>/`, so `resource_directory()` is
+    // `<install>` and the source is `<install>/plugins/<target>` -- a child of
+    // the destination. A `remove_dir_all` on the destination therefore deleted
+    // the source it was about to copy, `copy_dir_recursive` then found nothing,
+    // and the plugin was never vendored anywhere. That is why every container
+    // carried `Cannot find package '@deepseek-ai/dsh-box-context'`: the tree
+    // was emptied out from under itself on every daemon start.
+    for entry in ["node_modules", "plugins-manifest.json"] {
+        let path = cache_root.join(entry);
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+                .map_err(|error| format!("cannot clean {}: {error}", path.display()))?;
+        } else if path.is_file() {
+            std::fs::remove_file(&path)
+                .map_err(|error| format!("cannot clean {}: {error}", path.display()))?;
+        }
     }
+    // The copy itself is always required: the container start path reads
+    // `<runtime>/plugins/node_modules/...`, while the resource ships the same
+    // files one level deeper at `<runtime>/plugins/<target>/`. The only thing
+    // that must not happen is deleting the source -- which is why the cleanup
+    // above touches two entries instead of the whole directory. Copying a
+    // source that sits *inside* the destination is fine here because the
+    // per-entry cleanup never removes `<target>/`.
     copy_dir_recursive(&resource_plugins, &cache_root)
         .map_err(|error| format!("cannot vendor bundled plugins: {error}"))?;
 

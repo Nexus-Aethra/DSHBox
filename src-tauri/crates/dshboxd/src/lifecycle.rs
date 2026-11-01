@@ -543,10 +543,15 @@ pub(crate) fn materialize_bundled_sandbox_plugin(
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
+    // The vendored tree is written by `initialize_bundled_plugins`, which copies
+    // the resource's `node_modules/` verbatim -- so the package sits under its
+    // own scope (`@nexus-aethra/`), not a hardcoded one. Joining the full scoped
+    // name onto a scope made the path `@deepseek-ai/@nexus-aethra/...`, which no
+    // vendoring run ever writes, so every start fell through to the "not
+    // bundled" branch and silently skipped the plugin.
     let vendored = PathBuf::from(&root)
         .join("plugins")
         .join("node_modules")
-        .join("@deepseek-ai")
         .join(SANDBOX_PLUGIN_PACKAGE);
     if !vendored.join("package.json").is_file() {
         // Self-heal before giving up: the config's manifest digest may
@@ -579,7 +584,10 @@ pub(crate) fn materialize_bundled_sandbox_plugin(
     }
     // The skill ships inside the vendored package, so this reads the copy that
     // was just published rather than a second source of truth.
-    install_box_skill(directory, &vendored.join("skills").join(SANDBOX_PLUGIN_ID), task)?;
+    // `vendored` is the package directory itself, so the skill root is its own
+    // `skills/` child. Appending the package id again pointed one level too deep
+    // (`.../skills/dsh-box-sandbox`) and every start reported "not bundled".
+    install_box_skill(directory, &vendored.join("skills").join("dsh-box-tools"), task)?;
     Ok(())
 }
 
@@ -1351,5 +1359,55 @@ mod sandbox_plugin_install_tests {
         let bundled = scratch("skill-missing-src");
         install_box_skill(&container, &bundled, None).unwrap();
         assert!(!container.join("profile/skills/dsh-box-tools/SKILL.md").exists());
+    }
+}
+
+#[cfg(test)]
+mod sandbox_plugin_paths {
+    use super::*;
+
+    fn scratch(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("dshbox-paths-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// The vendored tree must resolve as `<runtime>/plugins/node_modules/<scoped name>`
+    /// -- exactly the layout `initialize_bundled_plugins` writes. Joining the whole
+    /// scoped name onto a hardcoded scope produced
+    /// `@deepseek-ai/@nexus-aethra/...`, which nothing ever creates, so the plugin
+    /// was silently skipped on every start.
+    #[test]
+    fn the_vendored_tree_is_found_under_its_own_scope() {
+        let runtime = scratch("vendored");
+        let pkg = runtime.join("plugins/node_modules").join(SANDBOX_PLUGIN_PACKAGE);
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("package.json"), "{}").unwrap();
+
+        let resolved = runtime
+            .join("plugins")
+            .join("node_modules")
+            .join(SANDBOX_PLUGIN_PACKAGE);
+        assert!(resolved.join("package.json").is_file(), "looked at {}", resolved.display());
+
+        assert!(!runtime
+            .join("plugins/node_modules/@deepseek-ai")
+            .join(SANDBOX_PLUGIN_PACKAGE)
+            .exists());
+    }
+
+    /// `vendored` is the package directory, so its skill lives at
+    /// `<vendored>/skills/dsh-box-tools` -- not one level deeper.
+    #[test]
+    fn the_bundled_skill_sits_under_the_package_not_another_level() {
+        let runtime = scratch("skillpath");
+        let pkg = runtime.join("plugins/node_modules").join(SANDBOX_PLUGIN_PACKAGE);
+        let skill = pkg.join("skills").join("dsh-box-tools");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "x").unwrap();
+
+        assert!(pkg.join("skills").join("dsh-box-tools").join("SKILL.md").is_file());
+        assert!(!pkg.join("skills").join("dsh-box-sandbox").exists());
     }
 }
