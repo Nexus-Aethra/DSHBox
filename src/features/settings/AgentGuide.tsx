@@ -6,16 +6,23 @@ import type { Text } from '../../i18n'
 const INSTALL = 'pnpm add @nexus-aethra/dsh-box-sandbox'
 
 /**
- * How to put the agent surface inside a DSH desktop profile.
+ * What DSH Box offers a DSH desktop install, and how it gets there.
  *
- * The install line is the whole point of this pane, so it is a real copyable
- * command rather than prose with a package name in it -- a person reading a
- * paragraph has to retype it correctly, and a typo in a package name resolves
- * to a different package or to nothing at all.
+ * DSH (DeepSeek Harness) has its own desktop app; DSH Box is the thing that
+ * runs Containers, Templates, plugins and resource copies. This pane is the
+ * handshake between them: the sandbox plugin publishes those operations as
+ * typed `box_*` tools, so an agent running in DSH can drive DSH Box without a
+ * shell and without parsing a CLI's stdout. That is the service this pane is
+ * about, which is why the install line comes first and the container mount
+ * second -- the second is a convenience Box performs on its own.
  *
- * Every claim here is checked against the plugin as published: 20 tools, nine
- * for the page and eleven for the box itself. The tool lists are named
- * individually rather than summarised, because "20 tools" tells a reader
+ * The install line is a real copyable command rather than prose with a package
+ * name in it: a person reading a paragraph has to retype it correctly, and a
+ * typo in a package name resolves to a different package or to nothing at all.
+ *
+ * Every count here is checked against what the plugin registers: ten page tools
+ * in `tools.ts`, eleven box tools in `manage.ts`. The tool lists are named
+ * individually rather than summarised, because "21 tools" tells a reader
  * nothing about whether the one they need is there.
  */
 export function AgentGuide({ text }: { text: Text }) {
@@ -36,7 +43,7 @@ export function AgentGuide({ text }: { text: Text }) {
     <div className="agent-guide">
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">AGENT</p>
+          <p className="eyebrow">DSH</p>
           <h2>{text.agentGuideTitle}</h2>
         </div>
       </div>
@@ -53,6 +60,16 @@ export function AgentGuide({ text }: { text: Text }) {
           <Button variant="secondary" size="sm" onClick={() => { void copy() }}>{copied ? text.agentGuideCopied : text.agentGuideCopy}</Button>
         </div>
         <p className="agent-guide-note">{text.agentGuideInstallNote}</p>
+      </Card>
+
+      <Card padding="md">
+        <p className="label">{text.agentGuideMountTitle}</p>
+        <p className="agent-guide-note">{text.agentGuideMountNote}</p>
+      </Card>
+
+      <Card padding="md">
+        <p className="label">{text.agentGuideSkillTitle}</p>
+        <p className="agent-guide-note">{text.agentGuideSkillNote}</p>
       </Card>
 
       <Card padding="md">
