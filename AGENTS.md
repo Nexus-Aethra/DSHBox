@@ -272,6 +272,29 @@ command as done only once the installed app has run it.
   (`ping_quickly`, 3s) is what the startup gate polls, so a stuck daemon answers
   "not yet" instead of holding a thread. The frontend polls one request at a
   time for the same reason: overlapping polls against a busy daemon pile up.
+- **The desktop and the daemon are one build batch, and a bump must rebuild both.**
+  `scripts/prepare-server.mjs` writes `src-tauri/.build-stamp` (epoch seconds) and
+  both `build.rs` files embed it as `DSHBOX_BUILD_STAMP`. The desktop compares
+  its own against the running daemon's `get_info.buildStamp` and shows a
+  "server is older" notice when they differ. So a change that touches the
+  daemon *must* be followed by a desktop rebuild in the same session:
+
+      node scripts/prepare-server.mjs --force     # new stamp + new sidecar
+      cargo build --release -p dshbox --features custom-protocol   # picks it up
+
+  Rebuilding only the sidecar leaves the installed client one batch behind, and
+  the window reports a stale server while the log says the stamps differ --
+  which reads as a broken upgrade rather than the missed step it is.
+
+- **An installed layout puts the resource dir where the runtime dir is.**
+  In a checkout the daemon resolves resources from `src-tauri/resources`; installed,
+  it walks up from `<install>/server/<target>/` and lands on `<install>` itself.
+  That makes `<install>/plugins/<target>` a *child* of the vendoring destination,
+  `<install>/plugins` -- so a `remove_dir_all` on the destination deletes the
+  source it was about to copy, silently vendoring nothing. Clean only the entries
+  you write (`node_modules`, `plugins-manifest.json`), never the directory. This
+  was the real cause of every container's
+  `Cannot find package '@deepseek-ai/dsh-box-context'`.
 - **An agent inside a container talks to the box through a plugin, not the CLI.**
   The DSH-side plugin (`@nexus-aethra/dsh-box-sandbox`, `plugins/dsh-box-sandbox`)
   registers `box_*` tools on the host it runs in, so an agent can drive the box
