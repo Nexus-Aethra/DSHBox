@@ -133,6 +133,18 @@ export function registerManageTools(ctx: Context): void {
       const containerId = required(record, 'containerId')
       const action = required(record, 'action')
       const rpc = getRpc()
+      // The guard below compares against the canonical stamped id, and the
+      // daemon now resolves aliases (name, bare timestamp) on the verbs this
+      // tool dispatches — so the caller's spelling has to be resolved the
+      // same way first, or restarting your own container by its short name
+      // walks straight past a guard written for full ids. A reference that
+      // does not resolve is the action's problem: the daemon answers the
+      // real error below, with its own wording.
+      let canonicalId = containerId
+      try {
+        const described = await rpc.call<{ id?: string }>('describe_container', { id: containerId })
+        if (typeof described?.id === 'string' && described.id !== '') canonicalId = described.id
+      } catch { /* the action reports the failure */ }
       const methods: Record<string, string> = {
         start: 'enqueue_container_start',
         stop: 'enqueue_container_stop',
@@ -145,7 +157,7 @@ export function registerManageTools(ctx: Context): void {
       // exist in the daemon and they are not the same call, so both are offered
       // rather than pretending the other does not.
       if (action === 'stop-now') {
-        if (runsInside(containerId)) {
+        if (runsInside(canonicalId)) {
           throw new Error('This agent is running inside ' + containerId + ', so stopping it would end the call before it could report a result.')
         }
         return {
@@ -166,7 +178,7 @@ export function registerManageTools(ctx: Context): void {
       // restart issued from inside showed the tool call in the transcript with
       // no answer and the client left reconnecting. So the whole tool refuses
       // self-targeting, and says what to do instead.
-      if (runsInside(containerId)) {
+      if (runsInside(canonicalId)) {
         throw new Error(
           `This agent is running inside ${containerId}, and ${action} would restart or stop`
             + ' the host running this call, so the result could never be reported -- the'
