@@ -104,7 +104,7 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         // the explicit check and the download are the two that do.
         Some("get_update_state") => crate::updates::get_update_state_rpc(state).map(Sync),
         Some("check_update") => crate::updates::check_update_rpc(state).map(Sync),
-    Some("list_update_releases") => crate::updates::list_update_releases_rpc().map(Sync),
+        Some("list_update_releases") => crate::updates::list_update_releases_rpc().map(Sync),
         Some("enqueue_update_download") => crate::updates::enqueue_update_download(state, request),
         Some("discard_update_download") => {
             crate::updates::discard_update_download(request).map(Sync)
@@ -167,7 +167,14 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("container_list_plugins") => {
             let id = request["containerId"].as_str().unwrap_or("").to_owned();
             let profile = request["profile"].as_str().unwrap_or("web").to_owned();
-            container_list_plugins(&id, &profile).map(|plugins| Sync(json!(plugins)))
+            // `container_list_plugins` reads the profile manifest by the id it is
+            // handed and has no state of its own, so the boundary is the only
+            // place a name can be turned into that id. `dispatch` answers a
+            // Value rather than a Result, so the failure is mapped here.
+            match crate::resolve::resolve_container_key(state, &id) {
+                Ok(id) => container_list_plugins(&id, &profile).map(|plugins| Sync(json!(plugins))),
+                Err(error) => Err(error),
+            }
         }
         Some("create_extension_bundle") => {
             let name = request["name"].as_str().unwrap_or("").to_owned();
@@ -177,24 +184,27 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("delete_extension_bundle") => delete_extension_bundle_rpc(request).map(Sync),
         Some("stop_container") => stop_container_rpc(state, request).map(Sync),
         Some("container_url") => container_url_rpc(state, request).map(Sync),
-    // Page-debugging surface. browser_status and set_browser_path take no
-    // container; the rest address one running container's headless session.
-    Some("debug_browser_status") => crate::debug::browser_status_rpc().map(Sync),
-    Some("debug_set_browser_path") => crate::debug::set_browser_path_rpc(request).map(Sync),
-    Some("debug_open") => crate::debug::open_rpc(state, request).map(Sync),
-    Some("debug_close") => crate::debug::close_rpc(state, request).map(Sync),
-    Some("debug_capture_screenshot") => crate::debug::screenshot_rpc(state, request).map(Sync),
-    Some("debug_query_elements") => crate::debug::query_elements_rpc(state, request).map(Sync),
-    Some("debug_click_element") => crate::debug::click_element_rpc(state, request).map(Sync),
-    Some("debug_click_at") => crate::debug::click_at_rpc(state, request).map(Sync),
-    Some("debug_click_by_name") => crate::debug::click_by_name_rpc(state, request).map(Sync),
-    Some("debug_type_text") => crate::debug::type_text_rpc(state, request).map(Sync),
-    Some("debug_press_key") => crate::debug::press_key_rpc(state, request).map(Sync),
-    Some("debug_page_text") => crate::debug::page_text_rpc(state, request).map(Sync),
-    Some("debug_scroll") => crate::debug::scroll_rpc(state, request).map(Sync),
-    Some("debug_set_viewport") => crate::debug::set_viewport_rpc(state, request).map(Sync),
-    Some("debug_console") => crate::debug::console_rpc(state, request).map(Sync),
-    Some("apply_document") => crate::apply::apply_document_rpc(state, request).map(Sync),
+        // Page-debugging surface. browser_status and set_browser_path take no
+        // container; the rest address one running container's headless session.
+        Some("debug_browser_status") => crate::debug::browser_status_rpc().map(Sync),
+        Some("debug_set_browser_path") => crate::debug::set_browser_path_rpc(request).map(Sync),
+        Some("debug_open") => crate::debug::open_rpc(state, request).map(Sync),
+        Some("debug_close") => crate::debug::close_rpc(state, request).map(Sync),
+        Some("debug_capture_screenshot") => crate::debug::screenshot_rpc(state, request).map(Sync),
+        Some("debug_query_elements") => crate::debug::query_elements_rpc(state, request).map(Sync),
+        Some("debug_click_element") => crate::debug::click_element_rpc(state, request).map(Sync),
+        Some("debug_click_at") => crate::debug::click_at_rpc(state, request).map(Sync),
+        Some("debug_click_by_name") => crate::debug::click_by_name_rpc(state, request).map(Sync),
+        Some("debug_type_text") => crate::debug::type_text_rpc(state, request).map(Sync),
+        Some("debug_press_key") => crate::debug::press_key_rpc(state, request).map(Sync),
+        Some("debug_page_text") => crate::debug::page_text_rpc(state, request).map(Sync),
+        Some("debug_scroll") => crate::debug::scroll_rpc(state, request).map(Sync),
+        Some("debug_set_viewport") => crate::debug::set_viewport_rpc(state, request).map(Sync),
+        Some("debug_console") => crate::debug::console_rpc(state, request).map(Sync),
+        Some("debug_navigate") => crate::debug::navigate_rpc(state, request).map(Sync),
+        Some("debug_hover") => crate::debug::hover_rpc(state, request).map(Sync),
+        Some("debug_evaluate") => crate::debug::evaluate_rpc(state, request).map(Sync),
+        Some("apply_document") => crate::apply::apply_document_rpc(state, request).map(Sync),
         Some("save_mirror_settings") => save_mirror_settings_rpc(request).map(Sync),
         Some("save_github_token") => save_github_token_rpc(request).map(Sync),
         Some("save_runtime_directory") => save_runtime_directory_rpc(state, request).map(Sync),
@@ -219,12 +229,10 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         }
         Some("plugin_dependency_graph") => plugin_dependency_graph_rpc(request).map(Sync),
         Some("list_container_workspaces") => {
-        crate::workspaces::list_container_workspaces_rpc(state, request).map(Sync)
-    }
-    Some("add_container_workspace") => {
-        crate::workspaces::add_container_workspace_rpc(state, request).map(Sync)
-    }
-    Some("list_container_resources") => {
+            crate::workspaces::list_container_workspaces_rpc(state, request).map(Sync)
+        }
+        Some("add_container_workspace") => crate::workspaces::add_container_workspace_rpc(state, request),
+        Some("list_container_resources") => {
             crate::resources::list_container_resources(state, request).map(Sync)
         }
         Some("list_resources") => crate::resources::list_resources(state, request).map(Sync),
@@ -273,7 +281,7 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
             enqueue_container_extension_copy(state, request)
         }
         Some("enqueue_plugin_export") => enqueue_plugin_export(state, request),
-        Some("remove_repository_plugin") => remove_repository_plugin_rpc(request).map(Sync),
+        Some("remove_repository_plugin") => remove_repository_plugin_rpc(state, request).map(Sync),
         Some("enqueue_container_bundle_install") => {
             enqueue_container_bundle_install(state, request)
         }
@@ -835,6 +843,9 @@ fn enqueue_container_plugin_add(
     if container_id.is_empty() || spec.is_empty() {
         return Err("expected containerId and spec".to_owned());
     }
+    // The worker resolves the container itself, from `read_config` rather than
+    // from this state, so it can only be handed a canonical id.
+    let container_id = crate::resolve::resolve_container_key(state, &container_id)?;
     let params = json!({
         "containerId": container_id.clone(),
         "profile": profile.clone(),
@@ -1060,13 +1071,18 @@ fn delete_extension_bundle_rpc(request: &Value) -> Result<Value, String> {
 }
 
 fn stop_container_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
-    let id = request["id"].as_str().unwrap_or("").to_owned();
+    let id = crate::resolve::resolve_container_key(state, request["id"].as_str().unwrap_or(""))?;
     stop_dsh_container(&id, &state.containers)?;
     Ok(json!({ "id": id, "stopped": true }))
 }
 
 fn container_url_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
-    let id = request["id"].as_str().unwrap_or("").to_owned();
+    // The running-host registry and the host record are both keyed by the
+    // canonical id, so an alias asked for here is not a lookup that fails --
+    // it is a lookup that answers "container is not running" for a container
+    // that plainly is. The reply carries the resolved id for the same reason
+    // `box_navigate` can then use it without asking twice.
+    let id = crate::resolve::resolve_container_key(state, request["id"].as_str().unwrap_or(""))?;
     container_url(state, &id).map(|url| json!({ "id": id, "url": url }))
 }
 
@@ -1227,10 +1243,15 @@ fn create_container_rpc(request: &Value) -> Result<Value, String> {
 }
 
 fn enqueue_container_start(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
-    let id = request["id"].as_str().unwrap_or("").to_owned();
-    if id.is_empty() {
+    let raw = request["id"].as_str().unwrap_or("").to_owned();
+    if raw.is_empty() {
         return Err("expected a container id".to_owned());
     }
+    // Resolved before the task is queued, because the scope below is the lock
+    // that serialises this container's tasks. An alias would enqueue a task
+    // keyed `container:alpha` beside one keyed `container:container-1730...`
+    // and let both stop, start and rewrite the same host at once.
+    let id = crate::resolve::resolve_container_key(state, &raw)?;
     let containers = state.containers.clone();
     let params = json!({ "id": id.clone() });
     enqueue_task_worker(
@@ -1248,10 +1269,15 @@ fn enqueue_container_start(state: &DaemonState, request: &Value) -> Result<Handl
 }
 
 fn enqueue_container_stop(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
-    let id = request["id"].as_str().unwrap_or("").to_owned();
-    if id.is_empty() {
+    let raw = request["id"].as_str().unwrap_or("").to_owned();
+    if raw.is_empty() {
         return Err("expected a container id".to_owned());
     }
+    // Resolved before the task is queued, because the scope below is the lock
+    // that serialises this container's tasks. An alias would enqueue a task
+    // keyed `container:alpha` beside one keyed `container:container-1730...`
+    // and let both stop, start and rewrite the same host at once.
+    let id = crate::resolve::resolve_container_key(state, &raw)?;
     let containers = state.containers.clone();
     let params = json!({ "id": id.clone() });
     enqueue_task_worker(
@@ -1272,10 +1298,15 @@ fn enqueue_container_rebuild(
     state: &DaemonState,
     request: &Value,
 ) -> Result<HandlerResult, String> {
-    let id = request["id"].as_str().unwrap_or("").to_owned();
-    if id.is_empty() {
+    let raw = request["id"].as_str().unwrap_or("").to_owned();
+    if raw.is_empty() {
         return Err("expected a container id".to_owned());
     }
+    // Resolved before the task is queued, because the scope below is the lock
+    // that serialises this container's tasks. An alias would enqueue a task
+    // keyed `container:alpha` beside one keyed `container:container-1730...`
+    // and let both stop, start and rewrite the same host at once.
+    let id = crate::resolve::resolve_container_key(state, &raw)?;
     let containers = state.containers.clone();
     let params = json!({ "id": id.clone() });
     enqueue_task_worker(
@@ -1302,10 +1333,15 @@ fn enqueue_container_restart(
     state: &DaemonState,
     request: &Value,
 ) -> Result<HandlerResult, String> {
-    let id = request["id"].as_str().unwrap_or("").to_owned();
-    if id.is_empty() {
+    let raw = request["id"].as_str().unwrap_or("").to_owned();
+    if raw.is_empty() {
         return Err("expected a container id".to_owned());
     }
+    // Resolved before the task is queued, because the scope below is the lock
+    // that serialises this container's tasks. An alias would enqueue a task
+    // keyed `container:alpha` beside one keyed `container:container-1730...`
+    // and let both stop, start and rewrite the same host at once.
+    let id = crate::resolve::resolve_container_key(state, &raw)?;
     let containers = state.containers.clone();
     let params = json!({ "id": id.clone() });
     enqueue_task_worker(
@@ -1367,6 +1403,11 @@ fn describe_container_rpc(state: &DaemonState, request: &Value) -> Result<Handle
     if !box_foundation::is_safe_identifier(&id) {
         return Err("invalid container id".to_owned());
     }
+    // A describe is a read, and the container in it has to be one the caller
+    // can name. The running-host lookup below is keyed by this id, so resolving
+    // here is also what keeps a description from reporting "stopped" for a
+    // container that is running under its canonical id.
+    let id = crate::resolve::resolve_container_key(state, &id)?;
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
@@ -1461,6 +1502,9 @@ fn enqueue_container_extension_add(
     if source.trim().is_empty() {
         return Err("extension source is required".to_owned());
     }
+    // `install_container_extension` looks the container up itself and takes no
+    // state, so the alias has to be spent here before the closure captures it.
+    let id = crate::resolve::resolve_container_key(state, &id)?;
     let params = json!({
         "id": id.clone(),
         "profile": profile.clone(),
@@ -1486,6 +1530,9 @@ fn enqueue_workspace_extension_import(
     {
         return Err("invalid workspace extension path".to_owned());
     }
+    // Same reason as the plugin install above: the importer reads the container
+    // from the runtime root, not from this state.
+    let id = crate::resolve::resolve_container_key(state, &id)?;
     let params = json!({ "id": id.clone(), "relativePath": relative_path.clone() });
     enqueue_task_worker(
         state,
@@ -1515,6 +1562,10 @@ fn enqueue_container_extension_copy(
     {
         return Err("invalid extension copy request".to_owned());
     }
+    // The copy worker installs into the container by scanning for this id, so a
+    // name or a bare timestamp would install nothing and report not-found for a
+    // container that is right there.
+    let id = crate::resolve::resolve_container_key(state, &id)?;
     let params = json!({ "id": id.clone(), "repositoryId": repository_id.clone() });
     enqueue_task_worker(
         state,
@@ -1560,10 +1611,14 @@ fn enqueue_plugin_export(state: &DaemonState, request: &Value) -> Result<Handler
     .map(HandlerResult::Async)
 }
 
-fn remove_repository_plugin_rpc(request: &Value) -> Result<Value, String> {
+fn remove_repository_plugin_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
     let profile = request["profile"].as_str().unwrap_or("").to_owned();
     let name = request["name"].as_str().unwrap_or("").to_owned();
+    // This edits one profile's manifest rather than deleting a container, so it
+    // resolves like any other verb; the response echoes the canonical id so a
+    // caller that removes twice by name reaches the same container both times.
+    let id = crate::resolve::resolve_container_key(state, &id)?;
     remove_repository_plugin(&id, &profile, &name)?;
     Ok(json!({ "id": id, "removed": true }))
 }
@@ -1795,7 +1850,15 @@ mod tests {
         let (state, _id, home, runtime) = setup(false);
         let err =
             describe_container_rpc(&state, &json!({ "id": "container-missing" })).unwrap_err();
-        assert!(err.contains("container not found"), "got: {err}");
+        // The wording moved with the shared resolver: an unknown reference is
+        // still an error, but it now names the containers that do exist, which
+        // is what ends an agent's guessing. Asserting the old literal would
+        // pin the behaviour this wiring exists to replace.
+        assert!(err.contains("no container named"), "got: {err}");
+        assert!(
+            err.contains("dsh-test"),
+            "the diagnostic names what exists: {err}"
+        );
         cleanup(&home, &runtime);
     }
 

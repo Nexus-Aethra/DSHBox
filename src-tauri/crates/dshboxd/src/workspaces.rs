@@ -16,8 +16,9 @@
 //!
 //! Writing is refused while the host is running. The host holds this document
 //! in memory and rewrites it on its own schedule, so a write underneath it is
-//! lost, silently, at the next save. Stopping first is the honest precondition
-//! and the caller is told exactly which flag to pass.
+//! lost, silently, at the next save. Stopping first is the honest precondition:
+//! `restart` makes the daemon do the stop, the write and the start in order,
+//! and a caller that does not want that pays for the refusal in one call.
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -303,34 +304,97 @@ pub(crate) fn add_container_workspace(
         // Said here rather than inferred: the symptom otherwise is a workspace
         // that vanished some minutes later, with no error anywhere near the
         // moment it was added.
+        //
+        // The way out is named in the caller's own vocabulary. This used to say
+        // "pass --restart", which is a CLI flag and not something an RPC caller
+        // can send at all, so an agent holding the documented `restart`
+        // parameter read the advice, passed it, and got the same refusal back:
+        // the parameter was real on one side of the wire and a ghost on the
+        // other, and the message blamed the caller for the difference.
         return Err(String::from(
             "this container is running, and the running host rewrites its own ",
-        ) + "workspace registry; stop it first (dshbox container stop <id>), "
-            + "or pass --restart to do both in order");
+        ) + "workspace registry; send restart: true to stop, register and start \
+again in order");
     }
     let title = request["title"].as_str();
     add_workspace(container, &path, title)
 }
-/// Resolve one container's directory the way the daemon stores it.
-fn container_dir(
-    state: &crate::state::DaemonState,
-    id: &str,
-) -> Result<std::path::PathBuf, String> {
-    let root = state
-        .paths
-        .read()
-        .map_err(|_| "daemon paths lock failed".to_owned())?
-        .runtime
-        .clone()
-        .ok_or_else(|| "DSH Box storage is not configured".to_owned())?;
-    let directory = root.join("instances").join(id);
-    if directory.is_dir() {
-        Ok(directory)
-    } else {
-        Err(format!("container not found: {id}"))
-    }
-}
 
+/// `add_container_workspace` with the restart the parameter promises.
+///
+/// Without `restart` this is the registry write, refused while the host runs.
+/// With it, stop / register / start happens as a task: a start runs to tens of
+/// seconds because DSH has to boot and announce its authenticated URL, and a
+/// caller holding an HTTP response that long cannot tell a slow start from a
+/// dead daemon. The queue is also where every other mutation of this container
+/// is serialised, which is the point -- an add that restarts must not run
+/// beside a rebuild of the same host.
+pub(crate) fn add_container_workspace_rpc(
+    state: &crate::state::DaemonState,
+    request: &Value,
+) -> Result<crate::dispatch::HandlerResult, String> {
+    let id = request["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or("expected a container id")?;
+    // Two things come out of one reference: the directory to register in, and
+    // the canonical id `host_is_running` and the task scope are keyed by. One
+    // resolution yields both, so neither half can see a different container.
+    let found = crate::resolve::resolve_container_id(state, id)?;
+    let directory = found.directory;
+    let id = found.id;
+
+    if !request["restart"].as_bool().unwrap_or(false) {
+        let answer = add_container_workspace(&directory, host_is_running(&id), request)?;
+        return Ok(crate::dispatch::HandlerResult::Sync(answer));
+    }
+
+    let path = request["path"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("expected a path to register")?
+        .to_owned();
+    let title = request["title"].as_str().map(str::to_owned);
+    let containers = state.containers.clone();
+    let params = json!({ "id": id, "path": path, "restart": true });
+    crate::dispatch::enqueue_task_worker(
+        state,
+        "workspace-add",
+        vec![format!("container:{id}")],
+        params,
+        move |task| {
+            // Stopped unconditionally rather than tested first. The failure this
+            // verb guards is a *lost write*, and checking for a running host
+            // before stopping it leaves a window in which the host comes up and
+            // rewrites the registry between the check and the stop. A stop of
+            // something already stopped costs one line in the task log.
+            task.update("Stopping the container", 10);
+            task.check_cancelled()?;
+            let _ = crate::lifecycle::stop_dsh_container(&id, containers.as_ref());
+            // The same tombstone drop `enqueue_container_restart` does: a start
+            // that inherits a stale generation reads as the old host returning.
+            crate::host::remove_host_record(&id);
+
+            task.update("Registering the workspace", 55);
+            let added = add_workspace(&directory, &path, title.as_deref())?;
+            task.log(&if added["created"].as_bool().unwrap_or(false) {
+                format!("registered {}", added["path"].as_str().unwrap_or(&path))
+            } else {
+                format!(
+                    "{} was already registered",
+                    added["path"].as_str().unwrap_or(&path)
+                )
+            });
+
+            task.update("Starting the container", 70);
+            task.check_cancelled()?;
+            crate::lifecycle::start_dsh_container_inner(&id, &containers.running, Some(task))?;
+            Ok(())
+        },
+    )
+    .map(crate::dispatch::HandlerResult::Async)
+}
 /// Whether this container's host process is alive right now.
 ///
 /// Read from the durable host record and checked against the pid table, not
@@ -350,21 +414,14 @@ pub(crate) fn list_container_workspaces_rpc(
         .as_str()
         .filter(|id| !id.is_empty())
         .ok_or("expected a container id")?;
-    list_workspaces(&container_dir(state, id)?)
+    // Resolve before reading the registry. The caller may have used the name
+    // it created the container with, or the id without its `container-`
+    // prefix; a directory joined from that raw string is a container that
+    // "does not exist" even though it does.
+    let directory = crate::resolve::resolve_container_dir(state, id)?;
+    list_workspaces(&directory)
 }
 
-/// `add_container_workspace` — register a directory, host stopped.
-pub(crate) fn add_container_workspace_rpc(
-    state: &crate::state::DaemonState,
-    request: &Value,
-) -> Result<Value, String> {
-    let id = request["id"]
-        .as_str()
-        .filter(|id| !id.is_empty())
-        .ok_or("expected a container id")?;
-    let directory = container_dir(state, id)?;
-    add_container_workspace(&directory, host_is_running(id), request)
-}
 #[cfg(test)]
 mod tests {
     use super::*;

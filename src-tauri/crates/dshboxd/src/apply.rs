@@ -122,7 +122,6 @@ pub(crate) fn apply_document_rpc(state: &DaemonState, request: &Value) -> Result
         return Err(format!("{source} declares neither types nor copies"));
     }
 
-    let containers = containers_by_name(state)?;
     let mut outcomes: Vec<Outcome> = Vec::new();
 
     for (index, spec) in manifest.types.iter().enumerate() {
@@ -133,7 +132,7 @@ pub(crate) fn apply_document_rpc(state: &DaemonState, request: &Value) -> Result
             .ok_or_else(|| {
                 format!("types[{index}] has no container, and the document names none")
             })?;
-        let id = resolve_container(&containers, &container)?;
+        let id = crate::resolve::resolve_container_key(state, &container)?;
         let label = spec
             .label
             .clone()
@@ -180,7 +179,10 @@ pub(crate) fn apply_document_rpc(state: &DaemonState, request: &Value) -> Result
             .ok_or_else(|| {
                 format!("copies[{index}] has no container, and the document names none")
             })?;
-        let id = resolve_container(&containers, &container)?;
+        // The same resolver as every RPC: a document written by hand names a
+        // container the way a person would, and the two rules this file used to
+        // keep privately were the thirteenth resolver the shared one replaces.
+        let id = crate::resolve::resolve_container_key(state, &container)?;
         let target = format!("copy {} ({} from {})", spec.name, spec.kind, container);
         if existing.contains(&spec.name) {
             outcomes.push(Outcome {
@@ -286,54 +288,6 @@ fn extract_and_wait(state: &DaemonState, request: &Value) -> Result<String, Stri
         std::thread::sleep(std::time::Duration::from_millis(150));
     }
 }
-/// Containers as (id, name) pairs, for resolving a document's name to an id.
-fn containers_by_name(state: &DaemonState) -> Result<Vec<(String, String)>, String> {
-    let value = crate::dispatch::list_containers(state)?;
-    let rows = value.as_array().cloned().unwrap_or_default();
-    Ok(rows
-        .iter()
-        .filter_map(|row| {
-            let id = row.get("id")?.as_str()?.to_owned();
-            let name = row
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or(&id)
-                .to_owned();
-            Some((id, name))
-        })
-        .collect())
-}
-
-/// Resolve a document's container reference, which may be an id or a name.
-///
-/// A document is written by hand, so it names a container the way a person
-/// would. Refusing an unknown name with the ones that exist is the difference
-/// between a typo being obvious and a document that quietly applies to nothing.
-fn resolve_container(containers: &[(String, String)], name: &str) -> Result<String, String> {
-    if let Some((id, _)) = containers.iter().find(|(id, _)| id == name) {
-        return Ok(id.clone());
-    }
-    if let Some((id, _)) = containers.iter().find(|(_, known)| known == name) {
-        return Ok(id.clone());
-    }
-    let known = containers
-        .iter()
-        .map(|(_, name)| name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    if known.is_empty() {
-        Err(format!(
-            "no container named {name:?}, and there are no containers"
-        ))
-    } else {
-        // Naming what does exist is the difference between a typo being obvious
-        // and a document that quietly applies to nothing.
-        Err(format!(
-            "no container named {name:?}; the containers are: {known}"
-        ))
-    }
-}
-
 /// The names already in the copy store, so a second take reports `exists`.
 fn stored_copy_names(state: &DaemonState) -> Result<Vec<String>, String> {
     let value = resources::list_resources(state, &json!({}))?;

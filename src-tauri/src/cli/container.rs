@@ -27,13 +27,21 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     }
     if matches!(action, "help" | "--help" | "-h") {
         println!("dshbox container logs <id>             tail the DSH host log");
-        println!("dshbox container url <id>              print the webview URL of a running container");
+        println!(
+            "dshbox container url <id>              print the webview URL of a running container"
+        );
         println!("dshbox container describe <id> [--json]   print detailed container info");
         println!("dshbox container show <id> [--json]    alias for describe");
-        println!("dshbox container open <id>             open the running container in a DSH Box window");
-        println!("dshbox container start <id>            start the DSH host of a stopped container");
+        println!(
+            "dshbox container open <id>             open the running container in a DSH Box window"
+        );
+        println!(
+            "dshbox container start <id>            start the DSH host of a stopped container"
+        );
         println!("dshbox container stop <id>             stop a running container");
-        println!("dshbox container restart <id>          restart a stopped/crashed host (no rebuild)");
+        println!(
+            "dshbox container restart <id>          restart a stopped/crashed host (no rebuild)"
+        );
         println!("dshbox container rebuild <id>          re-materialise extensions and restart");
         println!("dshbox container rm <id>               stop and delete the container");
         println!("dshbox container resource <verb>       list|stored|types|extract|inject|read|write|rm (see `resource help`)");
@@ -57,17 +65,55 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     }
 }
 
+/// Pick the one container a bare argument names.
+///
+/// The id is `container-<timestamp>`, which nobody types from memory, so a
+/// person reaches for the name they created the container with or the bare
+/// timestamp part of it. Matching only the exact id answered `container not
+/// found` for a container sitting in the list the caller just read -- the
+/// failure mode that had a real agent guessing the id format instead of
+/// reading the log. The order is exact id, then name, then the id with its
+/// `container-` prefix added, so the most specific spelling wins.
+fn find_container<'a>(
+    containers: &'a [box_containers::DshContainer],
+    wanted: &str,
+) -> Result<&'a box_containers::DshContainer, String> {
+    if let Some(found) = containers.iter().find(|container| container.id == wanted) {
+        return Ok(found);
+    }
+    if let Some(found) = containers.iter().find(|container| container.name == wanted) {
+        return Ok(found);
+    }
+    let prefixed = format!("container-{wanted}");
+    if let Some(found) = containers.iter().find(|container| container.id == prefixed) {
+        return Ok(found);
+    }
+    // An unresolvable name has to say what would have worked. Listing the names
+    // ends the guess; the bare `container not found` started it.
+    let mut names: Vec<&str> = containers
+        .iter()
+        .map(|container| container.name.as_str())
+        .collect();
+    names.sort_unstable();
+    if names.is_empty() {
+        Err(format!(
+            "no container named {wanted:?}, and there are no containers"
+        ))
+    } else {
+        Err(format!(
+            "no container named {wanted:?}; the containers are: {}",
+            names.join(", ")
+        ))
+    }
+}
+
 fn logs(id: &str, rest: &[String]) -> Result<(), String> {
     super::read_flags(rest, &[])?;
     let client = rpc::connect()?;
     let containers_value = rpc::call(&client, "list_containers", json!({}))?;
-    let containers: Vec<box_containers::DshContainer> =
-        serde_json::from_value(containers_value)
-            .map_err(|error| format!("invalid container list from daemon: {error}"))?;
-    let container = containers
-        .into_iter()
-        .find(|container| container.id == id)
-        .ok_or_else(|| format!("container not found: {id}"))?;
+    let containers: Vec<box_containers::DshContainer> = serde_json::from_value(containers_value)
+        .map_err(|error| format!("invalid container list from daemon: {error}"))?;
+    let container = find_container(&containers, id)?;
     let log_path = std::path::PathBuf::from(&container.directory)
         .join("logs")
         .join("host.log");
@@ -162,7 +208,9 @@ fn print_description_text(value: &Value) {
                             let diagnostic = plugin["diagnostic"].as_str();
                             match diagnostic {
                                 Some(error) => {
-                                    println!("      - {plugin_name} {plugin_version} (error: {error})")
+                                    println!(
+                                        "      - {plugin_name} {plugin_version} (error: {error})"
+                                    )
                                 }
                                 None => println!("      - {plugin_name} {plugin_version}"),
                             }

@@ -39,6 +39,26 @@ pub fn container_directory(root: &str, id: &str) -> PathBuf {
     PathBuf::from(root).join("instances").join(id)
 }
 
+/// The name a container is shown by, read from its own record.
+///
+/// One record, not a scan: a caller that already has the canonical id needs the
+/// display name to put in a message, and scanning every container to find one
+/// would make an error path cost more than the successful path. A container
+/// whose record is missing or unreadable answers `None`; the caller formats the
+/// id instead, because a name it could not read is not a name it may invent.
+pub fn container_name(root: &str, id: &str) -> Option<String> {
+    let path = container_directory(root, id).join("container.json");
+    let metadata = match fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(_) => return None,
+    };
+    let value: serde_json::Value = match serde_json::from_str(&metadata) {
+        Ok(value) => value,
+        Err(_) => return None,
+    };
+    value["name"].as_str().map(str::to_owned)
+}
+
 /// Path to the PID file dropped by the desktop app when a container host
 /// is launched. The CLI (and any other read-only consumer) checks this file
 /// plus a direct process query to decide whether the host is still running,
