@@ -42,9 +42,11 @@ export function useSettings(onError: (message: string | null) => void) {
   const [upgradingResources, setUpgradingResources] = useState(false)
   const [upgradeReport, setUpgradeReport] = useState<string[] | null>(null)
   const [githubMirror, setGithubMirror] = useState('')
+  const [githubToken, setGithubToken] = useState('')
   const [npmRegistry, setNpmRegistry] = useState('')
   const [npmRegistryCustom, setNpmRegistryCustom] = useState('')
   const [savingMirror, setSavingMirror] = useState(false)
+  const [savingToken, setSavingToken] = useState(false)
   const [serverService, setServerService] = useState<ServerServiceStatus | null>(null)
 
   useEffect(() => {
@@ -58,9 +60,10 @@ export function useSettings(onError: (message: string | null) => void) {
   // Keep the mirror settings form in sync when the saved config changes.
   useEffect(() => {
     setGithubMirror(config.githubMirror ?? '')
+    setGithubToken(config.githubToken ?? '')
     setNpmRegistry(config.npmRegistry ?? '')
     setNpmRegistryCustom(config.npmRegistry ?? '')
-  }, [config.githubMirror, config.npmRegistry])
+  }, [config.githubMirror, config.npmRegistry, config.githubToken])
 
   async function refreshToolchains(): Promise<void> {
     setDetecting(true)
@@ -169,6 +172,15 @@ export function useSettings(onError: (message: string | null) => void) {
     } catch (reason) { onError(String(reason)) } finally { setSavingMirror(false) }
   }
 
+  async function saveGithubToken(): Promise<void> {
+    setSavingToken(true)
+    try {
+      const config = await boxApi.saveGithubToken(githubToken.trim() || null)
+      setConfig(config)
+      onError(null)
+    } catch (reason) { onError(String(reason)) } finally { setSavingToken(false) }
+  }
+
   async function restartServerService(): Promise<void> {
     try { await boxApi.restartServerService(); setServerService(await boxApi.getServerServiceStatus()); onError(null) } catch (reason) { onError(String(reason)) }
   }
@@ -177,9 +189,9 @@ export function useSettings(onError: (message: string | null) => void) {
     config, setConfig, loading, toolchains, detecting, expandedToolchain, setExpandedToolchain,
     dshVersions, loadingVersions, installingVersion, installedDshVersions, setInstalledDshVersions,
     upgradingResources, upgradeReport, upgradeResources,
-    githubMirror, setGithubMirror, npmRegistry, setNpmRegistry, npmRegistryCustom, setNpmRegistryCustom,
-    savingMirror, serverService, refreshToolchains, loadDshVersions, installDshVersion,
+    githubMirror, setGithubMirror, githubToken, setGithubToken, npmRegistry, setNpmRegistry, npmRegistryCustom, setNpmRegistryCustom,
+    savingMirror, savingToken, serverService, refreshToolchains, loadDshVersions, installDshVersion,
     refreshDshCatalog, uninstallDshVersion, loadInstalledDshVersions, chooseRuntimeDirectory,
-    changeLanguage, saveGithubMirror, saveNpmRegistry, restartServerService,
+    changeLanguage, saveGithubMirror, saveGithubToken, saveNpmRegistry, restartServerService,
   }
 }

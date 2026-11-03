@@ -370,6 +370,15 @@ pub struct BoxConfig {
     /// catalog, runtime clones, and extension imports.
     #[serde(default)]
     pub github_mirror: Option<String>,
+    /// Optional GitHub API token for the updater. This is a machine-local
+    /// secret, which is why it lives in `config.json` beside the mirror and
+    /// never in the shared document store. A token changes *where* API
+    /// requests go, not just their headers: a mirror is a third party, so an
+    /// Authorization header pointed at one hands the credential over -- a
+    /// token always goes direct to `api.github.com` instead, and the mirror
+    /// keeps serving only the unauthenticated download tier.
+    #[serde(default)]
+    pub github_token: Option<String>,
     /// Optional npm registry (e.g. `https://registry.npmmirror.com`). When
     /// set, spawned pnpm/npm toolchains receive `npm_config_registry`.
     #[serde(default)]
@@ -453,6 +462,7 @@ impl Default for BoxConfig {
             language: default_language(),
             toolchain_sources: BTreeMap::new(),
             github_mirror: None,
+            github_token: None,
             npm_registry: None,
             git_path: None,
         browser_path: None,

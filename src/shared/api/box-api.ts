@@ -84,6 +84,7 @@ export const boxApi = {
   saveRuntimeDirectory: (directory: string) => ipc<BoxConfig>('save_runtime_directory', { directory }),
   saveLanguage: (language: Language) => ipc<BoxConfig>('save_language', { language }),
   saveMirrorSettings: (githubMirror: string | null, npmRegistry: string | null) => ipc<BoxConfig>('save_mirror_settings', { githubMirror, npmRegistry }),
+  saveGithubToken: (token: string | null) => ipc<BoxConfig>('save_github_token', { token }),
   getServerServiceStatus: () => ipc<ServerServiceStatus>('get_server_service_status'),
   getDaemonStatus: () => ipc<boolean>('get_daemon_status'),
   getDaemonBuildNotice: () => ipc<DaemonBuildNotice>('get_daemon_build_notice'),

@@ -183,22 +183,75 @@ fn network_client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|error| format!("cannot create the update client: {error}"))
 }
 
+/// How one API request reaches GitHub.
+///
+/// A token changes the *route*, not just the headers: a mirror such as
+/// gh-proxy.com is a third party, and an Authorization header pointed at one
+/// hands the credential over. So a token always goes direct to
+/// api.github.com -- 5,000 requests an hour instead of 60 -- while an
+/// anonymous request keeps the mirror route. The token never touches the
+/// download tier either way: release assets are public.
+fn api_endpoint(url: &str, mirror: Option<&str>, token: Option<&str>) -> (String, Option<String>) {
+    match token.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(trimmed) => (url.to_owned(), Some(format!("Bearer {trimmed}"))),
+        None => (mirror_url(url, mirror), None),
+    }
+}
+
+/// GET a GitHub API endpoint, honouring the token route and its fallback.
+///
+/// With a token the request goes direct; if this machine cannot reach GitHub
+/// at all -- a transport error, not an HTTP status -- the request retries
+/// once through the configured mirror *without* the credential. Degraded but
+/// working beats dead, and the token still never leaves for a third party.
+fn api_get(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    mirror: Option<&str>,
+    token: Option<&str>,
+    accept: &str,
+) -> Result<reqwest::blocking::Response, String> {
+    let (endpoint, authorization) = api_endpoint(url, mirror, token);
+    let send = |endpoint: &str, authorization: Option<&str>| {
+        let mut request = client.get(endpoint).header("Accept", accept);
+        if let Some(value) = authorization {
+            request = request.header("Authorization", value);
+        }
+        request.send()
+    };
+    match send(&endpoint, authorization.as_deref()) {
+        Ok(response) => Ok(response),
+        Err(direct_error) if authorization.is_some() && mirror.is_some() => {
+            let mirrored = mirror_url(url, mirror);
+            send(&mirrored, None).map_err(|error| {
+                format!("cannot reach GitHub (direct: {direct_error}; mirrored: {error})")
+            })
+        }
+        Err(error) => Err(format!("cannot reach GitHub: {error}")),
+    }
+}
+
+/// 403 on these endpoints is nearly always the anonymous rate limit running
+/// out; say so and name the setting that fixes it, not just a status code.
+fn rate_limit_hint(status: reqwest::StatusCode) -> String {
+    if status == reqwest::StatusCode::FORBIDDEN {
+        " (403 usually means the anonymous rate limit is used up; a GitHub token in Settings → General raises it)".to_owned()
+    } else {
+        String::new()
+    }
+}
+
 /// Ask GitHub for the newest release. The *quick* tier.
-fn fetch_latest_release(mirror: Option<&str>) -> Result<GitHubRelease, String> {
-    let endpoint = mirror_url(LATEST_RELEASE_API, mirror);
+fn fetch_latest_release(mirror: Option<&str>, token: Option<&str>) -> Result<GitHubRelease, String> {
     let client = network_client()?;
-    let response = client
-        .get(&endpoint)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .map_err(|error| format!("cannot reach GitHub: {error}"))?;
+    let response = api_get(&client, LATEST_RELEASE_API, mirror, token, "application/vnd.github+json")?;
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Err("the repository has no published release yet".to_owned());
     }
     let response = response
         .error_for_status()
-        .map_err(|error| format!("the release request failed: {error}"))?;
+        .map_err(|error| format!("the release request failed: {error}{}", rate_limit_hint(status)))?;
     response
         .json::<GitHubRelease>()
         .map_err(|error| format!("cannot parse the release: {error}"))
@@ -234,17 +287,13 @@ pub(crate) fn fetch_manifest(
 /// list. It deliberately checks nothing installable -- only the newest
 /// release carries a manifest, and the badge/available logic already owns
 /// that question.
-fn fetch_releases(mirror: Option<&str>) -> Result<Vec<GitHubRelease>, String> {
-    let endpoint = mirror_url(box_updates::RELEASES_LIST_API, mirror);
+fn fetch_releases(mirror: Option<&str>, token: Option<&str>) -> Result<Vec<GitHubRelease>, String> {
     let client = network_client()?;
-    let response = client
-        .get(&endpoint)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .map_err(|error| format!("cannot reach GitHub: {error}"))?;
+    let response = api_get(&client, box_updates::RELEASES_LIST_API, mirror, token, "application/vnd.github+json")?;
+    let status = response.status();
     let response = response
         .error_for_status()
-        .map_err(|error| format!("the releases request failed: {error}"))?;
+        .map_err(|error| format!("the releases request failed: {error}{}", rate_limit_hint(status)))?;
     response
         .json::<Vec<GitHubRelease>>()
         .map_err(|error| format!("cannot parse the releases: {error}"))
@@ -254,7 +303,7 @@ fn fetch_releases(mirror: Option<&str>) -> Result<Vec<GitHubRelease>, String> {
 /// notes, so the UI can preview what each version changes.
 pub(crate) fn list_update_releases_rpc() -> Result<Value, String> {
     let config = read_config()?;
-    let releases = fetch_releases(config.github_mirror.as_deref())?;
+    let releases = fetch_releases(config.github_mirror.as_deref(), config.github_token.as_deref())?;
     let rows = releases
         .iter()
         .map(|release| {
@@ -276,9 +325,13 @@ pub(crate) fn list_update_releases_rpc() -> Result<Value, String> {
 /// \`record\` is only updated on a successful check: a failed one records its
 /// error and leaves \`checked_at\` alone, so the UI can say "last tried" and
 /// "last successful" honestly instead of showing a stale success as fresh.
-pub(crate) fn perform_check(root: &Path, mirror: Option<&str>) -> Result<UpdateRecord, String> {
+pub(crate) fn perform_check(
+    root: &Path,
+    mirror: Option<&str>,
+    token: Option<&str>,
+) -> Result<UpdateRecord, String> {
     let mut record = read_record(root);
-    match fetch_latest_release(mirror) {
+    match fetch_latest_release(mirror, token) {
         Ok(release) => {
             record.checked_at = Some(now_seconds());
             record.latest_version = Some(
@@ -532,7 +585,11 @@ pub(crate) fn get_update_state_rpc(state: &DaemonState) -> Result<Value, String>
 pub(crate) fn check_update_rpc() -> Result<Value, String> {
     let config = read_config()?;
     if let Some(root) = config.runtime_directory.as_deref() {
-        crate::updates::perform_check(std::path::Path::new(root), config.github_mirror.as_deref())
+        crate::updates::perform_check(
+            std::path::Path::new(root),
+            config.github_mirror.as_deref(),
+            config.github_token.as_deref(),
+        )
         .map_err(|error| format!("update check failed: {error}"))?;
     }
     Ok(crate::updates::collect_state(&config))
@@ -717,7 +774,11 @@ fn background_check_once(deps: &BackgroundDeps) -> Result<BackgroundOutcome, Str
     let Some(root) = config.runtime_directory.clone() else {
         return Err("DSH Box storage is not configured".to_owned());
     };
-    let record = perform_check(std::path::Path::new(&root), config.github_mirror.as_deref())?;
+    let record = perform_check(
+        std::path::Path::new(&root),
+        config.github_mirror.as_deref(),
+        config.github_token.as_deref(),
+    )?;
     // Off and check stop here: detection only, never a fetch.
     if !matches!(config.auto_update.as_str(), "download" | "auto") {
         return Ok(BackgroundOutcome::Checked);
@@ -901,13 +962,40 @@ mod tests {
         // Point the fetch at a host that cannot answer, then assert the
         // timestamp survived. The failure path is reached by an unreachable
         // mirror rather than by mocking the network.
-        let error = perform_check(&root, Some("http://127.0.0.1:1")).unwrap_err();
+        let error = perform_check(&root, Some("http://127.0.0.1:1"), None).unwrap_err();
         assert!(!error.is_empty());
         let after = read_record(&root);
         assert_eq!(after.checked_at, Some(12345), "a failure must not look like a success");
         assert_eq!(after.last_error.as_deref(), Some(error.as_str()));
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[test]
+    fn a_token_sends_the_api_direct_and_never_through_a_mirror() {
+        // The rule this locks: a mirror is a third party, and an Authorization
+        // header pointed at one hands the credential over. A token changes the
+        // route, not just the headers.
+        let (endpoint, authorization) =
+            api_endpoint(LATEST_RELEASE_API, Some("https://gh-proxy.com"), Some("ghp_secret"));
+        assert_eq!(endpoint, LATEST_RELEASE_API);
+        assert_eq!(authorization.as_deref(), Some("Bearer ghp_secret"));
+        // Padded tokens are a paste artifact, not a different credential.
+        let (_, authorization) = api_endpoint(LATEST_RELEASE_API, None, Some("  ghp_secret  "));
+        assert_eq!(authorization.as_deref(), Some("Bearer ghp_secret"));
+    }
+
+    #[test]
+    fn without_a_token_the_mirror_route_survives() {
+        let (endpoint, authorization) =
+            api_endpoint(LATEST_RELEASE_API, Some("https://gh-proxy.com"), None);
+        assert!(endpoint.starts_with("https://gh-proxy.com/"), "{endpoint}");
+        assert_eq!(authorization, None);
+        // A blank token is no token.
+        let (endpoint, authorization) =
+            api_endpoint(LATEST_RELEASE_API, Some("https://gh-proxy.com"), Some("   "));
+        assert!(endpoint.starts_with("https://gh-proxy.com/"), "{endpoint}");
+        assert_eq!(authorization, None);
+    }
+
     #[test]
     fn the_off_policy_never_checks_on_its_own() {
         // Off is a standing preference; an explicit check_update still runs,

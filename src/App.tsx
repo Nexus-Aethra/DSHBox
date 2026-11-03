@@ -414,6 +414,13 @@ export function MainApp() {
                   </div>
                 </section>
                 <section className="settings-row">
+                  <div><p className="label">{text.githubToken}</p><p className="path">{text.githubTokenNote}</p></div>
+                  <div className="settings-controls">
+                    <Input type="password" value={settings.githubToken} placeholder="ghp_…" onChange={(event) => { settings.setGithubToken(event.target.value) }} className="settings-input" />
+                    <Button variant="primary" size="sm" disabled={settings.savingToken} onClick={() => { void settings.saveGithubToken() }}>{settings.savingToken ? '…' : text.saveToken}</Button>
+                  </div>
+                </section>
+                <section className="settings-row">
                   <div><p className="label">{text.npmRegistry}</p><p className="path">{text.npmRegistryNote}</p></div>
                   <div className="settings-controls">
                     <Select value={settings.npmRegistry} onChange={(event) => { settings.setNpmRegistry(event.target.value); void settings.saveNpmRegistry() }} options={NPM_REGISTRY_PRESETS.map((preset) => ({ value: preset.value, label: preset.label }))} />

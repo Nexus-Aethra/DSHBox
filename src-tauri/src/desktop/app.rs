@@ -340,6 +340,7 @@ fn run_inner() -> Result<(), String> {
             commands::config::save_runtime_directory,
             commands::config::save_language,
             commands::config::save_mirror_settings,
+            commands::config::save_github_token,
             get_server_service_status,
             get_daemon_status,
             get_daemon_build_notice,

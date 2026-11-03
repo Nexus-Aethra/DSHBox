@@ -151,6 +151,25 @@ desktop only stages it and forks it. `install_update` therefore answers
 "scheduled" before the process dies, and the UI's job is to say what is about
 to happen, including that running containers stop.
 
+## The GitHub token changes the route, not just the headers
+
+Anonymous GitHub API access is 60 requests an hour *per IP* -- and when the
+request goes through a shared accelerator such as gh-proxy.com, that IP is
+everyone's, so the version list 403s for reasons that have nothing to do with
+this machine. A token (Settings → General, stored in the machine-local
+`config.json`) raises the limit to 5,000 an hour.
+
+The rule the implementation locks with a test: **a token never travels
+through a mirror.** A mirror is a third party; an `Authorization` header
+pointed at one hands the credential over. A token therefore sends the API
+requests direct to `api.github.com`, while the mirror keeps serving the
+public download tier (the `latest.json` manifest and installers, which need
+no auth and are not API-rate-limited). If the direct request fails at the
+transport level -- a blocked network, not an HTTP status -- it retries
+anonymously through the mirror rather than dying, still without the
+credential. A 403 error message names the setting, so a rate limit does not
+dead-end.
+
 ## Wire surface
 
 Daemon RPCs: `get_update_state`, `check_update`, `enqueue_update_download`,

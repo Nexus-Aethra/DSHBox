@@ -310,6 +310,14 @@ command as done only once the installed app has run it.
   tried" from "last successful" honestly. The default policy is `check`:
   detecting a release is not the same act as replacing a running binary, and the
   second one is asked for (`download` / `auto`).
+- **A GitHub token changes the route, not just the headers.** A mirror such as
+  gh-proxy.com is a third party: forwarding `Authorization` through one hands
+  the credential over. So a token (Settings → General) sends the API requests
+  direct to `api.github.com` -- 5,000 requests an hour instead of the
+  anonymous 60, which a shared mirror exhausts for everyone -- and the mirror
+  keeps serving only the public download tier. If direct fails at the
+  transport level, the request retries anonymously through the mirror rather
+  than dying -- still without the credential. The 403 error names the setting.
 - **The desktop and the daemon are one build batch, and a bump must rebuild both.**
   `scripts/prepare-server.mjs` writes `src-tauri/.build-stamp` (epoch seconds) and
   both `build.rs` files embed it as `DSHBOX_BUILD_STAMP`. The desktop compares

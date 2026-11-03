@@ -26,7 +26,7 @@ DSH Box is a lightweight desktop shell built with [Tauri 2](https://tauri.app) t
 - **A slow daemon never freezes the window** — commands run off the main thread and every RPC is bounded.
 - **An older server is kept, and said so** — a service from a previous build keeps running, with a topbar line naming both.
 - **RPC + events** — one `POST /rpc` and one SSE stream serve the UI, the CLI and agents alike.
-- **Network-friendly** — GitHub mirror, npm registry mirror, automatic proxy detection.
+- **Network-friendly** — GitHub mirror, optional GitHub API token (sent direct to `api.github.com`, never through the mirror), npm registry mirror, automatic proxy detection.
 - **Tray and background service** — `dshboxd` keeps working with the window closed.
 - **Lightweight** — Tauri, not Electron.
 - **Bilingual UI** — English and 简体中文.

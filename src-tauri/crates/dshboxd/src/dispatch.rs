@@ -196,6 +196,7 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
     Some("debug_console") => crate::debug::console_rpc(state, request).map(Sync),
     Some("apply_document") => crate::apply::apply_document_rpc(state, request).map(Sync),
         Some("save_mirror_settings") => save_mirror_settings_rpc(request).map(Sync),
+        Some("save_github_token") => save_github_token_rpc(request).map(Sync),
         Some("save_runtime_directory") => save_runtime_directory_rpc(state, request).map(Sync),
         Some("refresh_dsh_catalog") => enqueue_dsh_catalog_refresh(state),
         Some("pull_template") => enqueue_pull_template(state, request),
@@ -1157,6 +1158,15 @@ fn save_mirror_settings_rpc(request: &Value) -> Result<Value, String> {
     let mut config = read_config()?;
     config.github_mirror = optional_string(&request["githubMirror"]);
     config.npm_registry = optional_string(&request["npmRegistry"]);
+    write_config(&config)?;
+    Ok(json!({ "saved": true }))
+}
+
+/// Store or clear the GitHub API token. The value is trimmed and an empty
+/// string clears it, so the settings field is its own eraser.
+fn save_github_token_rpc(request: &Value) -> Result<Value, String> {
+    let mut config = read_config()?;
+    config.github_token = optional_string(&request["githubToken"]);
     write_config(&config)?;
     Ok(json!({ "saved": true }))
 }
