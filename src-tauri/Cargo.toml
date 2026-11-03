@@ -27,6 +27,7 @@ members = [
   "crates/box-store",
   "crates/box-logger",
   "crates/box-template-core",
+  "crates/box-updates",
   "crates/dshboxd",
   "tools/runtime-packager",
 ]

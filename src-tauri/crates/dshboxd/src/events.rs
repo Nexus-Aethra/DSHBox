@@ -49,6 +49,12 @@ pub enum DaemonEvent {
     ResourceUpdated { id: String, status: String },
     /// Remote tags were fetched (result of `fetch_remote_tags`).
     TagsFetched { tags: Vec<String> },
+    /// A background update check finished; clients re-read `get_update_state`.
+    ///
+    /// An invalidation notice rather than the payload: the reader already
+    /// exists, and pushing the whole state here would be a second shape of
+    /// the same data to keep in step.
+    UpdateState,
 }
 
 impl DaemonEvent {
@@ -65,6 +71,7 @@ impl DaemonEvent {
             Self::ResourceRemoved { .. } => "resource_removed",
             Self::ResourceUpdated { .. } => "resource_updated",
             Self::TagsFetched { .. } => "tags_fetched",
+            Self::UpdateState => "update_state",
         }
     }
 }

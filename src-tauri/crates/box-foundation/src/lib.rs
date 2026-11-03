@@ -408,6 +408,33 @@ pub struct BoxConfig {
     /// exactly one new elevation prompt.
     #[serde(default)]
     pub defender_exclusions_for: Option<String>,
+    /// How this install handles its own updates: `off`, `check`, `download`
+    /// or `auto`. Stored here rather than beside the update state because it
+    /// is a machine-local preference the Settings pane owns, and because
+    /// `config.json` is the one file both the daemon and the desktop read.
+    ///
+    /// Defaults to `check`: detecting a new release is not the same act as
+    /// replacing the running binary, and the second one has to be asked for.
+    #[serde(default = "default_update_policy")]
+    pub auto_update: String,
+    /// The version the user chose to skip. While it equals the available
+    /// update, the UI stays quiet about it. A newer release clears it, because
+    /// "not this one" was never "never again".
+    #[serde(default)]
+    pub skipped_update_version: Option<String>,
+}
+
+/// `off` | `check` | `download` | `auto`.
+fn default_update_policy() -> String {
+    "check".to_owned()
+}
+
+/// The update policies this build accepts, in increasing order of autonomy.
+pub const UPDATE_POLICIES: [&str; 4] = ["off", "check", "download", "auto"];
+
+/// True when `value` names a policy this build knows.
+pub fn is_update_policy(value: &str) -> bool {
+    UPDATE_POLICIES.contains(&value)
 }
 
 fn default_language() -> String {
@@ -432,6 +459,8 @@ impl Default for BoxConfig {
             inherit_proxy: default_true(),
             plugins_manifest_digest: None,
             defender_exclusions_for: None,
+            auto_update: default_update_policy(),
+            skipped_update_version: None,
         }
     }
 }

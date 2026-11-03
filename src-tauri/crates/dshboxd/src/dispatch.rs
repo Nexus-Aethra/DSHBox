@@ -100,6 +100,18 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
             "runtime": bundled_runtime().map(|_| "ready").unwrap_or("missing"),
         }))),
         Some("get_info") => get_info().map(Sync),
+        // Update discovery. The read is cheap and never touches the network;
+        // the explicit check and the download are the two that do.
+        Some("get_update_state") => crate::updates::get_update_state_rpc(state).map(Sync),
+        Some("check_update") => crate::updates::check_update_rpc().map(Sync),
+    Some("list_update_releases") => crate::updates::list_update_releases_rpc().map(Sync),
+        Some("enqueue_update_download") => crate::updates::enqueue_update_download(state, request),
+        Some("discard_update_download") => {
+            crate::updates::discard_update_download(request).map(Sync)
+        }
+        Some("skip_update_version") => crate::updates::skip_update_version(request).map(Sync),
+        Some("clear_update_skip") => crate::updates::clear_update_skip().map(Sync),
+        Some("set_update_policy") => crate::updates::set_update_policy(request).map(Sync),
         Some("list_containers") => list_containers(state).map(Sync),
         Some("list_templates") => list_sealed_templates().map(|items| Sync(json!(items))),
         Some("read_template") => {
@@ -353,7 +365,10 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
 fn get_info() -> Result<Value, String> {
     let config = read_config()?;
     let mut info = json!({
-        "version": env!("CARGO_PKG_VERSION"),
+        // The application version this install was released as. The crate has
+        // its own 0.1.0 and reporting that here is what made the updater treat
+        // an up-to-date install as behind.
+        "version": crate::updates::APP_VERSION,
         "buildStamp": env!("DSHBOX_BUILD_STAMP"),
         "pid": std::process::id(),
         "runtimeDirectory": config.runtime_directory,

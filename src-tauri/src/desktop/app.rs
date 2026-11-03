@@ -39,6 +39,7 @@ pub(crate) mod lifecycle;
 mod services;
 mod tasks;
 mod toolchains;
+mod updates;
 mod versions;
 
 pub(crate) use bundles::*;
@@ -347,6 +348,17 @@ fn run_inner() -> Result<(), String> {
             stop_server_service,
             commands::toolchains::detect_toolchains,
             commands::toolchains::save_toolchain_source,
+            updates::get_update_state,
+            updates::check_for_update,
+    updates::list_update_releases,
+            updates::enqueue_update_download,
+            updates::set_update_policy,
+            updates::skip_update_version,
+            updates::clear_update_skip,
+            updates::discard_update_download,
+            updates::open_update_folder,
+            updates::install_update,
+            updates::get_install_on_quit,
             enqueue_toolchain_install,
             commands::versions::list_dsh_versions,
             commands::versions::upgrade_legacy_resources,
