@@ -160,7 +160,7 @@ const COMMANDS = {
   save_runtime_directory: async ({ directory }) => writeConfig({ runtimeDirectory: directory }),
   save_mirror_settings: async ({ githubMirror, npmRegistry }) =>
     writeConfig({ githubMirror, npmRegistry }),
-  save_github_token: async ({ githubToken }) => writeConfig({ githubToken }),
+  save_github_token: async ({ token }) => writeConfig({ githubToken: token }),
   get_server_service_status: async () => ({
     supported: false,
     enabled: false,

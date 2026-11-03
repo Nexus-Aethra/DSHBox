@@ -2,10 +2,10 @@
 //!
 //! The CLI is a thin client here like everywhere else: the daemon owns the
 //! network and the downloaded file, and the desktop owns the process that has
-//! to end before an installer runs. A CLI process *can* install, though, and
-//! does so through the same staged-helper mechanism the desktop uses, because
-//! this binary is one of the files being replaced and something outside it has
-//! to do the swapping.
+//! to end before an installer runs. `update install` therefore *prints* how
+//! to install the verified file rather than staging the swap itself: the
+//! staged, self-relaunching helper lives in the desktop app, and duplicating
+//! it here would be a second copy of the one script that must not drift.
 
 use serde_json::{json, Value};
 
@@ -15,7 +15,9 @@ dshbox update <command>
   status                      what the last check found, and the policy
   check                       ask GitHub now and print the result
   download                    fetch this machine's installer and verify it
-  install [--force]           run the verified installer, then relaunch
+  install [--force]           print how to install the verified file (the
+                              staged, self-relaunching install runs in the
+                              desktop app's Settings pane)
   policy [off|check|download|auto]
                               show, or set, how updates are handled
   skip                        ignore the currently available release
@@ -82,9 +84,10 @@ fn download(rest: &[String]) -> Result<(), String> {
 
 /// Install the downloaded release.
 ///
-/// The daemon cannot do this: the installer replaces the binaries the daemon
-/// is running from, and a process cannot swap the file it is executing. So the
-/// download is verified by the daemon and the swap is staged here.
+/// The daemon cannot run the installer (it replaces the binaries the daemon
+/// is running from), and neither can this process -- so this verb says how to
+/// install the verified file, the way the pane does for the platforms without
+/// an unattended installer.
 fn install(rest: &[String]) -> Result<(), String> {
     // Both flags are always known; `--force` is then read from the parsed
     // arguments. Deriving the known list from the value meant `--force` was

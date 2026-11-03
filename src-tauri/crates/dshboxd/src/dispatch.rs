@@ -1162,11 +1162,17 @@ fn save_mirror_settings_rpc(request: &Value) -> Result<Value, String> {
     Ok(json!({ "saved": true }))
 }
 
-/// Store or clear the GitHub API token. The value is trimmed and an empty
-/// string clears it, so the settings field is its own eraser.
+/// Store or clear the GitHub API token. Trimmed here as well as in the
+/// desktop command -- the RPC is reachable from other callers, and a padded
+/// token authenticates as itself. An empty string clears it, so the settings
+/// field is its own eraser.
 fn save_github_token_rpc(request: &Value) -> Result<Value, String> {
     let mut config = read_config()?;
-    config.github_token = optional_string(&request["githubToken"]);
+    config.github_token = request["githubToken"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     write_config(&config)?;
     Ok(json!({ "saved": true }))
 }

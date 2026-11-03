@@ -52,6 +52,7 @@ fn a_real_transfer_is_verified_and_then_accepted() {
         &digest,
         bytes.len() as u64,
         |_, _| {},
+        || false,
     )
     .expect("a matching transfer must be accepted");
     assert_eq!(written, bytes.len() as u64);
@@ -68,6 +69,7 @@ fn a_real_transfer_is_verified_and_then_accepted() {
         &wrong,
         bytes.len() as u64,
         |_, _| {},
+        || false,
     )
     .expect_err("a mismatched digest must be refused");
     assert!(matches!(error, box_updates::download::DownloadError::Digest { .. }));

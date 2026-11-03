@@ -378,13 +378,11 @@ dependencies = [
 name = "box-updates"
 version = "0.1.0"
 dependencies = [
- "box-foundation",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
- "tracing",
 ]
 
 [[package]]

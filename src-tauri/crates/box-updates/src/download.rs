@@ -20,6 +20,9 @@ pub enum DownloadError {
     MalformedDigest(String),
     /// The size disagrees with the manifest.
     Size { expected: u64, actual: u64 },
+    /// The caller asked to stop; the transfer ends mid-stream and the
+    /// staging file is removed with it.
+    Cancelled,
 }
 
 impl DownloadError {
@@ -35,6 +38,7 @@ impl DownloadError {
             Self::Size { expected, actual } => format!(
                 "the downloaded file is {actual} bytes; the release says {expected}"
             ),
+            Self::Cancelled => "download cancelled".to_owned(),
         }
     }
 }
@@ -89,14 +93,18 @@ impl StreamingDigest {
 /// manifest.
 ///
 /// The caller passes a `destination` that is a staging path; this function
-/// removes it on any mismatch, so a failed verification cannot leave a file
-/// that a later run would find and trust.
+/// removes it on any mismatch -- and on a mid-transfer cancellation, which
+/// must not leave a half-written installer behind either -- so a failed or
+/// abandoned attempt cannot leave a file that a later run would find and
+/// trust. `should_stop` is consulted between chunks: cancellation stops the
+/// transfer within one buffer, not after it.
 pub fn download_and_verify(
     mut reader: impl Read,
     destination: &std::path::Path,
     expected_digest: &str,
     expected_size: u64,
     mut progress: impl FnMut(u64, u64),
+    should_stop: impl Fn() -> bool,
 ) -> Result<u64, DownloadError> {
     let expected = normalize_digest(expected_digest)?;
     let parent = destination
@@ -122,6 +130,10 @@ pub fn download_and_verify(
         file.write_all(&buffer[..read])
             .map_err(|error| DownloadError::Transport(format!("write failed: {error}")))?;
         progress(digest.bytes(), expected_size);
+        if should_stop() {
+            let _ = std::fs::remove_file(destination);
+            return Err(DownloadError::Cancelled);
+        }
     }
     drop(file);
     let actual_bytes = digest.bytes();
@@ -189,6 +201,7 @@ mod tests {
             &digest,
             HELLO.len() as u64,
             |_, _| {},
+            || false,
         )
         .unwrap();
         assert_eq!(written, HELLO.len() as u64);
@@ -209,6 +222,7 @@ mod tests {
             &wrong,
             0,
             |_, _| {},
+            || false,
         )
         .unwrap_err();
         assert!(matches!(error, DownloadError::Digest { .. }));
@@ -229,6 +243,7 @@ mod tests {
             &digest,
             HELLO.len() as u64 + 1,
             |_, _| {},
+            || false,
         )
         .unwrap_err();
         assert!(matches!(error, DownloadError::Size { .. }));
@@ -240,8 +255,9 @@ mod tests {
     fn a_malformed_manifest_digest_is_refused_before_writing_anything() {
         let directory = scratch("malformed");
         let path = directory.join("installer.bin");
-        let error = download_and_verify(Cursor::new(HELLO), &path, "junk", 0, |_, _| {})
-            .unwrap_err();
+        let error =
+            download_and_verify(Cursor::new(HELLO), &path, "junk", 0, |_, _| {}, || false)
+                .unwrap_err();
         assert!(matches!(error, DownloadError::MalformedDigest(_)));
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&directory);
@@ -253,11 +269,37 @@ mod tests {
         let path = directory.join("installer.bin");
         let digest = hello_digest();
         let mut seen = Vec::new();
-        download_and_verify(Cursor::new(HELLO), &path, &digest, HELLO.len() as u64, |bytes, _| {
-            seen.push(bytes);
-        })
+        download_and_verify(
+            Cursor::new(HELLO),
+            &path,
+            &digest,
+            HELLO.len() as u64,
+            |bytes, _| seen.push(bytes),
+            || false,
+        )
         .unwrap();
         assert_eq!(seen.last().copied(), Some(HELLO.len() as u64));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_cancelled_transfer_stops_and_leaves_nothing_behind() {
+        // Cancel must bite between chunks, not after the whole body: a
+        // cancelled 160 MB download that keeps running is not cancelled.
+        let directory = scratch("cancel");
+        let path = directory.join("installer.bin");
+        let digest = hello_digest();
+        let error = download_and_verify(
+            Cursor::new(HELLO),
+            &path,
+            &digest,
+            0,
+            |_, _| {},
+            || true,
+        )
+        .unwrap_err();
+        assert!(matches!(error, DownloadError::Cancelled));
+        assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&directory);
     }
 }

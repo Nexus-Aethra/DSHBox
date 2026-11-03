@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { boxApi } from '../shared/api/box-api'
 import type { UpdatePolicy, UpdateState } from '../shared/types/domain'
 
@@ -15,6 +15,12 @@ import type { UpdatePolicy, UpdateState } from '../shared/types/domain'
 
 /** Poll interval while a download task runs. */
 const TASK_POLL_MS = 600
+/**
+ * How long to keep waiting before giving the loop up: a download task can
+ * legitimately take minutes on a slow mirror, but a loop without a deadline
+ * hammers the daemon forever if a task never settles.
+ */
+const TASK_DEADLINE_MS = 30 * 60 * 1000
 
 type DownloadProgress = { stage: string; progress: number }
 
@@ -29,8 +35,14 @@ type DownloadProgress = { stage: string; progress: number }
 async function waitForTask(
   id: string,
   onProgress: (progress: DownloadProgress) => void,
+  alive: () => boolean,
 ): Promise<void> {
+  const deadline = Date.now() + TASK_DEADLINE_MS
   for (;;) {
+    // The pane closed: stop polling. The task itself keeps running in the
+    // daemon and its result shows up on the next open -- a loop that outlives
+    // its caller is just noise against the daemon.
+    if (!alive()) throw new Error('the updates pane closed while the download ran')
     const tasks = await boxApi.listTasks()
     const task = tasks.find((entry) => entry.id === id)
     if (task === undefined) throw new Error('the download task disappeared from the queue')
@@ -39,6 +51,7 @@ async function waitForTask(
     if (task.status === 'failed' || task.status === 'cancelled' || task.status === 'interrupted') {
       throw new Error(task.error ?? 'the download did not finish')
     }
+    if (Date.now() > deadline) throw new Error('the download took too long; check the task panel')
     await new Promise((resolve) => setTimeout(resolve, TASK_POLL_MS))
   }
 }
@@ -48,6 +61,10 @@ export function useUpdates(onError: (message: string | null) => void) {
   const [checking, setChecking] = useState(false)
   const [busy, setBusy] = useState(false)
   const [downloading, setDownloading] = useState<DownloadProgress | null>(null)
+  // False once the component unmounts: waitForTask stops instead of polling
+  // from beyond the grave.
+  const aliveRef = useRef(true)
+  useEffect(() => () => { aliveRef.current = false }, [])
 
   const reload = useCallback(async () => {
     try {
@@ -124,7 +141,7 @@ export function useUpdates(onError: (message: string | null) => void) {
     setDownloading({ stage: 'starting', progress: 0 })
     try {
       const task = await boxApi.downloadUpdate(state?.available?.version ?? null)
-      await waitForTask(task.id, setDownloading)
+      await waitForTask(task.id, setDownloading, () => aliveRef.current)
       await reload()
       onError(null)
     } catch (reason) {

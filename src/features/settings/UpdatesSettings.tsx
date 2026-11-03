@@ -19,8 +19,6 @@ export type UpdatesText = {
   updatesVersionCurrent: string
   updatesVersionNewer: string
   updatesVersionOlder: string
-  updatesShowNotes: string
-  updatesHideNotes: string
   updatesNotesEmpty: string
   updatesUpgradeTo: string
   updatesUpdateRow: string
@@ -36,11 +34,9 @@ export type UpdatesText = {
   updatesPolicyAutoNote: string
   updatesCheck: string
   updatesChecking: string
-  updatesUpToDate: string
   updatesAvailable: (version: string) => string
   updatesNeverChecked: string
   updatesLastChecked: (when: string) => string
-  updatesDownload: string
   updatesDownloading: (stage: string, progress: number) => string
   updatesReady: (version: string) => string
   updatesReadyNote: (path: string) => string
@@ -51,12 +47,12 @@ export type UpdatesText = {
   updatesDiscard: string
   updatesSkip: string
   updatesUnskip: string
-  updatesSkipped: (version: string) => string
   updatesManual: string
   updatesManualReason: string
+  updatesBelowMinimum: string
+  updatesManifestUnavailable: string
   updatesManualCommand: (path: string) => string
   updatesReleaseNotes: string
-  updatesError: string
   updatesInterval: (hours: number) => string
 }
 
@@ -135,6 +131,15 @@ export function UpdatesSettings({ text, onError }: Props) {
   const canDownload = showUpdate && download === null && downloading === null && available?.asset !== null
   const megabytes = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1)
 
+  // Why a release cannot be installed from here, in one honest line: the
+  // reasons are different facts (too old to replace in place, a manifest
+  // that could not be read just now, an installer that needs root).
+  const manualReasonText = (reason: string | null) => reason === 'below-minimum'
+    ? text.updatesBelowMinimum
+    : reason === 'manifest-unavailable'
+      ? text.updatesManifestUnavailable
+      : text.updatesManualReason
+
   const rowStateOf = (version: string): RowState => version === state.currentVersion
     ? 'current'
     : newer && available !== null && version === available.version
@@ -151,7 +156,9 @@ export function UpdatesSettings({ text, onError }: Props) {
   const install = async () => {
     if (download === null) return
     // Ending every running container is part of this, so it is stated first.
-    if (!window.confirm(text.updatesInstallNote)) return
+    // A native dialog, not window.confirm: the webview no-ops confirm on
+    // macOS, which would turn this button into a silent nothing.
+    if (!(await boxApi.confirmDialog(text.updatesInstallNote))) return
     setInstalling(true)
     try {
       await boxApi.installUpdate(download.path)
@@ -252,7 +259,7 @@ export function UpdatesSettings({ text, onError }: Props) {
                           variant="primary"
                           size="sm"
                           disabled={!rowUpdateable || updates.busy}
-                          onClick={() => { void updates.download() }}
+                          onClick={(event) => { event.stopPropagation(); void updates.download() }}
                         >
                           {text.updatesUpdateRow}
                         </Button>
@@ -299,7 +306,7 @@ export function UpdatesSettings({ text, onError }: Props) {
                   )}
                 </div>
                 {newer && selectedIsUpdatable && manualReason !== null && (
-                  <p className="path">{text.updatesManualReason}</p>
+                  <p className="path">{manualReasonText(manualReason)}</p>
                 )}
                 {download !== null && selectedRelease.version === download.version && (
                   <p className="path">{text.updatesReadyNote(download.path)} · {text.updatesSize(megabytes(download.bytes))}</p>
@@ -320,19 +327,22 @@ export function UpdatesSettings({ text, onError }: Props) {
               <p className="label">{text.updatesReady(download.version)}</p>
               <p className="path">{text.updatesReadyNote(download.path)}</p>
               <p className="path">{text.updatesSize(megabytes(download.bytes))}</p>
-              {manualReason !== null && (
+              {state.available?.asset?.installMode === 'manual' && (
                 <p className="path">{text.updatesManualCommand(download.path)}</p>
+              )}
+              {manualReason !== null && state.available?.asset?.installMode !== 'manual' && (
+                <p className="path">{manualReasonText(manualReason)}</p>
               )}
             </div>
             <div className="settings-controls">
               <Button variant="ghost" size="sm" onClick={() => { void boxApi.openUpdateFolder(download.path) }}>
                 {text.updatesOpenFolder}
               </Button>
-              {manualReason !== null
+              {state.available?.asset?.installMode === 'manual'
                 // No digest-less install, and no silent sudo from a GUI: the
                 // path and the command are the honest half of a manual update.
                 ? <p className="path">{text.updatesManual}</p>
-                : <Button variant="primary" size="sm" loading={installing} disabled={installing || updates.busy} onClick={() => { void install() }}>
+                : manualReason === null && <Button variant="primary" size="sm" loading={installing} disabled={installing || updates.busy} onClick={() => { void install() }}>
                   {text.updatesInstall}
                 </Button>}
               <Button variant="ghost" size="sm" disabled={updates.busy || installing} onClick={() => { void updates.discard() }}>

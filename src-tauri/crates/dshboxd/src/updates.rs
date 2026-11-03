@@ -69,6 +69,14 @@ pub(crate) struct UpdateRecord {
     /// check reports the failure rather than the previous answer's timestamp.
     #[serde(default)]
     pub(crate) last_error: Option<String>,
+    /// The full tier's answer at check time: which file this machine would
+    /// run, with which digest -- or why it may not. Cached here so a state
+    /// read never touches the network; the check is the network event.
+    #[serde(default)]
+    pub(crate) asset: Option<Value>,
+    /// Why the cached asset is absent, when it is.
+    #[serde(default)]
+    pub(crate) manual_reason: Option<String>,
 }
 
 fn record_path(root: &Path) -> PathBuf {
@@ -86,19 +94,82 @@ fn write_record(root: &Path, record: &UpdateRecord) -> Result<(), String> {
     atomic_write_json(&record_path(root), record)
 }
 
+/// A version from outside the daemon names a directory under updates/.
+/// Validation is what keeps `0.1.9/../..` from being one.
+fn clean_version(version: &str) -> Result<(), String> {
+    let ok = !version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+        && !version.starts_with('.')
+        && !version.ends_with('.')
+        && !version.contains("..");
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("invalid version {version:?}"))
+    }
+}
+
+/// Files that live beside the installer but are not one.
+fn is_helper_artifact(name: &str) -> bool {
+    matches!(
+        name,
+        "install-update.cmd" | "install-update.sh" | "update-error.log" | "download.json"
+    )
+}
+
 /// Where a verified installer for \`version\` lives.
 pub(crate) fn download_directory(root: &Path, version: &str) -> PathBuf {
     root.join("updates").join(version)
 }
 
-/// The release payload the UI renders.
+/// The full tier's answer for one release tag, resolved while the network is
+/// already allowed: during a check, never during a pane read.
 ///
-/// It carries the *asset* too, which means reading the full manifest rather than
-/// only the quick tier: the pane and the install path both need to know which
-/// file this machine would run, and an update whose file cannot be named is not
-/// one the UI should offer a button for. A release that predates the manifest
-/// says so through `manualReason` instead of pretending.
-fn release_payload(config: &BoxConfig, record: &UpdateRecord, current: &str) -> Value {
+/// A manifest that cannot be *read* (transport error, 5xx, timeout) is
+/// deliberately not `no-manifest`: a release that has a manifest must not be
+/// misreported as one that predates it just because the mirror hiccuped.
+fn resolve_asset(tag: &str, current: &str, mirror: Option<&str>) -> (Option<Value>, Option<String>) {
+    let manifest = match fetch_manifest(tag, mirror) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            if error.starts_with("NO_MANIFEST:") {
+                return (None, Some("no-manifest".to_owned()));
+            }
+            warn!(tag, error, "the release manifest could not be read");
+            return (None, Some("manifest-unavailable".to_owned()));
+        }
+    };
+    if !manifest.installable_from(current) {
+        return (None, Some("below-minimum".to_owned()));
+    }
+    match manifest.preferred_asset(crate::state::bundled_target(), preferred_installers()) {
+        Ok(asset) => {
+            let reason = if asset.is_automatic() {
+                None
+            } else {
+                Some("manual-installer".to_owned())
+            };
+            let value = json!({
+                "url": asset.url,
+                "sha256": asset.sha256,
+                "size": asset.size,
+                "installer": asset.installer,
+                "installMode": asset.install_mode,
+            });
+            (Some(value), reason)
+        }
+        Err(problem) => (None, Some(problem.reason().to_owned())),
+    }
+}
+
+/// The release payload the UI renders, answered entirely from the record.
+///
+/// Every network answer here was already fetched by the check that wrote the
+/// record. A pane read is cheap by contract; one that secretly re-fetched the
+/// manifest through a 20-second-timeout client on every open broke it.
+fn release_payload(record: &UpdateRecord, current: &str) -> Value {
     let Some(version) = record.latest_version.as_deref() else {
         return json!(null);
     };
@@ -110,45 +181,14 @@ fn release_payload(config: &BoxConfig, record: &UpdateRecord, current: &str) -> 
         "version": version,
         "notesUrl": record.notes_url,
         "newer": newer,
-        "manualReason": null,
-        "asset": null,
+        "manualReason": record.manual_reason,
+        "asset": record.asset,
     });
-    if !newer {
-        return payload;
-    }
-    let tag = record
-        .latest_tag
-        .clone()
-        .unwrap_or_else(|| format!("v{version}"));
-    // Only worth the extra request when there is something to offer.
-    let Some(manifest) = fetch_manifest(&tag, config.github_mirror.as_deref()).ok() else {
-        // A release from before the manifest existed: nothing here has a
-        // digest, so nothing here is something this app will run.
-        payload["manualReason"] = json!("no-manifest");
-        return payload;
-    };
-    if !manifest.installable_from(current) {
-        payload["manualReason"] = json!("below-minimum");
-        return payload;
-    }
-    match manifest.preferred_asset(crate::state::bundled_target(), preferred_installers()) {
-        Ok(asset) => {
-            payload["manualReason"] = if asset.is_automatic() {
-                json!(null)
-            } else {
-                json!("manual-installer")
-            };
-            payload["asset"] = json!({
-                "url": asset.url,
-                "sha256": asset.sha256,
-                "size": asset.size,
-                "installer": asset.installer,
-                "installMode": asset.install_mode,
-            });
-        }
-        Err(problem) => {
-            payload["manualReason"] = json!(problem.reason());
-        }
+    if newer && record.asset.is_none() && record.manual_reason.is_none() {
+        // A record written before this field existed (an upgrade over an older
+        // daemon): say the answer is not known rather than inventing one. The
+        // next check fills it in.
+        payload["manualReason"] = json!("manifest-unavailable");
     }
     payload
 }
@@ -351,6 +391,16 @@ pub(crate) fn perform_check(
             //
             // Whether that release is an *update* is `is_newer`'s job, in the
             // payload, not the record's.
+            // The full tier is settled here, on the network thread, so a pane
+            // read never pays for it: which file this machine would run, and
+            // whether it may, travel in the record.
+            let tag = record
+                .latest_tag
+                .clone()
+                .unwrap_or_else(|| format!("v{}", record.latest_version.clone().unwrap_or_default()));
+            let (asset, manual_reason) = resolve_asset(&tag, APP_VERSION, mirror);
+            record.asset = asset;
+            record.manual_reason = manual_reason;
             let _ = write_record(root, &record);
             let _ = release.body;
             let _ = release.published_at;
@@ -397,6 +447,7 @@ pub(crate) fn download_with_cancel(
     mirror: Option<&str>,
     task: &TaskContext,
 ) -> Result<(), String> {
+    clean_version(version)?;
     task.update("reading the release manifest", 5);
     let manifest = fetch_manifest(tag, mirror)?;
     task.log(&format!("release manifest for {tag} read"));
@@ -455,9 +506,6 @@ pub(crate) fn download_with_cancel(
         &digest,
         asset.size,
         |bytes, expected| {
-            if task.cancelled() {
-                return;
-            }
             let denominator = if expected == 0 { total } else { expected };
             if denominator == 0 {
                 return;
@@ -468,11 +516,17 @@ pub(crate) fn download_with_cancel(
                 task.update("downloading", percent);
             }
         },
+        // Cancel bites between chunks, not after the whole body: the transfer
+        // stops within one buffer and the staging file goes with it.
+        || task.cancelled(),
     )
     .map_err(|error| error.message())?;
     task.check_cancelled()?;
     fs::rename(&staging, &final_path)
         .map_err(|error| format!("cannot store the verified installer: {error}"))?;
+    // Name the verified file: the directory also collects helper scripts and
+    // error logs, and "first whole file" would eventually report one of those.
+    let _ = atomic_write_json(&directory.join("download.json"), &json!({ "file": filename }));
     task.log(&format!(
         "verified {filename} ({written} bytes, sha256 {}...)",
         &digest[..12]
@@ -483,7 +537,18 @@ pub(crate) fn download_with_cancel(
 
 /// What the daemon reports about a downloaded installer for one version.
 pub(crate) fn download_payload(root: &Path, version: &str) -> Value {
+    if clean_version(version).is_err() {
+        return json!(null);
+    }
     let directory = download_directory(root, version);
+    // The download recorded the exact filename it verified; that is the file
+    // to report. Without the record (a download from before it existed), fall
+    // back to the directory listing, minus everything that is provably not an
+    // installer -- the install helper and its error log live here too.
+    let recorded = fs::read_to_string(directory.join("download.json"))
+        .ok()
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        .and_then(|value| value["file"].as_str().map(str::to_owned));
     let mut entries: Vec<(String, u64)> = Vec::new();
     if let Ok(listing) = fs::read_dir(&directory) {
         for entry in listing.flatten() {
@@ -492,12 +557,18 @@ pub(crate) fn download_payload(root: &Path, version: &str) -> Value {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
+            if is_helper_artifact(&name) {
+                continue;
+            }
             entries.push((name, metadata.len()));
         }
     }
     // A .part file is a download in flight or an abandoned one; only a whole
     // file is something to offer.
-    let ready = entries.iter().find(|(name, _)| !name.ends_with(".part"));
+    let ready = match recorded {
+        Some(name) => entries.iter().find(|(entry, _)| entry == &name).cloned(),
+        None => entries.iter().find(|(name, _)| !name.ends_with(".part")).cloned(),
+    };
     match ready {
         Some((name, size)) => json!({
             "version": version,
@@ -534,7 +605,7 @@ pub(crate) fn collect_state(config: &BoxConfig) -> Value {
     };
     let root = Path::new(root);
     let record = read_record(root);
-    let available = release_payload(config, &record, current_version);
+    let available = release_payload(&record, current_version);
     let download = record
         .latest_version
         .as_deref()
@@ -615,6 +686,7 @@ pub(crate) fn enqueue_update_download(
         .map(str::to_owned)
         .or_else(|| record.latest_version.clone())
         .ok_or("no release is known yet; check for updates first")?;
+    clean_version(&version)?;
     let tag = request["tag"]
         .as_str()
         .map(str::to_owned)
@@ -654,6 +726,7 @@ pub(crate) fn discard_update_download(request: &Value) -> Result<Value, String> 
         .map(str::to_owned)
         .or_else(|| record.latest_version.clone())
         .ok_or("no release is known yet")?;
+    clean_version(&version)?;
     let directory = crate::updates::download_directory(std::path::Path::new(root), &version);
     let mut removed = 0_u32;
     if let Ok(listing) = std::fs::read_dir(&directory) {
@@ -726,6 +799,18 @@ pub(crate) struct BackgroundDeps {
     events: std::sync::Arc<crate::events::DaemonEvents>,
 }
 
+/// The single-flight flag for background checks, cleared on drop.
+///
+/// Cleared by a guard rather than a hand-written store on every path: a
+/// panicking pass used to leave the flag set forever, and with it, background
+/// checks off for the life of the process.
+pub(crate) struct ClearRunningOnDrop<'a>(pub(crate) &'a std::sync::atomic::AtomicBool);
+impl Drop for ClearRunningOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// One background check, spawned detached so no RPC call waits on the network.
 ///
 /// At most one runs at a time: the flag is the whole lock, because two
@@ -747,8 +832,10 @@ pub(crate) fn schedule_background_check(state: &crate::state::DaemonState) {
         events: state.events.clone(),
     };
     std::thread::spawn(move || {
+        // The guard lives in the worker: it clears the flag when the pass
+        // ends OR unwinds, whichever way it ends.
+        let _clear_on_drop = ClearRunningOnDrop(&RUNNING);
         let outcome = background_check_once(&deps);
-        RUNNING.store(false, Ordering::SeqCst);
         match outcome {
             Ok(outcome) => {
                 if outcome != BackgroundOutcome::NotDue {
@@ -787,6 +874,12 @@ fn background_check_once(deps: &BackgroundDeps) -> Result<BackgroundOutcome, Str
         return Ok(BackgroundOutcome::Checked);
     };
     if !is_newer(&version, APP_VERSION) || is_skipped(&config, &version) {
+        return Ok(BackgroundOutcome::Checked);
+    }
+    // Policy download/auto download THE installer; a release without an
+    // installable asset has none, and fetching its bytes anyway would stock a
+    // file the install half refuses to run.
+    if release_payload(&record, APP_VERSION)["asset"].is_null() {
         return Ok(BackgroundOutcome::Checked);
     }
     // Already fetched and verified: re-downloading it asks the same question.
@@ -933,8 +1026,9 @@ mod tests {
             latest_tag: Some(format!("v{APP_VERSION}")),
             notes_url: None,
             last_error: None,
+            ..UpdateRecord::default()
         };
-        let payload = release_payload(&BoxConfig::default(), &record, APP_VERSION);
+        let payload = release_payload(&record, APP_VERSION);
         assert_eq!(
             payload["version"].as_str(),
             Some(APP_VERSION),
@@ -994,6 +1088,37 @@ mod tests {
             api_endpoint(LATEST_RELEASE_API, Some("https://gh-proxy.com"), Some("   "));
         assert!(endpoint.starts_with("https://gh-proxy.com/"), "{endpoint}");
         assert_eq!(authorization, None);
+    }
+
+    #[test]
+    fn a_newer_release_without_a_cached_answer_reads_as_unknown_not_installable() {
+        // A record from an older daemon carries no asset; the payload must
+        // say "not known" (manifest-unavailable) rather than present a
+        // button for a file nobody has verified.
+        let record = UpdateRecord {
+            checked_at: Some(now_seconds()),
+            latest_version: Some("9.0.0".to_owned()),
+            latest_tag: Some("v9.0.0".to_owned()),
+            ..UpdateRecord::default()
+        };
+        let payload = release_payload(&record, APP_VERSION);
+        assert_eq!(payload["asset"], serde_json::Value::Null);
+        assert_eq!(
+            payload["manualReason"].as_str(),
+            Some("manifest-unavailable")
+        );
+    }
+
+    #[test]
+    fn a_version_that_names_another_directory_is_refused() {
+        assert!(clean_version("0.1.9").is_ok());
+        assert!(clean_version("0.1.9-alpha.1").is_ok());
+        assert!(clean_version("..").is_err());
+        assert!(clean_version("0.1.9/..").is_err());
+        assert!(clean_version("0.1.9\\..").is_err());
+        assert!(clean_version(".").is_err());
+        assert!(clean_version("").is_err());
+        assert!(clean_version("0 1").is_err());
     }
 
     #[test]

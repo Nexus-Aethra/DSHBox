@@ -103,6 +103,29 @@ fn installer_platform(installer: &str) -> Option<InstallerPlatform> {
     }
 }
 
+/// The directory the new .app bundle belongs in: the parent of the running
+/// bundle, found by walking up from the launcher to the component ending in
+/// `.app`.
+///
+/// The launcher's own parent is `<bundle>.app/Contents/MacOS` -- *inside* the
+/// old bundle. Copying there nests the new bundle inside the old one, and
+/// `open "{launcher}"` then relaunches the old binary: an update that
+/// reports success and updates nothing.
+fn bundle_install_destination(launcher: &str) -> Option<String> {
+    let bundle = std::path::Path::new(launcher)
+        .ancestors()
+        .find(|ancestor| ancestor.extension().and_then(|ext| ext.to_str()) == Some("app"))?;
+    bundle
+        .parent()
+        .map(|parent| parent.to_string_lossy().into_owned())
+}
+
+/// Escape a path for the cmd script: doubled quotes survive inside a quoted
+/// argument, and a literal `%` must be doubled or cmd expands it.
+fn cmd_quote(value: &str) -> String {
+    value.replace('%', "%%").replace('"', "\"\"")
+}
+
 /// The helper script that installs one verified file, then relaunches this app.
 ///
 /// Pure and parameterized on purpose: this is the one piece of the update path
@@ -127,16 +150,18 @@ fn render_installer_script(
 setlocal
 rem Written by DSH Box {version} to install a verified update.
 rem Wait for the app that wrote this script to exit: the MSI cannot replace
-rem a file that is still open.
+rem a file that is still open. The sleeps are `ping`, not `timeout`: this
+rem helper runs with redirected (nulled) stdin, and `timeout` refuses to wait
+rem there -- which once turned this loop into a hot spin.
 :wait_app
 tasklist /FI "PID eq {app_pid}" | find "{app_pid}" >nul
 if not errorlevel 1 (
-  timeout /t 1 /nobreak >nul
+  ping -n 2 127.0.0.1 >nul
   goto wait_app
 )
 rem The daemon holds dshboxd.exe open and would fail the install as well.
 taskkill /F /IM dshboxd.exe >nul 2>&1
-timeout /t 2 /nobreak >nul
+ping -n 3 127.0.0.1 >nul
 start /wait "" msiexec /i "{installer}" /qn /norestart
 set RESULT=%ERRORLEVEL%
 if not "%RESULT%"=="0" if not "%RESULT%"=="3010" (
@@ -149,9 +174,9 @@ exit /b 0
 "#,
             version = env!("CARGO_PKG_VERSION"),
             app_pid = app_pid,
-            installer = installer,
-            launcher = launcher,
-            working_directory = working_directory,
+            installer = cmd_quote(installer),
+            launcher = cmd_quote(launcher),
+            working_directory = cmd_quote(working_directory),
         ),
         InstallerPlatform::MacDmg => format!(
             r#"#!/bin/sh
@@ -165,8 +190,9 @@ if [ -z "$app" ]; then
   hdiutil detach "$mount" -quiet
   exit 1
 fi
-# Replace the bundle beside the running one, not one somewhere else: the
-# launcher path is the only reliable statement about where this is installed.
+# Replace the bundle BESIDE the running one: destination is the directory
+# containing the .app, not Contents/MacOS inside it -- nesting the new bundle
+# inside the old one relaunches the old binary and calls it success.
 destination="{launcher_dir}"
 rm -rf "$destination/$(basename "$app")"
 cp -R "$app" "$destination/"
@@ -178,10 +204,14 @@ open "{launcher}"
             app_pid = app_pid,
             installer = installer,
             launcher = launcher,
-            launcher_dir = std::path::Path::new(launcher)
-                .parent()
-                .map(|parent| parent.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            launcher_dir = bundle_install_destination(launcher).unwrap_or_else(|| {
+                // No .app ancestor (a dev run from target/release): keep the
+                // old behaviour rather than writing a broken script.
+                std::path::Path::new(launcher)
+                    .parent()
+                    .map(|parent| parent.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            }),
         ),
     }
 }
@@ -204,6 +234,15 @@ pub(crate) fn install_update(app: tauri::AppHandle, path: String) -> Result<serd
     };
     if !std::path::Path::new(&path).exists() {
         return Err(format!("the verified installer {path} is missing"));
+    }
+    // The webview names the file; the daemon owns the fact. Without this
+    // check, `install update` is `msiexec /qn` on whatever a caller says.
+    let verified = state["download"]["path"].as_str().unwrap_or("");
+    if verified.is_empty() || std::path::Path::new(verified) != std::path::Path::new(&path) {
+        return Err(
+            "the installer must be the file the daemon verified -- check for updates and download again"
+                .to_owned(),
+        );
     }
     let app_pid = std::process::id();
     let launcher = std::env::current_exe()
@@ -322,6 +361,10 @@ mod tests {
         // fails the install on a locked file or wastes time.
         assert!(script.contains(r#"tasklist /FI "PID eq 4242""#), "{script}");
         assert!(script.contains("goto wait_app"), "{script}");
+        // `timeout` refuses to wait with redirected stdin; `ping` does.
+        assert!(script.contains("ping -n 2 127.0.0.1 >nul"), "{script}");
+        assert!(script.contains("ping -n 3 127.0.0.1 >nul"), "{script}");
+        assert!(!script.contains("timeout /t"), "{script}");
         // The daemon holds its own executable open and would fail the MSI.
         assert!(script.contains("taskkill /F /IM dshboxd.exe"), "{script}");
         assert!(
@@ -348,11 +391,32 @@ mod tests {
         assert!(script.contains("while kill -0 4242"), "{script}");
         assert!(script.contains("hdiutil attach"), "{script}");
         assert!(script.contains("hdiutil detach"), "{script}");
-        assert!(
-            script.contains(r#"destination="/Applications/DSH Box.app/Contents/MacOS""#),
-            "{script}"
-        );
+        // The destination is the directory CONTAINING the bundle: copying
+        // into Contents/MacOS nests the new bundle inside the old one and
+        // relaunches the old binary -- an update that reports success and
+        // updates nothing.
+        assert!(script.contains("destination=\"/Applications\""), "{script}");
+        assert!(!script.contains("destination=\"/Applications/DSH Box.app\""), "{script}");
         assert!(script.contains("cp -R"), "{script}");
+    }
+
+    #[test]
+    fn the_bundle_destination_is_the_app_bundle_parent() {
+        assert_eq!(
+            bundle_install_destination("/Applications/DSH Box.app/Contents/MacOS/dshbox")
+                .as_deref(),
+            Some("/Applications")
+        );
+        // A launcher with no .app ancestor has no bundle to walk out of.
+        assert_eq!(bundle_install_destination("/usr/local/bin/dshbox"), None);
+    }
+
+    #[test]
+    fn windows_paths_are_quoted_for_cmd() {
+        // Quotes double inside a quoted argument; a literal % must double or
+        // cmd expands it as a variable.
+        assert_eq!(cmd_quote("C:\\Program Files\\a\"b"), "C:\\Program Files\\a\"\"b");
+        assert_eq!(cmd_quote("D:\\x%y\\z.msi"), "D:\\x%%y\\z.msi");
     }
 
     #[test]

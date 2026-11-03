@@ -98,7 +98,7 @@ pane owns:
 | `off` | never (the UI can still ask once) | no | no |
 | `check` | yes, background | no | no |
 | `download` | yes | yes, automatically | on user action |
-| `auto` | yes | yes, automatically | on quit / restart |
+| `auto` | yes | yes, automatically | on user action — the fetch is automatic, the install still asks |
 
 The default is `check`. Silently replacing a binary is the kind of thing that
 has to be asked for; detecting is not.
@@ -172,14 +172,18 @@ dead-end.
 
 ## Wire surface
 
-Daemon RPCs: `get_update_state`, `check_update`, `enqueue_update_download`,
-`discard_update_download`, `skip_update_version`, `clear_update_skip`.
+Daemon RPCs: `get_update_state`, `check_update`, `list_update_releases`,
+`set_update_policy`, `enqueue_update_download`, `discard_update_download`,
+`skip_update_version`, `clear_update_skip`, `save_github_token`.
 
 Desktop commands add the ones that end a process or open a folder:
-`install_update`, `open_update_folder`, and `save_update_policy` (the config
-write the Settings pane needs).
+`install_update` and `open_update_folder`; the rest are forwards to the
+daemon. (`get_install_on_quit` is registered but not wired to a quit path
+yet: under `auto` the fetch is automatic and the install still asks.)
 
-`get_update_state` answers one flat object so the pane is a single round trip:
+`get_update_state` answers one flat object so the pane is a single round
+trip -- and it is answered from the record, not the network: the check that
+wrote the record already paid for the manifest.
 
 ```ts
 type UpdateState = {
@@ -196,26 +200,21 @@ type UpdateState = {
 
 type UpdateRelease = {
   version: string
-  releasedAt: string | null
-  notes: string | null
   notesUrl: string | null
-  minimumVersion: string | null
-  asset: UpdateAsset | null
-  /** True when this release cannot be installed from inside the app. */
-  manual: boolean
-  /** 'no-manifest' | 'no-asset' | 'below-minimum' | 'manual-installer' */
+  /** False when this build is already that version, or ahead of it. */
+  newer: boolean
+  /** 'no-manifest' | 'manifest-unavailable' | 'below-minimum' | 'manual-installer' */
   manualReason: string | null
+  asset: UpdateAsset | null
 }
 
-type UpdateAsset = { platform, url, sha256, size, installer, installMode }
+type UpdateAsset = { url: string, sha256: string, size: number, installer: string, installMode: 'auto' | 'manual' }
 
 type UpdateDownload = {
   version: string
-  state: 'downloading' | 'verifying' | 'ready' | 'failed'
+  state: 'ready'
   bytes: number
-  totalBytes: number
-  path: string | null
-  error: string | null
+  path: string
 }
 ```
 

@@ -364,7 +364,7 @@ One policy per machine, in the pane:
 | **Off** | only when you press the button | no | no |
 | **Notify** (default) | once a day | no | no |
 | **Download** | once a day | yes | when you say so |
-| **Automatic** | once a day | yes | when you quit the app |
+| **Automatic** | once a day | yes | when you say so — the fetch is automatic, the install still asks |
 
 Detection is cheap and local; replacing a running binary is not, so the default only tells you. Nothing is ever executed that was not first checked against the SHA-256 published in the release's `latest.json`, and a release that predates that manifest is offered as a manual download instead of an unverified install.
 

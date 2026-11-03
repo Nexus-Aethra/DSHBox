@@ -85,7 +85,16 @@ function renderInline(src: string, key: string): ReactNode[] {
     }
 
     m = tryMatch(RX_ANGLE_URL)
-    if (m === null) m = tryMatch(RX_IMAGE)
+    if (m !== null) {
+      // GFM autolink: <https://...> -- one capture group, unlike [text](url).
+      const href = safeHref(m[1])
+      if (href === null) plain += m[0]
+      else push(<a href={href} target="_blank" rel="noreferrer">{m[1]}</a>)
+      i += m[0].length
+      continue
+    }
+
+    m = tryMatch(RX_IMAGE)
     if (m === null) m = tryMatch(RX_LINK)
     if (m !== null) {
       const href = safeHref(m[2])
@@ -188,7 +197,10 @@ function renderTable(header: string[], aligns: ('left' | 'center' | 'right')[], 
   )
 }
 
-function parseBlocks(src: string, key: string): ReactNode[] {
+/** How deep quotes and nested lists may recurse before the rest renders flat. */
+const MAX_BLOCK_DEPTH = 24
+
+function parseBlocks(src: string, key: string, depth = 0): ReactNode[] {
   const lines = src.replace(/\r\n?/g, '\n').split('\n')
   const out: ReactNode[] = []
   let i = 0
@@ -243,7 +255,15 @@ function parseBlocks(src: string, key: string): ReactNode[] {
         body.push(lines[i].replace(/^ {0,3}> ?/, ''))
         i += 1
       }
-      out.push(<blockquote key={k()}>{parseBlocks(body.join('\n'), `${key}-q`)}</blockquote>)
+      out.push(
+        <blockquote key={k()}>
+          {/* A remote body sets the depth: a kilobyte of '>' characters must
+              degrade to flat text, not walk the stack off the end. */}
+          {depth + 1 >= MAX_BLOCK_DEPTH
+            ? <p>{body.map((line, index) => <Fragment key={index}>{index > 0 && <br />}{renderInline(line, `${key}-q${index}`)}</Fragment>)}</p>
+            : parseBlocks(body.join('\n'), `${key}-q`, depth + 1)}
+        </blockquote>,
+      )
       continue
     }
 
@@ -282,7 +302,11 @@ function parseBlocks(src: string, key: string): ReactNode[] {
         i += 1
       }
       const children = items.map((raw, index) => (
-        <li key={`${key}-li${index}`}>{parseBlocks(raw.join("\n"), `${key}-li${index}`)}</li>
+        <li key={`${key}-li${index}`}>
+          {depth + 1 >= MAX_BLOCK_DEPTH
+            ? <p>{renderInline(raw.join(' '), `${key}-li${index}`)}</p>
+            : parseBlocks(raw.join("\n"), `${key}-li${index}`, depth + 1)}
+        </li>
       ))
       out.push(ordered ? <ol key={k()}>{children}</ol> : <ul key={k()}>{children}</ul>)
       continue
