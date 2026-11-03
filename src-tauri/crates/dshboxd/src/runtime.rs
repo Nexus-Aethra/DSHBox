@@ -11,7 +11,6 @@
 //! execution side stops being process-shaped.
 
 use box_runtime::process::TrackedChild;
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Which execution backend a container's host runs on.
@@ -92,6 +91,8 @@ pub(crate) enum HostHandle {
     /// lifecycle; its `Drop` carries the final force-kill exactly as before
     /// this wrapper existed.
     Process(TrackedChild),
+    /// A virtual machine, observed and stopped through the backend's handle.
+    Vm(Box<dyn crate::vm::VmHandle>),
 }
 
 impl HostHandle {
@@ -100,9 +101,30 @@ impl HostHandle {
     pub fn id(&self) -> Option<u32> {
         match self {
             HostHandle::Process(child) => child.id(),
+            HostHandle::Vm(vm) => vm.id(),
         }
     }
 
+    /// Process-group id of the host (Linux/macOS); `None` for backends
+    /// without one (VM arms, Windows).
+    pub fn pgid(&mut self) -> Option<i32> {
+        match self {
+            HostHandle::Process(child) => child.pgid(),
+            HostHandle::Vm(_) => None,
+        }
+    }
+
+    /// Exit details once the host has exited: `(code, signal)`. A VM arm
+    /// reports `None` while it cannot observe the guest's own exit — the
+    /// shared health watcher owns liveness for VMs, by URL.
+    pub fn exit_status(&mut self) -> std::io::Result<Option<(i32, Option<i32>)>> {
+        match self {
+            HostHandle::Process(child) => {
+                Ok(child.try_wait()?.map(crate::host::exit_status_to_parts))
+            }
+            HostHandle::Vm(vm) => Ok(if vm.has_exited()? { Some((-1, None)) } else { None }),
+        }
+    }
     /// Non-blocking liveness: `true` once the host has exited. Deliberately
     /// not `Option<ExitStatus>` — `ExitStatus` has no stable constructor, so
     /// a VM arm could not implement this verb; a VMM answers liveness from
@@ -110,6 +132,7 @@ impl HostHandle {
     pub fn has_exited(&mut self) -> std::io::Result<bool> {
         match self {
             HostHandle::Process(child) => Ok(child.try_wait()?.is_some()),
+            HostHandle::Vm(vm) => vm.has_exited(),
         }
     }
 
@@ -120,6 +143,7 @@ impl HostHandle {
             HostHandle::Process(child) => {
                 let _ = child.kill_tree(false, Duration::from_secs(5));
             }
+            HostHandle::Vm(vm) => vm.stop(),
         }
     }
 }

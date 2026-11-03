@@ -27,6 +27,7 @@ mod test_support;
 mod toolchains;
 mod updates;
 mod versions;
+mod vm;
 mod workspaces;
 
 use box_runtime::process;
@@ -402,5 +403,20 @@ fn ensure_single_instance() -> Option<ServerDiscovery> {
 }
 
 fn main() {
+    // Hidden subcommand: the libkrun VMM child process. The daemon spawns
+    // itself so the blocking `krun_start_enter` lives in a killable child
+    // rather than a daemon thread.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "--vmm-run" {
+        #[cfg(target_os = "linux")]
+        {
+            std::process::exit(crate::vm::libkrun::vmm_main(&args[2..]));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("--vmm-run is only available on Linux");
+            std::process::exit(2);
+        }
+    }
     run();
 }

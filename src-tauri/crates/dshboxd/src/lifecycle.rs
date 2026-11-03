@@ -17,7 +17,6 @@ use std::{
     fs,
     net::TcpListener,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{mpsc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -160,13 +159,12 @@ pub(crate) fn start_dsh_container_inner(
     // was added long after containers existed, and creation never writes it.
     let runtime = crate::runtime::RuntimeKind::from_record(&value)?;
     if let crate::runtime::RuntimeKind::Vm(backend) = &runtime {
-        // The landing spot for microVM backends, not a degradation point:
-        // the record asked for a boundary the process backend cannot give,
-        // and failing loudly is the honest answer until one lands.
-        return Err(match backend {
-            Some(backend) => format!("container runtime vm:{backend} is not available in this build"),
-            None => "container runtime vm is not available in this build".to_owned(),
-        });
+        // Availability is checked before any side effect: a start that
+        // cannot use the requested backend must not leave partial state
+        // behind. Enforcement of the backend itself happens at launch.
+        crate::vm::check_backend(backend.as_deref()).map_err(|error| {
+            format!("container runtime {} is not usable: {error}", runtime.field())
+        })?;
     }
     repair_known_profile_template(&directory, profile)?;
     let _workspace = ensure_container_workspace(&directory)?;
@@ -268,31 +266,6 @@ pub(crate) fn start_dsh_container_inner(
                 source.display()
             ));
         }
-        let node = resolve_toolchain("node")?;
-        // The pnpm tree hangs off the runtime root (<root>/pnpm) as a
-        // sibling of node/ on every platform. Take it from the manifest
-        // root instead of counting .parent() levels — Windows ships
-        // node/node.exe while Unix ships node/bin/node, so the depth
-        // differs.
-        let runtime_root = bundled_runtime()?.root.clone();
-        let policy = process::dsh_host_policy(
-            std::path::Path::new(&node.path)
-                .parent()
-                .map(Path::to_path_buf)
-                .as_deref()
-                .unwrap_or(Path::new(".")),
-            &runtime_root.join("pnpm"),
-            &plugins_node_modules,
-        );
-        let policy = policy.declared_env(&declared_env).task_override(
-            "DSH_HOME",
-            directory.join("profile").to_string_lossy().into_owned(),
-        )
-        // The sandbox plugin answers "which container am I in" from this:
-        // the host process is told, but nothing hands the plugins it mounts
-        // an id, and the plugin's install-path parse is only a fallback for
-        // hosts started by daemons older than this stamp.
-        .task_override("DSHBOX_CONTAINER_ID", id);
         let port = allocate_loopback_port()?;
         let url = format!("http://127.0.0.1:{port}");
         fs::write(
@@ -306,37 +279,81 @@ pub(crate) fn start_dsh_container_inner(
         if let Some(task) = task {
             task.log(&format!("starting DSH host on {url}"));
         }
-        let spec = ProcessSpec::new(node.path.clone())
-            .args([
-                entry.to_string_lossy().as_ref(),
-                "--profile",
-                profile,
-                "--patch",
-                patch.to_string_lossy().as_ref(),
-                // Without this the host opens the user's real default browser
-                // on every start, restart and rebuild, and takes the foreground
-                // with it. Two things made that hard to see: the spawn sits in a
-                // retry loop, so one start could pop the browser up to three
-                // times, and a browser that is already running is handed the URL
-                // instead of being started, so no new process appears and a
-                // before/after process count reports nothing at all. The host
-                // log says so itself: "opening the default browser; pass --no-open
-                // to disable". Box is a server: the UI it opens is a webview the
-                // user asks for, and the agent drives it over loopback. Nothing
-                // about running a container should take over the desktop.
-                "--no-open",
-            ])
-            .cwd(&source)
-            .policy(policy)
-            .kind(ExecutionKind::Logged)
-            .log_path(&log_path)
-            .new_process_group(true);
-        let mut tracked: TrackedChild = run_logged(&spec, "DSH host")
-            .map_err(|error| format!("cannot start DSH host: {error}"))?
-            .into_tracked();
-        // Detach into a TrackedChild for stop / graceful_shutdown handling.
-        let host_pid = tracked.id().unwrap_or(0);
-        let host_pgid = tracked.pgid().unwrap_or(0);
+        let handle_is_vm = matches!(&runtime, crate::runtime::RuntimeKind::Vm(_));
+        let mut handle: crate::runtime::HostHandle = match &runtime {
+            crate::runtime::RuntimeKind::Host => {
+                let node = resolve_toolchain("node")?;
+                // The pnpm tree hangs off the runtime root (<root>/pnpm) as a
+                // sibling of node/ on every platform. Take it from the manifest
+                // root instead of counting .parent() levels — Windows ships
+                // node/node.exe while Unix ships node/bin/node, so the depth
+                // differs.
+                let runtime_root = bundled_runtime()?.root.clone();
+                let policy = process::dsh_host_policy(
+                    std::path::Path::new(&node.path)
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .as_deref()
+                        .unwrap_or(Path::new(".")),
+                    &runtime_root.join("pnpm"),
+                    &plugins_node_modules,
+                );
+                let policy = policy.declared_env(&declared_env).task_override(
+                    "DSH_HOME",
+                    directory.join("profile").to_string_lossy().into_owned(),
+                )
+                // The sandbox plugin answers "which container am I in" from this:
+                // the host process is told, but nothing hands the plugins it mounts
+                // an id, and the plugin's install-path parse is only a fallback for
+                // hosts started by daemons older than this stamp.
+                .task_override("DSHBOX_CONTAINER_ID", id);
+                let spec = ProcessSpec::new(node.path.clone())
+                    .args([
+                        entry.to_string_lossy().as_ref(),
+                        "--profile",
+                        profile,
+                        "--patch",
+                        patch.to_string_lossy().as_ref(),
+                        // Without this the host opens the user's real default browser
+                        // on every start, restart and rebuild, and takes the foreground
+                        // with it. Two things made that hard to see: the spawn sits in a
+                        // retry loop, so one start could pop the browser up to three
+                        // times, and a browser that is already running is handed the URL
+                        // instead of being started, so no new process appears and a
+                        // before/after process count reports nothing at all. The host
+                        // log says so itself: "opening the default browser; pass --no-open
+                        // to disable". Box is a server: the UI it opens is a webview the
+                        // user asks for, and the agent drives it over loopback. Nothing
+                        // about running a container should take over the desktop.
+                        "--no-open",
+                    ])
+                    .cwd(&source)
+                    .policy(policy)
+                    .kind(ExecutionKind::Logged)
+                    .log_path(&log_path)
+                    .new_process_group(true);
+                let tracked: TrackedChild = run_logged(&spec, "DSH host")
+                    .map_err(|error| format!("cannot start DSH host: {error}"))?
+                    .into_tracked();
+                crate::runtime::HostHandle::Process(tracked)
+            }
+            crate::runtime::RuntimeKind::Vm(backend) => {
+                if let Some(task) = task {
+                    task.update("Launching DSH host (VM)", 75);
+                }
+                crate::runtime::HostHandle::Vm(crate::vm::launch(
+                    id,
+                    &directory,
+                    profile,
+                    port,
+                    backend.as_deref(),
+                    task,
+                )?)
+            }
+        };
+        // Detach into a handle for stop / graceful_shutdown handling.
+        let host_pid = handle.id().unwrap_or(0);
+        let host_pgid = handle.pgid().unwrap_or(0);
         // Persist a starting record before the readiness probe begins so
         // a daemon crash mid-start still leaves something for the next
         // run to reconcile against.
@@ -367,13 +384,15 @@ pub(crate) fn start_dsh_container_inner(
         // the host log for that line and probe the authenticated URL when
         // present; the bare-URL probe keeps older runtimes working.
         let mut announced_url: Option<String> = None;
-        let ready = (0..HOST_READY_PROBES).any(|attempt| {
+        // A VM guest loads its module graph over a shared/drvfs filesystem
+        // and can take several times longer than a host process on first
+        // boot; widen the readiness window accordingly.
+        let ready = (0..(if handle_is_vm { HOST_READY_PROBES * 8 } else { HOST_READY_PROBES })).any(|attempt| {
             if task.map(TaskContext::cancelled).unwrap_or(false) {
-                let _ = tracked.kill_tree(false, Duration::from_secs(2));
+                handle.stop();
                 return false;
             }
-            if let Ok(Some(status)) = tracked.try_wait() {
-                let (code, signal) = host::exit_status_to_parts(status);
+            if let Ok(Some((code, signal))) = handle.exit_status() {
                 if let Some(task) = task {
                     if let Some(sig) = signal {
                         task.log(&format!(
@@ -444,7 +463,7 @@ pub(crate) fn start_dsh_container_inner(
                 .insert(
                     id.to_owned(),
                     ManagedHost {
-                        handle: crate::runtime::HostHandle::Process(tracked),
+                        handle,
                         url: url.clone(),
                         authenticated_url: announced_url.clone(),
                     },
@@ -462,12 +481,11 @@ pub(crate) fn start_dsh_container_inner(
             });
             return Err("task cancelled while waiting for DSH host".to_owned());
         }
-        let _ = tracked.kill_tree(false, Duration::from_secs(2));
-        let (code, signal) = tracked
-            .try_wait()
+        handle.stop();
+        let (code, signal) = handle
+            .exit_status()
             .ok()
             .flatten()
-            .map(host::exit_status_to_parts)
             .unwrap_or((-1, None));
         let _ = host::compare_and_swap_host_record(id, &initial, |on_disk| {
             let mut next = on_disk.clone();

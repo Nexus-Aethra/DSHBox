@@ -1372,6 +1372,10 @@ fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<HandlerR
         return Err("invalid container id".to_owned());
     }
     stop_dsh_container(&id, &state.containers)?;
+    // A vm:wsl2 container leaves a registered WSL distro behind; removing
+    // the container removes the distro with it. Best-effort: an already-
+    // unregistered distro must not fail the delete.
+    let _ = crate::vm::wsl::unregister_container(&id);
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
