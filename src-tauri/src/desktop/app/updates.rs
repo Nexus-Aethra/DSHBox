@@ -216,6 +216,47 @@ open "{launcher}"
     }
 }
 
+/// One staged update per process. The pane's Install button and the quit path
+/// both land here; two spawns would mean two installers racing one file.
+static INSTALL_STAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Validate, render, and spawn the install helper for one verified file.
+///
+/// Shared by the pane's Install button and the quit path -- the same
+/// operation, differing only in who schedules this process's exit afterwards.
+fn stage_install(platform: InstallerPlatform, path: &str) -> Result<std::path::PathBuf, String> {
+    use std::sync::atomic::Ordering;
+    if INSTALL_STAGED.swap(true, Ordering::SeqCst) {
+        return Err("an update is already staged in this session".to_owned());
+    }
+    let staged = (|| {
+        let app_pid = std::process::id();
+        let launcher = std::env::current_exe()
+            .map_err(|error| format!("cannot locate the running launcher: {error}"))?
+            .to_string_lossy()
+            .into_owned();
+        let working_directory = std::path::Path::new(path)
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_owned());
+        let script = render_installer_script(platform, app_pid, &launcher, path, &working_directory);
+        let script_name = match platform {
+            InstallerPlatform::WindowsMsi => "install-update.cmd",
+            InstallerPlatform::MacDmg => "install-update.sh",
+        };
+        let script_path = std::path::Path::new(&working_directory).join(script_name);
+        std::fs::write(&script_path, script)
+            .map_err(|error| format!("cannot write {}: {error}", script_path.display()))?;
+        spawn_helper(platform, &script_path)?;
+        Ok(script_path)
+    })();
+    // A failed staging must not brick the next attempt.
+    if staged.is_err() {
+        INSTALL_STAGED.store(false, Ordering::SeqCst);
+    }
+    staged
+}
+
 /// Stage the verified installer and start the helper that applies it.
 ///
 /// Answers before the app exits, because the caller is the app: the UI needs a
@@ -244,24 +285,7 @@ pub(crate) fn install_update(app: tauri::AppHandle, path: String) -> Result<serd
                 .to_owned(),
         );
     }
-    let app_pid = std::process::id();
-    let launcher = std::env::current_exe()
-        .map_err(|error| format!("cannot locate the running launcher: {error}"))?
-        .to_string_lossy()
-        .into_owned();
-    let working_directory = std::path::Path::new(&path)
-        .parent()
-        .map(|parent| parent.to_string_lossy().into_owned())
-        .unwrap_or_else(|| ".".to_owned());
-    let script = render_installer_script(platform, app_pid, &launcher, &path, &working_directory);
-    let script_name = match platform {
-        InstallerPlatform::WindowsMsi => "install-update.cmd",
-        InstallerPlatform::MacDmg => "install-update.sh",
-    };
-    let script_path = std::path::Path::new(&working_directory).join(script_name);
-    std::fs::write(&script_path, script)
-        .map_err(|error| format!("cannot write {}: {error}", script_path.display()))?;
-    spawn_helper(platform, &script_path)?;
+    let script_path = stage_install(platform, &path)?;
     // The helper waits for this process to disappear before touching the
     // install, so exiting is part of the operation rather than a courtesy.
     let app_for_exit = app.clone();
@@ -270,6 +294,69 @@ pub(crate) fn install_update(app: tauri::AppHandle, path: String) -> Result<serd
         app_for_exit.exit(0);
     });
     Ok(serde_json::json!({ "scheduled": true, "script": script_path.to_string_lossy() }))
+}
+
+/// Stage the automatic update when quitting with one ready. Best effort in
+/// both directions: a daemon that cannot answer, no candidate, or a staging
+/// failure all mean "just quit" -- quitting must never acquire a failure mode
+/// it did not have before. Runs BEFORE the daemon is stopped: the state it
+/// reads is the daemon's, and the helper it spawns waits for this process to
+/// die from the outside.
+///
+/// The candidate test (`install_on_quit_candidate`) owns the rules: policy
+/// auto, something newer, a verified file, an unattended installer. This
+/// function is only the wiring that makes those rules run at quit time.
+/// The quit path never spawns a daemon, and never calls \`connect()\`: its
+/// fallback spawns one and polls for seconds, which would turn quitting into
+/// starting. Read the discovery file directly and take only a
+/// demonstrably-alive daemon.
+fn quit_state() -> Option<serde_json::Value> {
+    let discovery = box_server_core::read_discovery().ok().flatten()?;
+    let client = box_client::RpcClient::from_discovery(&discovery);
+    client.ping_quickly().ok()?;
+    call(&client, "get_update_state", serde_json::json!({})).ok()
+}
+
+pub(crate) fn install_on_quit_if_any() {
+    use std::sync::atomic::Ordering;
+    // One attempt per process: the tray path and the runtime's
+    // exit-requested event (the macOS menu quit) both land here, and the
+    // second call must not re-read daemon state -- possibly from a daemon
+    // that is already stopping -- on the way out.
+    static ATTEMPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ATTEMPTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // Both call sites run on the window's main thread, so the work moves to
+    // a helper bounded by a short join: a healthy daemon answers a record
+    // read in milliseconds, and a wedged one costs the quit three seconds,
+    // not its RPC timeout. The thread uses quit_state() -- no spawn fallback
+    // -- so even one that outlives the wait cannot bring a daemon back while
+    // the user is leaving. One that finishes its staging detached is exactly
+    // the design the helper was built for: the script waits for this process
+    // to die, then installs.
+    let (done, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Some(state) = quit_state() {
+            if let Some(candidate) = install_on_quit_candidate(&state) {
+                if let Some(path) = candidate["path"].as_str() {
+                    let installer = candidate["installer"].as_str().unwrap_or("");
+                    if let Some(platform) = installer_platform(installer) {
+                        if std::path::Path::new(path).exists() {
+                            if let Err(error) = stage_install(platform, path) {
+                                // Surface, do not panic: the user is quitting
+                                // either way, but the next diagnosis should
+                                // not start from zero.
+                                write_startup_log(&format!("update-on-quit not staged: {error}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = done.send(());
+    });
+    let _ = done_rx.recv_timeout(std::time::Duration::from_secs(3));
 }
 
 /// Start the helper detached, so it survives this process exiting.

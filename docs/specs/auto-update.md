@@ -98,7 +98,7 @@ pane owns:
 | `off` | never (the UI can still ask once) | no | no |
 | `check` | yes, background | no | no |
 | `download` | yes | yes, automatically | on user action |
-| `auto` | yes | yes, automatically | on user action — the fetch is automatic, the install still asks |
+| `auto` | yes | yes, automatically | on quit, automatically |
 
 The default is `check`. Silently replacing a binary is the kind of thing that
 has to be asked for; detecting is not.
@@ -107,6 +107,24 @@ has to be asked for; detecting is not.
 manifest version, the available update is reported as skipped and the badge
 stays quiet. It clears itself when a newer version appears, and `clear_update_skip`
 clears it early.
+
+## Install on quit
+
+Quitting is where `auto` finishes its job, and the app has two quit
+gestures: the tray Quit entry, and -- on macOS -- the default app menu's
+Quit (Cmd+Q), which exits through the runtime's exit-requested event rather
+than the tray handler. Both stage the same helper the pane's Install button
+uses, before the daemon stops and the process exits; the window's close
+button only hides to tray and never quits. The candidate rules are strict
+and unit-tested: policy `auto`, something newer, a *verified* file present,
+an unattended installer for this platform, and no manual reason. Anything
+else -- a daemon that cannot answer included -- quits exactly as before;
+quitting must never acquire a failure mode it did not have.
+
+The staging has to happen *before* `app.exit(0)`: the helper's first job is
+waiting for this process to die, and it does that from the outside. A
+process-level one-shot flag keeps the quit path and the pane's button from
+staging two installers for one file.
 
 ## Background check throttle
 
@@ -162,13 +180,16 @@ this machine. A token (Settings → General, stored in the machine-local
 The rule the implementation locks with a test: **a token never travels
 through a mirror.** A mirror is a third party; an `Authorization` header
 pointed at one hands the credential over. A token therefore sends the API
-requests direct to `api.github.com`, while the mirror keeps serving the
-public download tier (the `latest.json` manifest and installers, which need
-no auth and are not API-rate-limited). If the direct request fails at the
-transport level -- a blocked network, not an HTTP status -- it retries
-anonymously through the mirror rather than dying, still without the
-credential. A 403 error message names the setting, so a rate limit does not
-dead-end.
+requests -- and reads the `latest.json` manifest -- direct, while the mirror
+keeps serving the installer bytes. That split matters beyond speed: the
+manifest carries the digests the installer is verified against, and a mirror
+that served *both* would be the whole trust chain. With the manifest read
+from github.com, the mirror can serve only bytes that must still match a
+digest it did not choose. Anonymous installs keep the mirror for everything
+(the documented tradeoff), no auth header goes anywhere near a download,
+and a direct read that fails at the transport level retries anonymously
+through the mirror rather than dying. A 403 error message names the setting,
+so a rate limit does not dead-end.
 
 ## Wire surface
 
@@ -178,8 +199,9 @@ Daemon RPCs: `get_update_state`, `check_update`, `list_update_releases`,
 
 Desktop commands add the ones that end a process or open a folder:
 `install_update` and `open_update_folder`; the rest are forwards to the
-daemon. (`get_install_on_quit` is registered but not wired to a quit path
-yet: under `auto` the fetch is automatic and the install still asks.)
+daemon. (`get_install_on_quit` stays registered for a caller that wants the
+candidate without staging; the quit paths -- tray Quit and the macOS menu
+quit -- stage through `install_on_quit_if_any` directly.)
 
 `get_update_state` answers one flat object so the pane is a single round
 trip -- and it is answered from the record, not the network: the check that

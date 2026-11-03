@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { boxApi } from '../../shared/api/box-api'
-import { useUpdates } from '../../state/useUpdates'
+import { stageOf, useUpdates } from '../../state/useUpdates'
 import type { UpdatePolicy, UpdateReleaseSummary } from '../../shared/types/domain'
 import { Button } from '../../ui/Button'
 import { Card } from '../../ui/Card'
@@ -37,7 +37,10 @@ export type UpdatesText = {
   updatesAvailable: (version: string) => string
   updatesNeverChecked: string
   updatesLastChecked: (when: string) => string
-  updatesDownloading: (stage: string, progress: number) => string
+  updatesStageManifest: string
+  updatesStageDownloading: (name: string | null) => string
+  updatesStageReady: string
+  updatesStageOther: (stage: string) => string
   updatesReady: (version: string) => string
   updatesReadyNote: (path: string) => string
   updatesSize: (megabytes: string) => string
@@ -131,6 +134,16 @@ export function UpdatesSettings({ text, onError }: Props) {
   const canDownload = showUpdate && download === null && downloading === null && available?.asset !== null
   const megabytes = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1)
 
+  // The daemon's stage strings are English task prose; the pane localizes
+  // the ones it knows and falls back to the raw text for anything new.
+  const downloadStageLabel = (stage: string) => {
+    const s = stageOf(stage)
+    if (s.key === 'manifest') return text.updatesStageManifest
+    if (s.key === 'ready') return text.updatesStageReady
+    if (s.key === 'downloading') return text.updatesStageDownloading(s.detail)
+    return text.updatesStageOther(s.detail ?? '')
+  }
+
   // Why a release cannot be installed from here, in one honest line: the
   // reasons are different facts (too old to replace in place, a manifest
   // that could not be read just now, an installer that needs root).
@@ -198,7 +211,7 @@ export function UpdatesSettings({ text, onError }: Props) {
         {downloading !== null && (
           <div className="settings-row">
             <div>
-              <p className="label">{text.updatesDownloading(downloading.stage, downloading.progress)}</p>
+              <p className="label">{downloadStageLabel(downloading.stage)} · {downloading.progress}%</p>
               <progress value={downloading.progress} max={100} />
             </div>
           </div>

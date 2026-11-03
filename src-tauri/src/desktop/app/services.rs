@@ -427,6 +427,13 @@ pub(crate) fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 // user's tray with no UI to control them; stop it
                 // alongside the UI. best-effort: errors are logged but
                 // never block exit.
+                //
+                // Before any of that: an automatic update with a verified
+                // file stages its helper now, while the daemon can still
+                // answer. The helper waits for this process to die, so
+                // staging has to happen first; a quit without a candidate
+                // behaves exactly as before.
+                updates::install_on_quit_if_any();
                 let _ = stop_user_service();
                 app.exit(0);
             }
