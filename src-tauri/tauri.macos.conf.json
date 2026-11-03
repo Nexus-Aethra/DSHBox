@@ -1,4 +1,17 @@
 {
+  "app": {
+    "windows": [
+      {
+        "title": "DSH Box",
+        "width": 1024,
+        "height": 760,
+        "minWidth": 640,
+        "minHeight": 560,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ]
+  },
   "bundle": {
     "resources": {
       "resources/runtime/macos-arm64/": "runtime/macos-arm64/",

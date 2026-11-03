@@ -1,4 +1,16 @@
 {
+  "app": {
+    "windows": [
+      {
+        "title": "DSH Box",
+        "width": 1024,
+        "height": 760,
+        "minWidth": 640,
+        "minHeight": 560,
+        "decorations": false
+      }
+    ]
+  },
   "bundle": {
     "resources": {
       "dist/": "dist/",

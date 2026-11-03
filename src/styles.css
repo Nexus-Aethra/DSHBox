@@ -11,6 +11,9 @@
   --color-success: #29734d; --color-danger: #b42318;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
   --shadow-panel: 0 8px 22px #1f23291c;
+  /* Full strip height of the custom title bar (44px bar + 1px border).
+     Consumers: the startup screen, the task drawer, the window buttons. */
+  --titlebar-height: 45px;
   /* Legacy base */
   font-family: Inter, ui-sans-serif, sans-serif;
   color: var(--color-text);
@@ -36,11 +39,27 @@ select {
 }
 select:focus { border-color: #2864dc; outline: 2px solid #dbe7ff; }
 .app-shell { max-width: 1080px; margin: 0 auto; padding: 22px 36px 72px; }
-.startup-shell { align-items: center; display: flex; justify-content: center; min-height: 100vh; }
+.startup-shell { align-items: center; display: flex; justify-content: center; min-height: calc(100vh - var(--titlebar-height)); }
 .startup { align-items: center; color: #737a83; display: flex; flex-direction: column; font-size: 14px; gap: 14px; }
 .startup p { margin: 0; }
 .startup-spinner { animation: ui-spin .8s linear infinite; border: 3px solid #e6e8eb; border-top-color: var(--color-primary); border-radius: 50%; height: 28px; width: 28px; }
-.topbar { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #eceef0; padding-bottom: 16px; }
+/* The title bar is ours, not the OS's: Windows/Linux run `decorations: false`
+   and macOS the overlay title style, so this strip is the window chrome. It
+   is sticky — content scrolls under it while the window stays draggable — and
+   full-bleed: the nav keeps the content column's width while the window
+   controls pin to the real window edge. `user-select: none` because a text
+   selection on a drag surface reads as a broken drag. */
+.titlebar { align-items: stretch; background: var(--color-bg); border-bottom: 1px solid #eceef0; display: flex; position: sticky; top: 0; user-select: none; z-index: 20; }
+.titlebar-content { align-items: center; column-gap: 12px; display: flex; flex: 1 1 auto; margin: 0 auto; max-width: 1152px; min-width: 0; padding: 0 36px; width: 100%; }
+.titlebar.mac .titlebar-content { padding-left: 84px; }
+.titlebar-spring { flex: 1 1 auto; }
+.titlebar .stale-daemon { color: var(--color-text-muted); flex: 1 1 auto; font-size: 12px; margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.window-controls { display: flex; }
+.win-btn { align-items: center; background: transparent; border: 0; color: #59636e; cursor: default; display: flex; height: var(--titlebar-height); justify-content: center; width: 46px; }
+.win-btn:hover { background: #f5f6f7; color: #1f2329; }
+.win-btn:active { background: #eceef0; }
+.win-btn-close:hover { background: #b42318; color: #fff; }
+.win-btn-close:active { background: #9a1e15; color: #fff; }
 .topbar-actions { align-items: center; display: flex; gap: 8px; }
 .task-button { align-items: center; background: #fff; border: 1px solid #e1e4e8; border-radius: 8px; color: #3d444d; cursor: pointer; display: inline-flex; font-size: 13px; gap: 7px; padding: 8px 11px; }
 .task-button span { align-items: center; background: #2864dc; border-radius: 999px; color: #fff; display: inline-flex; font-size: 11px; height: 17px; justify-content: center; min-width: 17px; padding: 0 5px; }
@@ -186,8 +205,8 @@ code.missing { color: #b42318; }
 .runtime-settings .workspace-heading { margin-bottom: 14px; }
 .runtime-settings .workspace-note { margin: 0 0 20px; }
 .onboarding-shell { max-width: 720px; }
-.onboarding-top { display: flex; justify-content: space-between; align-items: center; padding-bottom: 16px; }
-.onboarding { max-width: 540px; padding: 132px 0 40px; }
+
+.onboarding { max-width: 540px; padding: 96px 0 40px; }
 .large-primary { margin-top: 18px; padding: 12px 16px; }
 .settings-list { border: 1px solid #e6e8eb; border-radius: 14px; overflow: hidden; }
 .settings-layout { align-items: flex-start; display: grid; gap: 28px; grid-template-columns: 150px minmax(0, 1fr); }
@@ -271,7 +290,10 @@ code.missing { color: #b42318; }
 .primary { border: 0; border-radius: 8px; background: #2864dc; color: #fff; padding: 10px 14px; cursor: pointer; white-space: nowrap; }
 .primary:hover { background: #1d56c5; }
 .error { color: #b42318; font-size: 14px; margin: 16px 0 0; }
-.task-panel { background: #fff; border-left: 1px solid #e1e4e8; box-shadow: -10px 0 28px #1f232912; height: 100vh; overflow-y: auto; padding: 24px; position: fixed; right: 0; top: 0; width: min(460px, 100vw); z-index: 10; }
+/* The drawer docks below the title bar: the bar is sticky at z-20 and would
+   otherwise cover the panel header — its close button with it. z-10 stays:
+   the two no longer overlap. */
+.task-panel { background: #fff; border-left: 1px solid #e1e4e8; box-shadow: -10px 0 28px #1f232912; height: calc(100vh - var(--titlebar-height)); overflow-y: auto; padding: 24px; position: fixed; right: 0; top: var(--titlebar-height); width: min(460px, 100vw); z-index: 10; }
 .task-panel-header { align-items: flex-start; display: flex; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
 .task-panel h2 { font-size: 24px; letter-spacing: -.03em; margin: 0; }
 .task-group { border: 1px solid #e6e8eb; border-radius: 12px; overflow: hidden; }
@@ -554,7 +576,7 @@ code.missing { color: #b42318; }
   .plugin-graph-toolbar { align-items: flex-start; flex-direction: column; }
 }
 
-@media (max-width: 768px) { .app-shell { padding: 18px 20px 48px; } .topbar { align-items: flex-start; gap: 12px; flex-direction: column; } .navigation { width: 100%; overflow-x: auto; } .nav-item { padding: 8px 9px; white-space: nowrap; } .workspace, .onboarding { padding: 58px 0 34px; } .card, .toolchain-row { align-items: flex-start; flex-direction: column; } .toolchain-actions { width: 100%; justify-content: space-between; } .settings-layout { grid-template-columns: 1fr; gap: 16px; } .settings-sidebar { border-bottom: 1px solid #e6e8eb; border-right: 0; display: flex; padding: 0 0 12px; } .settings-row { align-items: flex-start; flex-direction: column; } .settings-row > :last-child { width: 100%; } .settings-input { width: 100%; } .settings-controls { justify-content: flex-start; } .extensions-heading, .extension-row, .extension-import { align-items: flex-start; flex-direction: column; } .extension-row > div:last-child { max-width: 100%; text-align: left; } .extension-import input { width: 100%; } }
+@media (max-width: 768px) { .app-shell { padding: 18px 20px 48px; } .titlebar-content { column-gap: 8px; padding: 0 20px; } .navigation { overflow-x: auto; } .nav-item { padding: 8px 9px; white-space: nowrap; } .workspace, .onboarding { padding: 58px 0 34px; } .card, .toolchain-row { align-items: flex-start; flex-direction: column; } .toolchain-actions { width: 100%; justify-content: space-between; } .settings-layout { grid-template-columns: 1fr; gap: 16px; } .settings-sidebar { border-bottom: 1px solid #e6e8eb; border-right: 0; display: flex; padding: 0 0 12px; } .settings-row { align-items: flex-start; flex-direction: column; } .settings-row > :last-child { width: 100%; } .settings-input { width: 100%; } .settings-controls { justify-content: flex-start; } .extensions-heading, .extension-row, .extension-import { align-items: flex-start; flex-direction: column; } .extension-row > div:last-child { max-width: 100%; text-align: left; } .extension-import input { width: 100%; } }
 .plugin-graph-note.danger { color: var(--color-danger); }
 
 /* Container resources panel: a table of what the container persists, with the
