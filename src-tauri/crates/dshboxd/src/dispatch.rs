@@ -103,7 +103,7 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         // Update discovery. The read is cheap and never touches the network;
         // the explicit check and the download are the two that do.
         Some("get_update_state") => crate::updates::get_update_state_rpc(state).map(Sync),
-        Some("check_update") => crate::updates::check_update_rpc().map(Sync),
+        Some("check_update") => crate::updates::check_update_rpc(state).map(Sync),
     Some("list_update_releases") => crate::updates::list_update_releases_rpc().map(Sync),
         Some("enqueue_update_download") => crate::updates::enqueue_update_download(state, request),
         Some("discard_update_download") => {

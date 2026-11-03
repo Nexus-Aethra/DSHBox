@@ -130,8 +130,13 @@ pub(crate) fn download_directory(root: &Path, version: &str) -> PathBuf {
 /// A manifest that cannot be *read* (transport error, 5xx, timeout) is
 /// deliberately not `no-manifest`: a release that has a manifest must not be
 /// misreported as one that predates it just because the mirror hiccuped.
-fn resolve_asset(tag: &str, current: &str, mirror: Option<&str>) -> (Option<Value>, Option<String>) {
-    let manifest = match fetch_manifest(tag, mirror) {
+fn resolve_asset(
+    tag: &str,
+    current: &str,
+    mirror: Option<&str>,
+    token: Option<&str>,
+) -> (Option<Value>, Option<String>) {
+    let manifest = match fetch_manifest(tag, mirror, token) {
         Ok(manifest) => manifest,
         Err(error) => {
             if error.starts_with("NO_MANIFEST:") {
@@ -297,17 +302,50 @@ fn fetch_latest_release(mirror: Option<&str>, token: Option<&str>) -> Result<Git
         .map_err(|error| format!("cannot parse the release: {error}"))
 }
 
+/// Where the manifest for \`tag\` is fetched from.
+///
+/// With a token the manifest comes from github.com itself: it carries the
+/// digests the mirror-served installer is checked against, and a mirror that
+/// served *both* would be the whole trust chain. Anonymous installs keep the
+/// mirror -- the documented tradeoff. No Authorization header either way:
+/// release assets are public, and the token stays in the API tier.
+fn manifest_url_for(tag: &str, mirror: Option<&str>, token: Option<&str>) -> String {
+    match token.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(_) => latest_manifest_url(tag),
+        None => mirror_url(&latest_manifest_url(tag), mirror),
+    }
+}
+
 /// Read the \`latest.json\` attached to \`tag\`. The *full* tier.
+///
+/// A token routes the manifest direct (see \`manifest_url_for\`); if that
+/// machine cannot reach github.com at all, the fetch retries anonymously
+/// through the mirror rather than dying -- the digests that preceded this
+/// read still came from github.com, and a transport failure must not look
+/// like "no manifest".
 pub(crate) fn fetch_manifest(
     tag: &str,
     mirror: Option<&str>,
+    token: Option<&str>,
 ) -> Result<UpdateManifest, String> {
-    let url = mirror_url(&latest_manifest_url(tag), mirror);
+    let url = manifest_url_for(tag, mirror, token);
     let client = network_client()?;
-    let response = client
-        .get(&url)
-        .send()
-        .map_err(|error| format!("cannot reach the release manifest: {error}"))?;
+    let send = |url: &str| {
+        client
+            .get(url)
+            .send()
+            .map_err(|error| format!("cannot reach the release manifest: {error}"))
+    };
+    let response = match send(&url) {
+        Ok(response) => response,
+        Err(direct_error) if token.is_some() && mirror.is_some() => {
+            let mirrored = mirror_url(&latest_manifest_url(tag), mirror);
+            send(&mirrored).map_err(|error| format!(
+                "cannot reach the release manifest (direct: {direct_error}; mirrored: {error})"
+            ))?
+        }
+        Err(error) => return Err(error),
+    };
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         // A release that predates the manifest. A real limitation of stale
         // release data, reported as itself rather than papered over.
@@ -398,7 +436,7 @@ pub(crate) fn perform_check(
                 .latest_tag
                 .clone()
                 .unwrap_or_else(|| format!("v{}", record.latest_version.clone().unwrap_or_default()));
-            let (asset, manual_reason) = resolve_asset(&tag, APP_VERSION, mirror);
+            let (asset, manual_reason) = resolve_asset(&tag, APP_VERSION, mirror, token);
             record.asset = asset;
             record.manual_reason = manual_reason;
             let _ = write_record(root, &record);
@@ -445,11 +483,12 @@ pub(crate) fn download_with_cancel(
     tag: &str,
     target: &str,
     mirror: Option<&str>,
+    token: Option<&str>,
     task: &TaskContext,
 ) -> Result<(), String> {
     clean_version(version)?;
     task.update("reading the release manifest", 5);
-    let manifest = fetch_manifest(tag, mirror)?;
+    let manifest = fetch_manifest(tag, mirror, token)?;
     task.log(&format!("release manifest for {tag} read"));
     let asset = manifest
         .preferred_asset(target, preferred_installers())
@@ -651,17 +690,26 @@ pub(crate) fn get_update_state_rpc(state: &DaemonState) -> Result<Value, String>
 
 /// Run a real check against the network and answer with the fresh state.
 ///
-/// The UI's explicit "check now" button. Unlike the background tier this always
-/// goes out, because the caller asked.
-pub(crate) fn check_update_rpc() -> Result<Value, String> {
+/// The UI's explicit "check now" button. Unlike the background tier this
+/// always goes out, because the caller asked. The record may have changed
+/// here too, so every client is told the same way the background pass tells
+/// them: an `update_state` invalidation, which is what lifts the badge in a
+/// window that sat open while the check ran.
+pub(crate) fn check_update_rpc(state: &DaemonState) -> Result<Value, String> {
     let config = read_config()?;
-    if let Some(root) = config.runtime_directory.as_deref() {
+    let changed = if let Some(root) = config.runtime_directory.as_deref() {
         crate::updates::perform_check(
             std::path::Path::new(root),
             config.github_mirror.as_deref(),
             config.github_token.as_deref(),
         )
-        .map_err(|error| format!("update check failed: {error}"))?;
+        .map_err(|error| format!("update check failed: {error}"))
+        .is_ok()
+    } else {
+        false
+    };
+    if changed {
+        crate::updates::announce(&state.events);
     }
     Ok(crate::updates::collect_state(&config))
 }
@@ -693,6 +741,7 @@ pub(crate) fn enqueue_update_download(
         .or_else(|| record.latest_tag.clone())
         .unwrap_or_else(|| format!("v{version}"));
     let mirror = config.github_mirror.clone();
+    let token = config.github_token.clone();
     let params = json!({ "version": version.clone(), "tag": tag.clone(), "target": target });
     crate::dispatch::enqueue_task_worker(
         state,
@@ -706,6 +755,7 @@ pub(crate) fn enqueue_update_download(
                 &tag,
                 &target,
                 mirror.as_deref(),
+                token.as_deref(),
                 task,
             )
         },
@@ -895,6 +945,7 @@ fn background_check_once(deps: &BackgroundDeps) -> Result<BackgroundOutcome, Str
         .unwrap_or_else(|| format!("v{version}"));
     let target = crate::state::bundled_target().to_owned();
     let mirror = config.github_mirror.clone();
+    let token = config.github_token.clone();
     // Enqueued through the queue itself, not through a DaemonState helper: the
     // thread has no state, and the task machinery only needs the queue and the
     // notifier.
@@ -926,6 +977,7 @@ fn background_check_once(deps: &BackgroundDeps) -> Result<BackgroundOutcome, Str
                     &tag,
                     &target,
                     mirror.as_deref(),
+                    token.as_deref(),
                     task,
                 )
                 .map_err(|error| error.to_string())
@@ -1063,6 +1115,22 @@ mod tests {
         assert_eq!(after.last_error.as_deref(), Some(error.as_str()));
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[test]
+    fn a_token_moves_the_manifest_off_the_mirror_too() {
+        // The manifest carries the digests the mirror-served installer is
+        // checked against; a mirror that served both would be the whole
+        // trust chain. A token reads the manifest direct; without one the
+        // mirror route stands.
+        let url = manifest_url_for("v0.2.0", Some("https://gh-proxy.com"), Some("ghp_secret"));
+        assert_eq!(url, latest_manifest_url("v0.2.0"));
+        assert!(url.starts_with("https://github.com/"), "{url}");
+        let mirrored = manifest_url_for("v0.2.0", Some("https://gh-proxy.com"), None);
+        assert!(mirrored.starts_with("https://gh-proxy.com/"), "{mirrored}");
+        // A blank token is no token.
+        let mirrored = manifest_url_for("v0.2.0", Some("https://gh-proxy.com"), Some("  "));
+        assert!(mirrored.starts_with("https://gh-proxy.com/"), "{mirrored}");
+    }
+
     #[test]
     fn a_token_sends_the_api_direct_and_never_through_a_mirror() {
         // The rule this locks: a mirror is a third party, and an Authorization
