@@ -23,6 +23,7 @@ export type UpdatesText = {
   updatesHideNotes: string
   updatesNotesEmpty: string
   updatesUpgradeTo: string
+  updatesUpdateRow: string
   updatesPolicy: string
   updatesPolicyNote: string
   updatesPolicyOff: string
@@ -217,12 +218,23 @@ export function UpdatesSettings({ text, onError }: Props) {
                 {releases.map((release) => {
                   const rowState = rowStateOf(release.version)
                   const isPicked = release.version === selectedVersion
+                  // The row button installs only the release the manifest
+                  // makes installable from here; every other row keeps it
+                  // grey instead of pretending a downgrade is one click away.
+                  const rowUpdateable = rowState === 'newer' && available !== null && available.asset !== null
                   return (
-                    <button
+                    <div
                       key={release.tag}
-                      type="button"
+                      role="button"
+                      tabIndex={0}
                       className={isPicked ? 'version-head picked' : 'version-head'}
                       onClick={() => { setSelected(release.version) }}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault()
+                          setSelected(release.version)
+                        }
+                      }}
                     >
                       <span className="version-name">
                         {release.version}
@@ -235,10 +247,17 @@ export function UpdatesSettings({ text, onError }: Props) {
                             ? text.updatesVersionNewer
                             : text.updatesVersionOlder}
                       </span>
-                      {release.publishedAt !== null && (
-                        <span className="version-date">{new Date(release.publishedAt).toLocaleDateString()}</span>
-                      )}
-                    </button>
+                      <span className="version-update">
+                        <Button
+                          variant="primary"
+                          size="sm"
+                          disabled={!rowUpdateable || updates.busy}
+                          onClick={() => { void updates.download() }}
+                        >
+                          {text.updatesUpdateRow}
+                        </Button>
+                      </span>
+                    </div>
                   )
                 })}
               </div>
@@ -257,6 +276,9 @@ export function UpdatesSettings({ text, onError }: Props) {
                     })()}
                     {' '}{selectedRelease.version}
                   </span>
+                  {selectedRelease.publishedAt !== null && (
+                    <span className="version-date">{new Date(selectedRelease.publishedAt).toLocaleDateString()}</span>
+                  )}
                   {selectedIsUpdatable && canDownload && (
                     <Button variant="primary" size="sm" disabled={updates.busy} onClick={() => { void updates.download() }}>
                       {text.updatesUpgradeTo}

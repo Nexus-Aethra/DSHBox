@@ -223,6 +223,9 @@ code.missing { color: #b42318; }
 .version-head:last-child { border-bottom: 0; }
 .version-head:hover { background: #f8f9fa; }
 .version-head.picked { background: #f4f7fd; }
+.version-head:focus-visible { outline: 2px solid #dbe7ff; outline-offset: -2px; }
+.version-update { margin-left: auto; }
+.version-update .ui-button:disabled { visibility: visible; }
 .version-name { font-size: 14px; font-weight: 600; }
 .version-prerelease { background: #f0e6b8; border-radius: 4px; color: #7a5c00; font-size: 11px; font-weight: 500; margin-left: 6px; padding: 1px 5px; }
 .version-badge { border-radius: 999px; flex: 0 0 auto; font-size: 11px; padding: 2px 9px; }
@@ -254,6 +257,9 @@ code.missing { color: #b42318; }
 .md pre code { background: none; padding: 0; }
 .md blockquote { border-left: 3px solid #d8dce1; color: #6b7280; margin: 8px 0; padding: 1px 0 1px 10px; }
 .md hr { border: 0; border-top: 1px solid #e6e8eb; margin: 12px 0; }
+.md table { border-collapse: collapse; margin: 8px 0; }
+.md th, .md td { border: 1px solid #e6e8eb; padding: 4px 8px; text-align: left; }
+.md th { background: #f0f1f3; font-weight: 600; }
 .md-empty { color: #8a919b; margin: 0; }
 .settings-save { display: block; font-size: 13px; margin: 18px 20px 0 auto; padding: 8px 12px; }
 .solo-label { margin: 0; }

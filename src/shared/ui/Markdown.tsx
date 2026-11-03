@@ -1,4 +1,4 @@
-import { Fragment, type ReactNode } from 'react'
+import { Fragment, type CSSProperties, type ReactNode } from 'react'
 
 /**
  * A dependency-free Markdown renderer for release notes.
@@ -9,9 +9,9 @@ import { Fragment, type ReactNode } from 'react'
  * emphasis) straight to React elements. Never `dangerouslySetInnerHTML`:
  * text is text, so a `<script>` in a note renders as visible characters --
  * the outcome a sanitizer aims for, reached by construction instead of by
- * filtering. Raw HTML and pipe tables are therefore *not* markdown here;
- * they render as plain text. Images render as links: this pane has no
- * business loading remote binaries.
+ * filtering. Raw HTML renders as plain text. GFM pipe tables render as
+ * tables, with the alignment the delimiter row asks for. Images render as
+ * links: this pane has no business loading remote binaries.
  *
  * A line break inside a paragraph renders as a break, the way GitHub renders
  * comments -- changelog authors write one item per line and expect to see
@@ -134,6 +134,59 @@ const RX_HEADING = /^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$/
 const RX_HR = /^ {0,3}([-*_])(?:\s*\1){2,}\s*$/
 const RX_QUOTE = /^ {0,3}>/
 const RX_ITEM = /^(\s*)([-*+]|\d{1,9}[.)])(\s+)/
+const RX_TABLE_DELIM = /^\s*\|?\s*:?-{1,}:?\s*(?:\|\s*:?-{1,}:?\s*)*\|?\s*$/
+
+/** A pipe row's cells: edge pipes trimmed, escaped pipes stitched back. */
+function splitTableRow(row: string): string[] {
+  let text = row.trim()
+  if (text.startsWith('|')) text = text.slice(1)
+  if (text.endsWith('|') && !text.endsWith('\\|')) text = text.slice(0, -1)
+  const cells: string[] = []
+  for (const piece of text.split('|')) {
+    if (cells.length > 0 && cells[cells.length - 1].endsWith('\\')) {
+      cells[cells.length - 1] = cells[cells.length - 1].slice(0, -1) + '|' + piece
+    } else {
+      cells.push(piece)
+    }
+  }
+  return cells.map((cell) => cell.trim())
+}
+
+/** The alignment each delimiter cell asks for: `:--` left, `:--:` center, `--:` right. */
+function tableAligns(delimiterRow: string): ('left' | 'center' | 'right')[] {
+  return splitTableRow(delimiterRow).map((cell) => {
+    const left = cell.startsWith(':')
+    const right = cell.endsWith(':')
+    if (left && right) return 'center' as const
+    if (right) return 'right' as const
+    return 'left' as const
+  })
+}
+
+function renderTable(header: string[], aligns: ('left' | 'center' | 'right')[], rows: string[][], key: string): ReactNode {
+  const cellStyle = (index: number): CSSProperties | undefined =>
+    aligns[index] === undefined || aligns[index] === 'left' ? undefined : { textAlign: aligns[index] }
+  return (
+    <table key={key}>
+      <thead>
+        <tr>
+          {header.map((cell, index) => (
+            <th key={index} style={cellStyle(index)}>{renderInline(cell, `${key}-th${index}`)}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((row, rowIndex) => (
+          <tr key={rowIndex}>
+            {header.map((_, index) => (
+              <td key={index} style={cellStyle(index)}>{renderInline(row[index] ?? '', `${key}-td${rowIndex}-${index}`)}</td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+}
 
 function parseBlocks(src: string, key: string): ReactNode[] {
   const lines = src.replace(/\r\n?/g, '\n').split('\n')
@@ -148,6 +201,14 @@ function parseBlocks(src: string, key: string): ReactNode[] {
     RX_HR.test(line) ||
     RX_QUOTE.test(line) ||
     RX_ITEM.test(line)
+  // A table starts at a pipe line whose next line is a delimiter row -- and
+  // only when the cell counts agree, so a prose line over a thematic break
+  // stays a paragraph over an <hr>.
+  const isTableStart = (index: number) =>
+    lines[index].includes('|') &&
+    index + 1 < lines.length &&
+    RX_TABLE_DELIM.test(lines[index + 1]) &&
+    splitTableRow(lines[index]).length === splitTableRow(lines[index + 1]).length
 
   while (i < lines.length) {
     const line = lines[i]
@@ -186,6 +247,19 @@ function parseBlocks(src: string, key: string): ReactNode[] {
       continue
     }
 
+    if (isTableStart(i)) {
+      const header = splitTableRow(line)
+      const aligns = tableAligns(lines[i + 1])
+      const rows: string[][] = []
+      i += 2
+      while (i < lines.length && lines[i].trim() !== '' && lines[i].includes('|')) {
+        rows.push(splitTableRow(lines[i]))
+        i += 1
+      }
+      out.push(renderTable(header, aligns, rows, k()))
+      continue
+    }
+
     const first = RX_ITEM.exec(line)
     if (first !== null) {
       const ordered = /\d/.test(first[2])
@@ -215,7 +289,7 @@ function parseBlocks(src: string, key: string): ReactNode[] {
     }
 
     const para: string[] = []
-    while (i < lines.length && !isBlockStart(lines[i])) {
+    while (i < lines.length && !isBlockStart(lines[i]) && !isTableStart(i)) {
       para.push(lines[i].trim())
       i += 1
     }
