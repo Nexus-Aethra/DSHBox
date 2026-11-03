@@ -74,10 +74,13 @@ export function TitleBar({ text, children }: { text: Text; children?: ReactNode 
     }
   }, [mode])
 
-  const dragAttr = mode === 'browser' ? undefined : 'true'
+  // "deep" is the subtree mode of Tauri's drag script (drag.js: bare/"true"
+  // is direct-hit only, so clicks on the nav or actions gaps would dead-end;
+  // "deep" drags from any descendant while CLICKABLE elements keep working).
+  const dragAttr = mode === 'browser' ? undefined : 'deep'
   return (
     <header className={mode === 'tauri-mac' ? 'titlebar mac' : 'titlebar'} data-tauri-drag-region={dragAttr}>
-      <div className="titlebar-content" data-tauri-drag-region={dragAttr}>
+      <div className="titlebar-content">
         {children ?? <div className="brand">DSH Box</div>}
       </div>
       {mode === 'tauri-win' && <WindowsControls text={text} maximized={maximized} />}

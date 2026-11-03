@@ -528,12 +528,14 @@ command as done only once the installed app has run it.
   React `.titlebar` is the window chrome. The buttons call the core window API
   (`@tauri-apps/api/window`) — no custom IPC commands, so `command_surface`
   stays green — granted by the `core:window:allow-*` entries in
-  `capabilities/default.json`. The drag surface is the literal
-  `data-tauri-drag-region` attribute on `.titlebar` and `.titlebar-content`;
-  non-interactive children (`.brand`, `.titlebar-spring`, `.stale-daemon`)
-  set `pointer-events: none` so clicks reach the drag surface instead of
-  dead-ending on text. In a plain browser (`pnpm dev`) the bar renders
-  without buttons — `TitleBar` keys off the missing `__TAURI_INTERNALS__`.
+  `capabilities/default.json`. The drag surface is
+  `data-tauri-drag-region="deep"` on `.titlebar` alone: in Tauri's drag
+  script a bare or `"true"` attribute is direct-hit only, so clicks on the
+  `.navigation` / `.topbar-actions` gaps would dead-end; `"deep"` drags from
+  anywhere in the subtree while CLICKABLE elements (buttons, links, inputs)
+  still block dragging and keep working. In a plain browser (`pnpm dev`) the
+  bar renders without buttons — `TitleBar` keys off the missing
+  `__TAURI_INTERNALS__`.
   Dropping the attribute or the capabilities leaves a window the mouse
   cannot move, which no test catches — check it by hand on a packaged build.
   And an undecorated window maximizes to the whole monitor, not the work
