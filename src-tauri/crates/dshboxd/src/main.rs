@@ -17,13 +17,14 @@ mod extensions;
 mod host;
 mod lifecycle;
 mod plugins;
+mod resolve;
 mod resources;
-mod updates;
 mod sealed;
 mod state;
 #[cfg(test)]
 mod test_support;
 mod toolchains;
+mod updates;
 mod versions;
 mod workspaces;
 
@@ -84,14 +85,19 @@ pub fn run() {
     // The plugin index mirrors what templates and containers actually resolved;
     // deriving it here means the plugin view is complete the first time it is
     // opened, without the user importing anything by hand.
-    match box_foundation::read_config().ok().and_then(|config| config.runtime_directory) {
+    match box_foundation::read_config()
+        .ok()
+        .and_then(|config| config.runtime_directory)
+    {
         Some(runtime) => match plugins::reconcile_plugin_index(std::path::Path::new(&runtime)) {
             Ok(0) => {}
-            Ok(added) => tracing::info!("plugin index: derived {added} plugin(s) from installed templates and containers"),            Err(error) => tracing::warn!("plugin index scan skipped: {error}"),
+            Ok(added) => tracing::info!(
+                "plugin index: derived {added} plugin(s) from installed templates and containers"
+            ),
+            Err(error) => tracing::warn!("plugin index scan skipped: {error}"),
         },
         None => {}
     }
-
 
     // Scan persisted host.json records and reconcile each one against
     // the live process table. A record in `starting`/`ready`/`running`
@@ -153,9 +159,10 @@ fn graceful_shutdown(state: &DaemonState) {
     // difference is the whole diagnosis: the log used to stop mid-line and
     // the next start found a task that was neither running nor finished, which
     // is indistinguishable from a hang.
-    match state.manager.interrupt_running(
-        "the DSH Box daemon shut down while this task was running",
-    ) {
+    match state
+        .manager
+        .interrupt_running("the DSH Box daemon shut down while this task was running")
+    {
         Ok(ids) if !ids.is_empty() => {
             tracing::info!(count = ids.len(), "interrupted in-flight tasks on shutdown");
         }
@@ -229,16 +236,26 @@ fn handle_http(mut stream: TcpStream, state: Arc<DaemonState>, token: &str) {
 
     // SSE event stream
     if method == "GET" && path.starts_with("/events") {
-        let query_token = path.split('?').nth(1).unwrap_or("")
+        let query_token = path
+            .split('?')
+            .nth(1)
+            .unwrap_or("")
             .split('&')
             .find_map(|pair| {
                 let mut kv = pair.splitn(2, '=');
                 let key = kv.next()?;
                 let val = kv.next()?;
-                if key == "token" { Some(val.to_owned()) } else { None }
+                if key == "token" {
+                    Some(val.to_owned())
+                } else {
+                    None
+                }
             });
         if query_token.as_deref() != Some(token) {
-            let _ = write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
             return;
         }
         handle_sse(stream, &state);
@@ -247,7 +264,10 @@ fn handle_http(mut stream: TcpStream, state: Arc<DaemonState>, token: &str) {
 
     // POST /rpc — JSON-RPC
     if method != "POST" || path != "/rpc" {
-        let _ = write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = write!(
+            stream,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
         return;
     }
 
@@ -266,17 +286,26 @@ fn handle_http(mut stream: TcpStream, state: Arc<DaemonState>, token: &str) {
         remaining -= to_read;
     }
     let Ok(body) = String::from_utf8(body_bytes) else {
-        let _ = write!(stream, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = write!(
+            stream,
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
         return;
     };
 
     let Ok(request) = serde_json::from_str::<serde_json::Value>(&body) else {
-        let _ = write!(stream, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = write!(
+            stream,
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
         return;
     };
 
     if request["token"].as_str() != Some(token) {
-        let _ = write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = write!(
+            stream,
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
         return;
     }
 
@@ -347,19 +376,24 @@ fn ensure_single_instance() -> Option<ServerDiscovery> {
     };
 
     let addr = format!("127.0.0.1:{}", existing.port);
-    match TcpStream::connect_timeout(&addr.parse::<std::net::SocketAddr>().ok()?, Duration::from_millis(250)) {
+    match TcpStream::connect_timeout(
+        &addr.parse::<std::net::SocketAddr>().ok()?,
+        Duration::from_millis(250),
+    ) {
         Ok(_) => {
             // Port is reachable — old daemon is alive. Log and signal exit.
             eprintln!(
                 "dshboxd: daemon already running on {} (pid {}) — exiting",
-                addr,
-                existing.pid
+                addr, existing.pid
             );
             Some(existing)
         }
         Err(_) => {
             // Port unreachable — stale discovery from a crashed daemon.
-            info!("removing stale discovery at {} (pid {}) — proceeding", addr, existing.pid);
+            info!(
+                "removing stale discovery at {} (pid {}) — proceeding",
+                addr, existing.pid
+            );
             remove_discovery();
             None
         }

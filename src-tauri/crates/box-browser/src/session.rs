@@ -189,6 +189,62 @@ impl BrowserSession {
         &self.url
     }
 
+    /// Point the attached page at another URL.
+    ///
+    /// `self.url` has to move with it. `find_page_target` identifies the page by
+    /// URL, and every page tool re-attaches through it on each call, so a
+    /// session whose recorded URL still names the page it left behind answers
+    /// "cannot attach to a page target" on the next call -- for a browser that
+    /// is perfectly healthy. Recording the destination first would be worse:
+    /// a navigation that fails would leave the session lying about where it is.
+    pub fn navigate(&mut self, url: &str) -> Result<(), String> {
+        self.call("Page.navigate", json!({ "url": url }))?;
+        self.url = url.to_owned();
+        Ok(())
+    }
+
+    /// The page's location, as the page itself reports it.
+    ///
+    /// Read from the document rather than from `self.url`: after a redirect,
+    /// a link the page followed, or a single-page app's own routing, the page
+    /// is somewhere the last navigation did not name.
+    pub fn current_url(&mut self) -> Result<String, String> {
+        self.evaluate_string("document.location.href")
+    }
+
+    /// The page's title, as the page itself reports it, for logs and
+    /// screenshots where "which window is this" matters.
+    pub fn current_title(&mut self) -> Result<String, String> {
+        self.evaluate_string("document.title")
+    }
+
+    /// Evaluate one expression and require a string back.
+    ///
+    /// A non-string answer is an error rather than an empty default: an
+    /// expression that returns `undefined` (a page that never set a title, or
+    /// one still navigating) is information, and turning it into `""` would
+    /// report a blank title the page does not have.
+    fn evaluate_string(&mut self, expression: &str) -> Result<String, String> {
+        let value = self.call(
+            "Runtime.evaluate",
+            json!({ "expression": expression, "returnByValue": true }),
+        )?;
+        match value
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .and_then(Value::as_str)
+        {
+            Some(text) => Ok(text.to_owned()),
+            None => Err(format!(
+                "{expression} did not return a string: {}",
+                value
+                    .get("result")
+                    .map(|result| result.to_string())
+                    .unwrap_or_else(|| "no result".to_owned())
+            )),
+        }
+    }
+
     /// Send one CDP command and return its result field.
     ///
     /// CDP multiplexes replies over one socket, so replies are matched by

@@ -136,6 +136,22 @@ export async function runTask(
 ): Promise<TaskRecord> {
   const rpc = getRpc()
   const enqueued = await rpc.call<TaskRecord>(method, params)
+  return followTask(enqueued, options)
+}
+
+/**
+ * Follow an already-enqueued task record to its end, with runTask's rules.
+ *
+ * Exists for the methods that only sometimes enqueue: the daemon answers them
+ * in line when no task was needed and with a task record when one was, and the
+ * caller cannot know which until the reply is in hand. A record without an id
+ * is not a task and is handed back untouched — deciding that shape is the
+ * caller's, since only it knows what the synchronous answer looks like.
+ */
+export async function followTask(
+  enqueued: TaskRecord,
+  options: WaitOptions = {},
+): Promise<TaskRecord> {
   const { finished, task } = await waitForTask(enqueued.id, options)
   if (!finished) {
     throw new Error(

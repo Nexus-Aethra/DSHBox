@@ -276,7 +276,12 @@ pub(crate) fn start_dsh_container_inner(
         let policy = policy.declared_env(&declared_env).task_override(
             "DSH_HOME",
             directory.join("profile").to_string_lossy().into_owned(),
-        );
+        )
+        // The sandbox plugin answers "which container am I in" from this:
+        // the host process is told, but nothing hands the plugins it mounts
+        // an id, and the plugin's install-path parse is only a fallback for
+        // hosts started by daemons older than this stamp.
+        .task_override("DSHBOX_CONTAINER_ID", id);
         let port = allocate_loopback_port()?;
         let url = format!("http://127.0.0.1:{port}");
         fs::write(
@@ -582,12 +587,86 @@ pub(crate) fn materialize_bundled_sandbox_plugin(
             "sandbox plugin is already installed"
         });
     }
+    // A vendored tree alone is not a mounted plugin. The profile composer
+    // mounts exactly the packages listed in the profile manifest's
+    // `dsh.profile.bundles`, resolving them as dependencies — so a container
+    // whose profile was composed before this plugin existed loads its files
+    // and then registers nothing, and the agent inside it has every tool
+    // described to it and none available. Declare the dependency and
+    // activate the bundle here, idempotently, so the mount rides the same
+    // start that ships the files.
+    declare_sandbox_bundle(directory, profile)?;
     // The skill ships inside the vendored package, so this reads the copy that
     // was just published rather than a second source of truth.
     // `vendored` is the package directory itself, so the skill root is its own
     // `skills/` child. Appending the package id again pointed one level too deep
     // (`.../skills/dsh-box-sandbox`) and every start reported "not bundled".
     install_box_skill(directory, &vendored.join("skills").join("dsh-box-tools"), task)?;
+    Ok(())
+}
+
+/// Declare the bundled sandbox plugin in the profile manifest, once.
+///
+/// Declare the bundled sandbox plugin in the profile manifest, once.
+///
+/// Keyed on the bundle list: when `dsh.profile.bundles` already names the
+/// package the manifest is left untouched (the composer keys on that list;
+/// a manifest naming the bundle without the dependency entry is the
+/// template's own business). Otherwise the dependency is added, pinned to
+/// the vendored version, and the package is appended to the list.
+fn declare_sandbox_bundle(directory: &Path, profile: &str) -> Result<(), String> {
+    let profile_dir = directory.join("profile").join("profiles").join(profile);
+    let manifest_path = profile_dir.join("package.json");
+    let text = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("cannot read profile manifest {}: {error}", manifest_path.display()))?;
+    let mut manifest: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("profile manifest is not valid JSON: {error}"))?;
+    let already_declared = manifest["dsh"]["profile"]["bundles"]
+        .as_array()
+        .map(|bundles| bundles.iter().any(|bundle| bundle.as_str() == Some(SANDBOX_PLUGIN_PACKAGE)))
+        .unwrap_or(false);
+    if already_declared {
+        return Ok(());
+    }
+    let version = fs::read_to_string(
+        profile_dir
+            .join("node_modules")
+            .join(SANDBOX_PLUGIN_PACKAGE)
+            .join("package.json"),
+    )
+    .ok()
+    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    .and_then(|package| package["version"].as_str().map(str::to_owned))
+    .unwrap_or_else(|| "*".to_owned());
+    let object = manifest
+        .as_object_mut()
+        .ok_or("profile manifest is not an object")?;
+    let dependencies = object
+        .entry("dependencies")
+        .or_insert_with(|| serde_json::json!({}));
+    dependencies
+        .as_object_mut()
+        .ok_or("profile manifest dependencies is not an object")?
+        .insert(SANDBOX_PLUGIN_PACKAGE.to_owned(), serde_json::json!(version));
+    let dsh = object.entry("dsh").or_insert_with(|| serde_json::json!({}));
+    let profile_section = dsh
+        .as_object_mut()
+        .ok_or("profile manifest dsh is not an object")?
+        .entry("profile")
+        .or_insert_with(|| serde_json::json!({}));
+    let bundles = profile_section
+        .as_object_mut()
+        .ok_or("profile manifest dsh.profile is not an object")?
+        .entry("bundles")
+        .or_insert_with(|| serde_json::json!([]));
+    bundles
+        .as_array_mut()
+        .ok_or("profile manifest dsh.profile.bundles is not an array")?
+        .push(serde_json::json!(SANDBOX_PLUGIN_PACKAGE));
+    let pretty = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| format!("cannot serialize profile manifest: {error}"))?;
+    fs::write(&manifest_path, pretty + "\n")
+        .map_err(|error| format!("cannot write profile manifest: {error}"))?;
     Ok(())
 }
 

@@ -112,7 +112,7 @@ function collectTopLevel(text, into) {
 function declaredProperties(toolName) {
   const at = plugin.indexOf("name: '" + toolName + "'")
   if (at < 0) return null
-  const seg = plugin.slice(at, at + 3000)
+  const seg = plugin.slice(at, at + 12000)
   const out = seg.indexOf('output:')
   if (out < 0) return null
   const si = seg.indexOf('schema:', out)
@@ -178,7 +178,7 @@ function executeBody(toolName) {
 function methodOf(toolName) {
   const at = at0(toolName)
   if (at < 0) return null
-  const seg = plugin.slice(at, at + 4000)
+  const seg = plugin.slice(at, at + 12000)
   const ei = seg.indexOf('async execute')
   if (ei < 0) return null
   const body = seg.slice(ei, ei + 900)
@@ -202,6 +202,9 @@ const METHOD_TO_RPC = {
   debug_close: 'close_rpc',
   debug_console: 'console_rpc',
   debug_browser_status: 'browser_status_rpc',
+  debug_navigate: 'navigate_rpc',
+  debug_hover: 'hover_rpc',
+  debug_evaluate: 'evaluate_rpc',
 }
 
 const verbose = process.argv.includes('--verbose')
@@ -233,7 +236,7 @@ for (const m of plugin.matchAll(/name: '(box_[a-z_]+)'/g)) {
   // only if it picks the fields. Spreading the whole answer drags that id in
   // under a second name, which additionalProperties:false then refuses, so a
   // spread next to a daemon that answers with id is its own finding.
-  const seg = plugin.slice(at0(tool), at0(tool) + 4000)
+  const seg = plugin.slice(at0(tool), at0(tool) + 12000)
   const spreads = /\.\.\.result/.test(executeBody(tool))
   const missing = [...returned].filter((k) => k !== 'id' && !declared.props.has(k))
   const dragsId = spreads && returned.has('id') && !declared.props.has('id')

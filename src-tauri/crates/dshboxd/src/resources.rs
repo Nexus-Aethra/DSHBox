@@ -29,6 +29,12 @@ fn runtime_root(state: &DaemonState) -> Result<PathBuf, String> {
         .ok_or_else(|| "DSH Box storage is not configured".to_owned())
 }
 
+/// The directory of an already-canonical container id.
+///
+/// Takes a canonical id only: resolution happens at the RPC boundary, through
+/// `crate::resolve`, before any request reaches here. A raw reference joined
+/// onto `instances/` is how a name or a bare timestamp answers `container not
+/// found` for a container that exists, so the raw string must not get this far.
 fn container_dir(root: &Path, id: &str) -> Result<PathBuf, String> {
     let directory = root.join("instances").join(id);
     if directory.is_dir() {
@@ -55,13 +61,20 @@ pub(crate) fn read_resource_tree(state: &DaemonState, request: &Value) -> Result
         .ok_or("expected a container-relative path")?;
     let section: Vec<String> = request["section"]
         .as_array()
-        .map(|keys| keys.iter().filter_map(|key| key.as_str().map(str::to_owned)).collect())
+        .map(|keys| {
+            keys.iter()
+                .filter_map(|key| key.as_str().map(str::to_owned))
+                .collect()
+        })
         .unwrap_or_default();
+    // Canonicalize at the boundary: the caller may name a container by the
+    // name it was created with, and nothing below this line needs to know that.
+    let id = crate::resolve::resolve_container_key(state, id)?;
     let root = runtime_root(state)?;
-    let container = container_dir(&root, id)?;
+    let container = container_dir(&root, &id)?;
     let file = transfer::safe_join(&container, rel)?;
-    let text = std::fs::read_to_string(&file)
-        .map_err(|error| format!("cannot read {rel}: {error}"))?;
+    let text =
+        std::fs::read_to_string(&file).map_err(|error| format!("cannot read {rel}: {error}"))?;
     let document: serde_yaml::Value = serde_yaml::from_str(&text)
         .map_err(|error| format!("{rel} is not a YAML document: {error}"))?;
     let mut nodes = Vec::new();
@@ -140,7 +153,10 @@ fn one_line(text: &str) -> String {
     }
 }
 
-fn yaml_at<'a>(document: &'a serde_yaml::Value, section: &[String]) -> Option<&'a serde_yaml::Value> {
+fn yaml_at<'a>(
+    document: &'a serde_yaml::Value,
+    section: &[String],
+) -> Option<&'a serde_yaml::Value> {
     let mut current = document;
     for key in section {
         current = current.get(key.as_str())?;
@@ -160,6 +176,10 @@ pub(crate) fn enqueue_resource_write(
         .filter(|id| !id.is_empty())
         .ok_or("expected a container id")?
         .to_owned();
+    // Canonical before enqueueing: the closure looks the container up by this
+    // id and the wake key names it, so an alias would either miss the directory
+    // or address a running host that the registry does not know by that name.
+    let id = crate::resolve::resolve_container_key(state, &id)?;
     let rel = request["path"]
         .as_str()
         .filter(|path| !path.is_empty())
@@ -167,7 +187,11 @@ pub(crate) fn enqueue_resource_write(
         .to_owned();
     let section: Vec<String> = request["section"]
         .as_array()
-        .map(|keys| keys.iter().filter_map(|key| key.as_str().map(str::to_owned)).collect())
+        .map(|keys| {
+            keys.iter()
+                .filter_map(|key| key.as_str().map(str::to_owned))
+                .collect()
+        })
         .unwrap_or_default();
     let text = request["text"].as_str().unwrap_or("").to_owned();
     let conflict = Conflict::parse(request["conflict"].as_str().unwrap_or("merge"))
@@ -278,7 +302,10 @@ fn retarget_parts(
     recorded
         .into_iter()
         .map(|part| match &part.slot {
-            Some(slot) => match fresh.iter().find(|candidate| candidate.slot.as_deref() == Some(slot.as_str())) {
+            Some(slot) => match fresh
+                .iter()
+                .find(|candidate| candidate.slot.as_deref() == Some(slot.as_str()))
+            {
                 Some(matched) => transfer::PayloadPart {
                     path: matched.path.clone(),
                     section: matched.section.clone(),
@@ -321,10 +348,7 @@ fn container_name(root: &Path, id: &str) -> String {
 /// Taking a copy is an explicit act, so it adds one: the first free
 /// `<base>`, `<base>-2`, `<base>-3`, … A user who wants to replace a copy
 /// names the new one after it and removes the old one.
-fn free_record_id(
-    collection: &Collection<ResourceRecord>,
-    base: &str,
-) -> Result<String, String> {
+fn free_record_id(collection: &Collection<ResourceRecord>, base: &str) -> Result<String, String> {
     let taken: BTreeSet<String> = collection
         .load_all()?
         .into_iter()
@@ -352,20 +376,26 @@ fn records(state: &DaemonState) -> Result<Collection<ResourceRecord>, String> {
         .paths
         .read()
         .map_err(|_| "daemon paths lock failed".to_owned())?;
-    Ok(record::collection(box_store::open_document_store_for_paths(
-        &paths,
-    )?))
+    Ok(record::collection(
+        box_store::open_document_store_for_paths(&paths)?,
+    ))
 }
 
 /// Everything a container could move: the built-in kinds, plugin declarations,
 /// scanned candidates, and what has already been extracted.
-pub(crate) fn list_container_resources(state: &DaemonState, request: &Value) -> Result<Value, String> {
+pub(crate) fn list_container_resources(
+    state: &DaemonState,
+    request: &Value,
+) -> Result<Value, String> {
     let id = request["id"]
         .as_str()
         .filter(|id| !id.is_empty())
         .ok_or("expected a container id")?
         .to_owned();
     let plugin = request["plugin"].as_str().map(str::to_owned);
+    // The response echoes `container`: it must be the canonical id, or a client
+    // that then acts on that echo would carry the alias forward.
+    let id = crate::resolve::resolve_container_key(state, &id)?;
     let root = runtime_root(state)?;
     let container = container_dir(&root, &id)?;
     let profile = profile_name(&container);
@@ -475,6 +505,9 @@ pub(crate) fn add_resource_view(state: &DaemonState, request: &Value) -> Result<
         .filter(|id| !id.is_empty())
         .ok_or("expected a container id")?
         .to_owned();
+    // A view is keyed by the container string, so the alias would become a
+    // second row for one container; canonicalize before the key is derived.
+    let container = crate::resolve::resolve_container_key(state, &container)?;
     let root = runtime_root(state)?;
     let directory = container_dir(&root, &container)?;
     let profile = profile_name(&directory);
@@ -505,7 +538,9 @@ pub(crate) fn add_resource_view(state: &DaemonState, request: &Value) -> Result<
         label,
         kind: kind_info.id.clone(),
         container: container.clone(),
-        path: dest.map(str::to_owned).or_else(|| Some(kind_info.path.clone())),
+        path: dest
+            .map(str::to_owned)
+            .or_else(|| Some(kind_info.path.clone())),
         secret: kind_info.secret,
         shape: kind_info.shape,
         entry_depth: kind_info.entry_depth,
@@ -542,7 +577,10 @@ pub(crate) fn list_resource_type(state: &DaemonState, request: &Value) -> Result
         .filter(|kind| !kind.is_empty())
         .ok_or("expected a resource kind")?
         .to_owned();
-    let path = request["path"].as_str().filter(|path| !path.is_empty()).map(str::to_owned);
+    let path = request["path"]
+        .as_str()
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned);
     let root = runtime_root(state)?;
     let mut containers = Vec::new();
     for (id, name, profile) in registered_containers(&root)? {
@@ -621,7 +659,10 @@ fn registered_containers(root: &Path) -> Result<Vec<(String, String, String)>, S
 /// List one directory of a container's storage area, so the UI can offer a
 /// file tree instead of asking for a path. Read-only, and confined to the
 /// container root — `safe_join` rejects anything that would leave it.
-pub(crate) fn browse_container_paths(state: &DaemonState, request: &Value) -> Result<Value, String> {
+pub(crate) fn browse_container_paths(
+    state: &DaemonState,
+    request: &Value,
+) -> Result<Value, String> {
     let id = request["id"]
         .as_str()
         .filter(|id| !id.is_empty())
@@ -629,6 +670,7 @@ pub(crate) fn browse_container_paths(state: &DaemonState, request: &Value) -> Re
         .to_owned();
     // Default to the profile, which is where resource state lives.
     let relative = request["path"].as_str().unwrap_or("profile").to_owned();
+    let id = crate::resolve::resolve_container_key(state, &id)?;
     let root = runtime_root(state)?;
     let container = container_dir(&root, &id)?;
     let directory = transfer::safe_join(&container, &relative)?;
@@ -636,7 +678,9 @@ pub(crate) fn browse_container_paths(state: &DaemonState, request: &Value) -> Re
         return Err(format!("{relative} is not a directory in container {id}"));
     }
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&directory).map_err(|error| format!("{}: {error}", directory.display()))? {
+    for entry in std::fs::read_dir(&directory)
+        .map_err(|error| format!("{}: {error}", directory.display()))?
+    {
         let entry = entry.map_err(|error| error.to_string())?;
         let name = entry.file_name().to_string_lossy().to_string();
         let path = entry.path();
@@ -649,7 +693,9 @@ pub(crate) fn browse_container_paths(state: &DaemonState, request: &Value) -> Re
         // that walking every directory would stall the panel.
         let bytes = if meta.is_file() { meta.len() } else { 0 };
         let children = if is_dir {
-            std::fs::read_dir(&path).map(|dir| dir.count() as u64).unwrap_or(0)
+            std::fs::read_dir(&path)
+                .map(|dir| dir.count() as u64)
+                .unwrap_or(0)
         } else {
             0
         };
@@ -668,9 +714,12 @@ pub(crate) fn browse_container_paths(state: &DaemonState, request: &Value) -> Re
     entries.sort_by(|left, right| {
         let left_dir = left["directory"].as_bool().unwrap_or(false);
         let right_dir = right["directory"].as_bool().unwrap_or(false);
-        right_dir
-            .cmp(&left_dir)
-            .then_with(|| left["name"].as_str().unwrap_or("").cmp(right["name"].as_str().unwrap_or("")))
+        right_dir.cmp(&left_dir).then_with(|| {
+            left["name"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(right["name"].as_str().unwrap_or(""))
+        })
     });
     let parent = Path::new(&relative)
         .parent()
@@ -694,9 +743,10 @@ fn resolve_kind(
         return Ok(kind);
     }
     let found = discover::discover(container, profile, plugin);
-    if let Some(entry) = found.into_iter().find(|entry| {
-        entry.kind.id == kind_id && dest.map_or(true, |dest| entry.kind.path == dest)
-    }) {
+    if let Some(entry) = found
+        .into_iter()
+        .find(|entry| entry.kind.id == kind_id && dest.map_or(true, |dest| entry.kind.path == dest))
+    {
         return Ok(entry.kind);
     }
     if let Some(path) = dest {
@@ -715,6 +765,11 @@ pub(crate) fn enqueue_resource_extract(
         .filter(|id| !id.is_empty())
         .ok_or("expected a container id")?
         .to_owned();
+    // Canonical before the task is enqueued: the closure below resolves the
+    // directory from this id, and the task label and wake key are built from
+    // it, so an alias here would land the task on a container that does not
+    // exist while the real one keeps running.
+    let id = crate::resolve::resolve_container_key(state, &id)?;
     let kind_id = request["kind"].as_str().unwrap_or("").to_owned();
     let entry = request["entry"].as_str().map(str::to_owned);
     let name = request["name"].as_str().map(str::to_owned);
@@ -830,12 +885,35 @@ pub(crate) fn enqueue_resource_inject(
         .filter(|id| !id.is_empty())
         .ok_or("expected a container id")?
         .to_owned();
-    let resource = request["resource"].as_str().filter(|v| !v.is_empty()).map(str::to_owned);
-    let from = request["from"].as_str().filter(|v| !v.is_empty()).map(str::to_owned);
-    let input = request["input"].as_str().filter(|v| !v.is_empty()).map(str::to_owned);
-    let kind_id = request["kind"].as_str().filter(|v| !v.is_empty()).map(str::to_owned);
-    let dest = request["dest"].as_str().filter(|v| !v.is_empty()).map(str::to_owned);
-    let entry = request["entry"].as_str().filter(|v| !v.is_empty()).map(str::to_owned);
+    // Both ends of a copy cross this boundary: the destination id keys the
+    // task and the directory it writes into, and `from` names a second
+    // container the closure reads, so each has to be canonical before the
+    // closure captures it.
+    let id = crate::resolve::resolve_container_key(state, &id)?;
+    let from = match request["from"].as_str().filter(|v| !v.is_empty()) {
+        Some(raw) => Some(crate::resolve::resolve_container_key(state, raw)?),
+        None => None,
+    };
+    let resource = request["resource"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    let input = request["input"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    let kind_id = request["kind"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    let dest = request["dest"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    let entry = request["entry"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
     let conflict = Conflict::parse(request["conflict"].as_str().unwrap_or(""))
         .ok_or("conflict must be refuse, overwrite or merge")?;
     let restart = request["restart"].as_bool().unwrap_or(false);
@@ -940,14 +1018,8 @@ pub(crate) fn enqueue_resource_inject(
                     record.entry_depth,
                 ),
                 (None, Some(kind_id), dest) => {
-                    let kind = resolve_kind(
-                        &container,
-                        &profile,
-                        None,
-                        kind_id,
-                        dest.as_deref(),
-                        None,
-                    )?;
+                    let kind =
+                        resolve_kind(&container, &profile, None, kind_id, dest.as_deref(), None)?;
                     (kind.path.clone(), kind.shape, kind.secret, kind.entry_depth)
                 }
                 (None, None, Some(dest)) => (dest.clone(), Shape::Opaque, false, 1),
@@ -990,7 +1062,9 @@ pub(crate) fn enqueue_resource_inject(
                 &kind_for_parts,
                 transfer::payload_parts(&payload, &path),
             );
-            let injected = transfer::inject_parts(&payload, &container, &parts, conflict, shape, depth, secret)?;
+            let injected = transfer::inject_parts(
+                &payload, &container, &parts, conflict, shape, depth, secret,
+            )?;
             task.log(&format!(
                 "{}: +{} files, replaced {}",
                 describe_parts(&parts),
@@ -1090,8 +1164,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            parts[0].path,
-            "profile/.credentials.yaml",
+            parts[0].path, "profile/.credentials.yaml",
             "an unslotted part keeps the path it was extracted with"
         );
         assert_eq!(parts[1].path, "profile/settings.yaml");
@@ -1148,7 +1221,10 @@ mod tests {
             "createdAt": 0,
         });
         let view: box_resources::ResourceView = serde_json::from_value(stored).unwrap();
-        assert!(view.enabled, "an older view must not disappear from the navigation");
+        assert!(
+            view.enabled,
+            "an older view must not disappear from the navigation"
+        );
     }
 
     /// Closing a type is not deleting it: the row and the copies taken under
@@ -1184,7 +1260,8 @@ mod tests {
 
     #[test]
     fn a_copy_without_a_name_is_named_after_its_container() {
-        let root = std::env::temp_dir().join(format!("dshbox-resource-name-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("dshbox-resource-name-{}", std::process::id()));
         let container = root.join("instances").join("container-1");
         std::fs::create_dir_all(&container).unwrap();
         std::fs::write(

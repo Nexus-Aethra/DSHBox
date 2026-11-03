@@ -157,10 +157,10 @@ fn container_is_stopped(id: &str) -> bool {
 }
 /// Launch (or replace) the headless session attached to a container.
 pub(crate) fn open_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
-    let id = request["id"].as_str().unwrap_or("").to_owned();
-    if id.is_empty() {
-        return Err("debug_open requires a container id".to_owned());
-    }
+    // Keyed by the canonical id: an alias would store a session under a name
+    // the liveness sweep cannot probe, and the same container opened twice by
+    // two spellings would hold two headless browsers.
+    let id = session_id(state, request)?;
     let browser = current_browser()?;
     let url = container_url(state, &id)?;
     let profile = profile_dir(state, &id)?;
@@ -205,7 +205,7 @@ pub(crate) fn open_rpc(state: &DaemonState, request: &Value) -> Result<Value, St
 
 /// Tear down one container's session.
 pub(crate) fn close_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
-    let id = request["id"].as_str().unwrap_or("").to_owned();
+    let id = session_id(state, request)?;
     let mut sessions = lock_sessions(state)?;
     let existed = sessions.remove(&id).is_some();
     Ok(json!({ "id": id, "closed": existed }))
@@ -363,13 +363,41 @@ fn first_frame(trace: &Value) -> Option<String> {
     Some(format!("{file}:{}", line + 1))
 }
 
+/// Where the attached page actually is, as the page itself reports it.
+///
+/// Read from the document rather than from the URL the session was launched
+/// with, because the two come apart: the container's host rebinds its loopback
+/// port on every start, a login redirects, and a hash route is not in the URL
+/// we asked for. The caller is asking "what is this browser showing", so the
+/// answer has to be the browser's.
+fn page_location(session: &mut BrowserSession) -> Result<(String, Option<String>), String> {
+    let url = session.current_url()?;
+    let title = session.current_title().ok().filter(|text| !text.is_empty());
+    Ok((url, title))
+}
+
+/// The reference a request carries, resolved to the id its session is keyed by.
+///
+/// Every page tool arrives here, so this is the one place a name or a bare
+/// timestamp can be accepted without each verb learning the rules: sessions are
+/// keyed by the canonical id (see `open_rpc`), and a lookup by alias would
+/// otherwise report "no debug session" for a container that is being looked at.
+fn session_id(state: &DaemonState, request: &Value) -> Result<String, String> {
+    let raw = request["id"].as_str().unwrap_or("");
+    if raw.is_empty() {
+        return Err("a container id is required".to_owned());
+    }
+    crate::resolve::resolve_container_in_root(&crate::resolve::runtime_root(state)?, raw)
+        .map(|found| found.id)
+}
+
 /// Run one CDP call against a container's session.
 fn with_session<T>(
     state: &DaemonState,
     request: &Value,
     action: impl FnOnce(&mut BrowserSession) -> Result<T, String>,
 ) -> Result<T, String> {
-    let id = request["id"].as_str().unwrap_or("").to_owned();
+    let id = session_id(state, request)?;
     let mut sessions = lock_sessions(state)?;
     let session = sessions
         .get_mut(&id)
@@ -590,7 +618,7 @@ pub(crate) fn screenshot_rpc(state: &DaemonState, request: &Value) -> Result<Val
             });
         }
     }
-    let id = request["id"].as_str().unwrap_or("").to_owned();
+    let id = session_id(state, request)?;
     let data = with_session(state, request, |session| {
         let result = session.call("Page.captureScreenshot", params)?;
         result
@@ -600,12 +628,22 @@ pub(crate) fn screenshot_rpc(state: &DaemonState, request: &Value) -> Result<Val
             .ok_or_else(|| "Page.captureScreenshot returned no image".to_owned())
     })?;
     let shot = write_screenshot(&screenshot_dir(state, &id)?, &data)?;
+    // The PNG is already on disk; a page that closed mid-call must not turn
+    // a successful capture into a failed tool call, so the location degrades
+    // to what the session still remembers (no CDP round-trip, no failure).
+    let (url, title) = with_session(state, request, page_location).or_else(|_| {
+        with_session(state, request, |session| {
+            Ok::<(String, Option<String>), String>((session.url().to_owned(), None))
+        })
+    })?;
     Ok(json!({
         "id": id,
         "path": shot.path,
         "width": shot.width,
         "height": shot.height,
         "bytes": shot.bytes,
+        "url": url,
+        "title": title,
     }))
 }
 /// Build the JS that describes every element matching a selector.
@@ -869,22 +907,31 @@ fn near_miss_names(tree: &Value, wanted: &str, limit: usize) -> Vec<String> {
         .map(|(_, entry)| entry)
         .collect()
 }
-/// Click the control identified by the role and name a page listing reported.
-///
-/// A page listing answers "what is here" as role plus name, so acting on that
-/// answer should take the same pair. Requiring a CSS selector in between forces
-/// the caller to translate one vocabulary into another -- by hand, from a name
-/// that is a translated string rather than an id -- and the translation is where
-/// the mistakes happen. A wrong selector misses; a wrong-but-matching selector
-/// hits the wrong thing and still reads as success.
-///
+
 /// Names are compared exactly. Substring matching is what let a toolbar and a
 /// settings sidebar both answer to one name, and near-misses are the whole
-/// problem this verb exists to remove.
-pub(crate) fn click_by_name_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
+/// problem a naming verb exists to remove.
+///
+/// What a naming verb is looking for, and how its caller disambiguates a tie.
+///
+/// Held as one value because two verbs ask the same question: click_by_name
+/// wants the coordinates to press, and hover wants the same coordinates to
+/// park a pointer on. Reading them separately is how the two would drift into
+/// answering "which control?" differently, and a caller that hovers one thing
+/// and clicks another would never see it coming.
+#[derive(Clone)]
+struct NameSearch {
+    name: String,
+    role: Option<String>,
+    nth: Option<usize>,
+    within_name: Option<String>,
+}
+
+/// Parse the naming arguments out of a request.
+fn name_search_from(request: &Value, verb: &str) -> Result<NameSearch, String> {
     let name = request["name"].as_str().unwrap_or("").to_owned();
     if name.trim().is_empty() {
-        return Err("click_by_name requires a non-empty name".to_owned());
+        return Err(format!("{verb} requires a non-empty name"));
     }
     let role = request
         .get("role")
@@ -904,218 +951,245 @@ pub(crate) fn click_by_name_rpc(state: &DaemonState, request: &Value) -> Result<
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase);
-    let (x, y, matched) = with_session(state, request, |session| {
-        let tree = session
-            .call("Accessibility.getFullAXTree", json!({}))
-            .map_err(|error| {
-                format!("accessibility tree is unavailable on this target: {error}")
-            })?;
-        let mut parent_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-        for node in tree["nodes"].as_array().into_iter().flatten() {
-            if let (Some(id), Some(parent)) = (node["nodeId"].as_str(), node["parentId"].as_str()) {
-                parent_of.insert(id, parent);
-            }
-        }
-        let chain_of = |id: &str| -> Vec<String> {
-            let mut chain = Vec::new();
-            let mut cursor = Some(id);
-            let mut guard = 0;
-            while let Some(current) = cursor {
-                chain.push(current.to_owned());
-                cursor = parent_of.get(current).copied();
-                guard += 1;
-                if guard > 64 {
-                    break;
-                }
-            }
-            chain
-        };
-        // The scope is the nearest node carrying that name, so a nested panel
-        // wins over an outer one with the same label.
-        let scope: Option<Vec<String>> = within_name.as_deref().and_then(|wanted| {
-            tree["nodes"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|node| {
-                    let id = node["nodeId"].as_str()?;
-                    let node_name = node["name"]["value"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    (node_name == wanted).then(|| chain_of(id))
-                })
-                .min_by_key(Vec::len)
-        });
-        if within_name.is_some() && scope.is_none() {
-            return Err(format!(
-                "nothing named {:?} to scope to",
-                within_name.unwrap_or_default()
-            ));
-        }
+    Ok(NameSearch {
+        name,
+        role,
+        nth,
+        within_name,
+    })
+}
 
-        let viewport = viewport_metrics(session)?;
-        // Centre of the control, after making sure it is actually on screen.
-        let reveal = |session: &mut BrowserSession, id: i64| -> Option<(f64, f64, f64, f64)> {
-            let Ok((x, y, width, height)) = backend_node_rect(session, id) else {
-                return None;
-            };
-            let clipped = x < 0.0
-                || y < 0.0
-                || x + width > viewport.width + 1.0
-                || y + height > viewport.height + 1.0;
-            if clipped {
-                return scroll_node_into_view(session, id).ok();
+/// Find one control by role and name, and return the point that is its centre.
+fn locate_by_name(
+    session: &mut BrowserSession,
+    search: NameSearch,
+) -> Result<(f64, f64, String), String> {
+    let NameSearch {
+        name,
+        role,
+        nth,
+        within_name,
+    } = search;
+    let tree = session
+        .call("Accessibility.getFullAXTree", json!({}))
+        .map_err(|error| format!("accessibility tree is unavailable on this target: {error}"))?;
+    let mut parent_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for node in tree["nodes"].as_array().into_iter().flatten() {
+        if let (Some(id), Some(parent)) = (node["nodeId"].as_str(), node["parentId"].as_str()) {
+            parent_of.insert(id, parent);
+        }
+    }
+    let chain_of = |id: &str| -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut cursor = Some(id);
+        let mut guard = 0;
+        while let Some(current) = cursor {
+            chain.push(current.to_owned());
+            cursor = parent_of.get(current).copied();
+            guard += 1;
+            if guard > 64 {
+                break;
             }
-            Some((x, y, width, height))
+        }
+        chain
+    };
+    // The scope is the nearest node carrying that name, so a nested panel
+    // wins over an outer one with the same label.
+    let scope: Option<Vec<String>> = within_name.as_deref().and_then(|wanted| {
+        tree["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|node| {
+                let id = node["nodeId"].as_str()?;
+                let node_name = node["name"]["value"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                (node_name == wanted).then(|| chain_of(id))
+            })
+            .min_by_key(Vec::len)
+    });
+    if within_name.is_some() && scope.is_none() {
+        return Err(format!(
+            "nothing named {:?} to scope to",
+            within_name.unwrap_or_default()
+        ));
+    }
+
+    let viewport = viewport_metrics(session)?;
+    // Centre of the control, after making sure it is actually on screen.
+    let reveal = |session: &mut BrowserSession, id: i64| -> Option<(f64, f64, f64, f64)> {
+        let Ok((x, y, width, height)) = backend_node_rect(session, id) else {
+            return None;
         };
-        let mut found: Vec<(f64, f64, String)> = Vec::new();
-        // Names that matched but had nowhere to click. Dropping them in
-        // silence is the failure this verb exists to remove: the caller would
-        // be told the control is absent while a listing has just named it.
-        let mut unplaceable: Vec<String> = Vec::new();
-        for node in tree["nodes"].as_array().into_iter().flatten() {
-            if node["ignored"].as_bool().unwrap_or(false) {
+        let clipped = x < 0.0
+            || y < 0.0
+            || x + width > viewport.width + 1.0
+            || y + height > viewport.height + 1.0;
+        if clipped {
+            return scroll_node_into_view(session, id).ok();
+        }
+        Some((x, y, width, height))
+    };
+    let mut found: Vec<(f64, f64, String)> = Vec::new();
+    // Names that matched but had nowhere to click. Dropping them in
+    // silence is the failure this verb exists to remove: the caller would
+    // be told the control is absent while a listing has just named it.
+    let mut unplaceable: Vec<String> = Vec::new();
+    for node in tree["nodes"].as_array().into_iter().flatten() {
+        if node["ignored"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        let node_role = node["role"]["value"].as_str().unwrap_or("").to_owned();
+        let node_name = node["name"]["value"].as_str().unwrap_or("").to_owned();
+        if let Some(scope) = scope.as_ref() {
+            let Some(id) = node["nodeId"].as_str() else {
+                continue;
+            };
+            if !chain_of(id).iter().any(|ancestor| scope.contains(ancestor)) {
                 continue;
             }
-            let node_role = node["role"]["value"].as_str().unwrap_or("").to_owned();
-            let node_name = node["name"]["value"].as_str().unwrap_or("").to_owned();
-            if let Some(scope) = scope.as_ref() {
-                let Some(id) = node["nodeId"].as_str() else {
-                    continue;
-                };
-                if !chain_of(id).iter().any(|ancestor| scope.contains(ancestor)) {
-                    continue;
-                }
-            }
-            if node_name != name {
+        }
+        if node_name != name {
+            continue;
+        }
+        if let Some(wanted) = role.as_deref() {
+            if !node_role.to_ascii_lowercase().contains(wanted) {
                 continue;
             }
-            if let Some(wanted) = role.as_deref() {
-                if !node_role.to_ascii_lowercase().contains(wanted) {
-                    continue;
-                }
-            }
-            if node_role.is_empty() || is_structural_noise(&node_role) {
-                continue;
-            }
-            // A control that is disabled cannot respond. Dispatching a click
-            // anyway reports landing and changes nothing, which is the worst
-            // answer a tool can give: it looks like the page is broken.
-            let disabled = node["properties"]
+        }
+        if node_role.is_empty() || is_structural_noise(&node_role) {
+            continue;
+        }
+        // A control that is disabled cannot respond. Dispatching a click
+        // anyway reports landing and changes nothing, which is the worst
+        // answer a tool can give: it looks like the page is broken.
+        let disabled = node["properties"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|property| property["name"].as_str() == Some("disabled"))
+            .and_then(|property| property["value"]["value"].as_bool())
+            .unwrap_or(false);
+        if disabled {
+            return Err(format!(
+                "{name:?} is disabled: a click would report landing and do nothing."
+            ));
+        }
+        let Some(id) = node["backendDOMNodeId"].as_i64() else {
+            unplaceable.push(node_role.clone());
+            continue;
+        };
+        let Some((rx, ry, width, height)) = reveal(session, id) else {
+            unplaceable.push(node_role.clone());
+            continue;
+        };
+        if width <= 0.0 || height <= 0.0 {
+            unplaceable.push(node_role.clone());
+            continue;
+        }
+        found.push((
+            rx + width / 2.0,
+            ry + height / 2.0,
+            format!("{} {:?}", node_role, node_name),
+        ));
+    }
+    if found.is_empty() {
+        // Distinguish "no such control" from "it is not in the scope you
+        // named". A dropdown rendered in a portal is a child of the page,
+        // not of the dialog it belongs to, so scoping to the dialog hides
+        // it -- and a message that only said "not found" sends the caller
+        // looking for a control that is plainly on screen.
+        if let Some(wanted) = within_name.as_deref() {
+            let elsewhere = tree["nodes"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .find(|property| property["name"].as_str() == Some("disabled"))
-                .and_then(|property| property["value"]["value"].as_bool())
-                .unwrap_or(false);
-            if disabled {
+                .any(|node| node["name"]["value"].as_str() == Some(name.as_str()));
+            if elsewhere {
                 return Err(format!(
-                    "{name:?} is disabled: a click would report landing and do nothing."
+                    "{name:?} is not inside {wanted:?}; a dropdown is often rendered in a portal.",
                 ));
             }
-            let Some(id) = node["backendDOMNodeId"].as_i64() else {
-                unplaceable.push(node_role.clone());
-                continue;
-            };
-            let Some((rx, ry, width, height)) = reveal(session, id) else {
-                unplaceable.push(node_role.clone());
-                continue;
-            };
-            if width <= 0.0 || height <= 0.0 {
-                unplaceable.push(node_role.clone());
-                continue;
-            }
-            found.push((
-                rx + width / 2.0,
-                ry + height / 2.0,
-                format!("{} {:?}", node_role, node_name),
+        }
+        if !unplaceable.is_empty() {
+            return Err(format!(
+                "{name:?} is listed as {} but has no position to click, so it is not rendered here",
+                unplaceable.join(", "),
             ));
         }
-        if found.is_empty() {
-            // Distinguish "no such control" from "it is not in the scope you
-            // named". A dropdown rendered in a portal is a child of the page,
-            // not of the dialog it belongs to, so scoping to the dialog hides
-            // it -- and a message that only said "not found" sends the caller
-            // looking for a control that is plainly on screen.
-            if let Some(wanted) = within_name.as_deref() {
-                let elsewhere = tree["nodes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|node| node["name"]["value"].as_str() == Some(name.as_str()));
-                if elsewhere {
-                    return Err(format!(
-                        "{name:?} is not inside {wanted:?}; a dropdown is often rendered in a portal.",
-                    ));
-                }
-            }
-            if !unplaceable.is_empty() {
-                return Err(format!(
-                    "{name:?} is listed as {} but has no position to click, so it is not rendered here",
-                    unplaceable.join(", "),
-                ));
-            }
-            // The accessibility tree does not contain everything on screen. A
-            // provider picker in a portal with its own accessibility context is
-            // not in the tree at all: it opens, a screenshot shows every item in
-            // it, and the tree returns nothing. Falling back to the rendered
-            // document finds what the tree omits, and saying so in the match
-            // tells the caller which answer they got.
-            let raw = evaluate(session, &dom_text_probe_js(&name))?;
-            let text = raw
-                .as_str()
-                .ok_or_else(|| "dom text probe returned a non-string result".to_owned())?;
-            let measured: Value = serde_json::from_str(text)
-                .map_err(|error| format!("cannot parse dom probe result: {error}"))?;
-            if !measured.is_null() {
-                let cx = measured["x"].as_f64().unwrap_or(0.0)
-                    + measured["w"].as_f64().unwrap_or(0.0) / 2.0;
-                let cy = measured["y"].as_f64().unwrap_or(0.0)
-                    + measured["h"].as_f64().unwrap_or(0.0) / 2.0;
-                return Ok((
-                    cx,
-                    cy,
-                    format!(
-                        "{} {:?} (found by text, absent from the accessibility tree)",
-                        measured["tag"].as_str().unwrap_or("element"),
-                        name
-                    ),
-                ));
-            }
-            // Offer the near misses with the failure. A caller who typed a
-            // name that does not exist should not have to go and re-read the
-            // page to discover what the page called it.
-            let near = near_miss_names(&tree, &name, 8);
-            if !near.is_empty() {
-                return Err(format!(
-                    "nothing named {:?} matches. Closest names: {}",
-                    name,
-                    near.join(", "),
-                ));
-            }
-            return Err(format!("nothing named {:?} matches", name));
+        // The accessibility tree does not contain everything on screen. A
+        // provider picker in a portal with its own accessibility context is
+        // not in the tree at all: it opens, a screenshot shows every item in
+        // it, and the tree returns nothing. Falling back to the rendered
+        // document finds what the tree omits, and saying so in the match
+        // tells the caller which answer they got.
+        let raw = evaluate(session, &dom_text_probe_js(&name))?;
+        let text = raw
+            .as_str()
+            .ok_or_else(|| "dom text probe returned a non-string result".to_owned())?;
+        let measured: Value = serde_json::from_str(text)
+            .map_err(|error| format!("cannot parse dom probe result: {error}"))?;
+        if !measured.is_null() {
+            let cx =
+                measured["x"].as_f64().unwrap_or(0.0) + measured["w"].as_f64().unwrap_or(0.0) / 2.0;
+            let cy =
+                measured["y"].as_f64().unwrap_or(0.0) + measured["h"].as_f64().unwrap_or(0.0) / 2.0;
+            return Ok((
+                cx,
+                cy,
+                format!(
+                    "{} {:?} (found by text, absent from the accessibility tree)",
+                    measured["tag"].as_str().unwrap_or("element"),
+                    name
+                ),
+            ));
         }
-        let pick = match nth {
-            Some(n) => found.get(n).ok_or_else(|| {
-                format!("{:?} matches {} things, no entry {}", name, found.len(), n)
-            })?,
-            None if found.len() == 1 => &found[0],
-            None => {
-                return Err(format!(
-                    "{:?} matches {} things: {} -- pass nth to pick one, or within to scope it",
-                    name,
-                    found.len(),
-                    found
-                        .iter()
-                        .map(|entry| entry.2.clone())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-        };
-        Ok((pick.0, pick.1, pick.2.clone()))
-    })?;
+        // Offer the near misses with the failure. A caller who typed a
+        // name that does not exist should not have to go and re-read the
+        // page to discover what the page called it.
+        let near = near_miss_names(&tree, &name, 8);
+        if !near.is_empty() {
+            return Err(format!(
+                "nothing named {:?} matches. Closest names: {}",
+                name,
+                near.join(", "),
+            ));
+        }
+        return Err(format!("nothing named {:?} matches", name));
+    }
+    let pick = match nth {
+        Some(n) => found
+            .get(n)
+            .ok_or_else(|| format!("{:?} matches {} things, no entry {}", name, found.len(), n))?,
+        None if found.len() == 1 => &found[0],
+        None => {
+            return Err(format!(
+                "{:?} matches {} things: {} -- pass nth to pick one, or within to scope it",
+                name,
+                found.len(),
+                found
+                    .iter()
+                    .map(|entry| entry.2.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    };
+    Ok((pick.0, pick.1, pick.2.clone()))
+}
+
+/// Click the control named by a page listing.
+///
+/// The locating is `locate_by_name`, shared with hover: an agent reaches a
+/// hover-gated control by naming it once and then doing two different things at
+/// the same point, and if the two verbs resolved the name differently the agent
+/// would hover one control and click another with no sign of it.
+pub(crate) fn click_by_name_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    let search = name_search_from(request, "click_by_name")?;
+    let name = search.name.clone();
+    let (x, y, matched) = with_session(state, request, |session| locate_by_name(session, search))?;
     let hit = with_session(state, request, |session| run_hit_test(session, x, y, None))?;
     with_session(state, request, |session| dispatch_click(session, x, y))?;
     Ok(click_response(
@@ -1678,10 +1752,18 @@ pub(crate) fn page_text_rpc(state: &DaemonState, request: &Value) -> Result<Valu
             elements = kept;
         }
 
+        // The page's own location travels with the listing. The container's host
+        // rebinds its port on every start, so "what is on screen" and "is this
+        // screen even still connected" are the same question, and a listing that
+        // answers one without the other sends the caller to a screenshot to find
+        // out that it is looking at a dead port.
+        let (url, title) = page_location(session)?;
         Ok(json!({
             "count": elements.len(),
             "truncated": truncated,
             "belowFold": below_fold,
+            "url": url,
+            "title": title,
             "elements": elements
         }))
     })
@@ -1883,6 +1965,155 @@ fn click_response(base: Value, hit: HitTest) -> Value {
     response
 }
 
+/// Move the attached page to another URL.
+///
+/// The container's host binds a fresh loopback port every start
+/// (`allocate_loopback_port` binds port 0 and lets the OS choose), so a page
+/// opened against a running container is pointed at a port that dies the
+/// moment the container restarts. Nothing else can put it back: the session
+/// keeps its browser, the tools keep working, and the caller sees a page that
+/// will never answer again. This is the recovery, and it is also the general
+/// "go somewhere else" verb a debugging surface needs.
+///
+/// With no URL the container's own live URL is used, because that is what the
+/// caller means 99% of the time: "take me back to the app", not "navigate
+/// somewhere I did not name".
+pub(crate) fn navigate_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    let wanted = request["url"].as_str().map(str::trim).filter(|text| !text.is_empty());
+    let id = session_id(state, request)?;
+    let target = match wanted {
+        Some(url) => url.to_owned(),
+        // The authenticated form, not the bare host URL: DSH 0.1.2+ answers a
+        // tokenless request with 401, so a navigation to the bare URL lands a
+        // headless browser on an "authentication required" page that looks
+        // exactly like a broken container.
+        None => container_url(state, &id)?,
+    };
+    // The debug browser drives the container's own loopback origins, and
+    // everything the page shows is readable back through box_evaluate and
+    // screenshots — so a file:// URL would hand local files to the agent.
+    // Same rule the DSH webview follows; loopback http(s) only.
+    let loopback = target.starts_with("http://127.0.0.1")
+        || target.starts_with("https://127.0.0.1")
+        || target.starts_with("http://localhost")
+        || target.starts_with("https://localhost")
+        || target.starts_with("http://[::1]")
+        || target.starts_with("https://[::1]");
+    if !loopback {
+        return Err(format!(
+            "navigate is restricted to the container's loopback origin (http(s) on 127.0.0.1, localhost or [::1]); refusing {target:?}"
+        ));
+    }
+    with_session(state, request, |session| session.navigate(&target))?;
+    // Settled from the page rather than echoed from the request: a navigation
+    // is not where the caller ends up (login redirects, SPA routing), and a
+    // reply that reports the asked-for URL teaches the caller to distrust it.
+    let (url, title) = with_session(state, request, page_location)?;
+    Ok(json!({ "id": id, "url": url, "title": title, "navigatedTo": target }))
+}
+
+/// Park the pointer on one point of the page.
+///
+/// A click already moves first (see `dispatch_click`), so this is not about
+/// reaching a click-only control: it is about the frame *between* the move and
+/// whatever comes next. Row actions in DSH's own UI are `display: none` until
+/// `:hover`, which means they are absent from the accessibility tree a listing
+/// reads and from the screenshot a caller takes, and there was no way to make
+/// them appear and then look. Hovering, then inspecting, is that missing frame.
+///
+/// Two leaves move: the target and then the point one element in from it, so
+/// CSS `:hover` and any `pointerenter` listener see a pointer that settled
+/// rather than one that crossed the boundary on the way past.
+fn dispatch_hover(session: &mut BrowserSession, x: f64, y: f64) -> Result<(), String> {
+    for (dx, dy) in [(0.0, 0.0), (0.5, 0.5)] {
+        session.call(
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseMoved",
+                "x": x + dx,
+                "y": y + dy,
+                "button": "none",
+                "buttons": 0,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+/// Hover one point, or one control named the way a page listing names it.
+pub(crate) fn hover_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    let has_point = request["x"].as_f64().is_some() && request["y"].as_f64().is_some();
+    let has_name = !request["name"].as_str().unwrap_or("").trim().is_empty();
+    if !has_point && !has_name {
+        return Err("hover requires x and y, or a name".to_owned());
+    }
+    let (x, y, matched) = if has_name {
+        let search = name_search_from(request, "hover")?;
+        let (x, y, matched) = with_session(state, request, |session| locate_by_name(session, search))?;
+        (x, y, json!(matched))
+    } else {
+        let x = request["x"].as_f64().unwrap_or(0.0);
+        let y = request["y"].as_f64().unwrap_or(0.0);
+        if !x.is_finite() || !y.is_finite() {
+            return Err("hover coordinates must be finite numbers".to_owned());
+        }
+        (x, y, Value::Null)
+    };
+    with_session(state, request, |session| dispatch_hover(session, x, y))?;
+    // What the hover revealed, read back. The point of hovering is that the
+    // page changed, and a reply that says only "hovered" makes the caller
+    // take a second call -- a screenshot or a listing -- to find out whether
+    // it worked. The hit test is the cheap version of that answer.
+    let hit = with_session(state, request, |session| run_hit_test(session, x, y, None))?;
+    let (url, _) = with_session(state, request, page_location)?;
+    // Every key present, null where it does not apply — the same shape the
+    // click verbs answer with, so one schema describes both and a caller
+    // never has to distinguish an absent field from an inapplicable one.
+    Ok(json!({
+        "url": url,
+        "x": x,
+        "y": y,
+        "landed": hit.landed,
+        "hitTag": hit.hit_tag,
+        "hitText": hit.hit_text,
+        "matched": matched,
+        "occludedBy": hit.occluded_by,
+    }))
+}
+
+/// Run an expression in the page and hand back its value.
+///
+/// Already used by every other verb here -- `evaluate` is what a hit test, an
+/// element query and a page title read go through -- so this exposes the
+/// mechanism rather than adding one. The gap it closes: a caller that needs a
+/// fact the typed verbs do not answer for (an attribute, a computed style,
+/// whether an element exists) had no way to ask, and had to guess from a
+/// screenshot.
+///
+/// The page is the whole scope. `box_evaluate` runs inside the debugged page
+/// the same way the page's own scripts do, which is no wider than what a page
+/// can already do to itself, and nothing narrower would be able to read a
+/// React-owned value.
+pub(crate) fn evaluate_rpc(state: &DaemonState, request: &Value) -> Result<Value, String> {
+    let expression = request["expression"].as_str().unwrap_or("").to_owned();
+    if expression.trim().is_empty() {
+        return Err("evaluate requires an expression".to_owned());
+    }
+    // Serialized as text rather than returned as JSON: an object with a
+    // getter, a DOM node, or a cycle cannot be put on the wire, and a page's
+    // own value is what the caller wanted to see.
+    let wrapped = format!(
+        // String(...) around the stringify: an expression evaluating to
+        // undefined makes JSON.stringify return undefined, the CDP reply
+        // then carries no value at all, and the schema the tool declares
+        // (result: string, required) is violated by an ordinary statement.
+        "(function () {{ var v = (eval({})); return (typeof v === 'string') ? v : String(JSON.stringify(v, null, 0)); }})()",
+        Value::String(expression.clone()).to_string()
+    );
+    let value = with_session(state, request, |session| evaluate(session, &wrapped))?;
+    let (url, _) = with_session(state, request, page_location)?;
+    Ok(json!({ "url": url, "result": value }))
+}
 /// JS that names the focused editable field, or null when there is none.
 ///
 /// "Editable" is the page's own answer rather than a list of tags: a disabled
