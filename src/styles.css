@@ -291,7 +291,10 @@ code.missing { color: #b42318; }
 .primary { border: 0; border-radius: 8px; background: #2864dc; color: #fff; padding: 10px 14px; cursor: pointer; white-space: nowrap; }
 .primary:hover { background: #1d56c5; }
 .error { color: #b42318; font-size: 14px; margin: 16px 0 0; }
-.task-panel { background: #fff; border-left: 1px solid #e1e4e8; box-shadow: -10px 0 28px #1f232912; height: 100vh; overflow-y: auto; padding: 24px; position: fixed; right: 0; top: 0; width: min(460px, 100vw); z-index: 10; }
+/* The drawer docks below the title bar (45px incl. its border): the bar is
+   sticky at z-20 and would otherwise cover the panel header — its close
+   button with it. z-10 stays: the two no longer overlap. */
+.task-panel { background: #fff; border-left: 1px solid #e1e4e8; box-shadow: -10px 0 28px #1f232912; height: calc(100vh - 45px); overflow-y: auto; padding: 24px; position: fixed; right: 0; top: 45px; width: min(460px, 100vw); z-index: 10; }
 .task-panel-header { align-items: flex-start; display: flex; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
 .task-panel h2 { font-size: 24px; letter-spacing: -.03em; margin: 0; }
 .task-group { border: 1px solid #e6e8eb; border-radius: 12px; overflow: hidden; }
