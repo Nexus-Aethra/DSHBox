@@ -19,6 +19,7 @@ mod lifecycle;
 mod plugins;
 mod resolve;
 mod resources;
+mod runtime;
 mod sealed;
 mod state;
 #[cfg(test)]
@@ -175,7 +176,7 @@ fn graceful_shutdown(state: &DaemonState) {
     };
     let drained: Vec<(String, u32)> = hosts
         .iter()
-        .filter_map(|(id, host)| host.child.id().map(|pid| (id.clone(), pid)))
+        .filter_map(|(id, host)| host.handle.id().map(|pid| (id.clone(), pid)))
         .collect();
     for (id, pid) in &drained {
         let _ = id;
@@ -188,7 +189,7 @@ fn graceful_shutdown(state: &DaemonState) {
         Err(poisoned) => poisoned.into_inner(),
     };
     for host in hosts.values_mut() {
-        if let Some(pid) = host.child.id() {
+        if let Some(pid) = host.handle.id() {
             let _ = process::kill_tree_pid(pid, None, true);
         }
     }

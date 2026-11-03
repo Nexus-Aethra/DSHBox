@@ -1448,6 +1448,15 @@ fn describe_container_rpc(state: &DaemonState, request: &Value) -> Result<Handle
         template: container.template.clone(),
         directory: container.directory.clone(),
         status: status.to_owned(),
+        // Normalised through the resolver's parser so a record carrying a
+        // malformed value still answers "host" here — the read verb must not
+        // fail; the start verb is where a bad runtime is an error.
+        runtime: container
+            .runtime
+            .as_deref()
+            .and_then(|text| crate::runtime::RuntimeKind::parse(text).ok())
+            .map(|kind| kind.field())
+            .unwrap_or_else(|| "host".to_owned()),
         url,
         host_pid,
         extensions: serde_json::to_value(&extensions)
@@ -1753,6 +1762,7 @@ mod tests {
                     profile: "web".into(),
                     template: Some("dsh-test".into()),
                     env: std::collections::BTreeMap::new(),
+                    runtime: None,
                     directory: directory.to_string_lossy().into_owned(),
                     status: "running".into(),
                 }),

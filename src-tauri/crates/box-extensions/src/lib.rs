@@ -1108,6 +1108,7 @@ mod tests {
             profile: "web".to_owned(),
             template: None,
             env: Default::default(),
+            runtime: None,
             directory: root.to_string_lossy().into_owned(),
             status: "stopped".to_owned(),
         }
@@ -1265,6 +1266,7 @@ mod tests {
                 profile: "web".to_owned(),
                 template: None,
                 env: Default::default(),
+                runtime: None,
                 directory: container_root.to_string_lossy().into_owned(),
                 status: "stopped".to_owned(),
             },
