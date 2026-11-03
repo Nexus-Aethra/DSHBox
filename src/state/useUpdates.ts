@@ -19,7 +19,8 @@ const TASK_POLL_MS = 600
 /**
  * The daemon's stage strings are English task prose; the pane localizes the
  * ones it knows and falls back to the raw text for anything new. Exported
- * pure so the mapping, not the daemon's wording, is what a test can pin.
+ * pure so the mapping stays independent of the daemon's wording -- and
+ * pinnable out-of-tree, since this repo has no frontend test runner.
  */
 export type DownloadStageKey = 'manifest' | 'downloading' | 'ready' | 'other'
 

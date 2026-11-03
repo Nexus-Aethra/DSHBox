@@ -306,18 +306,57 @@ pub(crate) fn install_update(app: tauri::AppHandle, path: String) -> Result<serd
 /// The candidate test (`install_on_quit_candidate`) owns the rules: policy
 /// auto, something newer, a verified file, an unattended installer. This
 /// function is only the wiring that makes those rules run at quit time.
+/// The quit path never spawns a daemon, and never calls \`connect()\`: its
+/// fallback spawns one and polls for seconds, which would turn quitting into
+/// starting. Read the discovery file directly and take only a
+/// demonstrably-alive daemon.
+fn quit_state() -> Option<serde_json::Value> {
+    let discovery = box_server_core::read_discovery().ok().flatten()?;
+    let client = box_client::RpcClient::from_discovery(&discovery);
+    client.ping_quickly().ok()?;
+    call(&client, "get_update_state", serde_json::json!({})).ok()
+}
+
 pub(crate) fn install_on_quit_if_any() {
-    let state = connect().ok().and_then(|client| {
-        call(&client, "get_update_state", serde_json::json!({})).ok()
-    });
-    let Some(state) = state else { return };
-    let Some(candidate) = install_on_quit_candidate(&state) else { return };
-    let Some(path) = candidate["path"].as_str() else { return };
-    let installer = candidate["installer"].as_str().unwrap_or("");
-    let Some(platform) = installer_platform(installer) else { return };
-    if std::path::Path::new(path).exists() {
-        let _ = stage_install(platform, path);
+    use std::sync::atomic::Ordering;
+    // One attempt per process: the tray path and the runtime's
+    // exit-requested event (the macOS menu quit) both land here, and the
+    // second call must not re-read daemon state -- possibly from a daemon
+    // that is already stopping -- on the way out.
+    static ATTEMPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ATTEMPTED.swap(true, Ordering::SeqCst) {
+        return;
     }
+    // Both call sites run on the window's main thread, so the work moves to
+    // a helper bounded by a short join: a healthy daemon answers a record
+    // read in milliseconds, and a wedged one costs the quit three seconds,
+    // not its RPC timeout. The thread uses quit_state() -- no spawn fallback
+    // -- so even one that outlives the wait cannot bring a daemon back while
+    // the user is leaving. One that finishes its staging detached is exactly
+    // the design the helper was built for: the script waits for this process
+    // to die, then installs.
+    let (done, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Some(state) = quit_state() {
+            if let Some(candidate) = install_on_quit_candidate(&state) {
+                if let Some(path) = candidate["path"].as_str() {
+                    let installer = candidate["installer"].as_str().unwrap_or("");
+                    if let Some(platform) = installer_platform(installer) {
+                        if std::path::Path::new(path).exists() {
+                            if let Err(error) = stage_install(platform, path) {
+                                // Surface, do not panic: the user is quitting
+                                // either way, but the next diagnosis should
+                                // not start from zero.
+                                write_startup_log(&format!("update-on-quit not staged: {error}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = done.send(());
+    });
+    let _ = done_rx.recv_timeout(std::time::Duration::from_secs(3));
 }
 
 /// Start the helper detached, so it survives this process exiting.

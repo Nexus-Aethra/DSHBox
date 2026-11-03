@@ -329,6 +329,7 @@ pub(crate) fn fetch_manifest(
     token: Option<&str>,
 ) -> Result<UpdateManifest, String> {
     let url = manifest_url_for(tag, mirror, token);
+    let has_token = token.map(str::trim).filter(|value| !value.is_empty()).is_some();
     let client = network_client()?;
     let send = |url: &str| {
         client
@@ -338,7 +339,7 @@ pub(crate) fn fetch_manifest(
     };
     let response = match send(&url) {
         Ok(response) => response,
-        Err(direct_error) if token.is_some() && mirror.is_some() => {
+        Err(direct_error) if has_token && mirror.is_some() => {
             let mirrored = mirror_url(&latest_manifest_url(tag), mirror);
             send(&mirrored).map_err(|error| format!(
                 "cannot reach the release manifest (direct: {direct_error}; mirrored: {error})"
@@ -697,20 +698,20 @@ pub(crate) fn get_update_state_rpc(state: &DaemonState) -> Result<Value, String>
 /// window that sat open while the check ran.
 pub(crate) fn check_update_rpc(state: &DaemonState) -> Result<Value, String> {
     let config = read_config()?;
-    let changed = if let Some(root) = config.runtime_directory.as_deref() {
+    if let Some(root) = config.runtime_directory.as_deref() {
+        // A failure returns Err -- the contract `dshbox update check`'s exit
+        // code is built on -- and writes lastError to the record, where the
+        // pane and the CLI both read it back.
         crate::updates::perform_check(
             std::path::Path::new(root),
             config.github_mirror.as_deref(),
             config.github_token.as_deref(),
         )
-        .map_err(|error| format!("update check failed: {error}"))
-        .is_ok()
-    } else {
-        false
-    };
-    if changed {
-        crate::updates::announce(&state.events);
+        .map_err(|error| format!("update check failed: {error}"))?;
     }
+    // Only a success gets here, so only successes announce -- the same shape
+    // as the background pass.
+    crate::updates::announce(&state.events);
     Ok(crate::updates::collect_state(&config))
 }
 

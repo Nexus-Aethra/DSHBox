@@ -438,8 +438,19 @@ fn run_inner() -> Result<(), String> {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .map_err(|error| format!("{error}"))
+        .build(tauri::generate_context!())
+        .map_err(|error| format!("{error}"))?
+        .run(|_app, event| {
+            // macOS ships a default app menu whose Quit (Cmd+Q) exits through
+            // the runtime, never through the tray handler: the automatic
+            // update stages here too, while the daemon can still answer. The
+            // one-shot attempt flag keeps a quit that already staged (the
+            // tray path) from re-reading daemon state on the way out.
+            if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+                updates::install_on_quit_if_any();
+            }
+        });
+    Ok(())
 }
 
 /// Guards the IPC surface the frontend can actually reach.

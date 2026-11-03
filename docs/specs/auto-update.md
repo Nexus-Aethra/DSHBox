@@ -110,15 +110,16 @@ clears it early.
 
 ## Install on quit
 
-The tray Quit entry is the one real exit this app has -- the window's close
-button hides to tray -- so it is where `auto` finishes its job. Before the
-service stops and the process exits, the quit handler asks the daemon for
-the install-on-quit candidate and, when there is one, stages the same helper
-the pane's Install button uses. The candidate rules are strict and
-unit-tested: policy `auto`, something newer, a *verified* file present, an
-unattended installer for this platform, and no manual reason. Anything else
--- a daemon that cannot answer included -- quits exactly as before; quitting
-must never acquire a failure mode it did not have.
+Quitting is where `auto` finishes its job, and the app has two quit
+gestures: the tray Quit entry, and -- on macOS -- the default app menu's
+Quit (Cmd+Q), which exits through the runtime's exit-requested event rather
+than the tray handler. Both stage the same helper the pane's Install button
+uses, before the daemon stops and the process exits; the window's close
+button only hides to tray and never quits. The candidate rules are strict
+and unit-tested: policy `auto`, something newer, a *verified* file present,
+an unattended installer for this platform, and no manual reason. Anything
+else -- a daemon that cannot answer included -- quits exactly as before;
+quitting must never acquire a failure mode it did not have.
 
 The staging has to happen *before* `app.exit(0)`: the helper's first job is
 waiting for this process to die, and it does that from the outside. A
@@ -198,8 +199,9 @@ Daemon RPCs: `get_update_state`, `check_update`, `list_update_releases`,
 
 Desktop commands add the ones that end a process or open a folder:
 `install_update` and `open_update_folder`; the rest are forwards to the
-daemon. (`get_install_on_quit` is registered but not wired to a quit path
-yet: under `auto` the fetch is automatic and the install still asks.)
+daemon. (`get_install_on_quit` stays registered for a caller that wants the
+candidate without staging; the quit paths -- tray Quit and the macOS menu
+quit -- stage through `install_on_quit_if_any` directly.)
 
 `get_update_state` answers one flat object so the pane is a single round
 trip -- and it is answered from the record, not the network: the check that

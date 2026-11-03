@@ -115,22 +115,32 @@ export function MainApp() {
   // than making a network call of its own. A failure here is silent on
   // purpose -- an update nobody can be told about yet is not an error the
   // user needs to see.
-  const applyUpdateState = (state: { available: { newer: boolean; version: string } | null; skippedVersion: string | null }) => {
-    const available = state.available
-    const skipped = state.skippedVersion
-    setUpdateBadge(available !== null && available.newer && available.version !== skipped ? available.version : null)
-  }
+  // The badge derivation is inlined into each effect on purpose: the effects
+  // run once ([] deps), and a helper captured from the render scope would go
+  // stale the day it grows a state dependency this repo has no eslint to
+  // catch. It only touches the stable setUpdateBadge.
   useEffect(() => {
     let cancelled = false
     void boxApi.getUpdateState()
-      .then((state) => { if (!cancelled) applyUpdateState(state) })
+      .then((state) => {
+        if (cancelled) return
+        const available = state.available
+        const skipped = state.skippedVersion
+        setUpdateBadge(available !== null && available.newer && available.version !== skipped ? available.version : null)
+      })
       .catch(() => undefined)
     return () => { cancelled = true }
   }, [])
   useEffect(() => {
     const unlisten = boxApi.listenTask<{ event: string }>('daemon://event', (payload) => {
       if (payload.event !== 'update_state') return
-      void boxApi.getUpdateState().then(applyUpdateState).catch(() => undefined)
+      void boxApi.getUpdateState()
+        .then((state) => {
+          const available = state.available
+          const skipped = state.skippedVersion
+          setUpdateBadge(available !== null && available.newer && available.version !== skipped ? available.version : null)
+        })
+        .catch(() => undefined)
     })
     return () => { void unlisten.then((unlisten) => unlisten()) }
   }, [])
