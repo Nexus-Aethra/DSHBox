@@ -38,6 +38,7 @@ pub(crate) mod image;
 pub(crate) mod lifecycle;
 mod services;
 mod tasks;
+mod titlebar;
 mod toolchains;
 mod updates;
 mod versions;
@@ -436,6 +437,11 @@ fn run_inner() -> Result<(), String> {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+            }
+            if let WindowEvent::Resized(_) = event {
+                // Windows-only: an undecorated maximize covers the taskbar;
+                // pin the maximized rect to the monitor's work area.
+                titlebar::keep_maximized_in_work_area(window);
             }
         })
         .build(tauri::generate_context!())

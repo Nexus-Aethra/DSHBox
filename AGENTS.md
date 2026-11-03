@@ -523,6 +523,22 @@ command as done only once the installed app has run it.
   may copy a second `dist/` over it. `build.rs` used to mirror the repo-root
   `dist/` in, which silently shipped a months-old frontend — a stale bundle
   looks exactly like "the feature was never implemented".
+- **The title bar is ours, not the OS's.** Windows/Linux run the main window
+  with `decorations: false` and macOS with `titleBarStyle: "Overlay"`, so the
+  React `.titlebar` is the window chrome. The buttons call the core window API
+  (`@tauri-apps/api/window`) — no custom IPC commands, so `command_surface`
+  stays green — granted by the `core:window:allow-*` entries in
+  `capabilities/default.json`. The drag surface is the literal
+  `data-tauri-drag-region` attribute on `.titlebar` and `.titlebar-content`;
+  non-interactive children (`.brand`, `.titlebar-spring`, `.stale-daemon`)
+  set `pointer-events: none` so clicks reach the drag surface instead of
+  dead-ending on text. In a plain browser (`pnpm dev`) the bar renders
+  without buttons — `TitleBar` keys off the missing `__TAURI_INTERNALS__`.
+  Dropping the attribute or the capabilities leaves a window the mouse
+  cannot move, which no test catches — check it by hand on a packaged build.
+  And an undecorated window maximizes to the whole monitor, not the work
+  area (no `WS_CAPTION`): `titlebar.rs::keep_maximized_in_work_area` pins
+  the maximized rect back on every resize, so the taskbar stays visible.
 
 ## Docs to read before touching sensitive areas
 

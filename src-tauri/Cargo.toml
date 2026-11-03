@@ -89,7 +89,9 @@ box-store = { path = "crates/box-store" }
 tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.45", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+# Window-chrome fixes (src/desktop/app/titlebar.rs): an undecorated maximize
+# covers the taskbar on Windows — this pins it to the monitor's work area.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
 
 [[bin]]
 name = "dshbox"
