@@ -175,6 +175,9 @@ const ARGS = {
   box_press_key: { containerId, key: 'Escape' },
   box_click_at: { containerId, x: 5, y: 5 },
   box_click_element: { containerId, name: '设置', role: 'button' },
+  box_navigate: { containerId },
+  box_hover: { containerId, x: 5, y: 5 },
+  box_evaluate: { containerId, expression: 'document.title' },
   box_close: { containerId },
 }
 

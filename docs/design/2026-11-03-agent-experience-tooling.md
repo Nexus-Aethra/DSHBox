@@ -94,6 +94,19 @@ parameters: { containerId, url?, wait?: "load" | "none" }
 `exceptionDetails` 转成错误文本，不静默返回 undefined。插件 `box_evaluate`：`{ containerId, expression }`
 → `{ result }`，输出沿用现有截断策略。
 
+## F. 调用者身份（追加决策）
+
+用户在实现中途提出：同一份插件既装在容器里也装在容器外（桌面 DSH、Web 会话），
+agent 无法区分自己坐在哪里——旧 `box-dsh-context` 移除后，"我是谁"没有跟着迁移过来。
+
+- 守护进程在容器内拉起 DSH host 时注入 `DSHBOX_CONTAINER_ID`（`lifecycle.rs`，
+  走 `dsh_host_policy` 的 `task_override`，环境保持白名单语义）。
+- 插件 `selfIdentity()`：env 戳为权威；安装路径解析（`<instance>/profile/...` 路径段）
+  仅作旧守护进程的兜底。身份只有两种：`container`（在某个 Box 容器里）与
+  `external`（容器外观察，桌面/Web 一律算 external——不预设载体）。
+- `box_overview` 输出恒带 `self: { role, containerId }`（不受 include 过滤影响）；
+  `runsInside` 自杀守卫改读同一身份，语义不变。
+
 ## 版本与发布
 
 - 日常**只做 patch 升级**（0.1.9 → 0.1.10）；`x.y.0` 只留给真正的功能里程碑，不随手 bump。

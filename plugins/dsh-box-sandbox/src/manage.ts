@@ -27,7 +27,7 @@ import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { getRpc } from './rpc'
-import { runTask, type TaskRecord } from './tasks'
+import { runTask, followTask, type TaskRecord } from './tasks'
 import { hostServices, type HostToolDefinition } from './tools'
 
 /** A long operation; a container start can sit on a prepare for minutes. */
@@ -205,10 +205,28 @@ export function registerManageTools(ctx: Context): void {
         containers: { type: 'array', items: { type: 'object' } },
         templates: { type: 'array', items: { type: 'object' } },
         plugins: { type: 'array', items: { type: 'object' } },
+        // Where the calling agent sits. role=container means the box being
+        // inspected is the one running this call; external means it is
+        // watched from outside (desktop, web, CLI) and no container is its own.
+        self: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            role: { type: 'string', enum: ['container', 'external'] },
+            containerId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+          },
+          required: ['role', 'containerId'],
+        },
       },
-      ['box', 'containers', 'templates', 'plugins'],
+      ['box', 'containers', 'templates', 'plugins', 'self'],
       (value) => {
         const lines: string[] = []
+        const self = (value.self ?? {}) as { role?: string, containerId?: string | null }
+        lines.push(
+          `Self: ${self.role === 'container'
+            ? `inside container ${String(self.containerId)} — lifecycle verbs on it are refused`
+            : 'external (not inside a Box container)'}.`,
+        )
         const box = (value.box ?? {}) as Record<string, unknown>
         const containers = (value.containers ?? []) as Record<string, unknown>[]
         const templates = (value.templates ?? []) as Record<string, unknown>[]
@@ -245,7 +263,16 @@ export function registerManageTools(ctx: Context): void {
         .map((part) => part.trim())
         .filter((part) => part !== '')
       const rpc = getRpc()
-      const result: Record<string, unknown> = { box: {}, containers: [], templates: [], plugins: [] }
+      // Identity travels with every answer, whatever the include filter asks
+      // for: an agent that requested only templates still needs to know
+      // whether it is looking at its own box from inside.
+      const result: Record<string, unknown> = {
+        box: {},
+        containers: [],
+        templates: [],
+        plugins: [],
+        self: selfIdentity(),
+      }
       if (want.includes('box')) {
         // What the box itself reports: counts, the runtime it is using, the
         // build it is on. Useful before acting, because it is the one answer
@@ -572,13 +599,25 @@ export function registerManageTools(ctx: Context): void {
         // here — a caller passing it got the daemon's "pass --restart"
         // refusal instead of the restart it asked for.
         if (flag(record, 'restart')) params.restart = true
-        const added = await rpc.call<{ created?: boolean }>('add_container_workspace', params)
+        // The daemon answers a plain add in line ({ created }) and a restart
+        // add with a background task that stops, registers, and starts again
+        // in order. Waiting when the reply is a task is what makes the next
+        // call see the registered workspace: listing while the container is
+        // still coming back would report what is not yet true.
+        const added = await rpc.call<{ created?: boolean } | TaskRecord>(
+          'add_container_workspace', params,
+        )
+        if (added !== null && typeof added === 'object'
+          && typeof (added as TaskRecord).id === 'string'
+          && typeof (added as TaskRecord).status === 'string') {
+          await followTask(added as TaskRecord, { timeoutMs: 840_000 })
+        }
         const listed = await rpc.call<{ workspaces?: unknown[] }>('list_container_workspaces', { id: containerId })
         return {
           action,
           containerId,
           workspaces: listed.workspaces ?? [],
-          created: added?.created === true,
+          created: added !== null && !('status' in (added as object)) && (added as { created?: boolean }).created === true,
         }
       }
       badAction('workspace', action, ['list', 'add'])
@@ -1243,28 +1282,53 @@ export function registerManageTools(ctx: Context): void {
 
 
 /**
- * True when this plugin is running inside the container it was asked about.
+ * Where this plugin instance sits.
  *
- * Nothing hands a plugin its own container id -- the host process is told which
- * container it is, but not the plugins it mounts -- so it is read back out of
- * where the plugin is installed, which is always
+ * `container` means the plugin runs inside a Box container — an agent driving
+ * the box that contains it, which is why self-targeting lifecycle verbs are
+ * refused. `external` covers every other seat: a DSH on the desktop, a web
+ * session, anything the daemon did not spawn — the caller observes the box
+ * from outside and no container is "its own".
+ */
+interface SelfIdentity {
+  role: 'container' | 'external'
+  containerId: string | null
+}
+
+/**
+ * The daemon stamps `DSHBOX_CONTAINER_ID` onto the host process it spawns, so
+ * a mounted plugin can name its own container without guessing. The stamp is
+ * the authority; the install-path parse below is the fallback for hosts
+ * started by older daemons, before the stamp existed — there, nothing hands a
+ * plugin its own container id, so it is read back out of where the plugin is
+ * installed, which is always
  * `<instance>/profile/profiles/<p>/node_modules/...`: the container id is a
  * directory name on the way to it.
  *
- * Comparing path segments to the id that was passed in, rather than testing the
- * id's shape, is the point. An earlier version matched a UUID 8-4-4-4-12 and
- * silently never matched anything: real ids are `container-<10 digits>-<uuid>`,
- * with a unix timestamp in front. A guard that quietly does not fire is worse
- * than no guard, because the code reads as though the case is handled.
+ * The fallback matches the segment's prefix, not the id's full shape. An
+ * earlier version matched a UUID 8-4-4-4-12 and silently never matched
+ * anything: ids are `container-<unix timestamp>...`, and a guard that quietly
+ * does not fire is worse than no guard, because the code reads as though the
+ * case is handled.
  */
-function runsInside(containerId: string): boolean {
+function selfIdentity(): SelfIdentity {
+  const stamped = process.env.DSHBOX_CONTAINER_ID?.trim()
+  if (stamped) return { role: 'container', containerId: stamped }
   let here: string
   try {
     here = dirname(fileURLToPath(import.meta.url))
   } catch {
-    return false
+    return { role: 'external', containerId: null }
   }
-  return here.split(/[\\/]/).includes(containerId)
+  const own = here.split(/[\\/]/).find((part) => /^container-\d/.test(part))
+  return own
+    ? { role: 'container', containerId: own }
+    : { role: 'external', containerId: null }
+}
+
+/** True when this plugin is running inside the container it was asked about. */
+function runsInside(containerId: string): boolean {
+  return selfIdentity().containerId === containerId
 }
 /** Read an optional finite number, treating blank and NaN as absent. */
 function number(args: Record<string, unknown>, field: string): number | undefined {

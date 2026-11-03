@@ -16,6 +16,11 @@ result, not a summary.
 - **`box_overview` before anything else.** It is the only listing tool: containers,
   templates, and the plugins the box knows. Acting on an id you guessed is the
   failure this tool removes.
+- **Check `self` in the same `box_overview` answer.** It says where you sit:
+  `role: container` with the container id you are running in, or `external` when
+  you watch the box from outside (a desktop or web DSH). A `container` agent
+  must not stop, restart, rebuild or remove its own container — `box_lifecycle`
+  refuses, because the call could never report back.
 - **Anything that changes state through a task needs `box_task`.** Call it with
   `action: 'status'` and the task id the action returned, or `action: 'list'` to
   find what is already running. A task that has not finished has not happened.
@@ -27,7 +32,7 @@ result, not a summary.
 
 | Tool | What it does |
 |---|---|
-| `box_overview` | Containers, templates, plugins. Start here. |
+| `box_overview` | Containers, templates, plugins, and where you sit (`self`). Start here. |
 | `box_lifecycle` | start / stop / stop-now / restart / rebuild / remove a container |
 | `box_create` | from-template, from-version, describe, url, browse-paths |
 | `box_resources` | list, read, write, extract, inject, rm, rm-view, view-on, view-off, prune, types, views |
@@ -35,7 +40,7 @@ result, not a summary.
 | `box_templates` | list, show, pull, import, export, remove, prune, catalog |
 | `box_settings` | toolchains, installed, catalog, refresh-catalog, data, references, template-info, template-list, save-mirrors, set-runtime-directory, uninstall-dsh |
 | `box_task` | list, status, cancel, delete |
-| `box_workspace` | list, add |
+| `box_workspace` | list, add (restart: true stops the container, adds, starts it again) |
 | `box_build` | build a template from a boxfile; apply a resource document |
 
 ## Rules that are easy to get wrong
@@ -60,9 +65,9 @@ result, not a summary.
 ## Debugging a page (separate tool family)
 
 The same plugin also registers browser tools against a headless Chromium session:
-`box_page_text`, `box_click_element`, `box_click_at`, `box_type_text`, `box_press_key`,
-`box_scroll`, `box_screenshot`, `box_console`, `box_set_viewport`, `box_set_browser`,
-`box_close`.
+`box_page_text`, `box_click_element`, `box_click_at`, `box_hover`, `box_type_text`, `box_press_key`,
+`box_scroll`, `box_navigate`, `box_evaluate`, `box_screenshot`, `box_console`, `box_set_viewport`,
+`box_set_browser`, `box_close`.
 
 When using them, always start with the observation tool and act only on what it
 returned. The tool descriptions carry the full workflow; follow them.

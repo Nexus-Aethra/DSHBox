@@ -168,6 +168,8 @@ interface PageText {
   count: number
   truncated: boolean
   belowFold: number
+  url: string
+  title: string | null
   elements: PageElement[]
 }
 
@@ -297,8 +299,10 @@ export function applyBoxTools(ctx: Context): void {
           width: { type: 'number' },
           height: { type: 'number' },
           bytes: { type: 'number' },
+          url: { type: 'string' },
+          title: nullable,
         },
-        required: ['containerId', 'path', 'width', 'height', 'bytes'],
+        required: ['containerId', 'path', 'width', 'height', 'bytes', 'url'],
       },
       render: (_args, value) => {
         const record = asRecord(value)
@@ -307,7 +311,8 @@ export function applyBoxTools(ctx: Context): void {
             type: 'text',
             text: 'Screenshot of container ' + String(record.containerId)
               + ' (' + String(record.width) + 'x' + String(record.height) + ', '
-              + String(record.bytes) + ' bytes) saved to ' + String(record.path) + '.',
+              + String(record.bytes) + ' bytes) saved to ' + String(record.path) + '.'
+              + ' Page: ' + String(record.url) + (record.title ? ' — ' + String(record.title) : '') + '.',
           },
         ]
       },
@@ -330,6 +335,8 @@ export function applyBoxTools(ctx: Context): void {
         width: result.width,
         height: result.height,
         bytes: result.bytes,
+        url: result.url,
+        title: result.title,
       }
     },
   })
@@ -466,6 +473,97 @@ export function applyBoxTools(ctx: Context): void {
     },
   })
 
+  registerTool(ctx, {
+    name: 'box_hover',
+    description:
+      'Park the pointer on a control and report what the hover revealed. Use it when a '
+      + 'control exists only while hovered — row actions in this UI are display:none until '
+      + ':hover, so box_page_text does not list them and box_click_element cannot find them: '
+      + 'hover the row first, then list or click. Target it the same way as box_click_element '
+      + '(role and name, or x,y when there is no name). The pointer stays where this leaves it '
+      + 'until the next move or click, and the reply names what ended up under it, so a hover '
+      + 'that landed on something else is visible immediately.',
+    parameters: {
+      type: 'object',
+      properties: {
+        containerId: { type: 'string', description: 'Container whose page to hover.' },
+        name: { type: 'string', description: 'Accessible name of the control to hover, matched exactly, e.g. the row name box_page_text reported.' },
+        role: { type: 'string', description: 'Role to require alongside the name, e.g. row or button.' },
+        nth: { type: 'number', description: 'Zero-based index among controls sharing the name. Omit for the first.' },
+        within: { type: 'string', description: 'Container name to scope the search to, when the same name appears in more than one place.' },
+        x: { type: 'number', description: 'Horizontal viewport coordinate, from the left edge. Use with y instead of name.' },
+        y: { type: 'number', description: 'Vertical viewport coordinate, from the top edge. Use with x instead of name.' },
+      },
+      required: ['containerId'],
+    },
+    timeoutMs: WARM_BUDGET_MS,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          containerId: { type: 'string' },
+          url: { type: 'string' },
+          x: { type: 'number' },
+          y: { type: 'number' },
+          landed: { type: 'boolean' },
+          hitTag: nullable,
+          hitText: nullable,
+          // Present only when the target was found by name: it names the
+          // control the coordinates belong to.
+          matched: nullable,
+          // Present only when landed is false.
+          occludedBy: nullable,
+        },
+        required: ['containerId', 'url', 'x', 'y', 'landed'],
+      },
+      render: (_args, value) => {
+        const record = asRecord(value)
+        const at = 'at (' + String(record.x) + ', ' + String(record.y) + ')'
+        if (record.landed === false) {
+          const cover = record.occludedBy
+            ? ' it was covered by <' + String(record.occludedBy) + '>'
+              + (record.hitText ? ' ' + JSON.stringify(record.hitText) : '')
+            : ' nothing is under that point'
+          return [{
+            type: 'text',
+            text: 'The hover ' + at + ' in container ' + String(record.containerId)
+              + ' did NOT land:' + cover + '.'
+              + nextHint('hover the row or control by name, then call box_page_text to list what appeared'),
+          }]
+        }
+        const under = record.hitTag ? ' over <' + String(record.hitTag) + '>' : ''
+        return [{
+          type: 'text',
+          text: 'Pointer parked ' + at + ' in container ' + String(record.containerId) + under + '.'
+            + (record.matched ? ' Target: ' + JSON.stringify(record.matched) + '.' : '')
+            + nextHint('call box_page_text again to list what the hover revealed, or box_click_element to act on it'),
+        }]
+      },
+    },
+    async execute(args) {
+      const containerId = containerIdOf(args)
+      const record = asRecord(args)
+      const hasName = typeof record.name === 'string' && record.name.trim() !== ''
+      const hasPoint = typeof record.x === 'number' && typeof record.y === 'number'
+      if (!hasName && !hasPoint)
+        throw new Error('give a name (with optional role, nth, within) or both x and y')
+      if (hasName) {
+        const result = await withSession<Record<string, unknown>>(containerId, 'debug_hover', {
+          name: record.name,
+          role: typeof record.role === 'string' ? record.role : undefined,
+          nth: typeof record.nth === 'number' ? record.nth : undefined,
+          within: typeof record.within === 'string' ? record.within : undefined,
+        })
+        return { containerId, ...result }
+      }
+      const result = await withSession<Record<string, unknown>>(containerId, 'debug_hover', {
+        x: record.x, y: record.y,
+      })
+      return { containerId, ...result }
+    },
+  })
+
 /* ------------------------------------------------------------------ */
 /* Page orientation, scrolling, typing and key presses.                 */
 /*                                                                        */
@@ -493,9 +591,9 @@ export function applyBoxTools(ctx: Context): void {
         within: {
           type: 'string',
           description:
-            + 'Name of a container to scope the listing to, such as a dialog. Use it when a'
-            + 'name is ambiguous: a settings dialog and the chat screen behind it can'
-            + 'both offer the same one, and acting on the wrong element still looks like'
+            'Name of a container to scope the listing to, such as a dialog. Use it when a '
+            + 'name is ambiguous: a settings dialog and the chat screen behind it can '
+            + 'both offer the same one, and acting on the wrong element still looks like '
             + 'it worked.',
         },
         limit: { type: 'number', description: 'Maximum entries to return. Defaults to 200.' },
@@ -512,9 +610,11 @@ export function applyBoxTools(ctx: Context): void {
           count: { type: 'number' },
           truncated: { type: 'boolean' },
           belowFold: { type: 'number' },
+          url: { type: 'string' },
+          title: nullable,
           elements: { type: 'array', items: { type: 'object' } },
         },
-        required: ['containerId', 'count', 'truncated', 'belowFold', 'elements'],
+        required: ['containerId', 'count', 'truncated', 'belowFold', 'url', 'elements'],
       },
       render: (_args, value) => {
         const record = asRecord(value)
@@ -524,7 +624,8 @@ export function applyBoxTools(ctx: Context): void {
         const below = Number(record.belowFold ?? 0)
         const lines: string[] = []
         lines.push(
-          'Page of container ' + String(record.containerId) + ': ' + String(record.count)
+          'Page of container ' + String(record.containerId) + ' at ' + String(record.url)
+          + (record.title ? ' — ' + String(record.title) : '') + ': ' + String(record.count)
           + ' entr' + (record.count === 1 ? 'y' : 'ies')
           + (record.truncated === true ? ' (truncated at the limit).' : '.'),
         )
@@ -803,6 +904,116 @@ export function applyBoxTools(ctx: Context): void {
       const result = await withSession<{ key: string }>(containerId, 'debug_press_key', {
         key: record.key.trim(),
       })
+      return { containerId, ...result }
+    },
+  })
+
+  registerTool(ctx, {
+    name: 'box_navigate',
+    description:
+      'Point the debugged page at a URL, or bring it back to the container app. With no url '
+      + 'it navigates to the container\'s own live address — this is the recovery after a '
+      + 'container restart: the host binds a fresh port on every start, so a page opened '
+      + 'before the restart can never answer again, and every page tool against it fails or '
+      + 'hangs. The reply reports where the page actually ended up (the app may redirect), '
+      + 'not where it was asked to go.',
+    parameters: {
+      type: 'object',
+      properties: {
+        containerId: { type: 'string', description: 'Container whose page to move.' },
+        url: { type: 'string', description: 'Absolute URL to open. Omit to go back to the container app itself.' },
+      },
+      required: ['containerId'],
+    },
+    timeoutMs: WARM_BUDGET_MS,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          containerId: { type: 'string' },
+          url: { type: 'string' },
+          title: nullable,
+          navigatedTo: { type: 'string' },
+        },
+        required: ['containerId', 'url', 'navigatedTo'],
+      },
+      render: (_args, value) => {
+        const record = asRecord(value)
+        return [{
+          type: 'text',
+          text: 'Page of container ' + String(record.containerId) + ' now at '
+            + String(record.url) + (record.title ? ' — ' + String(record.title) : '')
+            + ' (asked for ' + String(record.navigatedTo) + ').'
+            + nextHint('call box_page_text to see what the page shows now'),
+        }]
+      },
+    },
+    async execute(args) {
+      const containerId = containerIdOf(args)
+      const record = asRecord(args)
+      const url = typeof record.url === 'string' && record.url.trim() !== ''
+        ? record.url.trim()
+        : undefined
+      // Fields picked rather than spread: the daemon names the container id
+      // in its answer, and spreading that lands a second name for the
+      // container in the output, which the schema refuses.
+      const result = await withSession<{ url: string, title: string | null, navigatedTo: string }>(
+        containerId, 'debug_navigate', { url },
+      )
+      return { containerId, url: result.url, title: result.title, navigatedTo: result.navigatedTo }
+    },
+  })
+
+  registerTool(ctx, {
+    name: 'box_evaluate',
+    description:
+      'Run one JavaScript expression in the debugged page and return its value. Use it for '
+      + 'facts the other tools do not answer for: an attribute, a computed style, whether a '
+      + 'selector matches, a value React keeps out of the accessibility tree. Non-string '
+      + 'values come back JSON-encoded, so objects and arrays stay readable. The expression '
+      + 'runs inside the page with the page\'s own scope — it can do anything the page\'s own '
+      + 'scripts could, and no more.',
+    parameters: {
+      type: 'object',
+      properties: {
+        containerId: { type: 'string', description: 'Container whose page to evaluate in.' },
+        expression: {
+          type: 'string',
+          description: 'JavaScript to evaluate, e.g. document.title or Boolean(document.querySelector(".row-actions")).',
+        },
+      },
+      required: ['containerId', 'expression'],
+    },
+    timeoutMs: WARM_BUDGET_MS,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          containerId: { type: 'string' },
+          url: { type: 'string' },
+          result: { type: 'string' },
+        },
+        required: ['containerId', 'url', 'result'],
+      },
+      render: (_args, value) => {
+        const record = asRecord(value)
+        return [{
+          type: 'text',
+          text: 'Evaluated in container ' + String(record.containerId) + ' at '
+            + String(record.url) + ':\n' + String(record.result),
+        }]
+      },
+    },
+    async execute(args) {
+      const containerId = containerIdOf(args)
+      const record = asRecord(args)
+      if (typeof record.expression !== 'string' || record.expression.trim() === '')
+        throw new Error('expression is required and must be non-empty')
+      const result = await withSession<{ url: string, result: string }>(
+        containerId, 'debug_evaluate', { expression: record.expression },
+      )
       return { containerId, ...result }
     },
   })
