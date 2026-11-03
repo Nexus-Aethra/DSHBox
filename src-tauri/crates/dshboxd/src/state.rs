@@ -12,7 +12,7 @@ use box_scheduler::{TaskManager, TaskNotifier};
 use box_state::ResourceStateManager;
 use std::{
     collections::BTreeMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
 

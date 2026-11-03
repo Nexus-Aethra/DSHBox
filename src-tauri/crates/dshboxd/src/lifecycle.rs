@@ -13,7 +13,7 @@ use box_foundation::{is_safe_identifier, read_config};
 use box_runtime::process::{self, ExecutionKind, ProcessSpec, TrackedChild};
 use box_scheduler::TaskContext;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     fs,
     net::TcpListener,
     path::{Path, PathBuf},

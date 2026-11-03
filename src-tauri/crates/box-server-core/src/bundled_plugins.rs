@@ -40,7 +40,7 @@ pub fn initialize_bundled_plugins(resource_directory: &Path) -> Result<(), Strin
         // Developer build that skipped the plugin bundler; the container
         // start path tolerates the missing tree.
         eprintln!(
-            "bundled plugins skipped: {} not found",
+            "dshboxd: bundled plugins skipped: {} not found",
             manifest_path.display()
         );
         return Ok(());
@@ -108,7 +108,7 @@ pub fn initialize_bundled_plugins(resource_directory: &Path) -> Result<(), Strin
     updated.plugins_manifest_digest = Some(digest);
     write_config(&updated)?;
     eprintln!(
-        "vendored bundled plugins into {}",
+        "dshboxd: vendored bundled plugins into {}",
         cache_root.display()
     );
     Ok(())
@@ -118,12 +118,34 @@ pub fn initialize_bundled_plugins(resource_directory: &Path) -> Result<(), Strin
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
     use std::sync::Mutex;
 
     /// DSHBOX_CONFIG_DIR is process-global; keep the env-mutating test
     /// exclusive against anything else that might read it later.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Restores `DSHBOX_CONFIG_DIR` on drop, so an assert failure cannot leak
+    /// the override into the rest of this process's test run.
+    struct EnvGuard {
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var("DSHBOX_CONFIG_DIR").ok();
+            std::env::set_var("DSHBOX_CONFIG_DIR", path);
+            EnvGuard { previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("DSHBOX_CONFIG_DIR", value),
+                None => std::env::remove_var("DSHBOX_CONFIG_DIR"),
+            }
+        }
+    }
 
     fn fixture(source_root: &Path, target: &str) {
         let dir = source_root.join("plugins").join(target);
@@ -166,14 +188,7 @@ mod tests {
         fs::create_dir_all(&runtime).unwrap();
         fs::create_dir_all(&config_dir).unwrap();
 
-        let previous = std::env::var("DSHBOX_CONFIG_DIR").ok();
-        std::env::set_var("DSHBOX_CONFIG_DIR", &config_dir);
-        let restore = |previous: &Option<String>| {
-            match previous {
-                Some(value) => std::env::set_var("DSHBOX_CONFIG_DIR", value),
-                None => std::env::remove_var("DSHBOX_CONFIG_DIR"),
-            }
-        };
+        let _guard = EnvGuard::set(&config_dir);
 
         // The config must name the runtime directory before the first call.
         let config_path = config_dir.join("config.json");
@@ -202,7 +217,6 @@ mod tests {
         initialize_bundled_plugins(&resource).unwrap();
         assert!(vendored.join("index.js").is_file());
 
-        restore(&previous);
         let _ = fs::remove_dir_all(&temp);
     }
 }

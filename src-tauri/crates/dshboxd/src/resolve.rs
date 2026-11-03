@@ -67,10 +67,6 @@ mod tests {
     /// than through `DaemonState::load`: that reads `~/.dsh-box/config.json`,
     /// and a test that mutates HOME has to hold the process-global env lock for
     /// it. Resolution only ever needs `paths.runtime`.
-    fn state_at(root: &Path) -> DaemonState {
-        state_at_with(root, Some(root.to_path_buf()))
-    }
-
     fn state_at_with(root: &Path, runtime: Option<std::path::PathBuf>) -> DaemonState {
         DaemonState {
             manager: TaskManager::memory(),
