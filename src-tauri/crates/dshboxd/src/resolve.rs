@@ -52,11 +52,20 @@ fn check_shape(raw: &str) -> Result<(), String> {
     if raw.trim().is_empty() {
         return Err("expected a container id or name".to_owned());
     }
+    Ok(())
+}
+
+/// The gate for the one spelling that joins a path: `instances/<raw>`. Only a
+/// safe identifier with no empty dot-segment may be joined — this covers ".",
+/// "..", "..." and separators, each of which is a directory that exists next
+/// to `instances/<id>`. A reference this gate rejects still goes to name
+/// matching: names are only length-checked at creation, so a legal name can
+/// carry spaces, dots or any Unicode, and name matching returns directories
+/// taken from scanned records, never a join of the raw string.
+fn check_joinable(raw: &str) -> Result<(), String> {
     if !box_foundation::is_safe_identifier(raw) {
         return Err(format!("invalid container id: {raw:?}"));
     }
-    // Covers ".", "..", "..." and any empty segment: each is a directory
-    // that exists next to `instances/<id>`.
     if raw.split('.').any(|segment| segment.is_empty()) {
         return Err(format!("invalid container id: {raw:?}"));
     }
@@ -117,6 +126,12 @@ pub(crate) fn resolve_container_in_root(
 /// the page tools resolve a reference on every call, so paying for it on the
 /// one spelling that needs no lookup would tax every read to fund a name fix.
 fn fast_lookup(root: &Path, raw: &str) -> Result<Option<ResolvedContainer>, String> {
+    // The raw string is about to join a path, so only a joinable reference
+    // may take this shortcut; anything else defers to the scan, whose
+    // records never join the raw string.
+    if check_joinable(raw).is_err() {
+        return Ok(None);
+    }
     let directory = root.join("instances").join(raw);
     if !directory.is_dir() {
         return Ok(None);
@@ -139,27 +154,56 @@ fn fast_lookup(root: &Path, raw: &str) -> Result<Option<ResolvedContainer>, Stri
     }))
 }
 
-/// The three accepted spellings, then the honest failure.
+/// One match is a match; several are an ambiguity to report, never a guess.
+fn one_of<'c>(
+    candidates: Vec<&'c DshContainer>,
+    raw: &str,
+    what: &str,
+) -> Result<Option<&'c DshContainer>, String> {
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(Some(candidates[0])),
+        _ => {
+            let ids = candidates
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!("ambiguous container {what} {raw:?}; ids are: {ids}"))
+        }
+    }
+}
+
+/// The accepted spellings, then the honest failure.
+///
+/// Full id; bare timestamp (exact `container-<ts>` for timestamped ids, and
+/// the `container-<ts>-` prefix for the sealed-template shape that carries a
+/// task id after it); then the name, which may contain anything — see
+/// `check_joinable` for why no charset applies here.
 fn match_container(containers: &[DshContainer], raw: &str) -> Result<ResolvedContainer, String> {
     let mut matched: Option<&DshContainer> = containers.iter().find(|c| c.id == raw);
     if matched.is_none() {
         let prefixed = format!("container-{raw}");
-        matched = containers.iter().find(|c| c.id == prefixed);
+        matched = one_of(
+            containers.iter().filter(|c| c.id == prefixed).collect(),
+            raw,
+            "id prefix",
+        )?;
     }
     if matched.is_none() {
-        let by_name: Vec<&DshContainer> = containers.iter().filter(|c| c.name == raw).collect();
-        matched = match by_name.len() {
-            0 => None,
-            1 => Some(by_name[0]),
-            _ => {
-                let ids = by_name
-                    .iter()
-                    .map(|c| c.id.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(format!("ambiguous container name {raw:?}; ids are: {ids}"));
-            }
-        };
+        let prefix = format!("container-{raw}-");
+        matched = one_of(
+            containers.iter().filter(|c| c.id.starts_with(&prefix)).collect(),
+            raw,
+            "id prefix",
+        )?;
+    }
+    if matched.is_none() {
+        matched = one_of(
+            containers.iter().filter(|c| c.name == raw).collect(),
+            raw,
+            "name",
+        )?;
     }
 
     if let Some(found) = matched {
@@ -317,28 +361,46 @@ mod tests {
     }
 
     #[test]
+    fn a_sealed_style_timestamp_prefix_resolves() {
+        let root = scratch("sealed-prefix");
+        make_container(&root, "container-1730000000-4f2a", "sealed one");
+        make_container(&root, "container-1730000001-9b3c", "sealed two");
+        let found = resolve_container_id(&state_at(&root), "1730000000").unwrap();
+        assert_eq!(found.id, "container-1730000000-4f2a");
+        // Two ids sharing the timestamp prefix are an ambiguity, not a guess.
+        make_container(&root, "container-1730000000-77ee", "sealed three");
+        let error = resolve_container_id(&state_at(&root), "1730000000").unwrap_err();
+        assert!(error.contains("ambiguous"), "{error}");
+    }
+
+    #[test]
     fn a_parent_reference_never_reaches_the_filesystem() {
         let root = scratch("escape");
         make_container(&root, "container-1730000007", "alpha");
         // `instances/..` is the runtime root: joining it blindly would hand
         // back the directory holding every container, and a destructive verb
-        // would delete the store.
+        // would delete the store. The join gate refuses these before any path
+        // is built, and the scan never joins the raw string — so the fallback
+        // is an honest miss, not a traversal.
         for attempt in ["..", ".", "...", "..a", "a."] {
             let error = resolve_container_id(&state_at(&root), attempt).unwrap_err();
-            assert!(error.contains("invalid container id"), "{attempt}: {error}");
+            assert!(error.contains("no container named"), "{attempt}: {error}");
         }
     }
 
     #[test]
-    fn a_separated_or_blank_reference_is_rejected() {
+    fn a_blank_reference_is_rejected_and_a_spaced_name_resolves() {
         let root = scratch("shape");
-        for attempt in ["", "   ", "a/b", "a\\b", "a b", "a$b"] {
+        for attempt in ["", "   "] {
             let error = resolve_container_id(&state_at(&root), attempt).unwrap_err();
-            assert!(
-                error.contains("invalid container id") || error.contains("expected a container"),
-                "{attempt:?}: {error}"
-            );
+            assert!(error.contains("expected a container"), "{attempt:?}: {error}");
         }
+        // Names are only length-checked at creation: a legal name can carry
+        // spaces, slashes or any Unicode, and matching it must not be
+        // narrowed by the charset the id path-join needs.
+        make_container(&root, "container-1730000009", "dev box/开发");
+        let found = resolve_container_id(&state_at(&root), "dev box/开发").unwrap();
+        assert_eq!(found.id, "container-1730000009");
     }
 
     #[test]

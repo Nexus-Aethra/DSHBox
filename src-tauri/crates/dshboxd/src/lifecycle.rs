@@ -607,10 +607,13 @@ pub(crate) fn materialize_bundled_sandbox_plugin(
 
 /// Declare the bundled sandbox plugin in the profile manifest, once.
 ///
-/// Adds the dependency (pinned to the vendored version) and appends the
-/// package to `dsh.profile.bundles` when either is missing. Purely additive:
-/// a profile the user or a template already declared the plugin in is left
-/// byte-identical apart from the re-serialization.
+/// Declare the bundled sandbox plugin in the profile manifest, once.
+///
+/// Keyed on the bundle list: when `dsh.profile.bundles` already names the
+/// package the manifest is left untouched (the composer keys on that list;
+/// a manifest naming the bundle without the dependency entry is the
+/// template's own business). Otherwise the dependency is added, pinned to
+/// the vendored version, and the package is appended to the list.
 fn declare_sandbox_bundle(directory: &Path, profile: &str) -> Result<(), String> {
     let profile_dir = directory.join("profile").join("profiles").join(profile);
     let manifest_path = profile_dir.join("package.json");

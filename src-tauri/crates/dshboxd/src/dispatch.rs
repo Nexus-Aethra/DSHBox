@@ -1400,13 +1400,12 @@ fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<HandlerR
 /// is identical for every consumer (CLI text, CLI `--json`, future UI).
 fn describe_container_rpc(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
-    if !box_foundation::is_safe_identifier(&id) {
-        return Err("invalid container id".to_owned());
-    }
     // A describe is a read, and the container in it has to be one the caller
     // can name. The running-host lookup below is keyed by this id, so resolving
     // here is also what keeps a description from reporting "stopped" for a
-    // container that is running under its canonical id.
+    // container that is running under its canonical id. No charset gate here:
+    // names are only length-checked at creation, and the resolver applies its
+    // join gate exactly where a path would be built.
     let id = crate::resolve::resolve_container_key(state, &id)?;
     let root = read_config()?
         .runtime_directory
@@ -1836,11 +1835,15 @@ mod tests {
     }
 
     #[test]
-    fn describe_container_rejects_unsafe_identifier() {
+    fn describe_container_answers_a_traversal_shape_with_an_honest_miss() {
         let _guard = env_lock();
         let (state, _id, home, runtime) = setup(false);
+        // The join gate refuses path-shaped references before any path is
+        // built; the name fallback then answers the same way an unknown name
+        // does. No error text claims the reference was malformed, because a
+        // legal name can carry those characters.
         let err = describe_container_rpc(&state, &json!({ "id": "../etc/passwd" })).unwrap_err();
-        assert!(err.contains("invalid container id"), "got: {err}");
+        assert!(err.contains("no container named"), "got: {err}");
         cleanup(&home, &runtime);
     }
 

@@ -74,6 +74,12 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
 /// failure mode that had a real agent guessing the id format instead of
 /// reading the log. The order is exact id, then name, then the id with its
 /// `container-` prefix added, so the most specific spelling wins.
+///
+/// This is the CLI's own resolver, kept first-match because a person reading
+/// a list is choosing between named rows. The daemon-side equivalent for
+/// RPC verbs is `dshboxd/src/resolve.rs`, which errors on duplicate names
+/// instead of picking one — keep the two semantics in mind before reusing
+/// either for the other's callers.
 fn find_container<'a>(
     containers: &'a [box_containers::DshContainer],
     wanted: &str,

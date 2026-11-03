@@ -628,7 +628,14 @@ pub(crate) fn screenshot_rpc(state: &DaemonState, request: &Value) -> Result<Val
             .ok_or_else(|| "Page.captureScreenshot returned no image".to_owned())
     })?;
     let shot = write_screenshot(&screenshot_dir(state, &id)?, &data)?;
-    let (url, title) = with_session(state, request, page_location)?;
+    // The PNG is already on disk; a page that closed mid-call must not turn
+    // a successful capture into a failed tool call, so the location degrades
+    // to what the session still remembers (no CDP round-trip, no failure).
+    let (url, title) = with_session(state, request, page_location).or_else(|_| {
+        with_session(state, request, |session| {
+            Ok::<(String, Option<String>), String>((session.url().to_owned(), None))
+        })
+    })?;
     Ok(json!({
         "id": id,
         "path": shot.path,
@@ -1982,6 +1989,21 @@ pub(crate) fn navigate_rpc(state: &DaemonState, request: &Value) -> Result<Value
         // exactly like a broken container.
         None => container_url(state, &id)?,
     };
+    // The debug browser drives the container's own loopback origins, and
+    // everything the page shows is readable back through box_evaluate and
+    // screenshots — so a file:// URL would hand local files to the agent.
+    // Same rule the DSH webview follows; loopback http(s) only.
+    let loopback = target.starts_with("http://127.0.0.1")
+        || target.starts_with("https://127.0.0.1")
+        || target.starts_with("http://localhost")
+        || target.starts_with("https://localhost")
+        || target.starts_with("http://[::1]")
+        || target.starts_with("https://[::1]");
+    if !loopback {
+        return Err(format!(
+            "navigate is restricted to the container's loopback origin (http(s) on 127.0.0.1, localhost or [::1]); refusing {target:?}"
+        ));
+    }
     with_session(state, request, |session| session.navigate(&target))?;
     // Settled from the page rather than echoed from the request: a navigation
     // is not where the caller ends up (login redirects, SPA routing), and a
@@ -2081,7 +2103,11 @@ pub(crate) fn evaluate_rpc(state: &DaemonState, request: &Value) -> Result<Value
     // getter, a DOM node, or a cycle cannot be put on the wire, and a page's
     // own value is what the caller wanted to see.
     let wrapped = format!(
-        "(function () {{ var v = (eval({})); return (typeof v === 'string') ? v : JSON.stringify(v, null, 0); }})()",
+        // String(...) around the stringify: an expression evaluating to
+        // undefined makes JSON.stringify return undefined, the CDP reply
+        // then carries no value at all, and the schema the tool declares
+        // (result: string, required) is violated by an ordinary statement.
+        "(function () {{ var v = (eval({})); return (typeof v === 'string') ? v : String(JSON.stringify(v, null, 0)); }})()",
         Value::String(expression.clone()).to_string()
     );
     let value = with_session(state, request, |session| evaluate(session, &wrapped))?;

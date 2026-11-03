@@ -51,10 +51,12 @@ pub(crate) fn resolve_container_id(state: &DaemonState, raw: &str) -> Result<Res
 - `dshboxd/src/extensions.rs`：6 处 `container not found`
 - `dshboxd/src/apply.rs`：`resolve_container` 改为调用共享实现
 - CLI `src/cli/container.rs:67`（`logs`）：解析后再取目录
-- desktop `app/containers.rs:83`、`app/extensions.rs:105`
+- desktop `app/containers.rs`、`app/extensions.rs`：**未接线**——desktop 层发的是真实 id，保持精确匹配；
+  评审（P2-5）更正此处的过记，避免文档多报。
 
-约束：解析只在**读请求边界**做一次，向下传规范 id；`is_safe_identifier` 仍对**原始**入参先跑一遍
-（路径逃逸检查不能因为支持名字而后移）。**`delete_container` 不接解析**，见风险 R1。
+约束：解析只在**读请求边界**做一次，向下传规范 id。字符集检查只守**真正拼接路径**的那条捷径
+（`fast_lookup`）；名字匹配不设字符集门——名字在创建时只查长度，合法名字可以带空格、点号或任意
+Unicode（评审 P1-1）。**`delete_container` 不接解析**，见风险 R1。
 
 ## B. 导航与端口漂移（#2）
 

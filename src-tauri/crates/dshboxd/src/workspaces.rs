@@ -371,7 +371,18 @@ pub(crate) fn add_container_workspace_rpc(
             // something already stopped costs one line in the task log.
             task.update("Stopping the container", 10);
             task.check_cancelled()?;
-            let _ = crate::lifecycle::stop_dsh_container(&id, containers.as_ref());
+            // A stop that fails for a real reason (a lock it could not take,
+            // a config it could not read) may have left the host running,
+            // and the registry write below is the lost write this task
+            // exists to prevent — so the failure is fatal, not logged and
+            // continued. A stop of something already stopped reports
+            // success and costs one log line.
+            if let Err(error) = crate::lifecycle::stop_dsh_container(&id, containers.as_ref()) {
+                return Err(format!(
+                    "cannot stop {id} before registering the workspace: {error}"
+                ));
+            }
+            task.log(&format!("stopped {id}"));
             // The same tombstone drop `enqueue_container_restart` does: a start
             // that inherits a stale generation reads as the old host returning.
             crate::host::remove_host_record(&id);
