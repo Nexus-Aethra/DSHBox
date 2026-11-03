@@ -148,6 +148,55 @@ const COPY = {
     // fit are collected here, so no type is unreachable once there are more
     // than the bar is wide.
     resourceTabsOverflow: 'More',
+  updatesTitle: 'Updates',
+  updatesNote: 'DSH Box checks GitHub for its own releases. Detection is always local and cheap; installing replaces this app and restarts it.',
+  updatesCurrent: 'Current version',
+  updatesCheck: 'Check now',
+  updatesChecking: 'Checking…',
+  updatesUpToDate: 'This is the newest release.',
+  updatesAvailable: (version: string) => `Version ${version} is available.`,
+  updatesSkipped: (version: string) => `Version ${version} is available (skipped).`,
+  updatesSkip: 'Skip this version',
+  updatesUnskip: 'Stop skipping',
+  updatesNeverChecked: 'Never checked',
+  updatesLastChecked: (when: string) => `Last checked ${when}`,
+  updatesDownload: 'Download',
+  updatesDownloading: (stage: string, progress: number) => `Downloading… ${progress}% — ${stage}`,
+  updatesReady: (version: string) => `Version ${version} is downloaded and verified.`,
+  updatesReadyNote: (path: string) => `Verified installer: ${path}`,
+  updatesSize: (megabytes: string) => `${megabytes} MB`,
+  updatesOpenFolder: 'Open folder',
+  updatesInstall: 'Install and restart',
+  updatesInstallNote: 'DSH Box will close, install the update, and start again. Every running container stops. Continue?',
+  updatesDiscard: 'Delete download',
+  updatesManual: 'Install this file with your platform installer.',
+  updatesManualReason: 'This release cannot be installed from inside the app.',
+  updatesManualCommand: (path: string) => `Linux: sudo apt install "${path}" (or rpm -i)`,
+  updatesReleaseNotes: 'Release notes',
+  updatesError: 'Last error',
+  updatesPolicy: 'Update policy',
+  updatesPolicyNote: 'How much DSH Box handles on its own.',
+  updatesPolicyOff: 'Off',
+  updatesPolicyCheck: 'Notify',
+  updatesPolicyDownload: 'Download',
+  updatesPolicyAuto: 'Automatic',
+  updatesPolicyOffNote: 'Never checks or downloads. You can still check manually.',
+  updatesPolicyCheckNote: 'Checks once a day in the background and tells you when a release exists. Nothing is downloaded or installed.',
+  updatesPolicyDownloadNote: 'Checks and downloads the installer in the background. Installing stays your decision.',
+  updatesPolicyAutoNote: 'Checks and downloads in the background, and installs when you quit DSH Box.',
+  updatesInterval: (hours: number) => `Checks at most once every ${hours} hours.`,
+  updatesNav: 'Versions',
+  updatesVersionsTitle: 'Recent versions',
+  updatesVersionsNote: 'What each recent release changed. Only the newest release can be installed from inside the app.',
+  updatesVersionsLoading: 'Loading versions…',
+  updatesVersionsFailed: (error: string) => `Cannot load the version list: ${error}`,
+  updatesVersionCurrent: 'Current',
+  updatesVersionNewer: 'Update',
+  updatesVersionOlder: 'Older',
+  updatesShowNotes: 'Changes',
+  updatesHideNotes: 'Hide',
+  updatesNotesEmpty: 'This release has no notes.',
+  updatesUpgradeTo: 'Update to this version',
     resourceTypeLoading: 'Reading the copies…',
     resourceTypeCopies: 'Copies',
     resourceTypeCopiesEmpty: 'No copy yet — pick a container above and take one',
@@ -402,6 +451,55 @@ const COPY = {
     resourceAdd: '添加',
     resourceAdding: '添加中…',
     resourceTabsOverflow: '更多',
+  updatesTitle: '更新',
+  updatesNote: 'DSH Box 会向 GitHub 检查自身的新版本。检查始终在本地进行、开销很小；安装会替换本应用并重新启动。',
+  updatesCurrent: '当前版本',
+  updatesCheck: '立即检查',
+  updatesChecking: '正在检查…',
+  updatesUpToDate: '已经是最新版本。',
+  updatesAvailable: (version: string) => `发现新版本 ${version}。`,
+  updatesSkipped: (version: string) => `发现新版本 ${version}（已跳过）。`,
+  updatesSkip: '跳过此版本',
+  updatesUnskip: '取消跳过',
+  updatesNeverChecked: '尚未检查',
+  updatesLastChecked: (when: string) => `上次检查：${when}`,
+  updatesDownload: '下载',
+  updatesDownloading: (stage: string, progress: number) => `正在下载… ${progress}% — ${stage}`,
+  updatesReady: (version: string) => `版本 ${version} 已下载并通过校验。`,
+  updatesReadyNote: (path: string) => `已校验的安装包：${path}`,
+  updatesSize: (megabytes: string) => `${megabytes} MB`,
+  updatesOpenFolder: '打开所在文件夹',
+  updatesInstall: '安装并重启',
+  updatesInstallNote: 'DSH Box 将关闭、安装更新并重新启动。所有正在运行的容器都会停止。是否继续？',
+  updatesDiscard: '删除下载',
+  updatesManual: '请用系统安装程序安装该文件。',
+  updatesManualReason: '该版本无法从应用内直接安装。',
+  updatesManualCommand: (path: string) => `Linux：sudo apt install "${path}"（或 rpm -i）`,
+  updatesReleaseNotes: '发布说明',
+  updatesError: '上次错误',
+  updatesPolicy: '更新策略',
+  updatesPolicyNote: 'DSH Box 自行处理到什么程度。',
+  updatesPolicyOff: '关闭',
+  updatesPolicyCheck: '仅通知',
+  updatesPolicyDownload: '自动下载',
+  updatesPolicyAuto: '全自动',
+  updatesPolicyOffNote: '不检查也不下载。你仍然可以手动检查。',
+  updatesPolicyCheckNote: '每天在后台检查一次，有新版本时通知你。不下载、不安装。',
+  updatesPolicyDownloadNote: '在后台检查并下载安装包。是否安装仍由你决定。',
+  updatesPolicyAutoNote: '在后台检查并下载，并在你退出 DSH Box 时安装。',
+  updatesInterval: (hours: number) => `最多每 ${hours} 小时检查一次。`,
+  updatesNav: '版本切换',
+  updatesVersionsTitle: '版本列表',
+  updatesVersionsNote: '最近几个版本各自的变化。只有最新版本支持应用内安装。',
+  updatesVersionsLoading: '正在读取版本列表…',
+  updatesVersionsFailed: (error: string) => `无法读取版本列表：${error}`,
+  updatesVersionCurrent: '当前版本',
+  updatesVersionNewer: '可更新',
+  updatesVersionOlder: '历史版本',
+  updatesShowNotes: '查看变化',
+  updatesHideNotes: '收起',
+  updatesNotesEmpty: '该版本没有发布说明。',
+  updatesUpgradeTo: '更新到此版本',
     resourceTypeLoading: '正在读取副本…',
     resourceTypeCopies: '副本',
     resourceTypeCopiesEmpty: '还没有副本——在上面选一个容器，取一份',
@@ -500,6 +598,21 @@ const COPY = {
 } as const
 
 export type Text = (typeof COPY)[Language]
+
+// Both language blocks must carry exactly the same keys. Every UI string is
+// read as `text.<key>`; a key present in one language and missing from the
+// other typechecks fine (the read resolves against the union) and then renders
+// `undefined` at runtime -- a blank label in the language nobody on the team
+// reads. This assertion turns that into a build failure instead.
+type CopyKeys<L extends Language> = keyof (typeof COPY)[L]
+const _language_parity:
+  [CopyKeys<'en'>] extends [CopyKeys<'zh-CN'>]
+    ? [CopyKeys<'zh-CN'>] extends [CopyKeys<'en'>]
+      ? true
+      : { missingInEnglish: Exclude<CopyKeys<'zh-CN'>, CopyKeys<'en'>> }
+    : { missingInChinese: Exclude<CopyKeys<'en'>, CopyKeys<'zh-CN'>> } = true
+
+void _language_parity
 
 export function pickText(language: Language): Text {
   return COPY[language]

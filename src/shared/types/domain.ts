@@ -96,7 +96,69 @@ export type PluginGraph = {
 }
 export type TaskStatus = 'queued' | 'running' | 'waiting_input' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
 export type TaskRecord = { id: string; kind: string; resourceKeys: string[]; status: TaskStatus; stage: string; progress: number; createdAt: number; startedAt: number | null; finishedAt: number | null; logPath: string; error: string | null; params: Record<string, unknown>; cancelRequested: boolean }
-export type BoxConfig = { runtimeDirectory: string | null; selectedDshVersion: string | null; language: Language; toolchainSources: Record<string, string>; githubMirror: string | null; npmRegistry: string | null }
+export type BoxConfig = { runtimeDirectory: string | null; selectedDshVersion: string | null; language: Language; toolchainSources: Record<string, string>; githubMirror: string | null; npmRegistry: string | null; autoUpdate?: UpdatePolicy; skippedUpdateVersion?: string | null }
+
+
+// ---- self-update ----
+// Mirrors box_updates and dshboxd::updates. One flat state object so the
+// Settings pane is a single round trip; see docs/specs/auto-update.md.
+export type UpdatePolicy = 'off' | 'check' | 'download' | 'auto'
+
+/** One installer published for one platform. */
+export type UpdateAsset = {
+  url: string
+  sha256: string
+  size: number
+  /** msi | deb | rpm | dmg */
+  installer: string
+  /** `auto` installs unattended; `manual` needs a person (and root). */
+  installMode: 'auto' | 'manual'
+}
+
+/** The newest release the box knows about -- newer or not, so the pane can
+ *  say "up to date" without a second request, and a downgrade is never
+ *  offered as an update. */
+export type UpdateRelease = {
+  version: string
+  notesUrl: string | null
+  /** False when this build is already that version, or ahead of it. */
+  newer: boolean
+  /** Why this release cannot be installed from inside the app, if it cannot. */
+  manualReason: string | null
+  asset: UpdateAsset | null
+}
+
+export type UpdateDownload = {
+  version: string
+  state: 'ready'
+  bytes: number
+  path: string
+}
+
+/** One row of the version page's history list (read-only; installs still come
+ *  only from the newest release's manifest). */
+export type UpdateReleaseSummary = {
+  version: string
+  tag: string
+  publishedAt: string | null
+  /** The release body, rendered as plain text in the detail view. */
+  notes: string | null
+  notesUrl: string | null
+  prerelease: boolean
+}
+
+export type UpdateState = {
+  currentVersion: string
+  buildStamp: string
+  policy: UpdatePolicy
+  skippedVersion: string | null
+  checkedAt: number | null
+  lastError: string | null
+  checkIntervalSeconds: number
+  available: UpdateRelease | null
+  download: UpdateDownload | null
+}
+
 export type ResourceKind = 'toolchain' | 'runtime' | 'container' | 'task' | 'template' | 'plugin' | 'bundle'
 export type ResourceHealth = 'ready' | 'missing' | 'busy' | 'failed' | 'unknown'
 export type ResourceState = { resourceKey: string; kind: ResourceKind; name: string; health: ResourceHealth; detail: string | null; progress: number | null }

@@ -4,7 +4,7 @@ export type DaemonBuildNotice =
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import type { BoxConfig, ContainerExtensions, ContainerPathListing, ContainerResources, DataEntry, DshContainer, DshVersion, ExtensionBundle, GraphSourceKind, Language, PluginGraph, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, InstalledPlugin,
+import type { BoxConfig, ContainerExtensions, ContainerPathListing, ContainerResources, DataEntry, DshContainer, DshVersion, ExtensionBundle, GraphSourceKind, Language, PluginGraph, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, InstalledPlugin, UpdatePolicy, UpdateReleaseSummary, UpdateState,
   ResourceState, ResourceTree, ResourceTypeSummary, ResourceView, ServerServiceStatus, StoredResource, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
 
 type ToolchainPayload = { id: string; name: string; managedVersion: string | null }
@@ -87,6 +87,21 @@ export const boxApi = {
   getServerServiceStatus: () => ipc<ServerServiceStatus>('get_server_service_status'),
   getDaemonStatus: () => ipc<boolean>('get_daemon_status'),
   getDaemonBuildNotice: () => ipc<DaemonBuildNotice>('get_daemon_build_notice'),
+  // ---- self-update ----
+  // Every one of these is a daemon RPC except the two that end a process or
+  // open a folder, which are desktop commands: the daemon cannot replace the
+  // binary it is running from.
+  getUpdateState: () => ipc<UpdateState>('get_update_state'),
+  checkForUpdate: () => ipc<UpdateState>('check_for_update'),
+  listUpdateReleases: () => ipc<{ releases: UpdateReleaseSummary[] }>('list_update_releases'),
+  setUpdatePolicy: (policy: UpdatePolicy) => ipc<{ policy: UpdatePolicy }>('set_update_policy', { policy }),
+  skipUpdateVersion: (version: string | null) => ipc<{ skippedVersion: string | null }>('skip_update_version', { version }),
+  clearUpdateSkip: () => ipc<{ skippedVersion: null }>('clear_update_skip'),
+  downloadUpdate: (version: string | null) => ipc<TaskRecord>('enqueue_update_download', { version }),
+  discardUpdateDownload: (version: string | null) => ipc<{ version: string; removed: number }>('discard_update_download', { version }),
+  openUpdateFolder: (path: string) => ipc<void>('open_update_folder', { path }),
+  installUpdate: (path: string) => ipc<{ scheduled: boolean; script: string }>('install_update', { path }),
+  getInstallOnQuit: () => ipc<{ candidate: { version: string; path: string; installer: string } | null; policy: UpdatePolicy }>('get_install_on_quit'),
   restartServerService: () => ipc<void>('restart_server_service'),
   detectToolchains: async () => (await ipc<ToolchainPayload[]>('detect_toolchains')).map(({ id, name, managedVersion }) => ({ id, name, version: managedVersion })),
   listDshVersions: () => ipc<DshVersion[]>('list_dsh_versions'),
