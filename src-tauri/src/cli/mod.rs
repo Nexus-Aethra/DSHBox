@@ -18,6 +18,7 @@ pub mod rpc;
 pub mod run;
 pub mod setup_path;
 pub mod template;
+pub mod update;
 pub mod workspace;
 
 use crate::desktop;
@@ -91,6 +92,7 @@ pub fn run() -> Option<i32> {
         "image" => image::command(&arguments[1..]),
         "rpc" => raw_rpc(&arguments[1..]),
         "setup-path" => setup_path::command(&arguments[1..]),
+        "update" => update::command(&arguments[1..]),
         "template" => template::command(&arguments[1..]),
         "resources" => {
             eprintln!("warning: 'dshbox resources' is deprecated; 'plugin' and 'bundle' cover its actions.");
@@ -139,11 +141,17 @@ fn raw_rpc(arguments: &[String]) -> Result<(), String> {
 /// caller would not learn that the one thing it asked for was not applied until
 /// something downstream choked on the shape it got.
 pub(crate) fn read_flags(rest: &[String], known: &[&str]) -> Result<bool, String> {
-    let takes = known.join(", ");
+    let mut takes: Vec<&str> = vec!["--json"];
+    takes.extend(known.iter().copied());
+    let takes = takes.join(", ");
     let mut as_json = false;
     for argument in rest {
         if argument == "--json" {
             as_json = true;
+        } else if known.contains(&argument.as_str()) {
+            // A flag the verb documents. `--json` is universal and is handled
+            // above, so `known` never has to repeat it.
+            continue;
         } else {
             let kind = if argument.starts_with('-') { "flag" } else { "argument" };
             return Err(format!("unknown {kind} {argument}. This command takes: {takes}"));

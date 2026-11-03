@@ -402,6 +402,7 @@ DSH Box 在 build 阶段会自动:
 	| `read_template` | `name` | 模板脚本正文 |
 	| `read_template_list` | `name` | built template 资源清单 |
 	| `save_mirror_settings` | `githubMirror`, `npmRegistry` | — |
+	| `save_github_token` | `githubToken` | — |
 	| `save_runtime_directory` | `directory` | — |
 	| `container_list_plugins` | `containerId`, `profile` | 插件列表 |
 	| `remove_template` | `name` | — |

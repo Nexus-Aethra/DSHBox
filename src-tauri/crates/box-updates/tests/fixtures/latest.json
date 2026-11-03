@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "version": "0.1.9",
+  "releasedAt": "2026-11-02T00:00:00Z",
+  "notes": "DSH Box 0.1.9 is available. See the release page for the full notes.",
+  "notesUrl": "https://github.com/Nexus-Aethra/DSHBox/releases/tag/v0.1.9",
+  "minimumVersion": "0.1.9",
+  "platforms": {
+    "win-x64": [
+      {
+        "url": "https://github.com/Nexus-Aethra/DSHBox/releases/download/v0.1.9/dshbox_0.1.9_x64_en-US.msi",
+        "sha256": "1ea239f57ae94bba3534a7f1fc257bad348cb4023560113dc65140274e554167",
+        "size": 11,
+        "installer": "msi",
+        "installMode": "auto"
+      }
+    ],
+    "linux-x64": [
+      {
+        "url": "https://github.com/Nexus-Aethra/DSHBox/releases/download/v0.1.9/dshbox_0.1.9_amd64.deb",
+        "sha256": "133b3d54712e6572f4cf5ecae027afa60edfec17e75d9a28bb702972d2fe6a97",
+        "size": 11,
+        "installer": "deb",
+        "installMode": "manual"
+      },
+      {
+        "url": "https://github.com/Nexus-Aethra/DSHBox/releases/download/v0.1.9/dshbox-0.1.9-1.x86_64.rpm",
+        "sha256": "374598cc2bed25b3b27733d24d0ec4def2c5e6f95cbe2c53e4cefa23f7f25af7",
+        "size": 11,
+        "installer": "rpm",
+        "installMode": "manual"
+      }
+    ],
+    "macos-arm64": [
+      {
+        "url": "https://github.com/Nexus-Aethra/DSHBox/releases/download/v0.1.9/dshbox_0.1.9_aarch64.dmg",
+        "sha256": "fbedee52ae8ea9ec0cafb5e9b56fda536c54d0e9536a3b1fd5320230b8727c3f",
+        "size": 11,
+        "installer": "dmg",
+        "installMode": "auto"
+      }
+    ]
+  }
+}

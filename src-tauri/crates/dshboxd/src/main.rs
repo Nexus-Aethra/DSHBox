@@ -18,6 +18,7 @@ mod host;
 mod lifecycle;
 mod plugins;
 mod resources;
+mod updates;
 mod sealed;
 mod state;
 #[cfg(test)]

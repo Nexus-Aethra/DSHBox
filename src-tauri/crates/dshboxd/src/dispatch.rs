@@ -100,6 +100,18 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
             "runtime": bundled_runtime().map(|_| "ready").unwrap_or("missing"),
         }))),
         Some("get_info") => get_info().map(Sync),
+        // Update discovery. The read is cheap and never touches the network;
+        // the explicit check and the download are the two that do.
+        Some("get_update_state") => crate::updates::get_update_state_rpc(state).map(Sync),
+        Some("check_update") => crate::updates::check_update_rpc().map(Sync),
+    Some("list_update_releases") => crate::updates::list_update_releases_rpc().map(Sync),
+        Some("enqueue_update_download") => crate::updates::enqueue_update_download(state, request),
+        Some("discard_update_download") => {
+            crate::updates::discard_update_download(request).map(Sync)
+        }
+        Some("skip_update_version") => crate::updates::skip_update_version(request).map(Sync),
+        Some("clear_update_skip") => crate::updates::clear_update_skip().map(Sync),
+        Some("set_update_policy") => crate::updates::set_update_policy(request).map(Sync),
         Some("list_containers") => list_containers(state).map(Sync),
         Some("list_templates") => list_sealed_templates().map(|items| Sync(json!(items))),
         Some("read_template") => {
@@ -184,6 +196,7 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
     Some("debug_console") => crate::debug::console_rpc(state, request).map(Sync),
     Some("apply_document") => crate::apply::apply_document_rpc(state, request).map(Sync),
         Some("save_mirror_settings") => save_mirror_settings_rpc(request).map(Sync),
+        Some("save_github_token") => save_github_token_rpc(request).map(Sync),
         Some("save_runtime_directory") => save_runtime_directory_rpc(state, request).map(Sync),
         Some("refresh_dsh_catalog") => enqueue_dsh_catalog_refresh(state),
         Some("pull_template") => enqueue_pull_template(state, request),
@@ -353,7 +366,10 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
 fn get_info() -> Result<Value, String> {
     let config = read_config()?;
     let mut info = json!({
-        "version": env!("CARGO_PKG_VERSION"),
+        // The application version this install was released as. The crate has
+        // its own 0.1.0 and reporting that here is what made the updater treat
+        // an up-to-date install as behind.
+        "version": crate::updates::APP_VERSION,
         "buildStamp": env!("DSHBOX_BUILD_STAMP"),
         "pid": std::process::id(),
         "runtimeDirectory": config.runtime_directory,
@@ -1142,6 +1158,21 @@ fn save_mirror_settings_rpc(request: &Value) -> Result<Value, String> {
     let mut config = read_config()?;
     config.github_mirror = optional_string(&request["githubMirror"]);
     config.npm_registry = optional_string(&request["npmRegistry"]);
+    write_config(&config)?;
+    Ok(json!({ "saved": true }))
+}
+
+/// Store or clear the GitHub API token. Trimmed here as well as in the
+/// desktop command -- the RPC is reachable from other callers, and a padded
+/// token authenticates as itself. An empty string clears it, so the settings
+/// field is its own eraser.
+fn save_github_token_rpc(request: &Value) -> Result<Value, String> {
+    let mut config = read_config()?;
+    config.github_token = request["githubToken"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     write_config(&config)?;
     Ok(json!({ "saved": true }))
 }

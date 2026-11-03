@@ -273,6 +273,38 @@ jobs:
             echo "no docs/releases/${tag}.md; falling back to generated notes"
           fi
 
+      # The updater's *full* tier reads this asset: per platform, the installer
+      # URL, its byte size and its SHA-256. The digest comes from the file on
+      # disk that is about to be uploaded, never from the GitHub API -- that
+      # needs auth and races the upload. A release without this asset is one
+      # the app can see but cannot install.
+      #
+      # minimumVersion equals the version being released: this is the first
+      # release that ships an updater, so nothing older may replace itself in
+      # place into a layout it never had. Bump it only for a later release that
+      # cannot update from the current one.
+      #
+      # latest.json is copied into installers/ so the next step publishes it
+      # with the installers through the same create-or-upload path, keeping
+      # that step's --clobber behaviour for a re-run of a tag intact.
+      - name: Generate latest.json
+        env:
+          NOTES_FILE: ${{ steps.notes.outputs.file }}
+        run: |
+          node scripts/release-manifest.mjs \
+            --installers installers \
+            --version "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --notes-file "${NOTES_FILE}" \
+            > latest.json
+          # Validate the file that was actually written: a redirect that
+          # produced nothing must fail here, not upload an empty asset.
+          node scripts/release-manifest.mjs \
+            --check latest.json \
+            --version "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY"
+          cp latest.json installers/latest.json
+
       - name: Attach installers to the release
         env:
           GH_TOKEN: ${{ github.token }}

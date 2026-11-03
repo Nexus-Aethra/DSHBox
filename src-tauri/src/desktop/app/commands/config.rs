@@ -71,3 +71,23 @@ pub(crate) fn save_mirror_settings(
     refresh_global_state(&app);
     Ok(config)
 }
+
+#[tauri::command(async)]
+pub(crate) fn save_github_token(
+    token: Option<String>,
+    app: tauri::AppHandle,
+) -> Result<BoxConfig, String> {
+    let client = connect()?;
+    // Trimmed here and re-trimmed daemon-side: an empty field clears the
+    // token, so the settings input is its own eraser.
+    call(
+        &client,
+        "save_github_token",
+        serde_json::json!({
+            "githubToken": token.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty()),
+        }),
+    )?;
+    let config = read_config()?;
+    refresh_global_state(&app);
+    Ok(config)
+}

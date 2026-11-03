@@ -143,11 +143,24 @@ const COMMANDS = {
   // Answering {stale:false} keeps the banner off a path where it cannot be true,
   // and keeps this table in step with `command_surface`.
   get_daemon_build_notice: async () => ({ stale: false }),
+  // Update discovery is entirely daemon-side, so the browser can exercise the
+  // Settings pane against a real daemon. The two that end the app process or
+  // open a native folder cannot be: they are desktop commands, and the bridge
+  // answers a missing capability explicitly rather than faking it.
+  get_update_state: () => callDaemon('get_update_state', {}),
+  check_for_update: () => callDaemon('check_update', {}),
+  list_update_releases: () => callDaemon('list_update_releases', {}),
+  set_update_policy: ({ policy }) => callDaemon('set_update_policy', { policy }),
+  skip_update_version: ({ version }) => callDaemon('skip_update_version', { version }),
+  clear_update_skip: () => callDaemon('clear_update_skip', {}),
+  discard_update_download: ({ version }) => callDaemon('discard_update_download', { version }),
+  enqueue_update_download: ({ version }) => callDaemon('enqueue_update_download', { version }),
   load_config: async () => readConfig(),
   save_language: async ({ language }) => writeConfig({ language }),
   save_runtime_directory: async ({ directory }) => writeConfig({ runtimeDirectory: directory }),
   save_mirror_settings: async ({ githubMirror, npmRegistry }) =>
     writeConfig({ githubMirror, npmRegistry }),
+  save_github_token: async ({ token }) => writeConfig({ githubToken: token }),
   get_server_service_status: async () => ({
     supported: false,
     enabled: false,

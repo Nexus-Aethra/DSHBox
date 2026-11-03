@@ -44,6 +44,9 @@ select:focus { border-color: #2864dc; outline: 2px solid #dbe7ff; }
 .topbar-actions { align-items: center; display: flex; gap: 8px; }
 .task-button { align-items: center; background: #fff; border: 1px solid #e1e4e8; border-radius: 8px; color: #3d444d; cursor: pointer; display: inline-flex; font-size: 13px; gap: 7px; padding: 8px 11px; }
 .task-button span { align-items: center; background: #2864dc; border-radius: 999px; color: #fff; display: inline-flex; font-size: 11px; height: 17px; justify-content: center; min-width: 17px; padding: 0 5px; }
+/* An available update is an invitation, not a warning: a coloured label in the
+   top bar that opens the Updates pane. It is not red because nothing is wrong. */
+.update-badge { color: #2864dc; background: #eef3ff; border: 1px solid #dbe6ff; border-radius: 8px; font-size: 13px; padding: 7px 11px; }
 .brand { font-size: 17px; font-weight: 650; letter-spacing: -0.02em; }
 .navigation { display: flex; gap: 4px; }
 .nav-item { color: #737a83; background: transparent; border: 0; border-radius: 7px; cursor: pointer; font-size: 13px; padding: 8px 11px; }
@@ -201,6 +204,63 @@ code.missing { color: #b42318; }
 .settings-input:focus { border-color: #2864dc; outline: none; }
 .settings-controls { align-items: center; display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
 .settings-controls select { border: 1px solid #dce0e5; border-radius: 8px; font: 13px inherit; padding: 8px 28px 8px 9px; width: 260px; }
+.segmented { border: 1px solid #dce0e5; border-radius: 8px; display: flex; overflow: hidden; }
+.segmented .segment { background: #fff; border: 0; border-right: 1px solid #e6e8eb; color: #4b5563; cursor: pointer; flex: 1 1 auto; font: inherit; font-size: 13px; padding: 7px 14px; white-space: nowrap; }
+.segmented .segment:last-child { border-right: 0; }
+.segmented .segment:hover:not(:disabled) { background: #f3f5f7; }
+.segmented .segment.selected { background: #2864dc; color: #fff; }
+.segmented .segment:disabled { cursor: default; opacity: .55; }
+.status-line { padding: 10px 20px; }
+.fold-row { padding: 10px 20px; }
+.fold-toggle { align-items: center; background: none; border: 0; color: #4b5563; cursor: pointer; display: flex; font: inherit; font-size: 13px; font-weight: 600; gap: 8px; padding: 4px 0; }
+.fold-toggle:hover { color: #1f2937; }
+.fold-arrow { display: inline-block; transition: transform .15s ease; }
+.fold-arrow.open { transform: rotate(90deg); }
+.fold-count { background: #f0f1f3; border-radius: 999px; color: #6b7280; font-size: 11px; padding: 1px 8px; }
+.version-block { border-top: 1px solid #eef0f2; display: flex; flex-direction: column; gap: 10px; padding: 14px 20px 18px; }
+.version-list { border: 1px solid #eef0f2; border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; }
+.version-head { align-items: baseline; background: #fff; border: 0; border-bottom: 1px solid #f0f1f3; cursor: pointer; display: flex; font: inherit; gap: 12px; padding: 9px 14px; text-align: left; width: 100%; }
+.version-head:last-child { border-bottom: 0; }
+.version-head:hover { background: #f8f9fa; }
+.version-head.picked { background: #f4f7fd; }
+.version-head:focus-visible { outline: 2px solid #dbe7ff; outline-offset: -2px; }
+.version-update { margin-left: auto; }
+.version-update .ui-button:disabled { visibility: visible; }
+.version-name { font-size: 14px; font-weight: 600; }
+.version-prerelease { background: #f0e6b8; border-radius: 4px; color: #7a5c00; font-size: 11px; font-weight: 500; margin-left: 6px; padding: 1px 5px; }
+.version-badge { border-radius: 999px; flex: 0 0 auto; font-size: 11px; padding: 2px 9px; }
+.version-badge.current { background: #eef4ff; color: #2864dc; }
+.version-badge.newer { background: #e6f5ea; color: #1e7a38; }
+.version-badge.older { background: #f0f1f3; color: #6b7280; }
+.version-date { color: #8a919b; font-size: 12px; }
+.version-actions { display: flex; gap: 8px; margin-left: auto; }
+.version-detail { border: 1px solid #eef0f2; border-radius: 8px; padding: 12px 14px; }
+.version-detail-head { align-items: baseline; display: flex; gap: 12px; margin-bottom: 8px; }
+.version-notes { background: #f8f9fa; border: 1px solid #eef0f2; border-radius: 8px; color: #3d434b; font-size: 12.5px; line-height: 1.6; margin: 0; max-height: 320px; overflow: auto; padding: 12px 14px; }
+/* Rendered markdown (release notes). shared/ui/Markdown.tsx emits React
+   elements, not HTML, so these rules only dress structure that is already
+   safe text. Heading sizes stay inside the pane's scale instead of the
+   document ones a changelog writer assumed. */
+.md { overflow-wrap: break-word; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { font-size: 13px; font-weight: 650; line-height: 1.4; margin: 14px 0 5px; }
+.md h1 { font-size: 14px; }
+.md p { margin: 6px 0; }
+.md ul, .md ol { margin: 6px 0; padding-left: 20px; }
+.md li { margin: 3px 0; }
+.md li > p { margin: 2px 0; }
+.md li > ul, .md li > ol { margin: 3px 0; }
+.md a { color: #2864dc; overflow-wrap: anywhere; }
+.md code { background: #eceff2; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; padding: 1px 5px; }
+.md pre { background: #fff; border: 1px solid #e6e8eb; border-radius: 6px; margin: 8px 0; overflow: auto; padding: 8px 10px; }
+.md pre code { background: none; padding: 0; }
+.md blockquote { border-left: 3px solid #d8dce1; color: #6b7280; margin: 8px 0; padding: 1px 0 1px 10px; }
+.md hr { border: 0; border-top: 1px solid #e6e8eb; margin: 12px 0; }
+.md table { border-collapse: collapse; margin: 8px 0; }
+.md th, .md td { border: 1px solid #e6e8eb; padding: 4px 8px; text-align: left; }
+.md th { background: #f0f1f3; font-weight: 600; }
+.md-empty { color: #8a919b; margin: 0; }
 .settings-save { display: block; font-size: 13px; margin: 18px 20px 0 auto; padding: 8px 12px; }
 .solo-label { margin: 0; }
 .language-switch { display: inline-flex; padding: 3px; background: #f3f4f6; border-radius: 8px; }

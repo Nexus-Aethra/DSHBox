@@ -26,7 +26,7 @@ DSH Box is a lightweight desktop shell built with [Tauri 2](https://tauri.app) t
 - **A slow daemon never freezes the window** — commands run off the main thread and every RPC is bounded.
 - **An older server is kept, and said so** — a service from a previous build keeps running, with a topbar line naming both.
 - **RPC + events** — one `POST /rpc` and one SSE stream serve the UI, the CLI and agents alike.
-- **Network-friendly** — GitHub mirror, npm registry mirror, automatic proxy detection.
+- **Network-friendly** — GitHub mirror, optional GitHub API token (sent direct to `api.github.com`, never through the mirror), npm registry mirror, automatic proxy detection.
 - **Tray and background service** — `dshboxd` keeps working with the window closed.
 - **Lightweight** — Tauri, not Electron.
 - **Bilingual UI** — English and 简体中文.
@@ -81,7 +81,6 @@ the app picked for you.
 ![The topbar reporting that the background server is from an older build, with both stamps in the text](docs/images/stale-daemon.png)
 
 ---
-
 
 ---
 
@@ -353,6 +352,25 @@ git tag v0.1.8 && git push origin v0.1.8
 [`.github/workflows/release.yml`](.github/workflows/release.yml) takes it from there: it builds the Linux `.deb` + `.rpm`, the Windows MSI, and the macOS arm64 `.dmg` through the same `bundle:*` scripts a developer runs locally, and attaches all of them to the GitHub Release for that tag. The tag is compared against the three version fields first, so a mismatched tag fails instead of publishing mislabelled installers; if a release for the tag already exists, the artifacts are re-uploaded over it. Running the workflow manually (`workflow_dispatch`) builds everything without publishing, which is the way to test a pipeline change.
 
 Installers are **unsigned**: macOS needs the usual Gatekeeper bypass on first launch and Windows shows a SmartScreen prompt. Signing and notarization identities can be added to the workflow when certificates are available.
+
+### Updating
+
+DSH Box updates itself. The **Settings → Updates** pane shows the current version, the newest published release, and one control per stage: check, download, install. The daemon checks GitHub once a day in the background even when the window is closed, because it is the process that stays running; the top bar shows a quiet `Updates` label when a release exists.
+
+One policy per machine, in the pane:
+
+| Policy | Checks | Downloads | Installs |
+|--------|--------|-----------|----------|
+| **Off** | only when you press the button | no | no |
+| **Notify** (default) | once a day | no | no |
+| **Download** | once a day | yes | when you say so |
+| **Automatic** | once a day | yes | when you say so — the fetch is automatic, the install still asks |
+
+Detection is cheap and local; replacing a running binary is not, so the default only tells you. Nothing is ever executed that was not first checked against the SHA-256 published in the release's `latest.json`, and a release that predates that manifest is offered as a manual download instead of an unverified install.
+
+Windows and macOS install in place: the app closes, a detached helper waits for it to exit, runs the MSI or swaps the `.app`, then relaunches. **Every running container stops** — that is what the confirmation says before it starts. Linux packages need root, so the pane downloads and verifies the file and then shows the `apt`/`rpm` command rather than escalating behind the GUI.
+
+The SDK also exposes it without the UI: `dshbox update status|check|download|install|policy`, all of which accept `--json`. The full contract is in [`docs/specs/auto-update.md`](docs/specs/auto-update.md).
 
 ---
 

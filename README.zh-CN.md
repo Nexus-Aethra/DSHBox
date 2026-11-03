@@ -28,7 +28,7 @@ DSH Box 是一个用 [Tauri 2](https://tauri.app) 写的轻量桌面外壳，负
 - **daemon 慢也不冻窗口** —— 命令不在主线程执行，每个 RPC 都有超时。
 - **旧服务会保留，并且说清楚** —— 上一版构建的后台服务继续运行，顶栏一行写明两个版本，不靠你去日志里翻。
 - **RPC + 事件流** —— 一个 `POST /rpc` 加一条 SSE 流，界面、CLI 和 agent 共用。
-- **对网络友好** —— GitHub 镜像、npm 仓库镜像、自动代理探测。
+- **对网络友好** —— GitHub 镜像、可选的 GitHub API 令牌（仅直连 api.github.com 发送，绝不经过镜像）、npm 仓库镜像、自动代理探测。
 - **托盘与后台服务** —— 窗口关掉 `dshboxd` 仍继续工作。
 - **轻量** —— Tauri，不是 Electron。
 - **双语界面** —— English 与简体中文。
@@ -76,7 +76,6 @@ RPC 接口只会新增，客户端对旧服务做不到的调用会自行降级�
 ![顶栏提示后台服务来自较早的构建，文案中写明两个 stamp](docs/images/stale-daemon.png)
 
 ---
-
 
 ---
 
@@ -329,6 +328,25 @@ git tag v0.1.8 && git push origin v0.1.8
 接下来交给 [`.github/workflows/release.yml`](.github/workflows/release.yml)：它用开发者本地同样的 `bundle:*` 脚本构建 Linux `.deb` + `.rpm`、Windows MSI 和 macOS arm64 `.dmg`，并把它们附到该 tag 的 GitHub Release 上。tag 会先与三个版本字段比对，不一致直接失败而不是发布贴错标签的安装包；如果该 tag 已有 release，产物会被重新上传覆盖。手动触发（`workflow_dispatch`）会构建全部产物但不发布，适合验证流水线改动。
 
 安装包**未签名**：macOS 首次打开需要绕一次 Gatekeeper，Windows 会弹 SmartScreen。拿到证书后可以往 workflow 里加签名与公证身份。
+
+### 更新
+
+DSH Box 可以自行更新。**设置 → 更新** 页面显示当前版本、最新发布版本，以及每个阶段对应的一个操作：检查、下载、安装。daemon 每天在后台检查一次 GitHub，即使窗口关着也照常进行——因为它才是长期驻留的进程；有新版本时，顶栏会出现一个低调的 `更新` 标签。
+
+每台机器一份策略，在该页面里选择：
+
+| 策略 | 检查 | 下载 | 安装 |
+|------|------|------|------|
+| **关闭** | 只有你点按钮时 | 不下载 | 不安装 |
+| **仅通知**（默认） | 每天一次 | 不下载 | 不安装 |
+| **自动下载** | 每天一次 | 自动 | 由你决定 |
+| **全自动** | 每天一次 | 自动 | 仍需你确认——自动的是取回，不是安装 |
+
+检查开销很小且完全在本地；替换一个正在运行的二进制则不是，所以默认只做告知。任何文件在执行前都会先核对发布包 `latest.json` 中公布的 SHA-256；如果某个版本早于该清单，会以“手动下载”的方式呈现，而不是执行未经校验的安装。
+
+Windows 与 macOS 支持原地安装：应用关闭后，一个已脱离的辅助程序等待它退出，运行 MSI 或替换 `.app`，然后重新启动。**所有正在运行的容器都会停止**——确认框里写明了这一点。Linux 的软件包需要 root，所以该页面只负责下载并校验文件，然后给出 `apt`/`rpm` 命令，而不是在图形界面背后提权。
+
+也可以不通过界面操作：`dshbox update status|check|download|install|policy`，都支持 `--json`。完整契约见 [`docs/specs/auto-update.md`](docs/specs/auto-update.md)。
 
 ---
 

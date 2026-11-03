@@ -13,6 +13,7 @@ import { TaskPanel } from './features/tasks/TaskPanel'
 import { ToolchainRow } from './features/toolchains/ToolchainRow'
 import { AgentGuide } from './features/settings/AgentGuide'
 import { ResourceTypesSettings } from './features/settings/ResourceTypesSettings'
+import { UpdatesSettings } from './features/settings/UpdatesSettings'
 import { LanguageSwitch } from './shared/ui/LanguageSwitch'
 import { DirectoryCard, Workspace } from './shared/ui/Workspace'
 import { Button } from './ui/Button'
@@ -23,7 +24,7 @@ import { Select } from './ui/Select'
 import { Toolbar } from './ui/Toolbar'
 import { Stack } from './ui/Stack'
 type Section = 'container' | 'resources' | 'settings'
-type SettingsPane = 'general' | 'toolchains' | 'resources' | 'agent'
+type SettingsPane = 'general' | 'toolchains' | 'resources' | 'agent' | 'updates'
 
 /**
  * Startup gate: shows a spinner while the daemon comes up (fresh spawn or
@@ -94,12 +95,35 @@ export function MainApp() {
   // decided at startup and cannot change while this window is open, and the
   // command only reports a value the check already computed.
   const [staleDaemon, setStaleDaemon] = useState<DaemonBuildNotice>({ stale: false })
+  // The available update's version, or null. The top bar is an entry point:
+  // a user should not have to visit Settings to learn one exists.
+  const [updateBadge, setUpdateBadge] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
     void boxApi.getDaemonBuildNotice()
       .then((notice) => { if (!cancelled) setStaleDaemon(notice) })
       .catch(() => { /* a build that cannot answer this is not worth an error */ })
+    return () => { cancelled = true }
+  }, [])
+
+  // The badge: one cheap read when the window opens. The daemon does the
+  // actual checking on its own schedule, so this asks "do you already know
+  // about something" rather than making a network call of its own. A failure
+  // here is silent on purpose -- an update nobody can be told about yet is not
+  // an error the user needs to see at startup.
+  useEffect(() => {
+    let cancelled = false
+    void boxApi.getUpdateState()
+      .then((state) => {
+        if (cancelled) return
+        const available = state.available
+        const skipped = state.skippedVersion
+        if (available !== null && available.newer && available.version !== skipped) {
+          setUpdateBadge(available.version)
+        }
+      })
+      .catch(() => undefined)
     return () => { cancelled = true }
   }, [])
 
@@ -256,6 +280,7 @@ export function MainApp() {
         ))}
       </nav>
       <div className="topbar-actions">
+        {updateBadge !== null && <Button variant="ghost" size="sm" className="update-badge" title={text.updatesAvailable(updateBadge)} onClick={() => { setSettingsPane('updates'); setSection('settings'); loadSection('settings') }}>{text.updatesTitle}</Button>}
         <button type="button" className="task-button" onClick={() => { tasks.setTaskPanelOpen(true) }}>{text.tasks}{tasks.tasks.filter((task) => task.status === 'queued' || task.status === 'running').length > 0 && <span>{tasks.tasks.filter((task) => task.status === 'queued' || task.status === 'running').length}</span>}</button>
         <Button variant={section === 'settings' ? 'ghost' : 'ghost'} size="sm" className={section === 'settings' ? 'settings-button active' : 'settings-button'} onClick={() => { setSection('settings'); loadSection('settings') }}>{text.settings}</Button>
       </div>
@@ -368,6 +393,7 @@ export function MainApp() {
             <Button variant="ghost" size="sm" className={settingsPane === 'toolchains' ? 'active' : ''} onClick={() => { setSettingsPane('toolchains'); void settings.refreshToolchains() }}>{text.toolchainSettings}</Button>
             <Button variant="ghost" size="sm" className={settingsPane === 'resources' ? 'active' : ''} onClick={() => { setSettingsPane('resources') }}>{text.resourceTypesPane}</Button>
             <Button variant="ghost" size="sm" className={settingsPane === 'agent' ? 'active' : ''} onClick={() => { setSettingsPane('agent') }}>{text.agentGuide}</Button>
+            <Button variant="ghost" size="sm" className={settingsPane === 'updates' ? 'active' : ''} onClick={() => { setSettingsPane('updates') }}>{text.updatesNav}</Button>
           </nav>
           <div className="settings-content">
             {settingsPane === 'general' ? (
@@ -388,6 +414,13 @@ export function MainApp() {
                   </div>
                 </section>
                 <section className="settings-row">
+                  <div><p className="label">{text.githubToken}</p><p className="path">{text.githubTokenNote}</p></div>
+                  <div className="settings-controls">
+                    <Input type="password" value={settings.githubToken} placeholder="ghp_…" onChange={(event) => { settings.setGithubToken(event.target.value) }} className="settings-input" />
+                    <Button variant="primary" size="sm" disabled={settings.savingToken} onClick={() => { void settings.saveGithubToken() }}>{settings.savingToken ? '…' : text.saveToken}</Button>
+                  </div>
+                </section>
+                <section className="settings-row">
                   <div><p className="label">{text.npmRegistry}</p><p className="path">{text.npmRegistryNote}</p></div>
                   <div className="settings-controls">
                     <Select value={settings.npmRegistry} onChange={(event) => { settings.setNpmRegistry(event.target.value); void settings.saveNpmRegistry() }} options={NPM_REGISTRY_PRESETS.map((preset) => ({ value: preset.value, label: preset.label }))} />
@@ -401,6 +434,8 @@ export function MainApp() {
               </div>
             ) : settingsPane === 'agent' ? (
               <AgentGuide text={text} />
+            ) : settingsPane === 'updates' ? (
+              <UpdatesSettings text={text} onError={setError} />
             ) : settingsPane === 'resources' ? (
               <ResourceTypesSettings text={text} />
             ) : (
