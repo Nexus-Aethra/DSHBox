@@ -1,8 +1,11 @@
 //! Persistent DSH container metadata independent from desktop windows.
 
+pub mod resolve;
+
 use box_foundation::BoxResult;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::PathBuf};
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DshContainer {

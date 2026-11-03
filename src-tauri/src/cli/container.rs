@@ -67,50 +67,17 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
 
 /// Pick the one container a bare argument names.
 ///
-/// The id is `container-<timestamp>`, which nobody types from memory, so a
-/// person reaches for the name they created the container with or the bare
-/// timestamp part of it. Matching only the exact id answered `container not
-/// found` for a container sitting in the list the caller just read -- the
-/// failure mode that had a real agent guessing the id format instead of
-/// reading the log. The order is exact id, then name, then the id with its
-/// `container-` prefix added, so the most specific spelling wins.
-///
-/// This is the CLI's own resolver, kept first-match because a person reading
-/// a list is choosing between named rows. The daemon-side equivalent for
-/// RPC verbs is `dshboxd/src/resolve.rs`, which errors on duplicate names
-/// instead of picking one — keep the two semantics in mind before reusing
-/// either for the other's callers.
+/// Delegates to the shared resolver in `box_containers::resolve`, which the
+/// daemon verbs use too — one match rule everywhere. The rules: exact id,
+/// then the `container-<raw>` and `container-<raw>-` prefix spellings, then
+/// the name. Duplicate names are an ambiguity listing the ids, never a
+/// silent first match: a write aimed by name at two same-named containers
+/// must not land on whichever row the scan happened to visit first.
 fn find_container<'a>(
     containers: &'a [box_containers::DshContainer],
     wanted: &str,
 ) -> Result<&'a box_containers::DshContainer, String> {
-    if let Some(found) = containers.iter().find(|container| container.id == wanted) {
-        return Ok(found);
-    }
-    if let Some(found) = containers.iter().find(|container| container.name == wanted) {
-        return Ok(found);
-    }
-    let prefixed = format!("container-{wanted}");
-    if let Some(found) = containers.iter().find(|container| container.id == prefixed) {
-        return Ok(found);
-    }
-    // An unresolvable name has to say what would have worked. Listing the names
-    // ends the guess; the bare `container not found` started it.
-    let mut names: Vec<&str> = containers
-        .iter()
-        .map(|container| container.name.as_str())
-        .collect();
-    names.sort_unstable();
-    if names.is_empty() {
-        Err(format!(
-            "no container named {wanted:?}, and there are no containers"
-        ))
-    } else {
-        Err(format!(
-            "no container named {wanted:?}; the containers are: {}",
-            names.join(", ")
-        ))
-    }
+    box_containers::resolve::match_container(containers, wanted)
 }
 
 fn logs(id: &str, rest: &[String]) -> Result<(), String> {
