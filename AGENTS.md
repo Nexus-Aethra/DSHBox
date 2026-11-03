@@ -280,7 +280,11 @@ command as done only once the installed app has run it.
   the helper waits for the launcher's PID, stops `dshboxd` (it holds the exe open
   and would fail the install), runs `msiexec` or swaps the `.app`, then relaunches.
   `render_installer_script` is a pure function with tests for that reason: it is
-  the one piece that runs after the process which wrote it has died.
+  the one piece that runs after the process which wrote it has died. The tray
+  Quit entry is the third moment install happens: quitting with policy `auto`
+  and a verified candidate stages the same helper *before* exiting -- the
+  helper waits for the process to die, so staging must come first, and a quit
+  without a candidate behaves exactly as it always did.
 - **Discovery is two tiers, and only the second can install.** `releases/latest`
   is a cheap "something newer exists" for the badge; installing needs the
   `latest.json` asset, which names each platform's installer with a SHA-256. No
@@ -314,10 +318,14 @@ command as done only once the installed app has run it.
   gh-proxy.com is a third party: forwarding `Authorization` through one hands
   the credential over. So a token (Settings → General) sends the API requests
   direct to `api.github.com` -- 5,000 requests an hour instead of the
-  anonymous 60, which a shared mirror exhausts for everyone -- and the mirror
-  keeps serving only the public download tier. If direct fails at the
-  transport level, the request retries anonymously through the mirror rather
-  than dying -- still without the credential. The 403 error names the setting.
+  anonymous 60, which a shared mirror exhausts for everyone -- and the
+  `latest.json` manifest is read direct as well: it carries the digests the
+  mirror-served installer is verified against, and a mirror that served both
+  would be the whole trust chain. The installer bytes keep flowing through
+  the mirror, checked against digests it did not choose. If direct fails at
+  the transport level, the request retries anonymously through the mirror
+  rather than dying -- still without the credential. The 403 error names the
+  setting.
 - **The desktop and the daemon are one build batch, and a bump must rebuild both.**
   `scripts/prepare-server.mjs` writes `src-tauri/.build-stamp` (epoch seconds) and
   both `build.rs` files embed it as `DSHBOX_BUILD_STAMP`. The desktop compares

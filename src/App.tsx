@@ -107,24 +107,32 @@ export function MainApp() {
     return () => { cancelled = true }
   }, [])
 
-  // The badge: one cheap read when the window opens. The daemon does the
-  // actual checking on its own schedule, so this asks "do you already know
-  // about something" rather than making a network call of its own. A failure
-  // here is silent on purpose -- an update nobody can be told about yet is not
-  // an error the user needs to see at startup.
+  // The badge: one cheap read when the window opens, then refreshed by the
+  // daemon's `update_state` announcement -- a check that runs while the
+  // window sits open must still lift the badge, and a release that became
+  // current must still drop it. The daemon does the actual checking on its
+  // own schedule, so this asks "do you already know about something" rather
+  // than making a network call of its own. A failure here is silent on
+  // purpose -- an update nobody can be told about yet is not an error the
+  // user needs to see.
+  const applyUpdateState = (state: { available: { newer: boolean; version: string } | null; skippedVersion: string | null }) => {
+    const available = state.available
+    const skipped = state.skippedVersion
+    setUpdateBadge(available !== null && available.newer && available.version !== skipped ? available.version : null)
+  }
   useEffect(() => {
     let cancelled = false
     void boxApi.getUpdateState()
-      .then((state) => {
-        if (cancelled) return
-        const available = state.available
-        const skipped = state.skippedVersion
-        if (available !== null && available.newer && available.version !== skipped) {
-          setUpdateBadge(available.version)
-        }
-      })
+      .then((state) => { if (!cancelled) applyUpdateState(state) })
       .catch(() => undefined)
     return () => { cancelled = true }
+  }, [])
+  useEffect(() => {
+    const unlisten = boxApi.listenTask<{ event: string }>('daemon://event', (payload) => {
+      if (payload.event !== 'update_state') return
+      void boxApi.getUpdateState().then(applyUpdateState).catch(() => undefined)
+    })
+    return () => { void unlisten.then((unlisten) => unlisten()) }
   }, [])
 
   const settings = useSettings(setError)

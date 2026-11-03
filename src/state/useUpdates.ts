@@ -15,6 +15,24 @@ import type { UpdatePolicy, UpdateState } from '../shared/types/domain'
 
 /** Poll interval while a download task runs. */
 const TASK_POLL_MS = 600
+
+/**
+ * The daemon's stage strings are English task prose; the pane localizes the
+ * ones it knows and falls back to the raw text for anything new. Exported
+ * pure so the mapping, not the daemon's wording, is what a test can pin.
+ */
+export type DownloadStageKey = 'manifest' | 'downloading' | 'ready' | 'other'
+
+export function stageOf(stage: string): { key: DownloadStageKey; detail: string | null } {
+  if (stage === 'reading the release manifest') return { key: 'manifest', detail: null }
+  if (stage === '') return { key: 'downloading', detail: null }
+  if (stage.startsWith('downloading')) {
+    const detail = stage.slice('downloading'.length).trim()
+    return { key: 'downloading', detail: detail === '' ? null : detail }
+  }
+  if (stage === 'ready') return { key: 'ready', detail: null }
+  return { key: 'other', detail: stage }
+}
 /**
  * How long to keep waiting before giving the loop up: a download task can
  * legitimately take minutes on a slow mirror, but a loop without a deadline
@@ -79,6 +97,16 @@ export function useUpdates(onError: (message: string | null) => void) {
   // pressing anything.
   useEffect(() => { void reload() }, [reload])
 
+  // The daemon announces a finished check (the background pass and the pane's
+  // own button both do): refresh instead of showing a state that is already
+  // stale while the pane sits open.
+  useEffect(() => {
+    const unlisten = boxApi.listenTask<{ event: string }>('daemon://event', (payload) => {
+      if (payload.event === 'update_state') void reload()
+    })
+    return () => { void unlisten.then((unlisten) => unlisten()) }
+  }, [reload])
+
   const check = useCallback(async () => {
     setChecking(true)
     try {
@@ -138,7 +166,7 @@ export function useUpdates(onError: (message: string | null) => void) {
    */
   const download = useCallback(async () => {
     setBusy(true)
-    setDownloading({ stage: 'starting', progress: 0 })
+    setDownloading({ stage: '', progress: 0 })
     try {
       const task = await boxApi.downloadUpdate(state?.available?.version ?? null)
       await waitForTask(task.id, setDownloading, () => aliveRef.current)

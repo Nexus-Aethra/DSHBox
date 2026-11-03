@@ -98,7 +98,7 @@ pane owns:
 | `off` | never (the UI can still ask once) | no | no |
 | `check` | yes, background | no | no |
 | `download` | yes | yes, automatically | on user action |
-| `auto` | yes | yes, automatically | on user action — the fetch is automatic, the install still asks |
+| `auto` | yes | yes, automatically | on quit, automatically |
 
 The default is `check`. Silently replacing a binary is the kind of thing that
 has to be asked for; detecting is not.
@@ -107,6 +107,23 @@ has to be asked for; detecting is not.
 manifest version, the available update is reported as skipped and the badge
 stays quiet. It clears itself when a newer version appears, and `clear_update_skip`
 clears it early.
+
+## Install on quit
+
+The tray Quit entry is the one real exit this app has -- the window's close
+button hides to tray -- so it is where `auto` finishes its job. Before the
+service stops and the process exits, the quit handler asks the daemon for
+the install-on-quit candidate and, when there is one, stages the same helper
+the pane's Install button uses. The candidate rules are strict and
+unit-tested: policy `auto`, something newer, a *verified* file present, an
+unattended installer for this platform, and no manual reason. Anything else
+-- a daemon that cannot answer included -- quits exactly as before; quitting
+must never acquire a failure mode it did not have.
+
+The staging has to happen *before* `app.exit(0)`: the helper's first job is
+waiting for this process to die, and it does that from the outside. A
+process-level one-shot flag keeps the quit path and the pane's button from
+staging two installers for one file.
 
 ## Background check throttle
 
@@ -162,13 +179,16 @@ this machine. A token (Settings → General, stored in the machine-local
 The rule the implementation locks with a test: **a token never travels
 through a mirror.** A mirror is a third party; an `Authorization` header
 pointed at one hands the credential over. A token therefore sends the API
-requests direct to `api.github.com`, while the mirror keeps serving the
-public download tier (the `latest.json` manifest and installers, which need
-no auth and are not API-rate-limited). If the direct request fails at the
-transport level -- a blocked network, not an HTTP status -- it retries
-anonymously through the mirror rather than dying, still without the
-credential. A 403 error message names the setting, so a rate limit does not
-dead-end.
+requests -- and reads the `latest.json` manifest -- direct, while the mirror
+keeps serving the installer bytes. That split matters beyond speed: the
+manifest carries the digests the installer is verified against, and a mirror
+that served *both* would be the whole trust chain. With the manifest read
+from github.com, the mirror can serve only bytes that must still match a
+digest it did not choose. Anonymous installs keep the mirror for everything
+(the documented tradeoff), no auth header goes anywhere near a download,
+and a direct read that fails at the transport level retries anonymously
+through the mirror rather than dying. A 403 error message names the setting,
+so a rate limit does not dead-end.
 
 ## Wire surface
 
