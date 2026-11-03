@@ -1,6 +1,7 @@
 //! Filesystem, configuration, and validation primitives shared by DSH Box features.
 
 pub mod collection;
+pub mod copy_tree;
 
 use serde::{Deserialize, Serialize};
 use std::{

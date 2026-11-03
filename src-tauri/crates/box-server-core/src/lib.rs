@@ -1,5 +1,7 @@
 //! Local single-user control plane shared by the DSH Box desktop app and server.
 
+pub mod bundled_plugins;
+
 use box_foundation::{config_path, now_seconds, BoxResult};
 use serde::{Deserialize, Serialize};
 use std::{

@@ -4,11 +4,12 @@
 
 use crate::{
     containers::create_profile_manifest,
-    lifecycle::{copy_tree_following, materialize_bundled_sandbox_plugin},
+    lifecycle::materialize_bundled_sandbox_plugin,
     toolchains::{pnpm_policy, resolve_toolchain, run_logged, TaskCancel},
     versions::{list_prepared_bases, prepared_base_for_version, PreparedBaseRecord},
 };
 use box_api::{BuildImageRequest, CreateTemplateContainerRequest, TemplateInfo};
+use box_foundation::copy_tree::copy_tree_following;
 use box_extensions::transfer::extract_extension_tarball;
 use box_foundation::{
     atomic_write_json, now_seconds, write_template_manifest, PublishedResourceKind, RuntimeLayout,

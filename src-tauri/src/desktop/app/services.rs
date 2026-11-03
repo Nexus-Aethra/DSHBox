@@ -1,5 +1,4 @@
 use super::*;
-use serde::Deserialize;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
@@ -79,15 +78,7 @@ pub(crate) fn write_startup_log(message: &str) {
 }
 
 pub(crate) fn bundled_target() -> &'static str {
-    match (env::consts::OS, env::consts::ARCH) {
-        ("linux", "x86_64") => "linux-x64",
-        ("linux", "aarch64") => "linux-arm64",
-        ("windows", "x86_64") => "win-x64",
-        ("windows", "aarch64") => "win-arm64",
-        ("macos", "x86_64") => "macos-x64",
-        ("macos", "aarch64") => "macos-arm64",
-        _ => "unsupported",
-    }
+    box_server_core::bundled_plugins::bundled_target()
 }
 
 pub(crate) fn bundled_server_path(resource_directory: &Path) -> PathBuf {
@@ -448,184 +439,12 @@ pub(crate) fn bundled_runtime() -> Result<&'static BundledRuntime, String> {
         .get()
         .ok_or("bundled runtime is unavailable; restart DSH Box".to_owned())
 }
-/// Shape of `plugins-manifest.json` shipped by `scripts/build-plugin.mjs`.
-/// We only need a few fields to compute a digest; extra keys are ignored.
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct PluginsManifest {
-    #[allow(dead_code)]
-    target: String,
-    #[serde(rename = "pluginPackage")]
-    #[allow(dead_code)]
-    plugin_package: String,
-    #[serde(rename = "pluginVersion")]
-    #[allow(dead_code)]
-    plugin_version: String,
-    #[serde(rename = "builtAt")]
-    #[allow(dead_code)]
-    built_at: String,
-}
-
-/// Copy the bundled Cordis plugin tree from the Tauri resource into the
-/// persistent user cache at `<runtimeDirectory>/plugins/node_modules/`.
-///
-/// Reads `plugins-manifest.json` from the resource, hashes it together
-/// with the target triple, and compares that to
-/// `BoxConfig.plugins_manifest_digest`. When they match, the user cache
-/// is already current and no copy happens.
-///
-/// Defer silently when no runtime directory is configured yet: the
-/// `save_runtime_directory` flow will pick the user up next launch.
-#[allow(dead_code)]
+/// Vendor the bundled Cordis plugins from the Tauri resource into the
+/// persistent runtime cache. The implementation lives in box-server-core
+/// and is shared with the daemon — the two private copies had drifted (the
+/// desktop's removed the whole plugin cache directory, which in an installed
+/// layout deletes its own source). Errors are non-fatal at the call site:
+/// a container starts without the plugin rather than not starting.
 pub(crate) fn initialize_bundled_plugins(resource_directory: &Path) -> Result<(), String> {
-    let target = bundled_target();
-    let resource_plugins = resource_directory.join("plugins").join(target);
-    let manifest_path = resource_plugins.join("plugins-manifest.json");
-    if !manifest_path.is_file() {
-        // Resource might not carry the plugin (e.g. a developer build
-        // that skips the bundler). Fall back silently so the desktop
-        // still launches.
-        return Ok(());
-    }
-
-    let manifest_bytes = fs::read(&manifest_path)
-        .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
-    let manifest: PluginsManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|error| format!("cannot parse plugins manifest: {error}"))?;
-
-    // Stable digest: SHA-256 of the manifest body scoped to the target.
-    // Two installers for different platforms ship the same files under
-    // different target dirs, so the manifest body itself is the smallest
-    // signal that proves the resource changed.
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    manifest_bytes.hash(&mut hasher);
-    manifest.target.hash(&mut hasher);
-    let digest = format!("{:016x}", hasher.finish());
-
-    let config = read_config()?;
-    if config.plugins_manifest_digest.as_deref() == Some(digest.as_str()) {
-        return Ok(());
-    }
-
-    let Some(runtime_directory) = config.runtime_directory.as_ref() else {
-        // No runtime directory chosen yet; defer until the user picks one.
-        return Ok(());
-    };
-
-    let runtime_root = PathBuf::from(runtime_directory);
-    if !runtime_root.is_dir() {
-        return Ok(());
-    }
-
-    let cache_root = runtime_root.join("plugins");
-    // Clean ONLY the entries this function writes, never the directory.
-    // In an installed layout the resource directory is <install> itself, so
-    // the source (<install>/plugins/<target>) is a child of the destination
-    // (<install>/plugins): a remove_dir_all on the destination deletes the
-    // source it is about to copy, the copy then finds nothing, and every
-    // container start vendors nothing. The daemon-side copy in
-    // dshboxd::state carries the same constraint; the two copies are kept
-    // independent, so this one must obey it too.
-    for entry in ["node_modules", "plugins-manifest.json"] {
-        let path = cache_root.join(entry);
-        if path.is_dir() {
-            fs::remove_dir_all(&path)
-                .map_err(|error| format!("cannot clean {}: {error}", path.display()))?;
-        } else if path.is_file() {
-            fs::remove_file(&path)
-                .map_err(|error| format!("cannot clean {}: {error}", path.display()))?;
-        }
-    }
-    fs::create_dir_all(&cache_root)
-        .map_err(|error| format!("cannot create {}: {error}", cache_root.display()))?;
-
-    copy_dir_recursive(&resource_plugins, &cache_root)
-        .map_err(|error| format!("cannot copy plugins: {error}"))?;
-
-    let mut updated = config;
-    updated.plugins_manifest_digest = Some(digest);
-    if let Err(error) = write_config(&updated) {
-        write_startup_log(&format!("plugins manifest digest not persisted: {error}"));
-    }
-    write_startup_log(&format!("vendored plugins into {}", cache_root.display()));
-    Ok(())
-}
-
-/// Recursive directory copy with `cp -rL` semantics: any symlinks
-/// inside the source tree are dereferenced and their target contents
-/// materialised, never re-exported as a link. Identical in shape to
-/// `dshboxd::lifecycle::copy_tree_following`; the two copies are kept
-/// independent because they live in different binaries (the daemon and
-/// the desktop shell), and the surface is small enough that the
-/// duplication is cheaper than threading another crate boundary.
-pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = destination.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&from)?;
-        if metadata.file_type().is_symlink() {
-            // Resolve through the symlink. The resolved target may still
-            // be a directory (recursed below via the next branch) or a
-            // file (handled via fs::copy).
-            let resolved = fs::canonicalize(&from).unwrap_or_else(|_| from.clone());
-            let resolved_meta = fs::symlink_metadata(&resolved)
-                .or_else(|_| fs::metadata(&resolved))?;
-            if resolved_meta.is_dir() {
-                copy_dir_recursive(&resolved, &to)?;
-            } else {
-                fs::copy(&resolved, &to)?;
-            }
-        } else if metadata.is_dir() {
-            copy_dir_recursive(&from, &to)?;
-        } else if metadata.is_file() {
-            fs::copy(&from, &to)?;
-        }
-    }
-    Ok(())
-}
-#[cfg(test)]
-mod bundled_plugins_tests {
-    use super::*;
-    use std::fs;
-
-    /// A minimal manifest ships one Cordis plugin directory tree.
-    fn fixture(source_root: &Path, target: &str) {
-        let dir = source_root.join("plugins").join(target);
-        fs::create_dir_all(dir.join("node_modules").join("@nexus-aethra").join("dsh-box-sandbox")).unwrap();
-        fs::write(
-            dir.join("plugins-manifest.json"),
-            format!("{{\"target\":\"{}\",\"pluginPackage\":\"@nexus-aethra/dsh-box-sandbox\",\"pluginVersion\":\"0.1.0\",\"builtAt\":\"2026-08-15\"}}", target),
-        ).unwrap();
-        fs::write(
-            dir.join("node_modules").join("@nexus-aethra").join("dsh-box-sandbox").join("index.js"),
-            "export default {}\n",
-        ).unwrap();
-    }
-
-    #[test]
-    fn copies_when_digest_stale_and_idempotent_next_call() {
-        let temp = std::env::temp_dir().join(format!("dsh-box-plugins-{}", now_seconds()));
-        let resource = temp.join("resource");
-        let target = bundled_target();
-        fixture(&resource, target);
-
-        let copy_target = temp.join("runtime").join("plugins");
-        fs::create_dir_all(temp.join("runtime")).unwrap();
-
-        // First call copies everything into the target.
-        copy_dir_recursive(&resource.join("plugins").join(target), &copy_target).unwrap();
-        assert!(copy_target.join("plugins-manifest.json").is_file());
-        assert!(copy_target.join("node_modules").join("@nexus-aethra").join("dsh-box-sandbox").join("index.js").is_file());
-
-        // Second call with an unchanged source is a no-op for the copy
-        // (manifest body is byte-identical, so the digest matches).
-        // We can't drive initialize_bundled_plugins here without a writable
-        // ~/.dsh-box/config.json; the idempotency of the digest compare is
-        // covered by the call-site test plan in commit 5.
-        let _ = copy_target;
-        let _ = fs::remove_dir_all(&temp);
-    }
+    box_server_core::bundled_plugins::initialize_bundled_plugins(resource_directory)
 }
