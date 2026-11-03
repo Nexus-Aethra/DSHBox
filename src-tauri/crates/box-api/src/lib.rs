@@ -208,10 +208,12 @@ pub struct ContainerDescription {
     pub directory: String,
     /// "running" / "stopped" — same vocabulary as `DshContainer::status`.
     pub status: String,
-    /// Execution backend the container's record requests. Always "host" in
-    /// this build — including when the record carries no `runtime` field at
-    /// all; a `vm[:backend]` string travels through unchanged and fails the
-    /// start when the build cannot execute the named backend.
+    /// Execution backend the container's record requests, normalised by the
+    /// daemon. Three cases: a record with no `runtime` field — and a record
+    /// carrying an unparseable value, since this read verb must not fail —
+    /// answers `"host"`; `"host"` answers `"host"`; a `vm[:backend]` value
+    /// answers its canonical lowercase `"vm:backend"`. Enforcement happens
+    /// at start, where an unexecutable backend is an error.
     #[serde(default = "default_container_runtime")]
     pub runtime: String,
     /// Webview URL the daemon is serving; `Some` only while `status` is

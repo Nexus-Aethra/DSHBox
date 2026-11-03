@@ -46,16 +46,18 @@ impl RuntimeKind {
     }
 
     /// Parse one `runtime` field value. `host` (case-insensitive) is the
-    /// explicit process mode; `vm` and `vm:<backend>` request a VM.
+    /// explicit process mode; `vm` and `vm:<backend>` request a VM. Empty and
+    /// unknown values are errors — the field is a declaration, and silence
+    /// here would claim a boundary the process backend cannot give.
     pub fn parse(text: &str) -> Result<RuntimeKind, String> {
-        let text = text.trim();
-        if text.is_empty() || text.eq_ignore_ascii_case("host") {
+        let lower = text.trim().to_ascii_lowercase();
+        if lower == "host" {
             return Ok(RuntimeKind::Host);
         }
-        if text.eq_ignore_ascii_case("vm") {
+        if lower == "vm" {
             return Ok(RuntimeKind::Vm(None));
         }
-        if let Some(rest) = text
+        if let Some(rest) = lower
             .strip_prefix("vm")
             .filter(|rest| matches!(rest.as_bytes().first(), Some(b':') | Some(b'-') | Some(b'_')))
         {
@@ -63,10 +65,11 @@ impl RuntimeKind {
             if backend.is_empty() {
                 return Ok(RuntimeKind::Vm(None));
             }
-            return Ok(RuntimeKind::Vm(Some(backend.to_ascii_lowercase())));
+            return Ok(RuntimeKind::Vm(Some(backend.to_owned())));
         }
         Err(format!(
-            "unknown container runtime {text:?}; supported values are \"host\" and \"vm[:backend]\""
+            "unknown container runtime {:?}; supported values are \"host\" and \"vm[:backend]\"",
+            text.trim()
         ))
     }
 
@@ -100,10 +103,13 @@ impl HostHandle {
         }
     }
 
-    /// Non-blocking liveness: `Some(status)` once the host has exited.
-    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+    /// Non-blocking liveness: `true` once the host has exited. Deliberately
+    /// not `Option<ExitStatus>` — `ExitStatus` has no stable constructor, so
+    /// a VM arm could not implement this verb; a VMM answers liveness from
+    /// its own API, which is all this method promises.
+    pub fn has_exited(&mut self) -> std::io::Result<bool> {
         match self {
-            HostHandle::Process(child) => child.try_wait(),
+            HostHandle::Process(child) => Ok(child.try_wait()?.is_some()),
         }
     }
 
@@ -144,14 +150,24 @@ mod tests {
             RuntimeKind::parse("vm-wsl2").unwrap(),
             RuntimeKind::Vm(Some("wsl2".to_owned()))
         );
+        // Case handling is uniform: every token is matched on a lowercased
+        // copy, so "VM:X" is a VM request, not a mystery string.
+        assert_eq!(
+            RuntimeKind::parse("VM:X").unwrap(),
+            RuntimeKind::Vm(Some("x".to_owned()))
+        );
+        assert_eq!(
+            RuntimeKind::parse("Vm-Wsl2").unwrap(),
+            RuntimeKind::Vm(Some("wsl2".to_owned()))
+        );
         assert_eq!(RuntimeKind::parse("vm:firecracker").unwrap().field(), "vm:firecracker");
     }
 
     #[test]
     fn an_unknown_runtime_is_an_error_never_a_silent_host() {
-        for attempt in ["docker", "podman", "vmx"] {
+        for attempt in ["docker", "podman", "vmx", "", "   "] {
             let error = RuntimeKind::parse(attempt).unwrap_err();
-            assert!(error.contains("unknown container runtime"), "{attempt}: {error}");
+            assert!(error.contains("unknown container runtime"), "{attempt:?}: {error}");
         }
         let error = RuntimeKind::from_record(&serde_json::json!({ "runtime": 7 })).unwrap_err();
         assert!(error.contains("must be a string"), "{error}");

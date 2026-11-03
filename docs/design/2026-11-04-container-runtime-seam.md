@@ -30,20 +30,27 @@ Windows QEMU/WHPX 或 WSL2）在此后的 PR 中落进同一接缝。
 ```rust
 pub(crate) enum HostHandle {
     /// 本守护进程的子进程；TrackedChild 拥有 kill/reap。
-    Process(Box<TrackedChild>),
+    Process(TrackedChild),
     // VM 后端在此追加自己的臂（VMM API 客户端或模拟器进程句柄），
     // 上层动词（ps/url/stop/restart/describe）不需要知道。
 }
 ```
 
-暴露三个动词真正用到的操作：`id()`（观测与孤儿清理）、`try_wait()`（存活判定）、
-`stop()`（优雅树杀，Drop 兜底强杀不变）。VM 臂的同名操作走 VMM API。
+句柄只暴露三个动词真正用到的操作：`id()`（观测与孤儿清理）、`has_exited()`（存活判定；
+刻意不返回 `ExitStatus`——它没有稳定构造器，VM 臂无法实现）、`stop()`（优雅树杀，
+Drop 兜底强杀不变）。
 
 ### 分发点
 
 `start_dsh_container_inner` 读到非 `host` 的 RuntimeKind 时，以明确错误失败
 （`container runtime vm:<backend> is not available in this build`）——这是 VM 后端的
 落点，不是降级点。
+
+### 可观测
+
+`describe_container` 回报规范化后的 `runtime` 字段。三种情况：记录无该字段、或值无法
+解析（读动词不能失败——**这是唯一一处坏值不报错的地方**，强制执行点在 start）——
+答 `"host"`；`"host"` 答 `"host"`；`vm[:backend]` 答规范化的小写 `"vm:backend"`。
 
 ## 不变的东西
 

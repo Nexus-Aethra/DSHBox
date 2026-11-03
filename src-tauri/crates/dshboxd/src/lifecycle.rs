@@ -189,11 +189,10 @@ pub(crate) fn start_dsh_container_inner(
             .lock()
             .map_err(|_| "container manager lock failed")?;
         if let Some(host) = running.get_mut(id) {
-            if host
+            if !host
                 .handle
-                .try_wait()
+                .has_exited()
                 .map_err(|error| error.to_string())?
-                .is_none()
             {
                 return Ok(host.url.clone());
             }
