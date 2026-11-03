@@ -272,6 +272,44 @@ command as done only once the installed app has run it.
   (`ping_quickly`, 3s) is what the startup gate polls, so a stuck daemon answers
   "not yet" instead of holding a thread. The frontend polls one request at a
   time for the same reason: overlapping polls against a busy daemon pile up.
+- **An update is two halves, and neither may do the other's job.** The daemon
+  *finds* and *fetches* -- it is the always-running process, so a check that only
+  ran while a window was open would never run. The desktop *installs*, because
+  installing replaces the binary the daemon is made of, and a process cannot swap
+  the file it is executing. `install_update` writes a helper script and exits;
+  the helper waits for the launcher's PID, stops `dshboxd` (it holds the exe open
+  and would fail the install), runs `msiexec` or swaps the `.app`, then relaunches.
+  `render_installer_script` is a pure function with tests for that reason: it is
+  the one piece that runs after the process which wrote it has died.
+- **Discovery is two tiers, and only the second can install.** `releases/latest`
+  is a cheap "something newer exists" for the badge; installing needs the
+  `latest.json` asset, which names each platform's installer with a SHA-256. No
+  digest, no install -- a tag says nothing about a machine's bytes. A release
+  that predates the manifest reports `manualReason: no-manifest` and is offered
+  as a manual download rather than downgraded to an unverified one. The wire
+  shape is pinned across languages by `box-updates/tests/manifest_contract.rs`,
+  which parses the real output of `scripts/release-manifest.mjs`; a renamed field
+  would otherwise leave both suites green and the updater unable to read any
+  actual release.
+- **`platforms.<target>` is an array, not an object.** Linux publishes both a
+  `.deb` and a `.rpm` for one machine, so "the installer" is not well defined
+  there and the published order is the platform's preference. One installer for
+  a platform is an array of one, not a special case the reader branches on.
+  `installMode` comes from the manifest (`auto` for msi/dmg, `manual` for
+  deb/rpm because they need root); a GUI does not escalate itself, so the pane
+  shows the verified path and the `apt`/`rpm` command instead.
+- **Versions are compared as numbers, never as strings.** `0.1.10` is newer than
+  `0.1.9`; a pre-release is older than its release; and a numeric pre-release
+  identifier sorts *below* an alphanumeric one (semver rule 11 -- the opposite
+  of what deriving `Ord` over a `Vec` gives you). `box_updates::version` owns
+  this. Do not write a second comparison next to the code that needs it.
+- **The update check is throttled, and a failure is not a success.**
+  `get_update_state` answers from the recorded file and spawns at most one
+  detached refresh when `should_check` says the day has passed. A failed check
+  records `lastError` and leaves `checked_at` alone, so the pane can tell "last
+  tried" from "last successful" honestly. The default policy is `check`:
+  detecting a release is not the same act as replacing a running binary, and the
+  second one is asked for (`download` / `auto`).
 - **The desktop and the daemon are one build batch, and a bump must rebuild both.**
   `scripts/prepare-server.mjs` writes `src-tauri/.build-stamp` (epoch seconds) and
   both `build.rs` files embed it as `DSHBOX_BUILD_STAMP`. The desktop compares
