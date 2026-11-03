@@ -519,9 +519,23 @@ pub(crate) fn initialize_bundled_plugins(resource_directory: &Path) -> Result<()
     }
 
     let cache_root = runtime_root.join("plugins");
-    if cache_root.exists() {
-        fs::remove_dir_all(&cache_root)
-            .map_err(|error| format!("cannot clean {}: {error}", cache_root.display()))?;
+    // Clean ONLY the entries this function writes, never the directory.
+    // In an installed layout the resource directory is <install> itself, so
+    // the source (<install>/plugins/<target>) is a child of the destination
+    // (<install>/plugins): a remove_dir_all on the destination deletes the
+    // source it is about to copy, the copy then finds nothing, and every
+    // container start vendors nothing. The daemon-side copy in
+    // dshboxd::state carries the same constraint; the two copies are kept
+    // independent, so this one must obey it too.
+    for entry in ["node_modules", "plugins-manifest.json"] {
+        let path = cache_root.join(entry);
+        if path.is_dir() {
+            fs::remove_dir_all(&path)
+                .map_err(|error| format!("cannot clean {}: {error}", path.display()))?;
+        } else if path.is_file() {
+            fs::remove_file(&path)
+                .map_err(|error| format!("cannot clean {}: {error}", path.display()))?;
+        }
     }
     fs::create_dir_all(&cache_root)
         .map_err(|error| format!("cannot create {}: {error}", cache_root.display()))?;
