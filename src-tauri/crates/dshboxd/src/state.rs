@@ -6,7 +6,7 @@
 use box_foundation::{read_config, BoxConfig, BoxPaths, BoxResult};
 use box_runtime::{
     bundled::ResolvedBundledRuntime,
-    process::{self, TrackedChild},
+    process,
 };
 use box_scheduler::{TaskManager, TaskNotifier};
 use box_state::ResourceStateManager;
@@ -19,7 +19,7 @@ use std::{
 /// A managed host process (container server) owned by the daemon.
 /// Mirrors the desktop's `ManagedHost`; clients never hold these.
 pub(crate) struct ManagedHost {
-    pub(crate) child: TrackedChild,
+    pub(crate) handle: crate::runtime::HostHandle,
     pub(crate) url: String,
     /// The `dsh web:` URL parsed from the host log (per-launch capability
     /// token). `None` for DSH runtimes without the browser-trust fence, or

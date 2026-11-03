@@ -606,6 +606,7 @@ pub(crate) fn create_dsh_container_sync(
         // This path creates a container straight from a DSH version — no
         // Boxfile, so nothing is declared.
         env: std::collections::BTreeMap::new(),
+        runtime: None,
         directory: directory.to_string_lossy().into_owned(),
         status: "stopped".to_owned(),
     })

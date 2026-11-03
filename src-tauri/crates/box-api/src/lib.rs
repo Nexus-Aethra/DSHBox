@@ -208,6 +208,14 @@ pub struct ContainerDescription {
     pub directory: String,
     /// "running" / "stopped" — same vocabulary as `DshContainer::status`.
     pub status: String,
+    /// Execution backend the container's record requests, normalised by the
+    /// daemon. Three cases: a record with no `runtime` field — and a record
+    /// carrying an unparseable value, since this read verb must not fail —
+    /// answers `"host"`; `"host"` answers `"host"`; a `vm[:backend]` value
+    /// answers its canonical lowercase `"vm:backend"`. Enforcement happens
+    /// at start, where an unexecutable backend is an error.
+    #[serde(default = "default_container_runtime")]
+    pub runtime: String,
     /// Webview URL the daemon is serving; `Some` only while `status` is
     /// "running".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +231,10 @@ pub struct ContainerDescription {
     /// which cannot be a dep of this leaf wire crate (it would create a
     /// cycle via `box-containers`).
     pub extensions: serde_json::Value,
+}
+
+fn default_container_runtime() -> String {
+    "host".to_owned()
 }
 
 #[cfg(test)]
@@ -371,9 +383,10 @@ mod tests {
 
     #[test]
     fn container_description_wire_shape() {
-        // Minimal payload: `template`/`url`/`hostPid` default to absent and
-        // `extensions` carries whatever the daemon scanned (kept as a
-        // generic object on the wire).
+        // Minimal payload: `template`/`url`/`hostPid` default to absent,
+        // `runtime` defaults to "host" (a record written before the field
+        // existed is a host container), and `extensions` carries whatever
+        // the daemon scanned (kept as a generic object on the wire).
         let json = r#"{
             "id": "container-1786941505",
             "name": "dsh-test",
@@ -381,6 +394,7 @@ mod tests {
             "profile": "web",
             "directory": "/home/wpp/dshboxs/instances/container-1786941505",
             "status": "running",
+            "runtime": "host",
             "extensions": {
                 "containerId": "container-1786941505",
                 "profiles": [],
@@ -408,6 +422,7 @@ mod tests {
             "template": "dsh-test",
             "directory": "/home/wpp/dshboxs/instances/container-1786941505",
             "status": "running",
+            "runtime": "vm:firecracker",
             "url": "http://127.0.0.1:36847",
             "hostPid": 12345,
             "extensions": {}
@@ -416,5 +431,8 @@ mod tests {
         assert_eq!(parsed.template.as_deref(), Some("dsh-test"));
         assert_eq!(parsed.url.as_deref(), Some("http://127.0.0.1:36847"));
         assert_eq!(parsed.host_pid, Some(12345));
+        // The runtime string travels through this wire crate verbatim: it is
+        // the daemon that validates it against the backends it can execute.
+        assert_eq!(parsed.runtime, "vm:firecracker");
     }
 }

@@ -156,6 +156,18 @@ pub(crate) fn start_dsh_container_inner(
     let name = value["name"].as_str().unwrap_or(id).to_owned();
     let template = value["template"].as_str().map(str::to_owned);
     let declared_env = declared_env_from_metadata(&value);
+    // Which backend brings this container up. Absent means host: the field
+    // was added long after containers existed, and creation never writes it.
+    let runtime = crate::runtime::RuntimeKind::from_record(&value)?;
+    if let crate::runtime::RuntimeKind::Vm(backend) = &runtime {
+        // The landing spot for microVM backends, not a degradation point:
+        // the record asked for a boundary the process backend cannot give,
+        // and failing loudly is the honest answer until one lands.
+        return Err(match backend {
+            Some(backend) => format!("container runtime vm:{backend} is not available in this build"),
+            None => "container runtime vm is not available in this build".to_owned(),
+        });
+    }
     repair_known_profile_template(&directory, profile)?;
     let _workspace = ensure_container_workspace(&directory)?;
     let dshbox_home =
@@ -177,11 +189,10 @@ pub(crate) fn start_dsh_container_inner(
             .lock()
             .map_err(|_| "container manager lock failed")?;
         if let Some(host) = running.get_mut(id) {
-            if host
-                .child
-                .try_wait()
+            if !host
+                .handle
+                .has_exited()
                 .map_err(|error| error.to_string())?
-                .is_none()
             {
                 return Ok(host.url.clone());
             }
@@ -433,7 +444,7 @@ pub(crate) fn start_dsh_container_inner(
                 .insert(
                     id.to_owned(),
                     ManagedHost {
-                        child: tracked,
+                        handle: crate::runtime::HostHandle::Process(tracked),
                         url: url.clone(),
                         authenticated_url: announced_url.clone(),
                     },
@@ -496,8 +507,8 @@ pub(crate) fn stop_dsh_container(id: &str, manager: &ContainerManager) -> Result
         .map_err(|_| "container manager lock failed")?
         .remove(id);
     if let Some(mut host) = host {
-        let _ = host.child.kill_tree(false, Duration::from_secs(5));
-        // TrackedChild's Drop impl performs the final force-kill + reap
+        host.handle.stop();
+        // The handle's own Drop impl performs the final force-kill + reap
         // if the process hasn't exited yet, so we don't need an extra
         // wait() here.
     }

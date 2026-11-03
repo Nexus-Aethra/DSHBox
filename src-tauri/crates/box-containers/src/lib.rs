@@ -20,6 +20,12 @@ pub struct DshContainer {
     /// environment whitelist.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Execution backend requested by the container record's optional
+    /// `runtime` field. Absent means the host process backend; a VM request
+    /// travels through this field and fails the start when the build cannot
+    /// execute the named backend. Creation never writes the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
     pub directory: String,
     pub status: String,
 }
@@ -148,6 +154,7 @@ pub fn scan_containers(root: &str) -> BoxResult<BTreeMap<String, DshContainer>> 
                         .collect()
                 })
                 .unwrap_or_default(),
+            runtime: value["runtime"].as_str().map(str::to_owned),
             directory: entry.path().to_string_lossy().into_owned(),
             status: "stopped".to_owned(),
         };
@@ -191,6 +198,7 @@ mod tests {
             profile: "web".to_owned(),
             template: None,
             env: BTreeMap::new(),
+            runtime: None,
             directory: instance.to_string_lossy().into_owned(),
             status: "stopped".to_owned(),
         }

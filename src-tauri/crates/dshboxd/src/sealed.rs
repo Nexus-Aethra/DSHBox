@@ -514,6 +514,7 @@ pub(crate) fn create_container_from_sealed(
         version,
         profile,
         template: Some(template_name),
+        runtime: None,
         directory: destination.to_string_lossy().into_owned(),
         status: "stopped".to_owned(),
         env: manifest.env,
