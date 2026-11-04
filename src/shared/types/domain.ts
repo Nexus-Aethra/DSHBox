@@ -95,7 +95,22 @@ export type PluginGraph = {
   scannedAt: number
 }
 export type TaskStatus = 'queued' | 'running' | 'waiting_input' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
-export type TaskRecord = { id: string; kind: string; resourceKeys: string[]; status: TaskStatus; stage: string; progress: number; createdAt: number; startedAt: number | null; finishedAt: number | null; logPath: string; error: string | null; params: Record<string, unknown>; cancelRequested: boolean }
+export type StageState = 'pending' | 'running' | 'done' | 'skipped' | 'failed'
+/** One declared step of a task, with its own progress bar. */
+export type TaskStage = {
+  id: string
+  label: string
+  state: StageState
+  /** This stage's own 0-100, not the task's. */
+  progress: number
+  startedAt: number | null
+  finishedAt: number | null
+  /** Expected seconds, so the UI can show elapsed against a budget. */
+  durationHintSecs: number
+  attempts: number
+  failureDetail?: string | null
+}
+export type TaskRecord = { id: string; kind: string; resourceKeys: string[]; status: TaskStatus; stage: string; progress: number; /** Declared stages; empty for task kinds that declare none and for records written before stages existed. */ stages?: TaskStage[]; createdAt: number; startedAt: number | null; finishedAt: number | null; logPath: string; error: string | null; params: Record<string, unknown>; cancelRequested: boolean }
 export type BoxConfig = { runtimeDirectory: string | null; selectedDshVersion: string | null; language: Language; toolchainSources: Record<string, string>; githubMirror: string | null; npmRegistry: string | null; githubToken?: string | null; autoUpdate?: UpdatePolicy; skippedUpdateVersion?: string | null }
 
 

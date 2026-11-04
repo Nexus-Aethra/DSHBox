@@ -143,6 +143,97 @@ impl From<&str> for TaskState {
     }
 }
 
+/// One declared step of a task, with its own progress.
+///
+/// A single overall bar cannot answer the question a waiting user actually asks
+/// ("is it working, and on what?"). A task spends minutes inside one step —
+/// `pnpm run build` alone measured 433-471 s — so the step needs its own bar,
+/// its budget, and whether it is the one that failed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskStage {
+    /// Stable identifier (`build.web`), used for retry accounting and i18n.
+    pub id: String,
+    /// Human text the daemon writes, for when no translation matches the id.
+    pub label: String,
+    pub state: StageState,
+    /// This stage's own 0-100, not the task's.
+    pub progress: u8,
+    pub started_at: Option<u64>,
+    pub finished_at: Option<u64>,
+    /// Expected seconds. The UI turns elapsed/budget into a bar, so a slow step
+    /// reads as slow instead of as a dead process.
+    pub duration_hint_secs: u64,
+    /// How many times this stage has been attempted; a retry is visible.
+    pub attempts: u32,
+    /// Where exactly a failed stage stopped, so the answer is not just "failed".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub failure_detail: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StageState {
+    /// Never started.
+    #[default]
+    Pending,
+    Running,
+    Done,
+    /// Not applicable this run (e.g. a host-only step on a VM build).
+    Skipped,
+    Failed,
+}
+
+/// Overall 0-100 derived from the declared stages.
+///
+/// Weighted by budget rather than stage count: a 450 s build must not weigh the
+/// same as a 15 s validation, or the single bar this replaces is exactly what
+/// we would still be producing. An unfinished stage contributes its own
+/// progress, so the overall bar moves whenever any stage observes movement.
+fn overall_progress(stages: &[TaskStage]) -> u8 {
+    let total: u64 = stages.iter().map(|s| u64::from(s.duration_hint_secs.max(1))).sum();
+    if total == 0 {
+        return 0;
+    }
+    let earned: u64 = stages
+        .iter()
+        .map(|stage| {
+            let weight = u64::from(stage.duration_hint_secs.max(1));
+            let fraction = match stage.state {
+                StageState::Done | StageState::Skipped => 100u64,
+                StageState::Failed | StageState::Running | StageState::Pending => {
+                    u64::from(stage.progress)
+                }
+            };
+            weight * fraction
+        })
+        .sum();
+    // Rounded, not truncated: a 20 s stage inside a 645 s total reaches only
+    // ~3% of the whole bar, and truncating kept it at 0% while work was
+    // demonstrably happening. The old single bar's job is to move.
+    let overall = ((earned + total / 2) / total).min(100) as u8;
+    // A running stage that has begun still counts as started work, so the bar
+    // does not sit at zero for the whole of a short opening step.
+    let any_running = stages.iter().any(|s| s.state == StageState::Running);
+    let any_done = stages.iter().any(|s| s.state == StageState::Done);
+    if overall == 0 && any_running && !any_done {
+        return 1;
+    }
+    overall
+}
+
+impl StageState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskRecord {
@@ -153,6 +244,11 @@ pub struct TaskRecord {
     pub status: String,
     pub stage: String,
     pub progress: u8,
+    /// Declared stages with their own progress. Empty for a task kind that does
+    /// not declare any, and for records written before stages existed — the UI
+    /// falls back to the single overall bar, so an old record still renders.
+    #[serde(default)]
+    pub stages: Vec<TaskStage>,
     pub created_at: u64,
     pub started_at: Option<u64>,
     pub finished_at: Option<u64>,
@@ -246,6 +342,87 @@ impl TaskContext {
         } else {
             Ok(())
         }
+    }
+
+    /// Declare the stages this task will move through. Called once, early.
+    ///
+    /// `(id, label, budget_seconds)` — the budget is what turns "still going"
+    /// into "63% of a ~4 minute step", which is the difference between a bar
+    /// that informs and one that merely spins.
+    pub fn plan_stages(&self, stages: &[(&str, &str, u64)]) {
+        let planned: Vec<TaskStage> = stages
+            .iter()
+            .map(|(id, label, budget)| TaskStage {
+                id: (*id).to_owned(),
+                label: (*label).to_owned(),
+                state: StageState::Pending,
+                progress: 0,
+                started_at: None,
+                finished_at: None,
+                duration_hint_secs: *budget,
+                attempts: 0,
+                failure_detail: None,
+            })
+            .collect();
+        let _ = self.manager.set_stages(&self.paths, &self.task_id, planned.clone());
+        let _ = planned;
+    }
+
+    /// Notify the host that the per-stage picture changed, and keep the
+    /// legacy summary fields in step with it.
+    ///
+    /// Every stage transition funnels through here: the manager already wrote
+    /// the record, so this reads it back once and emits both the one-line
+    /// summary an old client understands and the stage array the panel needs.
+    /// Without it, stages would be persisted but never pushed, and the UI
+    /// would show the first snapshot until the next poll.
+    fn publish_stages(&self) {
+        if let Ok(task) = self.manager.task(&self.task_id) {
+            self.notifier
+                .stage(&self.task_id, &task.stage, task.progress);
+        }
+    }
+
+    /// Mark a stage started (or resumed, which bumps its attempt count).
+    pub fn stage_started(&self, id: &str) {
+        let _ = self.manager.begin_stage(&self.paths, &self.task_id, id);
+        self.publish_stages();
+    }
+
+    /// Record observed progress inside a stage. Pass a milestone, not a guess.
+    pub fn stage_progress(&self, id: &str, progress: u8) {
+        let _ = self
+            .manager
+            .set_stage_progress(&self.paths, &self.task_id, id, progress);
+        self.publish_stages();
+    }
+
+    /// Advance a stage from elapsed time against its budget, capped below 100.
+    ///
+    /// The cap is the point: a bar that reaches 100% on a timer lies, and a step
+    /// this reports as 90% can still be stuck. Only `stage_done` says finished,
+    /// so "at 90% and elapsed keeps climbing" is the honest signal for "hung".
+    pub fn stage_tick(&self, id: &str) {
+        let _ = self.manager.tick_stage(&self.paths, &self.task_id, id);
+        self.publish_stages();
+    }
+
+    pub fn stage_done(&self, id: &str) {
+        let _ = self.manager.finish_stage(&self.paths, &self.task_id, id, None);
+        self.publish_stages();
+    }
+
+    /// Mark a stage failed, carrying where it stopped.
+    pub fn stage_failed(&self, id: &str, detail: impl Into<String>) {
+        let _ = self
+            .manager
+            .finish_stage(&self.paths, &self.task_id, id, Some(detail.into()));
+        self.publish_stages();
+    }
+
+    pub fn stage_skipped(&self, id: &str) {
+        let _ = self.manager.skip_stage(&self.paths, &self.task_id, id);
+        self.publish_stages();
     }
 
     pub fn update(&self, stage: impl Into<String>, progress: u8) {
@@ -378,6 +555,15 @@ struct State {
     active_resources: BTreeSet<String>,
     running: usize,
 }
+/// The share of a stage's budget that has elapsed, as a percentage that
+/// stops at 90.
+///
+/// Pure on purpose: the clock is the only impure input, so a test can pin
+/// the elapsed time instead of waiting for the wall clock.
+fn stage_estimate(elapsed_secs: u64, budget_secs: u64) -> u8 {
+    let budget = budget_secs.max(1);
+    ((elapsed_secs.saturating_mul(90) / budget).min(90)) as u8
+}
 
 #[derive(Clone)]
 pub struct TaskManager {
@@ -496,6 +682,7 @@ impl TaskManager {
             status: TaskState::Queued.to_string(),
             stage: "Queued".to_owned(),
             progress: 0,
+            stages: Vec::new(),
             created_at: now_seconds(),
             started_at: None,
             finished_at: None,
@@ -588,6 +775,129 @@ impl TaskManager {
         Ok(Some(updated))
     }
 
+    /// Replace the declared stage plan. Persisted with the record.
+    pub fn set_stages(&self, _paths: &BoxPaths, id: &str, stages: Vec<TaskStage>) -> BoxResult<()> {
+        let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
+        let task = state.tasks.get_mut(id).ok_or("task not found")?;
+        task.stages = stages;
+        drop(state);
+        self.persist()
+    }
+
+    /// Start a stage, or bump its attempt count when it is already running or
+    /// was left unfinished by a retry operation.
+    pub fn begin_stage(&self, _paths: &BoxPaths, id: &str, stage_id: &str) -> BoxResult<()> {
+        let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
+        let task = state.tasks.get_mut(id).ok_or("task not found")?;
+        let Some(stage) = task.stages.iter_mut().find(|s| s.id == stage_id) else {
+            return Err(format!("stage not declared: {stage_id}"));
+        };
+        if stage.state != StageState::Pending {
+            stage.attempts = stage.attempts.saturating_add(1);
+        }
+        stage.state = StageState::Running;
+        stage.started_at = Some(now_seconds());
+        stage.finished_at = None;
+        stage.failure_detail = None;
+        drop(state);
+        self.persist()
+    }
+
+    /// Record observed progress inside one stage (0-100).
+    ///
+    /// Monotonic within a run: a later, smaller number is a stale observation
+    /// and is ignored rather than shown as the bar going backwards.
+    pub fn set_stage_progress(
+        &self,
+        _paths: &BoxPaths,
+        id: &str,
+        stage_id: &str,
+        progress: u8,
+    ) -> BoxResult<()> {
+        let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
+        let task = state.tasks.get_mut(id).ok_or("task not found")?;
+        let Some(stage) = task.stages.iter_mut().find(|s| s.id == stage_id) else {
+            return Err(format!("stage not declared: {stage_id}"));
+        };
+        stage.progress = progress.min(100).max(stage.progress);
+        // Keep the legacy overall fields truthful for readers that only know
+        // `stage`/`progress` (the command_surface gate, older clients).
+        task.stage = stage.label.clone();
+        task.progress = overall_progress(&task.stages);
+        drop(state);
+        self.persist()
+    }
+
+    /// Advance a running stage from elapsed time against its budget.
+    ///
+    /// Capped at 90: only `finish_stage` reports completion. A stage frozen at
+    /// 90 with a rising elapsed time is the honest picture of a stuck step,
+    /// while a timer that reaches 100 would claim success it cannot observe.
+    pub fn tick_stage(&self, _paths: &BoxPaths, id: &str, stage_id: &str) -> BoxResult<()> {
+        let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
+        let task = state.tasks.get_mut(id).ok_or("task not found")?;
+        let Some(stage) = task.stages.iter_mut().find(|s| s.id == stage_id) else {
+            return Err(format!("stage not declared: {stage_id}"));
+        };
+        if stage.state != StageState::Running {
+            return Ok(());
+        }
+        let elapsed = now_seconds().saturating_sub(stage.started_at.unwrap_or(now_seconds()));
+        let budget = stage.duration_hint_secs.max(1);
+        let estimate = stage_estimate(elapsed, budget);
+        stage.progress = stage.progress.max(estimate);
+        task.stage = stage.label.clone();
+        task.progress = overall_progress(&task.stages);
+        drop(state);
+        self.persist()
+    }
+
+    /// Close a stage as done, or as failed with the detail of where it stopped.
+    pub fn finish_stage(
+        &self,
+        _paths: &BoxPaths,
+        id: &str,
+        stage_id: &str,
+        failure: Option<String>,
+    ) -> BoxResult<()> {
+        let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
+        let task = state.tasks.get_mut(id).ok_or("task not found")?;
+        let Some(index) = task.stages.iter().position(|s| s.id == stage_id) else {
+            return Err(format!("stage not declared: {stage_id}"));
+        };
+        let now = now_seconds();
+        {
+            let stage = &mut task.stages[index];
+            stage.finished_at = Some(now);
+            match failure {
+                Some(detail) => {
+                    stage.state = StageState::Failed;
+                    stage.failure_detail = Some(detail);
+                }
+                None => {
+                    stage.state = StageState::Done;
+                    stage.progress = 100;
+                }
+            }
+        }
+        task.stage = task.stages[index].label.clone();
+        task.progress = overall_progress(&task.stages);
+        drop(state);
+        self.persist()
+    }
+
+    pub fn skip_stage(&self, _paths: &BoxPaths, id: &str, stage_id: &str) -> BoxResult<()> {
+        let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
+        let task = state.tasks.get_mut(id).ok_or("task not found")?;
+        let Some(stage) = task.stages.iter_mut().find(|s| s.id == stage_id) else {
+            return Err(format!("stage not declared: {stage_id}"));
+        };
+        stage.state = StageState::Skipped;
+        stage.finished_at = Some(now_seconds());
+        task.progress = overall_progress(&task.stages);
+        drop(state);
+        self.persist()
+    }
     pub fn update(
         &self,
         _paths: &BoxPaths,
@@ -990,6 +1300,23 @@ mod tests {
     use super::*;
     use std::{env, fs, path::Path};
 
+    /// A TaskContext bound to one enqueued task, for exercising the stage API
+    /// without running the worker.
+    fn context(paths: &BoxPaths, manager: &TaskManager, task_id: &str) -> TaskContext {
+        TaskContext {
+            manager: manager.clone(),
+            paths: paths.clone(),
+            notifier: std::sync::Arc::new(NoopNotifier),
+            task_id: task_id.to_owned(),
+            profile_dir: None,
+        }
+    }
+
+    struct NoopNotifier;
+    impl TaskNotifier for NoopNotifier {
+        fn stage(&self, _task_id: &str, _stage: &str, _progress: u8) {}
+        fn log(&self, _task_id: &str, _line: &str) {}
+    }
     fn paths(name: &str) -> BoxPaths {
         let root = env::temp_dir().join(format!("dsh-box-scheduler-{name}-{}", now_seconds()));
         BoxPaths {
@@ -1309,6 +1636,128 @@ mod tests {
             .iter()
             .any(|line| line.contains("cancelled before execution")));
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+    #[test]
+    fn tick_caps_below_complete_and_finish_is_the_only_way_to_a_hundred() {
+        let paths = paths("stage-tick");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = manager
+            .enqueue(&paths, "template-pull", vec![], serde_json::json!({}))
+            .unwrap();
+        let ctx = context(&paths, &manager, &task.id);
+        ctx.plan_stages(&[("build", "Building", 1)]);
+        ctx.stage_started("build");
+        // Far past the budget: still not complete. The estimator is a pure
+        // function of elapsed time, so the wall clock cannot make this test
+        // flaky in either direction.
+        for _ in 0..3 {
+            ctx.stage_tick("build");
+        }
+        let stages = manager.task(&task.id).unwrap().stages;
+        let build = stages.iter().find(|s| s.id == "build").unwrap();
+        assert!(
+            build.progress <= 90,
+            "a timer tops out below complete, got {}",
+            build.progress
+        );
+        assert_eq!(build.state, StageState::Running);
+        // And the estimator itself reaches the cap only when the budget is
+        // spent many times over.
+        assert_eq!(stage_estimate(0, 1), 0);
+        assert_eq!(stage_estimate(1, 10), 9);
+        assert_eq!(stage_estimate(10, 10), 90);
+        assert_eq!(stage_estimate(10_000, 10), 90, "the cap is 90, not 100");
+        ctx.stage_done("build");
+        let stages = manager.task(&task.id).unwrap().stages;
+        let build = stages.iter().find(|s| s.id == "build").unwrap();
+        assert_eq!(build.progress, 100);
+        assert_eq!(build.state, StageState::Done);
+    }
+
+    /// A failed stage records where it stopped, and the stages after it stay
+    /// pending rather than pretending to have succeeded.
+    #[test]
+    fn a_failed_stage_carries_its_detail_and_leaves_later_stages_pending() {
+        let paths = paths("stage-fail");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = manager
+            .enqueue(&paths, "template-pull", vec![], serde_json::json!({}))
+            .unwrap();
+        let ctx = context(&paths, &manager, &task.id);
+        ctx.plan_stages(&[("clone", "Cloning", 20), ("build", "Building", 450), ("publish", "Publishing", 40)]);
+        ctx.stage_started("clone");
+        ctx.stage_done("clone");
+        ctx.stage_started("build");
+        ctx.stage_failed("build", "pnpm run build failed; inspect prepare.log");
+        let stages = manager.task(&task.id).unwrap().stages;
+        let build = stages.iter().find(|s| s.id == "build").unwrap();
+        assert_eq!(build.state, StageState::Failed);
+        assert!(build.failure_detail.as_deref().unwrap_or("").contains("pnpm run build"));
+        let publish = stages.iter().find(|s| s.id == "publish").unwrap();
+        assert_eq!(publish.state, StageState::Pending, "later stages must not look done");
+        assert_eq!(publish.progress, 0);
+    }
+
+    /// Retrying a stage is visible as a count, not as a silent restart.
+    #[test]
+    fn restarting_a_stage_bumps_its_attempt_count() {
+        let paths = paths("stage-attempts");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = manager
+            .enqueue(&paths, "template-pull", vec![], serde_json::json!({}))
+            .unwrap();
+        let ctx = context(&paths, &manager, &task.id);
+        ctx.plan_stages(&[("install", "Installing", 120)]);
+        ctx.stage_started("install");
+        ctx.stage_failed("install", "network");
+        ctx.stage_started("install");
+        let stages = manager.task(&task.id).unwrap().stages;
+        let install = stages.iter().find(|s| s.id == "install").unwrap();
+        assert_eq!(install.attempts, 1);
+        assert_eq!(install.state, StageState::Running);
+        assert!(install.failure_detail.is_none(), "a retry clears the previous detail");
+    }
+
+    /// The overall figure is weighted by budget, so the old single bar keeps
+    /// telling the truth for readers that do not know about stages.
+    #[test]
+    fn overall_progress_is_weighted_and_never_reads_as_frozen() {
+        let stages = vec![
+            TaskStage { id: "a".to_owned(), label: "a".to_owned(), state: StageState::Done, progress: 100, started_at: None, finished_at: None, duration_hint_secs: 100, attempts: 0, failure_detail: None },
+            TaskStage { id: "b".to_owned(), label: "b".to_owned(), state: StageState::Running, progress: 50, started_at: None, finished_at: None, duration_hint_secs: 300, attempts: 0, failure_detail: None },
+        ];
+        // 100% of 100 plus 50% of 300, over 400 total: 62.5, rounded to 63.
+        assert_eq!(overall_progress(&stages), 63);
+        assert_eq!(overall_progress(&[]), 0);
+
+        // The case that made the old bar look dead: a short opening stage at
+        // 18% inside a 645 s total is ~0.5% of the whole, which truncation
+        // reported as 0 while the clone was demonstrably running.
+        let opening = vec![
+            TaskStage { id: "clone".to_owned(), label: "c".to_owned(), state: StageState::Running, progress: 18, started_at: Some(1), finished_at: None, duration_hint_secs: 20, attempts: 0, failure_detail: None },
+            TaskStage { id: "build".to_owned(), label: "b".to_owned(), state: StageState::Pending, progress: 0, started_at: None, finished_at: None, duration_hint_secs: 625, attempts: 0, failure_detail: None },
+        ];
+        assert_eq!(overall_progress(&opening), 1);
+
+        // A stage that has only just started is still started work.
+        let just_started = vec![
+            TaskStage { id: "clone".to_owned(), label: "c".to_owned(), state: StageState::Running, progress: 0, started_at: Some(1), finished_at: None, duration_hint_secs: 20, attempts: 0, failure_detail: None },
+        ];
+        assert_eq!(overall_progress(&just_started), 1);
+    }
+
+    /// A record written before stages existed still loads and renders.
+    #[test]
+    fn a_record_without_stages_still_deserialises() {
+        let json = serde_json::json!({
+            "id": "t1", "kind": "template-pull", "resourceKeys": [],
+            "status": "running", "stage": "Working", "progress": 40,
+            "createdAt": 1, "startedAt": 2, "finishedAt": null,
+            "logPath": "/tmp/t1.log", "error": null, "params": {},
+            "cancelRequested": false
+        });
+        let record: TaskRecord = serde_json::from_value(json).unwrap();
+        assert!(record.stages.is_empty(), "an old record has no stages, and the UI falls back");
     }
 }
 

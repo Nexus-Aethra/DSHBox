@@ -188,6 +188,13 @@ pub(crate) fn pull_template_with_cancel(
     cancelled: impl Fn() -> bool + Send + 'static,
     task: &TaskContext,
 ) -> Result<(), String> {
+    // The cancel flag is asked more than once: the clone consumes it, and the
+    // error path needs it again to tell a user cancellation from a failure.
+    let cancel_flag = std::sync::Arc::new(std::sync::Mutex::new(cancelled));
+    let cancelled = {
+        let flag = std::sync::Arc::clone(&cancel_flag);
+        move || flag.lock().map(|guard| guard()).unwrap_or(true)
+    };
     let root = read_config()?
         .runtime_directory
         .clone()
@@ -204,7 +211,24 @@ pub(crate) fn pull_template_with_cancel(
         ));
     }
 
-    task.update("Cloning Harness source", 10);
+    // Declare the whole shape up front so the UI can show what is still to
+    // come, not just what is happening now. Budgets come from measurement:
+    // `pnpm run build` takes 433-471 s on this machine, which is most of the
+    // elapsed time, so the three build sub-steps carry most of the budget.
+    task.plan_stages(&[
+        ("clone", "Cloning Harness source", 20),
+        ("install", "Installing DSH dependencies", 120),
+        ("build", "Building DSH client artifacts", 450),
+        ("validate", "Validating prepared base", 15),
+        ("publish", "Publishing prepared base", 40),
+    ]);
+    task.stage_started("clone");
+    // Which stage is running right now, so every error path can mark it
+    // failed instead of leaving a bar that reads as running on a dead task.
+    let stage_now = std::cell::RefCell::new("clone");
+    // One guard per running stage: dropping it (on the happy path or on a `?`)
+    // stops the timer, so no stage keeps ticking after it is done or failed.
+    let _clone_tick = StageTicker::start(task, "clone");
     task.log(&format!("cloning {ref_value} into private staging"));
     let staged = layout.create_staging_dir("template_pull")?;
     let harness = staged.join("harness");
@@ -212,7 +236,10 @@ pub(crate) fn pull_template_with_cancel(
         let mirror = read_config().ok().and_then(|config| config.github_mirror);
         let target = mirror_url(&parsed.url, mirror.as_deref());
         let revision = parsed.tag.as_deref().filter(|tag| *tag != "latest");
-        let commit = shallow_clone_with_cancel(&target, &harness, revision, cancelled)
+        let commit = shallow_clone_with_cancel(&target, &harness, revision, {
+            let flag = std::sync::Arc::clone(&cancel_flag);
+            move || flag.lock().map(|guard| guard()).unwrap_or(true)
+        })
             .map_err(|error| {
                 if error.contains("SSL") {
                     format!(
@@ -227,7 +254,11 @@ pub(crate) fn pull_template_with_cancel(
         configure_staged_pnpm_platform(&harness)?;
         let pnpm = resolve_toolchain("pnpm")?;
         let log_path = staged.join("prepare.log");
-        task.update("Installing DSH dependencies", 35);
+        drop(_clone_tick);
+        task.stage_done("clone");
+        *stage_now.borrow_mut() = "install";
+        task.stage_started("install");
+        let _install_tick = StageTicker::start(task, "install");
         task.log("installing DSH dependencies in prepared-base staging");
         run_pnpm_task(
             &pnpm,
@@ -248,10 +279,19 @@ pub(crate) fn pull_template_with_cancel(
         // and the platform — not on the profile's plugins — so a prepared base
         // can carry it for every template built from it. This is the slow step
         // (native addon, host/client libraries, web frontend).
-        task.update("Building DSH client artifacts", 50);
+        drop(_install_tick);
+        task.stage_done("install");
+        *stage_now.borrow_mut() = "build";
+        task.stage_started("build");
+        let _build_tick = StageTicker::start(task, "build");
         task.log("building DSH client artifacts (native addon, host/client libs, web frontend); this is the slow step");
         let build_started = std::time::Instant::now();
-        run_pnpm_task_with(
+        // `pnpm run build` is one child process, so its internal order is not
+        // observable from here. Rather than invent sub-steps, the ticker above
+        // advances the stage from elapsed time against its budget: the bar then
+        // moves because time is really passing, and a stuck build freezes at 90%
+        // with the elapsed time still climbing — which is the honest report.
+        let build_result = run_pnpm_task_with(
             &pnpm,
             &harness,
             ["run", "build"],
@@ -259,7 +299,16 @@ pub(crate) fn pull_template_with_cancel(
             task,
             "prepared-base client build",
             &[("DSH_CLIENT_COMMIT_HASH", commit.as_str())],
-        )?;
+        );
+        // Stop the ticker before reporting the outcome, so a finished stage
+        // cannot be overwritten by a late tick.
+        drop(_build_tick);
+        if let Err(error) = build_result {
+            // The failure is recorded once, by mark_stage_outcome on the way
+            // out: marking it here as well would broadcast a failed stage
+            // that the uniform path then overwrites.
+            return Err(error);
+        }
         task.log(&format!(
             "client artifacts built in {}s",
             build_started.elapsed().as_secs()
@@ -267,8 +316,12 @@ pub(crate) fn pull_template_with_cancel(
         crate::sealed::write_client_artifact_marker(&harness, &commit)?;
         task.check_cancelled()?;
 
-        task.update("Validating prepared base", 60);
+        task.stage_done("build");
+        *stage_now.borrow_mut() = "validate";
+        task.stage_started("validate");
+        let _validate_tick = StageTicker::start(task, "validate");
         validate_prepared_harness(&harness)?;
+        drop(_validate_tick);
         let runtime = bundled_runtime()?;
         let created_at = now_seconds();
         let digest = box_dsh_versions::template_content_hash(&format!(
@@ -290,6 +343,7 @@ pub(crate) fn pull_template_with_cancel(
     let mut record = match prepare {
         Ok(record) => record,
         Err(error) => {
+            mark_stage_outcome(task, &stage_now, &error, cancelled());
             // Staging is deliberately ephemeral, but the user-facing error
             // points at the pnpm transcript. Retain that transcript before
             // cleanup so a failed template pull is diagnosable after the task
@@ -338,25 +392,35 @@ pub(crate) fn pull_template_with_cancel(
         size_bytes: record.size_bytes,
         validated_at: now_seconds(),
     };
-    write_template_manifest(&staged, &manifest)?;
-    task.update("Publishing prepared base", 84);
-    let destination =
-        layout.prepared_base_dir(record.id.strip_prefix("base-").unwrap_or(&record.id))?;
-    if destination.exists() {
-        let _ = fs::remove_dir_all(&staged);
-        return Err(format!(
-            "prepared base already exists at {}",
-            destination.display()
-        ));
+    let publish_result = (|| -> Result<(), String> {
+        write_template_manifest(&staged, &manifest)?;
+        task.stage_done("validate");
+        *stage_now.borrow_mut() = "publish";
+        task.stage_started("publish");
+        let _publish_tick = StageTicker::start(task, "publish");
+        let destination =
+            layout.prepared_base_dir(record.id.strip_prefix("base-").unwrap_or(&record.id))?;
+        if destination.exists() {
+            let _ = fs::remove_dir_all(&staged);
+            return Err(format!(
+                "prepared base already exists at {}",
+                destination.display()
+            ));
+        }
+        layout.publish_staged_tree(&staged, &destination)?;
+        record.directory = destination.to_string_lossy().into_owned();
+        index.insert(record.version.clone(), record.clone());
+        write_prepared_base_index(&layout, &index)?;
+        let mut updated = read_config()?;
+        updated.selected_dsh_version = Some(record.version.clone());
+        write_config(&updated)?;
+        task.stage_done("publish");
+        Ok(())
+    })();
+    if let Err(error) = publish_result {
+        mark_stage_outcome(task, &stage_now, &error, cancelled());
+        return Err(error);
     }
-    layout.publish_staged_tree(&staged, &destination)?;
-    record.directory = destination.to_string_lossy().into_owned();
-    index.insert(record.version.clone(), record.clone());
-    write_prepared_base_index(&layout, &index)?;
-    let mut updated = read_config()?;
-    updated.selected_dsh_version = Some(record.version.clone());
-    write_config(&updated)?;
-    task.update("Prepared base ready", 100);
     task.log(&format!(
         "prepared base {} ({}) is ready",
         record.version, record.id
@@ -366,6 +430,28 @@ pub(crate) fn pull_template_with_cancel(
         ref_value, record.version
     );
     Ok(())
+}
+
+/// Mark the stage that was running when the pull failed, so a dead task never
+/// leaves a stage bar reading as still running. A cancellation is not a
+/// failure: the stage is skipped, anything else records the failure detail.
+fn mark_stage_outcome(
+    task: &TaskContext,
+    stage_now: &std::cell::RefCell<&'static str>,
+    error: &str,
+    cancelled: bool,
+) {
+    let stage = *stage_now.borrow();
+    // Ask the cancel flag rather than reading the error text. The message is
+    // spelled in several places across crates ("task cancelled", "task
+    // cancelled while {description}"), and a cancelled clone surfaces as a
+    // libgit2 error ("Git clone failed: ...") with the cancellation nowhere
+    // in it — matching on text would call that a failure.
+    if cancelled || error.starts_with("task cancelled") {
+        task.stage_skipped(stage);
+    } else {
+        task.stage_failed(stage, error);
+    }
 }
 
 /// pnpm's lockfile resolver needs an explicit supported-architectures entry
@@ -407,6 +493,45 @@ fn configure_staged_pnpm_platform(harness: &Path) -> Result<(), String> {
     .map_err(|error| format!("cannot write {}: {error}", workspace.display()))
 }
 
+/// A stage that ticks itself while it runs.
+///
+/// Drives `stage_tick` on a timer so a stage's bar moves because time really
+/// is passing, not because a number was written once. Dropping it stops the
+/// timer, which is why every stage below holds one in a local binding until
+/// it is done: the guard is the lifetime, so a `?` on an error path stops the
+/// ticking too instead of leaving a thread behind.
+struct StageTicker {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StageTicker {
+    fn start(task: &TaskContext, stage_id: &str) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = stop.clone();
+        let context = task.clone();
+        let id = stage_id.to_owned();
+        let handle = std::thread::spawn(move || {
+            while flag.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                context.stage_tick(&id);
+            }
+        });
+        Self { stop, handle: Some(handle) }
+    }
+}
+
+impl Drop for StageTicker {
+    fn drop(&mut self) {
+        self.stop.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 fn run_pnpm_task<const N: usize>(
     pnpm: &crate::toolchains::ResolvedToolchain,
     directory: &Path,

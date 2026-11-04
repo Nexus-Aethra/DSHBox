@@ -313,6 +313,35 @@ code.missing { color: #b42318; }
 .danger-button { color: #b42318 !important; }
 .task-pager { align-items: center; display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }.task-pager span { color: #737a83; font-size: 12px; }
 .task-pager .secondary { min-width: 28px; padding: 4px 9px; }
+
+/* Task stages: one row per declared step, each with its own bar.
+   A single overall bar sits still for minutes inside a slow step, which is
+   indistinguishable from a crash; a row per stage shows which step is live,
+   how long it has run, and what it was expected to take. */
+.task-stages { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.task-stage { border-left: 2px solid #edf0f3; padding-left: 8px; }
+.task-stage-running { border-left-color: #2864dc; }
+.task-stage-done { border-left-color: #12805c; }
+.task-stage-failed { border-left-color: #b42318; }
+.task-stage-head { align-items: center; display: flex; gap: 6px; font-size: 12px; }
+.task-stage-marker { color: #667085; font-variant-numeric: tabular-nums; width: 12px; }
+.task-stage-running .task-stage-marker { color: #2864dc; }
+.task-stage-done .task-stage-marker { color: #12805c; }
+.task-stage-failed .task-stage-marker { color: #b42318; }
+.task-stage-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-stage-pending .task-stage-label, .task-stage-pending .task-stage-pct { color: #98a2b3; }
+.task-stage-pct { font-variant-numeric: tabular-nums; color: #475467; }
+.task-stage-bar { background: #edf0f3; border-radius: 999px; height: 4px; margin: 4px 0 2px; overflow: hidden; }
+.task-stage-bar i { background: #98a2b3; display: block; height: 100%; transition: width 240ms ease; }
+.task-stage-running .task-stage-bar i { background: #2864dc; }
+.task-stage-done .task-stage-bar i { background: #12805c; }
+.task-stage-failed .task-stage-bar i { background: #b42318; }
+.task-stage-pending .task-stage-bar i { background: #d0d5dd; }
+.task-stage-meta { color: #98a2b3; display: flex; font-size: 11px; gap: 10px; font-variant-numeric: tabular-nums; }
+/* Past its budget is the one state worth colouring: it is the honest 'this is
+   taking longer than expected' signal, and it is not the same as failed. */
+.task-stage-meta .task-stage-over { color: #b54708; font-weight: 600; }
+.task-stage-failure { color: #b42318; font-size: 11px; margin-top: 3px; }
 .task-inline-log { margin-top: 8px; }.task-inline-log-head { align-items: center; display: flex; justify-content: space-between; margin-bottom: 6px; }.task-inline-log-head span { color: #737a83; font-size: 11px; font-weight: 650; letter-spacing: .05em; text-transform: uppercase; }.task-inline-log pre { background: #15191f; border-radius: 8px; color: #dce3eb; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; max-height: 240px; overflow: auto; padding: 10px 12px; white-space: pre-wrap; }
 /* === UI component library === */
 .ui-button { align-items: center; background: var(--color-bg); border: 1px solid var(--color-border); border-radius: var(--radius-md); color: #3d444d; cursor: pointer; display: inline-flex; font-size: 13px; font-weight: 500; gap: 6px; justify-content: center; padding: 8px 12px; transition: background 120ms ease, border-color 120ms ease, color 120ms ease; white-space: nowrap; }

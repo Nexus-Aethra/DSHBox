@@ -428,6 +428,7 @@ mod tests {
             status: status.to_owned(),
             stage: status.to_owned(),
             progress: 42,
+            stages: Vec::new(),
             created_at: 1,
             started_at: None,
             finished_at: None,

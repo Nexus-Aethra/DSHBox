@@ -55,6 +55,15 @@ pub enum DaemonEvent {
     /// exists, and pushing the whole state here would be a second shape of
     /// the same data to keep in step.
     UpdateState,
+    /// A task's declared stages changed (started, progressed or finished).
+    ///
+    /// Separate from `TaskStage`, which carries only the one-line summary the
+    /// old single bar needs. The per-stage picture has its own shape, and
+    /// folding it into that event would make both harder to read.
+    TaskStages {
+        task_id: String,
+        stages: serde_json::Value,
+    },
     /// A box-helper completed its registration handshake.
     NodeRegistered {
         id: String,
@@ -86,6 +95,7 @@ impl DaemonEvent {
             Self::ResourceUpdated { .. } => "resource_updated",
             Self::TagsFetched { .. } => "tags_fetched",
             Self::UpdateState => "update_state",
+            Self::TaskStages { .. } => "task_stages",
             Self::NodeRegistered { .. } => "node_registered",
             Self::NodeStatus { .. } => "node_status",
             Self::NodeLog { .. } => "node_log",
@@ -104,6 +114,7 @@ impl DaemonEvent {
         match self {
             Self::NodeRegistered { .. } | Self::NodeStatus { .. } | Self::NodeLog { .. } => true,
             Self::TaskStage { .. }
+            | Self::TaskStages { .. }
             | Self::TaskLog { .. }
             | Self::TaskFinished { .. }
             | Self::RollbackStarted { .. }
