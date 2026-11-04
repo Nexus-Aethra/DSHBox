@@ -304,7 +304,9 @@ pub(crate) fn pull_template_with_cancel(
         // cannot be overwritten by a late tick.
         drop(_build_tick);
         if let Err(error) = build_result {
-            task.stage_failed("build", &error);
+            // The failure is recorded once, by mark_stage_outcome on the way
+            // out: marking it here as well would broadcast a failed stage
+            // that the uniform path then overwrites.
             return Err(error);
         }
         task.log(&format!(
