@@ -11,19 +11,21 @@
 
 ### 现状核实（2026-11-05，读代码得出）
 
-`shallow_clone_with_cancel`（`box-runtime/src/lib.rs:361`）有 **4 个生产调用点**，
-**其中 2 条是 Harness**：
+`shallow_clone_with_cancel`（`box-runtime/src/lib.rs:361`）的生产调用点：
 
-| 调用点 | 克隆对象 | 频率 |
+| 调用点 | 克隆对象 | 状态 |
 |---|---|---|
-| `dshboxd/src/versions.rs:239` | Harness prepared base（`<runtime>/prepared-bases/`） | 每个版本一次 |
-| `box-dsh-versions/src/lib.rs:669` | Harness 版本目录（`<root>/runtimes/<version>/source`），`dshbox template install` 走这条 | 每个版本一次 |
-| `dshboxd/src/data.rs:356` | 任意仓库（ADD data 的 GitHub 源） | 按需 |
-| `dshboxd/src/extensions.rs:888`、`bundles.rs:735` | 任意仓库（容器内导入插件、bundle 回源） | 按需 |
+| `dshboxd/src/versions.rs:239` | Harness prepared base（`<runtime>/templates/base-<digest>/`，`box-foundation/src/lib.rs:171-172`） | **生产路径**，每个版本一次 |
+| `dshboxd/src/data.rs:356` | 任意仓库（ADD data 的 GitHub 源） | 生产路径，按需 |
+| `dshboxd/src/extensions.rs:888`、`bundles.rs:735` | 任意仓库（容器内导入插件、bundle 回源） | 生产路径，按需 |
+| `box-dsh-versions/src/lib.rs:669` | Harness 版本目录（`<root>/runtimes/<version>/source`） | **遗留不可达**：`box_template_core::install_template`（`box-template-core/src/lib.rs:66`）没有生产调用者；它写的 `runtimes/` 布局也被 schema-10 的 `initialize_schema_10`（`box-foundation/src/lib.rs:205-212`）拒绝 |
 
-只改第一条，`dshbox template install` 的收益是零 —— 所以镜像必须**同时服务这两条
-Harness 路径**。任意仓库那三条不在范围内：克隆的是用户自己的仓库，一仓一镜像
-没有复用价值。
+**生产上只有一条 Harness clone 路径。** `dshbox template install`
+（`src/cli/template.rs:89`）走 RPC `pull_template` → `dispatch.rs:220` →
+`versions.rs:787` → `versions.rs:239`，与 UI 是同一条 —— 所以镜像只需要接一处。
+
+任意仓库那三条不在范围内：克隆的是用户自己的仓库，一仓一镜像没有复用价值。
+遗留那一条也不在范围内：它当前跑不通，改它是无用功。
 
 ### 一个必须先说清楚的事实
 
@@ -79,8 +81,16 @@ remote URL 漂移**。规则：
 | 镜像损坏 | libgit2 报对象/pack 级别错误（缺对象、pack 损坏） | 删除镜像，重建一次 |
 | 网络不可达 | fetch 连不上（传输层错误） | **保留镜像**；目标 tag 已在镜像里就直接用，不在就明确报错 |
 
-区分方式：fetch 的错误属于**传输层**（连不上、超时）还是**对象层**（缺对象、
-pack 损坏）—— 前者保留镜像，后者重建。
+判定必须可机械执行，不能靠错误字符串匹配。两条条件：
+
+1. **能不能连上远端** —— `git2::Error::class()` 属于 `ErrorClass::Network` /
+   `Http` / `Ssl` / `Timeout` 的，是传输层，**保留镜像**；
+2. **连上了但目标 ref 缺失** —— fetch 本身没报错，而之后 `revparse_single(tag)`
+   在镜像里找不到目标，那才是"对象缺失"，**重建镜像**。
+
+注意这两条不是同一个维度：`ErrorClass::Git` / `Os` 既可能是传输失败也可能是
+存储损坏，不能单看 class 就决定删镜像。判定顺序是"先问连没连上，再问 ref 在不在
+镜像里"，只有后者缺失才重建。
 
 离线解析 tag 时注意：`list_remote_tags`（`box-runtime/src/lib.rs:408`）对
 `https://` URL 一律走 `remote_anonymous` + `connect_auth`（:458-471），**必须联网**；
@@ -128,33 +138,34 @@ prepared base 的完整 DSH 树（含 node_modules 与构建产物）、sealed t
 - 镜像只留**对象**，不做 checkout —— 不产生工作树；
 - `git gc` / 限制历史深度是候选，但**需要实测取舍**：浅历史能省空间，会失去
   "以后能取到任意旧 tag"的能力；
-- 提供"删除镜像"的入口（它是缓存，不是用户数据）。
+- 提供"删除镜像"的入口：`dshbox template mirror purge` 子命令（CLI 一处即可，
+  镜像是缓存不是用户数据，不需要 UI 按钮）。
 
 ## 不在范围
 
 - 任意仓库的 clone（`data.rs` / `extensions.rs` / `bundles.rs` 那三条）。
 - prepared base 的索引、去重、`validate_prepared_harness` 逻辑 —— 一个 DSH 版本
   一个 base 的颗粒度规则见 `docs/specs/prepared-template-runtime.md`；镜像是**源码的
-  来源**，不是另一层 base 缓存。
+  来源**，不是另一层 base 缓存（prepared base 落在 `<runtime>/templates/base-<digest>/`，
+  镜像不参与它的寻址）。
 - `client_artifacts_present` 的平台规则。
 
 ## 文件清单（预期）
 
 ```
 src-tauri/crates/box-runtime/src/lib.rs      +ensure_bare_mirror / +fetch_ref_to_mirror
-src-tauri/crates/box-runtime/src/lib.rs      +local_clone_from_mirror（离线 tag 解析）
 src-tauri/crates/dshboxd/src/versions.rs     pull_template_with_cancel 改走镜像
-src-tauri/crates/box-dsh-versions/src/lib.rs pull_template 改走镜像（第二条 Harness 路径）
 src-tauri/crates/dshboxd/src/dispatch.rs     +harness-mirror 资源 key
 docs/design/2026-11-04-shared-harness-mirror.md   本文件
 ```
 
 ## 验收
 
-1. 第二个版本不再全量传输：镜像里已有 tag 时，pull 不产生全量 clone（有单测 +
-   实测两次 pull 的传输量对比）。
-2. 两条 Harness 路径都走镜像：`pull_template` 与 `dshbox template install` 都在
-   镜像上完成（有测试）。
+1. 第二个版本不再全量传输：镜像里已有 tag 时，pull 不产生全量 clone —— 单测断言
+   第二次 fetch 新增的对象数**只等于**目标 tag 引入的对象数（传输量在 CI 里不可测，
+   对象数可测）。
+2. UI 与 CLI 落在同一条镜像路径上：`dshbox template install`（`src/cli/template.rs:89`）
+   与 UI 的拉取都经由 `versions.rs:239`，二者都在镜像上完成（有测试）。
 3. 离线可用：断网后 pull 一个镜像里已有的 tag 成功；失败时**镜像未被删除**（有单测）。
 4. 镜像损坏会重建：人为损坏镜像后 pull 自动重建一次，而不是永久失败（有单测）。
 5. 取消仍然有效：clone 途中取消，任务进入 cancelled 且不留下半个 staging（有单测）。
@@ -171,5 +182,4 @@ docs/design/2026-11-04-shared-harness-mirror.md   本文件
 | `config set mirror` 让 remote URL 漂移 | `MIRROR_SOURCE_URL` 比对 + `set-url`，不因换源重建 |
 | 锁粒度限制：整任务持锁，checkout 也被串行化 | 先用单任务实现；并发收益记为已知限制，或后续拆两个任务 |
 | 与 `repository:dsh-versions` 重复串行化 | 镜像用独立 key；一个 pull 最多 3 个 key |
-| 两条 Harness 路径各建一份镜像 | 两条路径共用同一个 `<runtime>/harness-mirror.git` |
 | 镜像缓存被误当用户数据（导出/拷贝/清理） | 镜像明确是缓存：不进导出、不进拷贝、不计入用户数据统计 |
