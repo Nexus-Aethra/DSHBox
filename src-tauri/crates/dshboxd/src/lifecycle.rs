@@ -387,9 +387,13 @@ pub(crate) fn start_dsh_container_inner(
         // A VM guest loads its module graph over a shared/drvfs filesystem
         // and can take several times longer than a host process on first
         // boot; widen the readiness window accordingly.
-        let ready = (0..(if handle_is_vm { HOST_READY_PROBES * 8 } else { HOST_READY_PROBES })).any(|attempt| {
+        let ready_probes = if handle_is_vm { HOST_READY_PROBES * 8 } else { HOST_READY_PROBES };
+        // Four 250ms probes per second; keep the log's denominator honest for
+        // the widened VM window instead of always printing "/60s".
+        let ready_budget_secs = ready_probes / 4;
+        let ready = (0..ready_probes).any(|attempt| {
             if task.map(TaskContext::cancelled).unwrap_or(false) {
-                handle.stop();
+                handle.stop_abrupt();
                 return false;
             }
             if let Ok(Some((code, signal))) = handle.exit_status() {
@@ -406,7 +410,7 @@ pub(crate) fn start_dsh_container_inner(
             }
             if let Some(task) = task {
                 if attempt % 20 == 0 {
-                    task.log(&format!("waiting for DSH host ({}/60s)", attempt / 4));
+                    task.log(&format!("waiting for DSH host ({}/{}s)", attempt / 4, ready_budget_secs));
                 }
             }
             if announced_url.is_none() {
@@ -481,7 +485,7 @@ pub(crate) fn start_dsh_container_inner(
             });
             return Err("task cancelled while waiting for DSH host".to_owned());
         }
-        handle.stop();
+        handle.stop_abrupt();
         let (code, signal) = handle
             .exit_status()
             .ok()

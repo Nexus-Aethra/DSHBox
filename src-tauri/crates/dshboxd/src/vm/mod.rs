@@ -41,6 +41,33 @@ pub(crate) fn windows_to_wsl_path(path: &Path) -> Option<String> {
 /// Pinned like every other runtime artifact; bumped deliberately.
 pub const GUEST_NODE_VERSION: &str = "22.20.0";
 
+/// SHA-256 of node-v22.20.0-linux-x64.tar.xz, from
+/// https://nodejs.org/dist/v22.20.0/SHASUMS256.txt
+#[cfg(target_os = "linux")]
+pub const GUEST_NODE_SHA256: &str =
+    "00bbd05e306ea68b6e13e17360d0e2f680b493ef95f2fea1c4296ff7437530bc";
+
+/// SHA-256 of Ubuntu 24.04 WSL amd64 rootfs, from
+/// https://cloud-images.ubuntu.com/wsl/releases/24.04/current/SHA256SUMS
+/// (the `ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz` row).
+pub const WSL_BASE_SHA256: &str =
+    "8251e27ffff381a4af5f41dcb94d867de3e0d9774a9241908ab34555d99315ea";
+
+/// Verify a downloaded artifact against a pinned hex digest. The digest is
+/// the trust anchor; a mismatch aborts, never falls back or retries silently.
+pub fn verify_sha256(bytes: &[u8], expected: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected {
+        return Err(format!(
+            "artifact digest mismatch: expected {expected}, got {actual}"
+        ));
+    }
+    Ok(())
+}
+
 pub fn guest_node_url() -> String {
     format!(
         "https://nodejs.org/dist/v{GUEST_NODE_VERSION}/node-v{GUEST_NODE_VERSION}-linux-x64.tar.xz"
@@ -132,5 +159,11 @@ pub fn launch(
             "VM backend {other:?} is not available on this platform; supported: {}",
             supported_list()
         )),
+        // No platform arm above matched (macOS and any future host): fail
+        // with the same honest error rather than leaving the match
+        // non-exhaustive. Without this arm the crate does not compile on a
+        // host with no VM backend, which broke the macOS release build.
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        None => Err("this platform has no VM backend".to_owned()),
     }
 }

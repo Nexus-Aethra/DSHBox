@@ -146,6 +146,18 @@ impl HostHandle {
             HostHandle::Vm(vm) => vm.stop(),
         }
     }
+
+    /// Shorter grace for the start-failure / cancel path. Host containers
+    /// used a 2s kill_tree here before the VM seam existed; keep that
+    /// behaviour instead of inheriting `stop()`'s 5s.
+    pub fn stop_abrupt(&mut self) {
+        match self {
+            HostHandle::Process(child) => {
+                let _ = child.kill_tree(false, Duration::from_secs(2));
+            }
+            HostHandle::Vm(vm) => vm.stop(),
+        }
+    }
 }
 
 #[cfg(test)]

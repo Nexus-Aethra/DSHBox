@@ -22,7 +22,7 @@
 pub mod imp {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     use box_runtime::process::TrackedChild;
 
@@ -76,8 +76,15 @@ pub mod imp {
                         .and_then(|response| response.error_for_status())
                         .and_then(|response| response.bytes())
                         .map_err(|error| format!("cannot download guest Node.js: {error}"))?;
-                    std::fs::write(&node_tar, &bytes)
-                        .map_err(|error| format!("cannot write {}: {error}", node_tar.display()))?;
+                    super::super::verify_sha256(&bytes, super::super::GUEST_NODE_SHA256)
+                        .map_err(|error| format!("guest Node.js: {error}"))?;
+                    // Atomic publish: a truncated download must not be
+                    // trusted by the next start.
+                    let partial = vm_dir.join("node.tar.xz.part");
+                    std::fs::write(&partial, &bytes)
+                        .map_err(|error| format!("cannot write {}: {error}", partial.display()))?;
+                    std::fs::rename(&partial, &node_tar)
+                        .map_err(|error| format!("cannot publish {}: {error}", node_tar.display()))?;
                 }
                 let status = Command::new("tar")
                     .args([
@@ -105,6 +112,10 @@ pub mod imp {
                     { "tag": "dsh", "path": container_directory.join("harness").to_string_lossy() },
                     { "tag": "home", "path": container_directory.join("profile").to_string_lossy() },
                     { "tag": "state", "path": container_directory.join("state").to_string_lossy() },
+                    // lifecycle writes box-web.patch.yml at the container root,
+                    // NOT under state/. Share the whole container directory so
+                    // the guest can read it; /dsh keeps the harness workdir.
+                    { "tag": "container", "path": container_directory.to_string_lossy() },
                 ],
                 "workdir": "/dsh",
                 "exec": "/usr/local/bin/node",
@@ -113,7 +124,7 @@ pub mod imp {
                     "--profile",
                     profile,
                     "--patch",
-                    "/state/box-web.patch.yml",
+                    "/container/box-web.patch.yml",
                     "--no-open",
                 ],
                 "env": {
@@ -276,8 +287,6 @@ pub mod imp {
                     library.get(b"krun_add_virtiofs\0").map_err(|e| e.to_string())?;
                 let set_exec: Symbol<unsafe extern "C" fn(u32, *const std::os::raw::c_char, *const *const std::os::raw::c_char, *const *const std::os::raw::c_char) -> i32> =
                     library.get(b"krun_set_exec\0").map_err(|e| e.to_string())?;
-                let set_env: Symbol<unsafe extern "C" fn(u32, *const *const std::os::raw::c_char) -> i32> =
-                    library.get(b"krun_set_env\0").map_err(|e| e.to_string())?;
                 let set_workdir: Symbol<unsafe extern "C" fn(u32, *const std::os::raw::c_char) -> i32> =
                     library.get(b"krun_set_workdir\0").map_err(|e| e.to_string())?;
                 let console: Symbol<unsafe extern "C" fn(u32, *const std::os::raw::c_char) -> i32> =

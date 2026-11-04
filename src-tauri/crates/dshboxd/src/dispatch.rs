@@ -1372,13 +1372,31 @@ fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<HandlerR
         return Err("invalid container id".to_owned());
     }
     stop_dsh_container(&id, &state.containers)?;
-    // A vm:wsl2 container leaves a registered WSL distro behind; removing
-    // the container removes the distro with it. Best-effort: an already-
-    // unregistered distro must not fail the delete.
-    let _ = crate::vm::wsl::unregister_container(&id);
     let root = read_config()?
         .runtime_directory
         .ok_or("DSH Box storage is not configured")?;
+    // Only a vm:wsl2 container ever leaves a registered WSL distro behind.
+    // Read the record before deleting its directory, gate on both platform
+    // and declared runtime, and report (rather than swallow) a failed
+    // unregister: the container directory is about to go away, so a leftover
+    // distro would otherwise be unreachable and hold the vhdx forever.
+    #[cfg(target_os = "windows")]
+    {
+        let record = Path::new(&root)
+            .join("instances")
+            .join(&id)
+            .join("container.json");
+        let is_wsl_vm = std::fs::read_to_string(&record)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|value| value["runtime"].as_str().map(str::to_owned))
+            .is_some_and(|runtime| runtime == "vm" || runtime == "vm:wsl2");
+        if is_wsl_vm {
+            if let Err(error) = crate::vm::wsl::unregister_container(&id) {
+                tracing::warn!("could not unregister WSL distro for {id}: {error}");
+            }
+        }
+    }
     // Reconcile before mutating so a stale file does not cause the
     // owner map to drift from the canonical sources we're about to
     // release.

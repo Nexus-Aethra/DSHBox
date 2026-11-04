@@ -3,10 +3,11 @@
 //! The container's prepared directory stays on the Windows filesystem and
 //! is mounted into the distro through drvfs (`/mnt/<drive>/...`), so the
 //! directory-is-the-container model holds without an image pipeline. The
-//! distro is imported from a base tarball (exported once from an existing
-//! user distro), provisioned with a pinned Node.js build, and the DSH host
-//! is launched inside it. WSL2's localhost forwarding exposes the guest's
-//! `127.0.0.1:<port>` on the host, which is the loopback contract.
+//! distro is imported from the official Ubuntu WSL rootfs tarball (downloaded
+//! and cached once; `DSHBOX_WSL_BASE_TAR` overrides it), provisioned with a
+//! pinned Node.js build, and the DSH host is launched inside it. WSL2's
+//! localhost forwarding exposes the guest's `127.0.0.1:<port>` on the host,
+//! which is the loopback contract.
 //!
 //! A keeper child (`wsl -d <distro> -- sleep infinity`) serves three
 //! purposes at once: it gives `host.pid` a real PID to observe, it binds
@@ -103,7 +104,12 @@ fn ensure_base_tarball() -> Result<PathBuf, String> {
     }
     let gz = cache.join("ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz");
     if !gz.is_file() {
+        // Stream into a temporary file and rename only on success: an
+        // interrupted download must not be cached as if it were complete.
+        let partial = cache.join("ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz.part");
+        let _ = fs::remove_file(&partial);
         let client = reqwest::blocking::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(1800))
             .build()
             .map_err(|error| format!("cannot build download client: {error}"))?;
@@ -112,21 +118,37 @@ fn ensure_base_tarball() -> Result<PathBuf, String> {
             .send()
             .and_then(|response| response.error_for_status())
             .map_err(|error| format!("cannot download the WSL base rootfs: {error}"))?;
-        let mut file = fs::File::create(&gz)
-            .map_err(|error| format!("cannot create {}: {error}", gz.display()))?;
+        let mut file = fs::File::create(&partial)
+            .map_err(|error| format!("cannot create {}: {error}", partial.display()))?;
         std::io::copy(&mut response, &mut file)
             .map_err(|error| format!("cannot download the WSL base rootfs: {error}"))?;
         file.sync_all()
-            .map_err(|error| format!("cannot flush {}: {error}", gz.display()))?;
+            .map_err(|error| format!("cannot flush {}: {error}", partial.display()))?;
+        drop(file);
+        fs::rename(&partial, &gz).map_err(|error| format!("cannot publish the WSL base rootfs: {error}"))?;
     }
+    // Verify the pinned digest before anything is unpacked or imported,
+    // including a gz that was cached by an earlier run.
+    let gz_bytes = fs::read(&gz)
+        .map_err(|error| format!("cannot read {}: {error}", gz.display()))?;
+    super::verify_sha256(&gz_bytes, super::WSL_BASE_SHA256)
+        .map_err(|error| format!("WSL base rootfs: {error}"))?;
     // Un-gzip into an uncompressed tar: `wsl --import` wants a plain tar.
+    // Write to .part too, so a crash mid-unpack cannot leave a truncated
+    // tar that every later start would trust.
+    let partial_tar = cache.join("wsl-base.tar.part");
+    let _ = fs::remove_file(&partial_tar);
     let input = fs::File::open(&gz).map_err(|error| error.to_string())?;
-    let mut output = fs::File::create(&base).map_err(|error| error.to_string())?;
+    let mut output = fs::File::create(&partial_tar).map_err(|error| error.to_string())?;
     std::io::copy(
         &mut flate2::read::GzDecoder::new(input),
         &mut output,
     )
     .map_err(|error| format!("cannot unpack the WSL base rootfs: {error}"))?;
+    output.sync_all().map_err(|error| error.to_string())?;
+    drop(output);
+    fs::rename(&partial_tar, &base)
+        .map_err(|error| format!("cannot publish the WSL base tar: {error}"))?;
     Ok(base)
 }
 
@@ -167,10 +189,14 @@ impl WslVm {
                 &vm_dir.join("distro").to_string_lossy(),
                 &base.to_string_lossy(),
             ])?;
+            // The fresh rootfs has no Node yet. Drop the Windows-side marker
+            // so a re-import (manual unregister, WSL reset) actually
+            // re-provisions instead of launching a guest without node.
+            let _ = fs::remove_file(vm_dir.join("provisioned"));
         }
 
         // Provision once: a pinned Node.js build extracted into /usr/local.
-        // The marker lives on the Windows side, so re-imports re-provision.
+        // The marker lives on the Windows side, and is invalidated on import.
         let marker = vm_dir.join("provisioned");
         if !marker.is_file() {
             if let Some(task) = task {
@@ -234,6 +260,13 @@ impl WslVm {
         container_directory: &Path,
         profile: &str,
     ) -> Result<(), String> {
+        // `profile` is interpolated into a `bash -c` script below. It comes
+        // from container.json, which is local user data, but a stray shell
+        // metacharacter would still turn into command execution inside the
+        // guest. Validate before any path is built.
+        if !box_foundation::is_safe_identifier(profile) {
+            return Err(format!("invalid profile for vm:wsl2: {profile:?}"));
+        }
         let guest = |path: &Path| {
             super::windows_to_wsl_path(path).ok_or_else(|| {
                 format!("{} is not on a fixed drive; vm:wsl2 containers must live on one", path.display())
@@ -243,15 +276,29 @@ impl WslVm {
         let home = guest(&container_directory.join("profile"))?;
         let patch = guest(&container_directory.join("box-web.patch.yml"))?;
         let log = guest(&container_directory.join("logs").join("host.log"))?;
-        let script = format!(
-            "cd {harness} && DSH_HOME={home} DSHBOX_CONTAINER_ID={container_id} setsid setsid nohup /usr/local/bin/node apps/cli/lib/bin.js --profile {profile} --patch {patch} --no-open < /dev/null >> {log} 2>&1 & sleep 2"
-        );
-        silent(
-            Command::new("wsl")
-                .args(["-d", &self.distro, "--exec", "bash", "-c", &script]),
+        // Pass every dynamic value as a positional parameter, never
+        // interpolated into the script text: runtime directories and
+        // container.json fields may contain spaces or shell metacharacters.
+        // `bash -c <script> <name> <arg>...` puts <name> in $0 and the
+        // arguments in $1..$6.
+        let script = r#"cd "$1" || exit 1
+DSH_HOME="$2" DSHBOX_CONTAINER_ID="$3" setsid nohup /usr/local/bin/node apps/cli/lib/bin.js --profile "$4" --patch "$5" --no-open < /dev/null >> "$6" 2>&1 &
+sleep 2"#;
+        let launched = silent(
+            Command::new("wsl").args([
+                "-d", &self.distro, "--exec", "bash", "-c", script,
+                "dshbox-launch", &harness, &home, container_id, profile, &patch, &log,
+            ]),
         )
         .output()
         .map_err(|error| format!("cannot launch DSH host in WSL: {error}"))?;
+        if !launched.status.success() {
+            return Err(format!(
+                "cannot launch DSH host in WSL (exit {}): {}",
+                launched.status,
+                String::from_utf8_lossy(&launched.stderr).trim()
+            ));
+        }
         Ok(())
     }
 
