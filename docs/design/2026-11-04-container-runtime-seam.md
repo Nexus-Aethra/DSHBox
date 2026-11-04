@@ -72,6 +72,11 @@ Drop 兜底强杀不变）。
 - **整机镜像导入/导出很快**：wsl --export 1327 MB tar 26.6 s，wsl --import 14.5 s。所以拷贝的单位必须是「整个镜像 tar + 每容器独立的 profile/(62.5 MB)」，不能逐文件。
 - 产物必须按**目标平台**判定：client_artifacts_present 现在用 build_platform()（宿主 OS-ARCH）比对 marker，Windows 准备的 win32 原生 addon 对 Linux guest 永远不命中。Linux 产物需要在 Linux 内 pnpm install && pnpm run build 生成，不能从宿主拼出来。
 
+### libkrun 的已知缺口（合并后单独一支修，见 fix/libkrun-vmm-pgroup 及后续 Linux 实机分支）
+
+- **VMM 子进程进程组**：`dshboxd --vmm-run` 起初用裸 `Command::spawn`，Unix 下继承 daemon 的进程组；而 `TrackedChild::kill_tree` 发的是 `kill(-pgid, SIGTERM)`（`box-runtime/src/process/lifecycle.rs`），停止一个 VM 容器会把 daemon 与所有 host 容器一起 TERM。现复用 `configure_non_interactive(&mut cmd, true)` 做 setsid；Linux 实机实测：无 setsid 时子 pgid = 父 pgid 558，setsid 后子 pgid = 自身 pid 598。
+- **virtiofs 不会自动挂载**：libkrun 1.9 的 guest init 只挂 `/dev /proc /sys /dev/pts /dev/shm`，`krun_add_virtiofs` 仅注册设备。config 里的 `/dsh`、`/home`、`/container` 挂载点与 `mount -t virtiofs` 必须由 guest init 显式完成，否则 `workdir /dsh`、`apps/cli/lib/bin.js`、`/container/box-web.patch.yml`、`DSH_HOME=/home` 全部不存在。此外 `krun_set_console_output` 是 VMM 侧文件，DSH 的 `dsh web:` 行不会自动追加到宿主 `logs/host.log`，`parse_announced_host_url` 因此拿不到 authenticated URL。**Libkrun 分支在本机无 libkrun.so，尚未实机验证，不能视为可用后端**；路线图 C 阶段按「供给适配器 + helper 在 guest 内挂载/启动」重做这条路径。
+
 ### 下一步（本分支之后，独立规划）
 
 上述约束说明真正的抽象不是「给模板加一个已编译标志」，而是把宿主也抽象成一个 **node**：每个 node 是一台真实执行环境（host / WSL2 / libkrun / VZ / docker），建立后第一件事连控制层注册；box-helper 跑在 node 内，承接 clone/install/build/export/copy 等全部文件操作，控制层只派意图。这样 host 与 VM 走同一条路径，镜像按 (node_id, base_id) 缓存，且可以在模板上指定运行到哪个 node。本分支**不含**这套重构，完整施工顺序见 [`docs/design/2026-11-04-node-architecture-roadmap.md`](2026-11-04-node-architecture-roadmap.md)。

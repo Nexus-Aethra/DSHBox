@@ -145,8 +145,15 @@ pub mod imp {
 
             let self_exe = std::env::current_exe()
                 .map_err(|error| format!("cannot locate this daemon: {error}"))?;
-            let child = Command::new(self_exe)
-                .args(["--vmm-run", &config_path.to_string_lossy()])
+            let mut command = Command::new(self_exe);
+            command.args(["--vmm-run", &config_path.to_string_lossy()]);
+            // The VMM must be its own process group. TrackedChild::kill_tree
+            // sends the signal to -pgid; without setsid the child inherits
+            // the daemon's process group and stopping one VM would TERM the
+            // daemon and every other container. This is the same helper the
+            // host-process backend uses, so the two paths cannot drift.
+            box_runtime::process::platform::configure_non_interactive(&mut command, true);
+            let child = command
                 .spawn()
                 .map_err(|error| format!("cannot start VMM child: {error}"))?;
             Ok(LibkrunVm {
