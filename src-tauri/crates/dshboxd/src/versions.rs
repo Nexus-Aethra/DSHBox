@@ -425,7 +425,10 @@ pub(crate) fn pull_template_with_cancel(
 /// failure: the stage is skipped, anything else records the failure detail.
 fn mark_stage_outcome(task: &TaskContext, stage_now: &std::cell::RefCell<&'static str>, error: &str) {
     let stage = *stage_now.borrow();
-    if error == "task cancelled" {
+    // The cancellation message is spelled in several places across crates
+    // ("task cancelled", "task cancelled while {description}"), so match the
+    // prefix: a user cancellation is a skip, a failure is a failure.
+    if error.starts_with("task cancelled") {
         task.stage_skipped(stage);
     } else {
         task.stage_failed(stage, error);
