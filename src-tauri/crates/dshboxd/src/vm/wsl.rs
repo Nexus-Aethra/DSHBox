@@ -374,7 +374,14 @@ impl VmHandle for WslVm {
 /// Best-effort by contract: an already-unregistered distro is not an error.
 pub fn unregister_container(container_id: &str) -> Result<(), String> {
     let distro = distro_name(container_id);
-    if list_distros()?.iter().any(|name| name == &distro) {
+    // WSL may have been uninstalled since the container was created. There
+    // is then no distro to remove, and the delete must not fail because of
+    // it — the container directory is the only thing left to clean up.
+    let distros = match list_distros() {
+        Ok(distros) => distros,
+        Err(_) => return Ok(()),
+    };
+    if distros.iter().any(|name| name == &distro) {
         wsl_output(&["--unregister", &distro])?;
     }
     Ok(())

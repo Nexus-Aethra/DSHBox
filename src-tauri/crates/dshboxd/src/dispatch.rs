@@ -1370,6 +1370,7 @@ fn enqueue_container_restart(
 /// function so the delete path and its tests cannot drift: RuntimeKind::parse
 /// accepts several spellings (`vm`, `vm:wsl2`, `vm-wsl2`, `VM:WSL2`, …)
 /// and a literal string match would leave an orphan distro behind.
+#[cfg(any(target_os = "windows", test))]
 fn record_requests_wsl_vm(value: &serde_json::Value) -> bool {
     match crate::runtime::RuntimeKind::from_record(value) {
         // `vm` means the platform default, which on Windows is wsl2.
