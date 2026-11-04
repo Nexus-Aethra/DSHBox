@@ -89,6 +89,13 @@ pub mod imp {
                     std::fs::rename(&partial, &node_tar)
                         .map_err(|error| format!("cannot publish {}: {error}", node_tar.display()))?;
                 }
+                // Verify every cached copy too, before extracting it as
+                // root. The download path already checked the bytes, but a
+                // file left by an older or tampered run must not be trusted.
+                let node_bytes = std::fs::read(&node_tar)
+                    .map_err(|error| format!("cannot read {}: {error}", node_tar.display()))?;
+                super::super::verify_sha256(&node_bytes, super::super::GUEST_NODE_SHA256)
+                    .map_err(|error| format!("guest Node.js: {error}"))?;
                 let status = Command::new("tar")
                     .args([
                         "-xJf",
