@@ -188,6 +188,13 @@ pub(crate) fn pull_template_with_cancel(
     cancelled: impl Fn() -> bool + Send + 'static,
     task: &TaskContext,
 ) -> Result<(), String> {
+    // The cancel flag is asked more than once: the clone consumes it, and the
+    // error path needs it again to tell a user cancellation from a failure.
+    let cancel_flag = std::sync::Arc::new(std::sync::Mutex::new(cancelled));
+    let cancelled = {
+        let flag = std::sync::Arc::clone(&cancel_flag);
+        move || flag.lock().map(|guard| guard()).unwrap_or(true)
+    };
     let root = read_config()?
         .runtime_directory
         .clone()
@@ -229,7 +236,10 @@ pub(crate) fn pull_template_with_cancel(
         let mirror = read_config().ok().and_then(|config| config.github_mirror);
         let target = mirror_url(&parsed.url, mirror.as_deref());
         let revision = parsed.tag.as_deref().filter(|tag| *tag != "latest");
-        let commit = shallow_clone_with_cancel(&target, &harness, revision, cancelled)
+        let commit = shallow_clone_with_cancel(&target, &harness, revision, {
+            let flag = std::sync::Arc::clone(&cancel_flag);
+            move || flag.lock().map(|guard| guard()).unwrap_or(true)
+        })
             .map_err(|error| {
                 if error.contains("SSL") {
                     format!(
@@ -331,7 +341,7 @@ pub(crate) fn pull_template_with_cancel(
     let mut record = match prepare {
         Ok(record) => record,
         Err(error) => {
-            mark_stage_outcome(task, &stage_now, &error);
+            mark_stage_outcome(task, &stage_now, &error, cancelled());
             // Staging is deliberately ephemeral, but the user-facing error
             // points at the pnpm transcript. Retain that transcript before
             // cleanup so a failed template pull is diagnosable after the task
@@ -406,7 +416,7 @@ pub(crate) fn pull_template_with_cancel(
         Ok(())
     })();
     if let Err(error) = publish_result {
-        mark_stage_outcome(task, &stage_now, &error);
+        mark_stage_outcome(task, &stage_now, &error, cancelled());
         return Err(error);
     }
     task.log(&format!(
@@ -423,12 +433,19 @@ pub(crate) fn pull_template_with_cancel(
 /// Mark the stage that was running when the pull failed, so a dead task never
 /// leaves a stage bar reading as still running. A cancellation is not a
 /// failure: the stage is skipped, anything else records the failure detail.
-fn mark_stage_outcome(task: &TaskContext, stage_now: &std::cell::RefCell<&'static str>, error: &str) {
+fn mark_stage_outcome(
+    task: &TaskContext,
+    stage_now: &std::cell::RefCell<&'static str>,
+    error: &str,
+    cancelled: bool,
+) {
     let stage = *stage_now.borrow();
-    // The cancellation message is spelled in several places across crates
-    // ("task cancelled", "task cancelled while {description}"), so match the
-    // prefix: a user cancellation is a skip, a failure is a failure.
-    if error.starts_with("task cancelled") {
+    // Ask the cancel flag rather than reading the error text. The message is
+    // spelled in several places across crates ("task cancelled", "task
+    // cancelled while {description}"), and a cancelled clone surfaces as a
+    // libgit2 error ("Git clone failed: ...") with the cancellation nowhere
+    // in it — matching on text would call that a failure.
+    if cancelled || error.starts_with("task cancelled") {
         task.stage_skipped(stage);
     } else {
         task.stage_failed(stage, error);
