@@ -93,8 +93,8 @@ remote URL 漂移**。规则：
 2. **连上了但目标 ref 缺失** —— fetch 本身没报错，而之后 `revparse_single(tag)`
    在镜像里找不到目标，那才是"对象缺失"，**重建镜像**。
 
-注意这两条不是同一个维度：`ErrorClass::Git` / `Os` 既可能是传输失败也可能是
-存储损坏，不能单看 class 就决定删镜像。判定顺序是"先问连没连上，再问 ref 在不在
+注意这两条不是同一个维度：`ErrorClass::Odb`（坏对象）/ `Os` 既可能是传输失败
+也可能是存储损坏，不能单看 class 就决定删镜像。判定顺序是"先问连没连上，再问 ref 在不在
 镜像里"，只有后者缺失才重建。
 
 离线解析 tag 时注意：`list_remote_tags`（`box-runtime/src/lib.rs:408`）对
