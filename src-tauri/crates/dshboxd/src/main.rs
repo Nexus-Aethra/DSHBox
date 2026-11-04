@@ -292,7 +292,11 @@ fn handle_http(mut stream: TcpStream, state: Arc<DaemonState>, token: &str) {
             );
             return;
         }
-        handle_sse(stream, &state);
+        // A session-token subscriber is a helper inside a node: it gets the
+        // node picture and node events, and none of the control plane's task
+        // or resource state. `is_main` decides which snapshot and which
+        // events it may see.
+        handle_sse(stream, &state, is_main);
         return;
     }
 
@@ -396,7 +400,7 @@ fn handle_http(mut stream: TcpStream, state: Arc<DaemonState>, token: &str) {
 /// SSE event stream: subscribe to the daemon's event bus and write received
 /// events as `text/event-stream` lines. The connection stays open until the
 /// client disconnects.
-fn handle_sse(mut stream: TcpStream, state: &DaemonState) {
+fn handle_sse(mut stream: TcpStream, state: &DaemonState, is_main: bool) {
     // Write SSE headers
     if writeln!(
         stream,
@@ -407,17 +411,27 @@ fn handle_sse(mut stream: TcpStream, state: &DaemonState) {
     // Subscribe to events
     let (_sid, rx) = state.events.subscribe();
 
-    // Write snapshot of current state
-    let snapshot = serde_json::json!({
-        "tasks": state.manager.list().unwrap_or_default(),
-        "resources": {},
-        "nodes": state.nodes.list().unwrap_or_default(),
-    });
+    // Write snapshot of current state. A restricted subscriber sees the node
+    // picture only: tasks carry working directories, error strings and log
+    // tails, which is control-plane state a helper has no business reading.
+    let snapshot = if is_main {
+        serde_json::json!({
+            "tasks": state.manager.list().unwrap_or_default(),
+            "resources": {},
+            "nodes": state.nodes.list().unwrap_or_default(),
+        })
+    } else {
+        serde_json::json!({ "nodes": state.nodes.list().unwrap_or_default() })
+    };
     let _ = writeln!(stream, "event: snapshot\ndata: {}\n", snapshot);
     let _ = stream.flush();
 
-    // Forward events as they arrive
+    // Forward events as they arrive. A restricted subscriber receives the node
+    // events the whitelist actually grants it, and nothing about tasks.
     while let Ok(event) = rx.recv() {
+        if !is_main && !event.is_node_event() {
+            continue;
+        }
         let name = event.event_name();
         let json = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned());
         let _ = writeln!(stream, "event: {name}\ndata: {json}\n");
