@@ -32,6 +32,7 @@ mod versions;
 mod vm;
 mod workspaces;
 
+use crate::events::DaemonEvent;
 use box_runtime::process;
 use box_server_core::{read_discovery, remove_discovery, write_discovery, ServerDiscovery};
 use state::{initialize_bundled_plugins, initialize_bundled_runtime, DaemonState};
@@ -283,20 +284,25 @@ fn handle_http(mut stream: TcpStream, state: Arc<DaemonState>, token: &str) {
                 (kv.next()? == "epoch").then(|| kv.next().unwrap_or("").parse::<u64>().ok()).flatten()
             })
             .unwrap_or(0);
-        let is_session = !is_main
-            && state.nodes.validate_session(query_token.as_deref(), None, epoch);
-        if !is_main && !is_session {
+        // Resolve the session to its node, not just to a boolean: the stream
+        // is filtered per node, so the identity has to travel with the scope.
+        let session_node = if is_main {
+            None
+        } else {
+            state.nodes.session_node_for(query_token.as_deref(), epoch)
+        };
+        let scope = if is_main {
+            SseScope::ControlPlane
+        } else if let Some(node_id) = session_node {
+            SseScope::Node(node_id)
+        } else {
             let _ = write!(
                 stream,
                 "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
             return;
-        }
-        // A session-token subscriber is a helper inside a node: it gets the
-        // node picture and node events, and none of the control plane's task
-        // or resource state. `is_main` decides which snapshot and which
-        // events it may see.
-        handle_sse(stream, &state, is_main);
+        };
+        handle_sse(stream, &state, &scope);
         return;
     }
 
@@ -397,39 +403,124 @@ fn handle_http(mut stream: TcpStream, state: Arc<DaemonState>, token: &str) {
     }
 }
 
+/// How often an open stream re-checks that its credential is still live. Short
+/// enough that a revocation takes effect while the user is still watching,
+/// long enough that an idle stream costs nothing worth measuring.
+const REVOKE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// What an SSE subscriber is allowed to see. Two kinds exist: the control
+/// plane (main token) sees everything, and a node helper sees its own node
+/// and nothing else.
+///
+/// This is a type rather than a bool because the difference is not just
+/// "more or less": a helper must be filtered *by node id*, and a bare
+/// flag cannot express that. Passing the wrong thing then reads as a
+/// compile error instead of a silent leak.
+enum SseScope {
+    ControlPlane,
+    Node(String),
+}
+
+impl SseScope {
+    fn is_main(&self) -> bool {
+        matches!(self, Self::ControlPlane)
+    }
+
+    fn node_id(&self) -> Option<&str> {
+        match self {
+            Self::ControlPlane => None,
+            Self::Node(id) => Some(id),
+        }
+    }
+
+    /// Whether this subscriber may receive the event. A node helper gets
+    /// node events for its own node only: `node_log` carries text another
+    /// guest controls, so an unscoped feed lets one guest write into another
+    /// guest's view.
+    fn allows(&self, event: &DaemonEvent) -> bool {
+        match self {
+            Self::ControlPlane => true,
+            Self::Node(own) => {
+                event.is_node_event() && event.node_id() == Some(own.as_str())
+            }
+        }
+    }
+
+    /// Re-check the credential behind an already-open stream.
+    ///
+    /// A session is validated once when the stream opens, and `node_deregister`
+    /// removes it afterwards. Checking only at connect means revocation never
+    /// revokes: a deregistered helper would keep receiving its node's events for
+    /// as long as its socket stayed open, which is exactly the window a
+    /// revoked credential must not have.
+    fn still_valid(&self, state: &DaemonState) -> bool {
+        match self {
+            Self::ControlPlane => true,
+            Self::Node(id) => state.nodes.has_session(id),
+        }
+    }
+}
 /// SSE event stream: subscribe to the daemon's event bus and write received
 /// events as `text/event-stream` lines. The connection stays open until the
 /// client disconnects.
-fn handle_sse(mut stream: TcpStream, state: &DaemonState, is_main: bool) {
+fn handle_sse(mut stream: TcpStream, state: &DaemonState, subscriber: &SseScope) {
     // Write SSE headers
     if writeln!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
-    ).is_err() { return; }
+    )
+    .is_err()
+    {
+        return;
+    }
     let _ = stream.flush();
 
-    // Subscribe to events
+    // Subscribe before building the snapshot, so an event that lands between
+    // the two is delivered rather than dropped on the floor.
     let (_sid, rx) = state.events.subscribe();
 
-    // Write snapshot of current state. A restricted subscriber sees the node
-    // picture only: tasks carry working directories, error strings and log
-    // tails, which is control-plane state a helper has no business reading.
-    let snapshot = if is_main {
+    // Snapshot: the control plane gets tasks, resources and nodes; a helper
+    // gets its own node record only. A NodeRecord carries a control URL and a
+    // helper version, and other nodes are not its business.
+    let nodes = state.nodes.list().unwrap_or_default();
+    let visible: Vec<_> = match subscriber.node_id() {
+        Some(id) => nodes.into_iter().filter(|n| n.id == id).collect(),
+        None => nodes,
+    };
+    let snapshot = if subscriber.is_main() {
         serde_json::json!({
             "tasks": state.manager.list().unwrap_or_default(),
             "resources": {},
-            "nodes": state.nodes.list().unwrap_or_default(),
+            "nodes": visible,
         })
     } else {
-        serde_json::json!({ "nodes": state.nodes.list().unwrap_or_default() })
+        serde_json::json!({ "nodes": visible })
     };
     let _ = writeln!(stream, "event: snapshot\ndata: {}\n", snapshot);
     let _ = stream.flush();
 
-    // Forward events as they arrive. A restricted subscriber receives the node
-    // events the whitelist actually grants it, and nothing about tasks.
-    while let Ok(event) = rx.recv() {
-        if !is_main && !event.is_node_event() {
+    // Forward events as they arrive, filtered by scope. `allows` is what keeps
+    // one guest from reading another node's log lines.
+    //
+    // `recv_timeout` rather than `recv`: a revocation (the node deregistered,
+    // or the daemon restarted and sessions died with it) has to reach an
+    // already-open stream. A blocking `recv` would only notice when the next
+    // unrelated event happened to arrive, which for an idle node is never.
+    loop {
+        let event = match rx.recv_timeout(REVOKE_CHECK_INTERVAL) {
+            Ok(event) => event,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if subscriber.still_valid(state) {
+                    continue;
+                }
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if !subscriber.still_valid(state) {
+            break;
+        }
+        if !subscriber.allows(&event) {
             continue;
         }
         let name = event.event_name();

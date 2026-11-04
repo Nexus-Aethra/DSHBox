@@ -1,7 +1,7 @@
 //! Node registry for the control plane (roadmap stage A).
 //!
 //! A node is one real execution environment: the daemon's own host process,
-//! a WSL2 distro, a libkrun microVM, an Apple VZ VM, a docker container…
+//! a WSL2 distro, a libkrun microVM, an Apple VZ VM, a docker container鈥?
 //! Stage A only owns the *registry and the registration handshake*; it does
 //! not start containers or move files. See docs/design/2026-11-04-node-core.md.
 
@@ -49,7 +49,7 @@ pub struct NodeRecord {
     pub enrolled_at: Option<u64>,
     pub last_seen: Option<u64>,
     pub helper_version: Option<String>,
-    /// Backend-specific reference (distro name, container id, …). Stage A
+    /// Backend-specific reference (distro name, container id, 鈥?. Stage A
     /// never reads it; the supply adapter in stage C will.
     pub backend_ref: Option<String>,
     /// The daemon's own host. Built-in, never heartbeats, never expires,
@@ -120,7 +120,7 @@ pub struct NodeManager {
 impl NodeManager {
     /// Build the manager. Uses the SQLite document store when a runtime is
     /// configured, and an in-memory collection otherwise (fresh install or
-    /// unit tests) — the same degradation the task queue uses.
+    /// unit tests) 鈥?the same degradation the task queue uses.
     pub fn load(paths: &BoxPaths, control_url: String, events: Arc<crate::events::DaemonEvents>) -> Self {
         let collection: Collection<NodeRecord> = match open_document_store_for_paths(paths) {
             Ok(store) => Collection::new(store, "nodes", node_key),
@@ -245,6 +245,13 @@ impl NodeManager {
         if kind.trim().is_empty() || !box_foundation::is_safe_identifier(kind) {
             return Err("invalid node kind".to_owned());
         }
+        // "host" names this daemon process. A helper registering under it would
+        // overwrite the built-in record with `host_node: false`, and the very
+        // next `deregister` would then delete it 鈥?the protection that stops a
+        // helper touching the host node assumes the id is not theirs to take.
+        if node_id.as_deref() == Some(HOST_NODE_ID) {
+            return Err(format!("node id '{HOST_NODE_ID}' is reserved for this daemon"));
+        }
         let id = node_id
             .filter(|v| !v.is_empty() && box_foundation::is_safe_identifier(v))
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -272,11 +279,13 @@ impl NodeManager {
     ) -> Result<(String, String, u64, u64), String> {
         let grant = {
             let mut grants = self.grants.lock().unwrap();
-            let grant = grants
-                .remove(enroll_token)
-                .ok_or("enroll token is unknown or already used")?;
+            // One message for unknown, already used and expired. Telling them
+            // apart tells an unauthenticated caller which guesses were closer,
+            // and the register path is the one place a stranger can knock.
+            const BAD_GRANT: &str = "enroll token is unknown, already used or expired";
+            let grant = grants.remove(enroll_token).ok_or(BAD_GRANT)?;
             if grant.expires_at < now_seconds() {
-                return Err("enroll token expired".to_owned());
+                return Err(BAD_GRANT.to_owned());
             }
             grant
         };
@@ -287,7 +296,11 @@ impl NodeManager {
             id: grant.node_id.clone(),
             kind: grant.kind,
             platform: grant.platform,
-            status: NodeStatus::Online,
+            // Written as `registering` and promoted below, so the record never
+            // claims `online` in the window before its session exists. A crash
+            // in that window leaves `registering`, which `sweep` expires 鈥?the
+            // state machine row is exercised rather than decorative.
+            status: NodeStatus::Registering,
             capabilities: grant.capabilities,
             control_url: Some(self.control_url()),
             session_epoch: epoch,
@@ -307,6 +320,11 @@ impl NodeManager {
                 epoch,
             },
         );
+        // Promote now that the session exists. Order matters: the record says
+        // `registering` until a token can actually be used, so nothing observes
+        // a node that is online with no way to reach it.
+        self.set_status(&grant.node_id, NodeStatus::Online)
+            .map_err(|e| e.to_string())?;
         self.events.broadcast(crate::events::DaemonEvent::NodeRegistered {
             id: record.id.clone(),
             kind: record.kind.clone(),
@@ -399,17 +417,40 @@ impl NodeManager {
         Ok(())
     }
 
+    /// Whether a live session exists for this node in *this* daemon process.
+    ///
+    /// Sessions are memory-only, so after a restart nothing has one. An
+    /// already-open SSE stream uses this to notice that its credential was
+    /// revoked (deregistered) or invalidated (daemon restarted).
+    pub fn has_session(&self, node_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .map(|sessions| sessions.contains_key(node_id))
+            .unwrap_or(false)
+    }
+
     /// Mark online nodes whose last heartbeat is older than the threshold as
     /// offline. Records are kept (their artifacts/backend refs remain), so a
     /// returning helper can go straight back to online.
     pub fn sweep(&self) -> usize {
         let now = now_seconds();
         let mut changed = 0;
+        // Expire stale enroll grants on the same tick: they are never
+        // persisted, so an unused one would otherwise sit in memory for the
+        // daemon's whole lifetime.
+        if let Ok(mut grants) = self.grants.lock() {
+            grants.retain(|_, grant| grant.expires_at >= now);
+        }
         for node in self.list().unwrap_or_default() {
-            if node.host_node || node.status != NodeStatus::Online {
+            // `registering` is a real state now: a helper that died between
+            // writing its record and receiving its session must not stay
+            // `registering` forever, so it expires like an idle online node.
+            if node.host_node
+                || !matches!(node.status, NodeStatus::Online | NodeStatus::Registering)
+            {
                 continue;
             }
-            let last = node.last_seen.unwrap_or(0);
+            let last = node.last_seen.or(node.enrolled_at).unwrap_or(0);
             if now.saturating_sub(last) > OFFLINE_AFTER_SECONDS {
                 if self.set_status(&node.id, NodeStatus::Offline).is_ok() {
                     changed += 1;
@@ -463,9 +504,9 @@ mod tests {
         assert_eq!(hb, HEARTBEAT_SECONDS);
         // A second use of the same one-shot grant must fail.
         assert!(m.register(&grant, None).is_err());
-        // The session is valid for its own node and current epoch…
+        // The session is valid for its own node and current epoch鈥?
         assert!(m.validate_session(Some(&session), Some(&id), epoch));
-        // …but not for another node, a stale epoch, or as a global token.
+        // 鈥ut not for another node, a stale epoch, or as a global token.
         assert!(!m.validate_session(Some(&session), Some("other"), epoch));
         assert!(!m.validate_session(Some(&session), Some(&id), epoch + 1));
         assert!(!m.validate_session(None, Some(&id), epoch));
@@ -560,5 +601,88 @@ mod tests {
         assert_eq!(record, back);
         assert!(json.contains("\"hostNode\":false"));
         assert!(json.contains("\"sessionEpoch\":7"));
+    }
+
+    #[test]
+    fn host_id_is_reserved_at_enroll() {
+        // Registering under the host id would overwrite the built-in record
+        // with host_node:false, and the protection that guards the host node
+        // assumes the id is not a helper's to take.
+        let m = manager();
+        let error = m
+            .enroll("wsl2", "linux-x64", vec![], Some(HOST_NODE_ID.to_owned()))
+            .unwrap_err();
+        assert!(error.contains("reserved"), "unexpected error: {error}");
+        let host = m.get(HOST_NODE_ID).unwrap().unwrap();
+        assert!(host.host_node);
+        assert_eq!(host.kind, "host");
+    }
+
+    #[test]
+    fn a_bad_grant_reads_the_same_whatever_went_wrong() {
+        // Unknown, already used and expired must be indistinguishable: the
+        // register path is reachable without a credential, so telling them
+        // apart tells a stranger which guesses were closer.
+        let m = manager();
+        let unknown = m.register("no-such-grant", None).unwrap_err();
+        let used = {
+            let grant = m.enroll("wsl2", "linux-x64", vec![], Some("g2".into())).unwrap().0;
+            m.register(&grant, None).unwrap();
+            m.register(&grant, None).unwrap_err()
+        };
+        let expired = {
+            let grant = m.enroll("wsl2", "linux-x64", vec![], Some("g3".into())).unwrap().0;
+            if let Ok(mut grants) = m.grants.lock() {
+                if let Some(g) = grants.get_mut(&grant) {
+                    g.expires_at = now_seconds() - 1;
+                }
+            }
+            m.register(&grant, None).unwrap_err()
+        };
+        assert_eq!(unknown, used);
+        assert_eq!(used, expired);
+    }
+
+    #[test]
+    fn register_promotes_registering_to_online() {
+        // The record must never claim online before its session exists, so
+        // the intermediate state has to be real and settled on success.
+        let m = manager();
+        let (grant, id, _, _) = m.enroll("wsl2", "linux-x64", vec![], Some("promo".into())).unwrap();
+        m.register(&grant, None).unwrap();
+        assert_eq!(m.get(&id).unwrap().unwrap().status, NodeStatus::Online);
+        assert!(m.has_session(&id), "a successful register leaves a live session");
+    }
+
+    #[test]
+    fn a_deregistered_node_has_no_session_left() {
+        // An open SSE stream asks exactly this to notice a revocation.
+        let m = manager();
+        let (grant, id, _, _) = m.enroll("wsl2", "linux-x64", vec![], Some("revoked".into())).unwrap();
+        m.register(&grant, None).unwrap();
+        assert!(m.has_session(&id));
+        m.deregister(&id).unwrap();
+        assert!(!m.has_session(&id), "revocation must revoke");
+    }
+
+    #[test]
+    fn sweep_expires_registering_and_purges_grants() {
+        let m = manager();
+        let (grant, id, _, _) = m.enroll("wsl2", "linux-x64", vec![], Some("stuck".into())).unwrap();
+        m.register(&grant, None).unwrap();
+        let mut rec = m.get(&id).unwrap().unwrap();
+        rec.status = NodeStatus::Registering;
+        rec.last_seen = Some(now_seconds() - OFFLINE_AFTER_SECONDS - 1);
+        m.collection.upsert(&[rec]).unwrap();
+        assert_eq!(m.sweep(), 1);
+        assert_eq!(m.get(&id).unwrap().unwrap().status, NodeStatus::Offline);
+        let live = m.enroll("wsl2", "linux-x64", vec![], Some("purge".into())).unwrap().0;
+        if let Ok(mut grants) = m.grants.lock() {
+            if let Some(g) = grants.get_mut(&live) {
+                g.expires_at = now_seconds() - 1;
+            }
+        }
+        m.sweep();
+        assert!(!m.grants.lock().unwrap().contains_key(&live));
     }
 }

@@ -82,17 +82,26 @@ pub(crate) fn node_get(state: &DaemonState, request: &Value) -> Result<Value, St
 }
 
 pub(crate) fn node_echo(state: &DaemonState, request: &Value) -> Result<Value, String> {
-    let node_id = request["__nodeId"].as_str().unwrap_or("").to_owned();
+    // Same rule as node_heartbeat: the node identity comes from the validated
+    // session. Defaulting to "" instead would let a main-token call reach the
+    // registry under an id that names no node.
+    let node_id = request["__nodeId"]
+        .as_str()
+        .ok_or("session is not bound to a node")?;
     let text = request["text"].as_str().unwrap_or("").to_owned();
-    state.nodes.report(&node_id, "info", &format!("echo: {text}"));
+    state.nodes.report(node_id, "info", &format!("echo: {text}"));
     Ok(json!({ "text": text, "nodeId": node_id }))
 }
 
 pub(crate) fn node_report(state: &DaemonState, request: &Value) -> Result<Value, String> {
-    let node_id = request["__nodeId"].as_str().unwrap_or("").to_owned();
+    // A report is attributed to the node that made it, and only that node: an
+    // empty or body-supplied id would let one guest write into another's log.
+    let node_id = request["__nodeId"]
+        .as_str()
+        .ok_or("session is not bound to a node")?;
     let level = request["level"].as_str().unwrap_or("info").to_owned();
     let line = request["line"].as_str().unwrap_or("").to_owned();
-    state.nodes.report(&node_id, &level, &line);
+    state.nodes.report(node_id, &level, &line);
     Ok(json!({ "ok": true }))
 }
 

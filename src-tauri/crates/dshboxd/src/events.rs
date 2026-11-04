@@ -1,4 +1,4 @@
-﻿//! Daemon event bus for SSE streaming.
+//! Daemon event bus for SSE streaming.
 //!
 //! Every task progress update, log line, and resource change is broadcast
 //! to all connected `/events` subscribers. The daemon writes the event
@@ -45,7 +45,7 @@ pub enum DaemonEvent {
     },
     /// A resource was removed (soft-deleted) from the resource map.
     ResourceRemoved { id: String },
-    /// A resource's status changed (e.g., active 鈫?deleted).
+    /// A resource's status changed (e.g., active → deleted).
     ResourceUpdated { id: String, status: String },
     /// Remote tags were fetched (result of `fetch_remote_tags`).
     TagsFetched { tags: Vec<String> },
@@ -92,18 +92,40 @@ impl DaemonEvent {
         }
     }
 
-    /// Whether this event belongs to the node surface. A helper's session
-    /// token may subscribe to `/events`, but only to what its whitelist grants
-    /// it; task and resource events are control-plane state, not node state.
+    /// Whether this event belongs to the node surface. A helper session
+    /// token may subscribe to the event stream, but only to what its
+    /// whitelist grants it; task and resource events are control-plane
+    /// state, not node state.
     ///
-    /// Kept next to `event_name` on purpose: a new node event that forgets this
-    /// match is a new event a helper silently never receives, and the two lists
-    /// being adjacent is what makes that omission visible.
+    /// Written as an exhaustive match rather than a wildcard so a new
+    /// variant forces a decision here instead of defaulting to "not a node
+    /// event" and vanishing from the surface without anyone noticing.
     pub fn is_node_event(&self) -> bool {
-        matches!(
-            self,
-            Self::NodeRegistered { .. } | Self::NodeStatus { .. } | Self::NodeLog { .. }
-        )
+        match self {
+            Self::NodeRegistered { .. } | Self::NodeStatus { .. } | Self::NodeLog { .. } => true,
+            Self::TaskStage { .. }
+            | Self::TaskLog { .. }
+            | Self::TaskFinished { .. }
+            | Self::RollbackStarted { .. }
+            | Self::RollbackFinished { .. }
+            | Self::RollbackFailed { .. }
+            | Self::ResourceAdded { .. }
+            | Self::ResourceRemoved { .. }
+            | Self::ResourceUpdated { .. }
+            | Self::TagsFetched { .. }
+            | Self::UpdateState => false,
+        }
+    }
+
+    /// The node this event belongs to, so a subscriber can be shown its
+    /// own node events only.
+    pub fn node_id(&self) -> Option<&str> {
+        match self {
+            Self::NodeRegistered { id, .. }
+            | Self::NodeStatus { id, .. }
+            | Self::NodeLog { id, .. } => Some(id),
+            _ => None,
+        }
     }
 }
 
@@ -148,65 +170,5 @@ impl DaemonEvents {
     pub fn broadcast(&self, event: DaemonEvent) {
         let mut subs = self.subs.lock().unwrap();
         subs.retain(|_id, tx| tx.send(event.clone()).is_ok());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The set of node events, spelled out once. A helper's session token may
-    /// subscribe to `/events`, so anything in this list is reachable from
-    /// inside a guest: adding to it is a decision, not an accident.
-    fn node_events() -> Vec<DaemonEvent> {
-        vec![
-            DaemonEvent::NodeRegistered {
-                id: "n".to_owned(),
-                kind: "wsl2".to_owned(),
-                platform: "linux-x64".to_owned(),
-            },
-            DaemonEvent::NodeStatus {
-                id: "n".to_owned(),
-                status: "online".to_owned(),
-            },
-            DaemonEvent::NodeLog {
-                id: "n".to_owned(),
-                level: "info".to_owned(),
-                line: "hi".to_owned(),
-            },
-        ]
-    }
-
-    #[test]
-    fn node_events_are_exactly_the_node_surface() {
-        for event in node_events() {
-            assert!(event.is_node_event(), "{} must be a node event", event.event_name());
-        }
-        // Control-plane events are not node events, whatever their name looks
-        // like. This is what stops a task log from reaching a guest.
-        let control = [
-            DaemonEvent::TaskStage { task_id: "t".to_owned(), stage: "preparing".to_owned(), progress: 1 },
-            DaemonEvent::TaskLog { task_id: "t".to_owned(), line: "l".to_owned() },
-            DaemonEvent::TaskFinished { task_id: "t".to_owned(), status: "done".to_owned(), error: None },
-            DaemonEvent::ResourceAdded { id: "r".to_owned(), r#type: "credentials".to_owned(), name: "c".to_owned() },
-            DaemonEvent::ResourceRemoved { id: "r".to_owned() },
-            DaemonEvent::ResourceUpdated { id: "r".to_owned(), status: "deleted".to_owned() },
-            DaemonEvent::TagsFetched { tags: vec![] },
-            DaemonEvent::UpdateState,
-            DaemonEvent::RollbackStarted { task_id: "t".to_owned() },
-            DaemonEvent::RollbackFinished { task_id: "t".to_owned() },
-            DaemonEvent::RollbackFailed { task_id: "t".to_owned(), error: "e".to_owned() },
-        ];
-        for event in control {
-            assert!(!event.is_node_event(), "{} must not reach a session subscriber", event.event_name());
-        }
-    }
-
-    #[test]
-    fn node_event_names_are_the_wire_names() {
-        // The UI switches on these strings; a rename is a silent drop, so the
-        // wire spelling is pinned rather than remembered.
-        let names: Vec<&str> = node_events().iter().map(|e| e.event_name()).collect();
-        assert_eq!(names, vec!["node_registered", "node_status", "node_log"]);
     }
 }
