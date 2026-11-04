@@ -147,6 +147,7 @@ worked). `command_surface` in `desktop/app.rs` diffs the command literals in
 command as done only once the installed app has run it.
 
 ## Known gotchas
+- **VM runtime is experimental and WSL2 is not hard isolation.** A container with `runtime: "vm"` / `"vm:<backend>"` opts in; an absent field is host mode. On Windows Home, WHPX/Hyper-V are unavailable, so the only backend is one WSL2 distro per container: mnt/pid/uts namespaces are separate, but the kernel, boot id, hostname and **netns are shared** (a guest loopback port is reachable from the Windows host and from sibling distros). Do not describe it as a security boundary. Copying the 108k-file Harness tree over drvfs takes >25 min at ~1.3 MB/s, while `wsl --import` of a 1.3 GB tar takes 14.5 s — move whole images, not per-file trees. And `client_artifacts_present` compares the marker against the **host's** `build_platform()`, so a Windows-prepared base never satisfies a Linux guest; Linux artifacts must be built inside Linux.
 
 - **No system Node/pnpm/Git required (Windows); Linux uses host git with isolated
   config.** Bundled Node + pnpm (pinned in `runtime-lock.json`, SHA-256/SHA-512

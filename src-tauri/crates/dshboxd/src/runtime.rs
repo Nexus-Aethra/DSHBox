@@ -8,10 +8,9 @@
 //! responder is a process or a virtual machine. The control plane (task
 //! queue, host.json, SSE events) and the agent surface (box_* tools over
 //! loopback) are already runtime-agnostic; this module is where the
-//! execution side stops being process-shaped.
+//! execution side is no longer process-shaped (host process or VM handle).
 
 use box_runtime::process::TrackedChild;
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Which execution backend a container's host runs on.
@@ -22,8 +21,8 @@ use std::time::Duration;
 /// and the creation path does not write the field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeKind {
-    /// A child process of the daemon, on the host OS. The only backend
-    /// this build implements.
+    /// A child process of the daemon, on the host OS. The default when a
+    /// container declares no VM runtime.
     Host,
     /// A virtual machine. The payload names the requested backend
     /// (`firecracker`, `wsl2`, `whpx`, …); `None` means "any VM backend".
@@ -85,13 +84,15 @@ impl RuntimeKind {
 
 /// What the daemon holds once a container's host is up.
 ///
-/// Process-shaped today; a VM backend adds its own arm (a VMM API client or
+/// A host process or a VM handle; the backend owns the latter (a VMM API client or
 /// a handle to the emulator process) without any verb above knowing.
 pub(crate) enum HostHandle {
     /// A child process of this daemon. `TrackedChild` owns the kill/reap
     /// lifecycle; its `Drop` carries the final force-kill exactly as before
     /// this wrapper existed.
     Process(TrackedChild),
+    /// A virtual machine, observed and stopped through the backend's handle.
+    Vm(Box<dyn crate::vm::VmHandle>),
 }
 
 impl HostHandle {
@@ -100,9 +101,30 @@ impl HostHandle {
     pub fn id(&self) -> Option<u32> {
         match self {
             HostHandle::Process(child) => child.id(),
+            HostHandle::Vm(vm) => vm.id(),
         }
     }
 
+    /// Process-group id of the host (Linux/macOS); `None` for backends
+    /// without one (VM arms, Windows).
+    pub fn pgid(&mut self) -> Option<i32> {
+        match self {
+            HostHandle::Process(child) => child.pgid(),
+            HostHandle::Vm(_) => None,
+        }
+    }
+
+    /// Exit details once the host has exited: `(code, signal)`. A VM arm
+    /// reports `None` while it cannot observe the guest's own exit — the
+    /// shared health watcher owns liveness for VMs, by URL.
+    pub fn exit_status(&mut self) -> std::io::Result<Option<(i32, Option<i32>)>> {
+        match self {
+            HostHandle::Process(child) => {
+                Ok(child.try_wait()?.map(crate::host::exit_status_to_parts))
+            }
+            HostHandle::Vm(vm) => Ok(if vm.has_exited()? { Some((-1, None)) } else { None }),
+        }
+    }
     /// Non-blocking liveness: `true` once the host has exited. Deliberately
     /// not `Option<ExitStatus>` — `ExitStatus` has no stable constructor, so
     /// a VM arm could not implement this verb; a VMM answers liveness from
@@ -110,6 +132,7 @@ impl HostHandle {
     pub fn has_exited(&mut self) -> std::io::Result<bool> {
         match self {
             HostHandle::Process(child) => Ok(child.try_wait()?.is_some()),
+            HostHandle::Vm(vm) => vm.has_exited(),
         }
     }
 
@@ -120,6 +143,19 @@ impl HostHandle {
             HostHandle::Process(child) => {
                 let _ = child.kill_tree(false, Duration::from_secs(5));
             }
+            HostHandle::Vm(vm) => vm.stop(),
+        }
+    }
+
+    /// Shorter grace for the start-failure / cancel path. Host containers
+    /// used a 2s kill_tree here before the VM seam existed; keep that
+    /// behaviour instead of inheriting `stop()`'s 5s.
+    pub fn stop_abrupt(&mut self) {
+        match self {
+            HostHandle::Process(child) => {
+                let _ = child.kill_tree(false, Duration::from_secs(2));
+            }
+            HostHandle::Vm(vm) => vm.stop(),
         }
     }
 }

@@ -11,6 +11,7 @@ DSH Box is a lightweight desktop shell built with [Tauri 2](https://tauri.app) t
 ## Highlights
 
 - **Isolated containers** — one DSH version, profile, workspace and host process each.
+- **Optional VM runtime (experimental)** — a container may declare `runtime: "vm"` / `"vm:<backend>"`; host mode stays the default. Windows uses one WSL2 distro per container, Linux a libkrun microVM. See [the runtime design note](docs/design/2026-11-04-container-runtime-seam.md).
 - **Embedded WebView** — the DSH UI opens in a native window; no ports, no URLs to paste.
 - **Ready in seconds** — a pulled Harness version arrives with its client artifacts built; `run` is a copy (~10s).
 - **Plugin dependency graph** — what loads, in what order, why: depth bands, halves apart, fold a depth away.
