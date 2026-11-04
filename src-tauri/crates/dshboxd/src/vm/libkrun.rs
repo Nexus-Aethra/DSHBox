@@ -48,7 +48,10 @@ pub mod imp {
             container_id: &str,
             container_directory: &Path,
             profile: &str,
-            port: u16,
+            // TSI shares the host network stack; the guest learns the port
+            // from box-web.patch.yml, not from the VMM config. Keep the
+            // parameter so every backend's start() has the same shape.
+            _port: u16,
             task: Option<&box_scheduler::TaskContext>,
         ) -> Result<LibkrunVm, String> {
             available()?;
@@ -131,7 +134,6 @@ pub mod imp {
                     "DSH_HOME": "/home",
                     "DSHBOX_CONTAINER_ID": container_id,
                 },
-                "port": port,
                 "console": container_directory.join("logs").join("host.log").to_string_lossy(),
             });
             let config_path = vm_dir.join("libkrun-cfg.json");

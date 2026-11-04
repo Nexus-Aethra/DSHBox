@@ -43,7 +43,6 @@ pub const GUEST_NODE_VERSION: &str = "22.20.0";
 
 /// SHA-256 of node-v22.20.0-linux-x64.tar.xz, from
 /// https://nodejs.org/dist/v22.20.0/SHASUMS256.txt
-#[cfg(target_os = "linux")]
 pub const GUEST_NODE_SHA256: &str =
     "00bbd05e306ea68b6e13e17360d0e2f680b493ef95f2fea1c4296ff7437530bc";
 

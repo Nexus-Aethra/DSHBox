@@ -4,7 +4,8 @@
 //! is mounted into the distro through drvfs (`/mnt/<drive>/...`), so the
 //! directory-is-the-container model holds without an image pipeline. The
 //! distro is imported from the official Ubuntu WSL rootfs tarball (downloaded
-//! and cached once; `DSHBOX_WSL_BASE_TAR` overrides it), provisioned with a
+//! and cached once; `DSHBOX_WSL_BASE_TAR` overrides it — the caller is then
+//! responsible for that tar's integrity), provisioned with a
 //! pinned Node.js build, and the DSH host is launched inside it. WSL2's
 //! localhost forwarding exposes the guest's `127.0.0.1:<port>` on the host,
 //! which is the loopback contract.
@@ -99,10 +100,16 @@ fn ensure_base_tarball() -> Result<PathBuf, String> {
         ));
     }
     let base = cache.join("wsl-base.tar");
-    if base.is_file() {
-        return Ok(base);
-    }
     let gz = cache.join("ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz");
+    // A cached wsl-base.tar is not a trust anchor: %TEMP% is writable by
+    // other users on this machine. Only a gz whose digest matches the pinned
+    // SHA-256 may produce (or re-produce) it. Never return a bare cached tar.
+    if base.is_file() && !gz.is_file() {
+        return Err(format!(
+            "cached {} has no verifiable source {}; delete it to re-download",
+            base.display(), gz.display()
+        ));
+    }
     if !gz.is_file() {
         // Stream into a temporary file and rename only on success: an
         // interrupted download must not be cached as if it were complete.
@@ -128,14 +135,20 @@ fn ensure_base_tarball() -> Result<PathBuf, String> {
         fs::rename(&partial, &gz).map_err(|error| format!("cannot publish the WSL base rootfs: {error}"))?;
     }
     // Verify the pinned digest before anything is unpacked or imported,
-    // including a gz that was cached by an earlier run.
+    // including a gz that was cached by an earlier run. This runs on every
+    // call, including the cached-base branch above.
+    if !gz.is_file() {
+        return Err(format!("WSL base rootfs is missing: {}", gz.display()));
+    }
     let gz_bytes = fs::read(&gz)
         .map_err(|error| format!("cannot read {}: {error}", gz.display()))?;
     super::verify_sha256(&gz_bytes, super::WSL_BASE_SHA256)
         .map_err(|error| format!("WSL base rootfs: {error}"))?;
     // Un-gzip into an uncompressed tar: `wsl --import` wants a plain tar.
-    // Write to .part too, so a crash mid-unpack cannot leave a truncated
-    // tar that every later start would trust.
+    // Always rebuild it from the verified gz so a tampered cached tar can
+    // never shadow the verified source. Write to .part so a crash mid-unpack
+    // cannot leave a truncated tar that every later start would trust.
+    let _ = fs::remove_file(&base);
     let partial_tar = cache.join("wsl-base.tar.part");
     let _ = fs::remove_file(&partial_tar);
     let input = fs::File::open(&gz).map_err(|error| error.to_string())?;
@@ -205,6 +218,7 @@ impl WslVm {
             let node_tar = vm_dir.join("node.tar.xz");
             if !node_tar.is_file() {
                 let client = reqwest::blocking::Client::builder()
+                    .no_proxy()
                     .timeout(Duration::from_secs(300))
                     .build()
                     .map_err(|error| format!("cannot build download client: {error}"))?;
@@ -214,9 +228,22 @@ impl WslVm {
                     .and_then(|response| response.error_for_status())
                     .and_then(|response| response.bytes())
                     .map_err(|error| format!("cannot download guest Node.js: {error}"))?;
-                std::fs::write(&node_tar, &bytes)
-                    .map_err(|error| format!("cannot write {}: {error}", node_tar.display()))?;
+                super::verify_sha256(&bytes, super::GUEST_NODE_SHA256)
+                    .map_err(|error| format!("guest Node.js: {error}"))?;
+                // Atomic publish: a truncated download must not be trusted
+                // by the next start, and must never be unpacked as root.
+                let partial = vm_dir.join("node.tar.xz.part");
+                let _ = fs::remove_file(&partial);
+                fs::write(&partial, &bytes)
+                    .map_err(|error| format!("cannot write {}: {error}", partial.display()))?;
+                fs::rename(&partial, &node_tar)
+                    .map_err(|error| format!("cannot publish {}: {error}", node_tar.display()))?;
             }
+            // Verify every cached copy too before extracting it as root.
+            let node_bytes = fs::read(&node_tar)
+                .map_err(|error| format!("cannot read {}: {error}", node_tar.display()))?;
+            super::verify_sha256(&node_bytes, super::GUEST_NODE_SHA256)
+                .map_err(|error| format!("guest Node.js: {error}"))?;
             let guest_tar = super::windows_to_wsl_path(&node_tar)
                 .ok_or("node tarball is not on a fixed drive")?;
             wsl_output(&[
@@ -260,10 +287,10 @@ impl WslVm {
         container_directory: &Path,
         profile: &str,
     ) -> Result<(), String> {
-        // `profile` is interpolated into a `bash -c` script below. It comes
-        // from container.json, which is local user data, but a stray shell
-        // metacharacter would still turn into command execution inside the
-        // guest. Validate before any path is built.
+        // `profile` is passed as a positional parameter below, never
+        // interpolated into the script. It still comes from container.json,
+        // so reject anything that is not a plain identifier before any path
+        // is built.
         if !box_foundation::is_safe_identifier(profile) {
             return Err(format!("invalid profile for vm:wsl2: {profile:?}"));
         }

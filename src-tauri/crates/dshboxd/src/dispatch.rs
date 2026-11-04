@@ -1366,6 +1366,21 @@ fn enqueue_container_restart(
     .map(HandlerResult::Async)
 }
 
+/// Whether a parsed container.json asks for a WSL2 VM. Kept as a pure
+/// function so the delete path and its tests cannot drift: RuntimeKind::parse
+/// accepts several spellings (`vm`, `vm:wsl2`, `vm-wsl2`, `VM:WSL2`, …)
+/// and a literal string match would leave an orphan distro behind.
+fn record_requests_wsl_vm(value: &serde_json::Value) -> bool {
+    match crate::runtime::RuntimeKind::from_record(value) {
+        // `vm` means the platform default, which on Windows is wsl2.
+        Ok(crate::runtime::RuntimeKind::Vm(None)) => true,
+        Ok(crate::runtime::RuntimeKind::Vm(Some(backend))) => {
+            backend.eq_ignore_ascii_case("wsl2")
+        }
+        _ => false,
+    }
+}
+
 fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<HandlerResult, String> {
     let id = request["id"].as_str().unwrap_or("").to_owned();
     if !box_foundation::is_safe_identifier(&id) {
@@ -1377,9 +1392,9 @@ fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<HandlerR
         .ok_or("DSH Box storage is not configured")?;
     // Only a vm:wsl2 container ever leaves a registered WSL distro behind.
     // Read the record before deleting its directory, gate on both platform
-    // and declared runtime, and report (rather than swallow) a failed
-    // unregister: the container directory is about to go away, so a leftover
-    // distro would otherwise be unreachable and hold the vhdx forever.
+    // and declared runtime. A failed unregister must fail the delete: the
+    // container directory is still intact here, so the user can retry,
+    // whereas deleting it first would orphan the distro and its vhdx.
     #[cfg(target_os = "windows")]
     {
         let record = Path::new(&root)
@@ -1389,12 +1404,11 @@ fn delete_container_rpc(state: &DaemonState, request: &Value) -> Result<HandlerR
         let is_wsl_vm = std::fs::read_to_string(&record)
             .ok()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .and_then(|value| value["runtime"].as_str().map(str::to_owned))
-            .is_some_and(|runtime| runtime == "vm" || runtime == "vm:wsl2");
+            .is_some_and(|value| record_requests_wsl_vm(&value));
         if is_wsl_vm {
-            if let Err(error) = crate::vm::wsl::unregister_container(&id) {
-                tracing::warn!("could not unregister WSL distro for {id}: {error}");
-            }
+            crate::vm::wsl::unregister_container(&id).map_err(|error| {
+                format!("could not unregister WSL distro for {id}: {error}")
+            })?;
         }
     }
     // Reconcile before mutating so a stale file does not cause the
@@ -1695,6 +1709,34 @@ fn delete_task_rpc(state: &DaemonState, request: &Value) -> Result<Value, String
         .remove(&paths, id)
         .map(|_| json!({ "id": id, "deleted": true }))
         .map_err(|e| e.to_string())
+}
+
+
+#[cfg(test)]
+mod wsl_vm_delete_tests {
+    use super::record_requests_wsl_vm;
+
+    #[test]
+    fn every_vm_spelling_that_starts_a_wsl_distro_is_deleted_too() {
+        for spelling in [
+            "vm", "VM", "vm:wsl2", "VM:WSL2", "vm-wsl2", "vm_wsl2", "Vm-Wsl2", "vm:",
+        ] {
+            let value = serde_json::json!({ "runtime": spelling });
+            assert!(record_requests_wsl_vm(&value), "missed {spelling:?}");
+        }
+    }
+
+    #[test]
+    fn host_and_other_backends_are_not_wsl_vms() {
+        for spelling in ["host", "HOST", "vm:libkrun", "vm:firecracker"] {
+            let value = serde_json::json!({ "runtime": spelling });
+            assert!(!record_requests_wsl_vm(&value), "wrongly matched {spelling:?}");
+        }
+        assert!(!record_requests_wsl_vm(&serde_json::json!({})));
+        assert!(!record_requests_wsl_vm(&serde_json::json!({ "runtime": null })));
+        assert!(!record_requests_wsl_vm(&serde_json::json!({ "runtime": 7 })));
+        assert!(!record_requests_wsl_vm(&serde_json::json!({ "runtime": "nonsense" })));
+    }
 }
 
 #[cfg(test)]
