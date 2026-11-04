@@ -294,7 +294,10 @@ fn handle_http(mut stream: TcpStream, state: Arc<DaemonState>, token: &str) {
         let scope = if is_main {
             SseScope::ControlPlane
         } else if let Some(node_id) = session_node {
-            SseScope::Node(node_id)
+            SseScope::Node {
+                id: node_id,
+                bearer: query_token.clone().unwrap_or_default(),
+            }
         } else {
             let _ = write!(
                 stream,
@@ -418,7 +421,11 @@ const REVOKE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// compile error instead of a silent leak.
 enum SseScope {
     ControlPlane,
-    Node(String),
+    /// The node id *and* the bearer that opened the stream. The bearer matters:
+    /// two grants can be minted for one node id, and the second `register`
+    /// replaces the session. Keeping only the id would let the first helper's
+    /// stream stay alive on the second helper's credential.
+    Node { id: String, bearer: String },
 }
 
 impl SseScope {
@@ -429,7 +436,7 @@ impl SseScope {
     fn node_id(&self) -> Option<&str> {
         match self {
             Self::ControlPlane => None,
-            Self::Node(id) => Some(id),
+            Self::Node { id, .. } => Some(id),
         }
     }
 
@@ -440,8 +447,8 @@ impl SseScope {
     fn allows(&self, event: &DaemonEvent) -> bool {
         match self {
             Self::ControlPlane => true,
-            Self::Node(own) => {
-                event.is_node_event() && event.node_id() == Some(own.as_str())
+            Self::Node { id, .. } => {
+                event.is_node_event() && event.node_id() == Some(id.as_str())
             }
         }
     }
@@ -456,7 +463,9 @@ impl SseScope {
     fn still_valid(&self, state: &DaemonState) -> bool {
         match self {
             Self::ControlPlane => true,
-            Self::Node(id) => state.nodes.has_session(id),
+            // Per credential, not per node: `has_session` would happily accept a
+            // *different* helper that re-registered under the same node id.
+            Self::Node { id, bearer } => state.nodes.session_still_matches(id, bearer),
         }
     }
 }
@@ -477,7 +486,7 @@ fn handle_sse(mut stream: TcpStream, state: &DaemonState, subscriber: &SseScope)
 
     // Subscribe before building the snapshot, so an event that lands between
     // the two is delivered rather than dropped on the floor.
-    let (_sid, rx) = state.events.subscribe();
+    let (sid, rx) = state.events.subscribe();
 
     // Snapshot: the control plane gets tasks, resources and nodes; a helper
     // gets its own node record only. A NodeRecord carries a control URL and a
@@ -525,9 +534,15 @@ fn handle_sse(mut stream: TcpStream, state: &DaemonState, subscriber: &SseScope)
         }
         let name = event.event_name();
         let json = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned());
-        let _ = writeln!(stream, "event: {name}\ndata: {json}\n");
+        if writeln!(stream, "event: {name}\ndata: {json}\n").is_err() {
+            break;
+        }
         let _ = stream.flush();
     }
+    // A client that vanished leaves a subscriber holding a live sender, which
+    // `broadcast` prunes only when a send fails — and a send to a live receiver
+    // never fails. Dropping it here is what actually frees the thread.
+    state.events.unsubscribe(sid);
 }
 
 /// Prevent multiple daemon instances from competing on the same discovery file.

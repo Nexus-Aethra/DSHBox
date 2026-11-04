@@ -1,7 +1,7 @@
 //! Node registry for the control plane (roadmap stage A).
 //!
 //! A node is one real execution environment: the daemon's own host process,
-//! a WSL2 distro, a libkrun microVM, an Apple VZ VM, a docker container鈥?
+//! a WSL2 distro, a libkrun microVM, an Apple VZ VM, a docker container,
 //! Stage A only owns the *registry and the registration handshake*; it does
 //! not start containers or move files. See docs/design/2026-11-04-node-core.md.
 
@@ -49,7 +49,7 @@ pub struct NodeRecord {
     pub enrolled_at: Option<u64>,
     pub last_seen: Option<u64>,
     pub helper_version: Option<String>,
-    /// Backend-specific reference (distro name, container id, 鈥?. Stage A
+    /// Backend-specific reference (distro name, container id, …). Stage A
     /// never reads it; the supply adapter in stage C will.
     pub backend_ref: Option<String>,
     /// The daemon's own host. Built-in, never heartbeats, never expires,
@@ -120,7 +120,7 @@ pub struct NodeManager {
 impl NodeManager {
     /// Build the manager. Uses the SQLite document store when a runtime is
     /// configured, and an in-memory collection otherwise (fresh install or
-    /// unit tests) 鈥?the same degradation the task queue uses.
+    /// unit tests) — the same degradation the task queue uses.
     pub fn load(paths: &BoxPaths, control_url: String, events: Arc<crate::events::DaemonEvents>) -> Self {
         let collection: Collection<NodeRecord> = match open_document_store_for_paths(paths) {
             Ok(store) => Collection::new(store, "nodes", node_key),
@@ -247,7 +247,7 @@ impl NodeManager {
         }
         // "host" names this daemon process. A helper registering under it would
         // overwrite the built-in record with `host_node: false`, and the very
-        // next `deregister` would then delete it 鈥?the protection that stops a
+        // next `deregister` would then delete it — the protection that stops a
         // helper touching the host node assumes the id is not theirs to take.
         if node_id.as_deref() == Some(HOST_NODE_ID) {
             return Err(format!("node id '{HOST_NODE_ID}' is reserved for this daemon"));
@@ -298,7 +298,7 @@ impl NodeManager {
             platform: grant.platform,
             // Written as `registering` and promoted below, so the record never
             // claims `online` in the window before its session exists. A crash
-            // in that window leaves `registering`, which `sweep` expires 鈥?the
+            // in that window leaves `registering`, which `sweep` expires — the
             // state machine row is exercised rather than decorative.
             status: NodeStatus::Registering,
             capabilities: grant.capabilities,
@@ -323,8 +323,27 @@ impl NodeManager {
         // Promote now that the session exists. Order matters: the record says
         // `registering` until a token can actually be used, so nothing observes
         // a node that is online with no way to reach it.
-        self.set_status(&grant.node_id, NodeStatus::Online)
-            .map_err(|e| e.to_string())?;
+        //
+        // Guarded on the record still being the one this register wrote. A
+        // `deregister` landing in the window above would otherwise be undone by
+        // a bare `set_status`, which re-reads whatever is there and writes
+        // `online` over it — resurrecting a node the user just removed.
+        if let Some(mut current) = self.get(&grant.node_id).map_err(|e| e.to_string())? {
+            if current.status == NodeStatus::Registering
+                && current.session_epoch == epoch
+                && current.enrolled_at == Some(now)
+            {
+                current.status = NodeStatus::Online;
+                current.last_seen = Some(now_seconds());
+                self.collection
+                    .upsert(&[current])
+                    .map_err(|e| e.to_string())?;
+                self.events.broadcast(crate::events::DaemonEvent::NodeStatus {
+                    id: grant.node_id.clone(),
+                    status: "online".to_owned(),
+                });
+            }
+        }
         self.events.broadcast(crate::events::DaemonEvent::NodeRegistered {
             id: record.id.clone(),
             kind: record.kind.clone(),
@@ -422,6 +441,26 @@ impl NodeManager {
     /// Sessions are memory-only, so after a restart nothing has one. An
     /// already-open SSE stream uses this to notice that its credential was
     /// revoked (deregistered) or invalidated (daemon restarted).
+    /// Whether this exact bearer is still the live session for `node_id`.
+    ///
+    /// Stricter than `has_session`, and the difference is load-bearing: a second
+    /// `register` for the same node id replaces the session under it, so "a
+    /// session exists for this node" stays true after the first credential dies.
+    /// An open stream must check the credential it was opened with.
+    pub fn session_still_matches(&self, node_id: &str, bearer: &str) -> bool {
+        // Read the epoch before taking the sessions lock: `current_epoch` takes
+        // the epoch lock, and one fixed order is what keeps this deadlock-free.
+        let epoch = self.current_epoch();
+        self.sessions
+            .lock()
+            .map(|sessions| {
+                sessions.get(node_id).is_some_and(|session| {
+                    session.epoch == epoch && constant_time_eq(&session.token, bearer)
+                })
+            })
+            .unwrap_or(false)
+    }
+
     pub fn has_session(&self, node_id: &str) -> bool {
         self.sessions
             .lock()
@@ -504,9 +543,9 @@ mod tests {
         assert_eq!(hb, HEARTBEAT_SECONDS);
         // A second use of the same one-shot grant must fail.
         assert!(m.register(&grant, None).is_err());
-        // The session is valid for its own node and current epoch鈥?
+        // The session is valid for its own node and current epoch…
         assert!(m.validate_session(Some(&session), Some(&id), epoch));
-        // 鈥ut not for another node, a stale epoch, or as a global token.
+        // …but not for another node, a stale epoch, or as a global token.
         assert!(!m.validate_session(Some(&session), Some("other"), epoch));
         assert!(!m.validate_session(Some(&session), Some(&id), epoch + 1));
         assert!(!m.validate_session(None, Some(&id), epoch));
@@ -684,5 +723,48 @@ mod tests {
         }
         m.sweep();
         assert!(!m.grants.lock().unwrap().contains_key(&live));
+    }
+
+    #[test]
+    fn a_second_session_replaces_the_first_and_revokes_it() {
+        // Two grants for one node id. The second register replaces the
+        // session, so a stream opened with the first token must be told it is
+        // no longer the live credential — checking "a session exists for this
+        // node" would keep saying yes forever.
+        let m = manager();
+        let (g1, id, _, _) = m.enroll("wsl2", "linux-x64", vec![], Some("dup".into())).unwrap();
+        let (_, first, _, _) = m.register(&g1, None).unwrap();
+        assert!(m.session_still_matches(&id, &first));
+        let (g2, id2, _, _) = m.enroll("wsl2", "linux-x64", vec![], Some("dup".into())).unwrap();
+        assert_eq!(id, id2);
+        let (_, second, _, _) = m.register(&g2, None).unwrap();
+        assert_ne!(first, second);
+        assert!(m.session_still_matches(&id, &second), "the new bearer is live");
+        assert!(!m.session_still_matches(&id, &first), "the replaced bearer is not");
+        // The per-node shortcut still says yes, which is why a stream must not
+        // use it.
+        assert!(m.has_session(&id));
+    }
+
+    #[test]
+    fn deregister_between_session_and_promote_leaves_the_node_deleted() {
+        // The window between writing the record and promoting it is real; a
+        // deregister landing inside it must not be undone by the promote.
+        let m = manager();
+        let (grant, id, _, _) = m.enroll("wsl2", "linux-x64", vec![], Some("win".into())).unwrap();
+        m.register(&grant, None).unwrap();
+        m.deregister(&id).unwrap();
+        assert!(m.get(&id).unwrap().is_none(), "a promote must not resurrect a deleted node");
+    }
+
+    #[test]
+    fn register_records_the_epoch_and_enrol_time_the_promote_guards_on() {
+        let m = manager();
+        let (grant, id, epoch, _) = m.enroll("wsl2", "linux-x64", vec![], Some("meta".into())).unwrap();
+        m.register(&grant, None).unwrap();
+        let node = m.get(&id).unwrap().unwrap();
+        assert_eq!(node.status, NodeStatus::Online);
+        assert_eq!(node.session_epoch, epoch);
+        assert!(node.enrolled_at.is_some(), "the promote needs this to identify its own record");
     }
 }
