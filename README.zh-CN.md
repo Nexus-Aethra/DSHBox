@@ -13,6 +13,7 @@ DSH Box 是一个用 [Tauri 2](https://tauri.app) 写的轻量桌面外壳，负
 ## 功能亮点
 
 - **容器相互隔离** —— 每个容器自己的 DSH 版本、profile、工作区和宿主进程。
+- **可选的虚拟机运行模式（实验性）** —— 容器可声明 `runtime: "vm"` / `"vm:<backend>"`，缺省仍是宿主进程模式。Windows 每容器一个 WSL2 distro，Linux 一个 libkrun microVM。见[运行时设计说明](docs/design/2026-11-04-container-runtime-seam.md)。
 - **内嵌 WebView** —— DSH 界面在原生窗口里打开，不用端口转发、不用复制 URL。
 - **几秒就绪** —— 拉取的 Harness 版本自带已构建的客户端产物，`dshbox run` 只是复制加 store 链接（~10 秒）。
 - **插件依赖图** —— 加载了什么、按什么顺序、为什么：深度分层、宿主与浏览器半身分开绘制、可以把某一层折叠掉。
