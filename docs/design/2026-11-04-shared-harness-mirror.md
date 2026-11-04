@@ -55,7 +55,9 @@ remote URL 漂移**。规则：
 
 - 文件不存在 → 全量克隆，写入该文件；
 - 文件存在且与当前 remote 一致 → 直接用；
-- 文件存在但不一致 → **不删除镜像**，用 `git remote set-url` 改指，再按需增量 fetch。
+- 文件存在但不一致 → **不删除镜像**，用 `Repository::remote_set_url("origin", <url>)`
+  改指，再按需增量 fetch。这是 libgit2 的 API，不是 shell git —— `Remote` 类型没有
+  `set_url` 方法（`git2-0.20.4/src/repo.rs:730`）。
   换镜像源不等于换内容，多半是同一份仓库换个入口；真要重建由用户显式删除镜像目录。
 
 ### 2. 增量 fetch
@@ -83,8 +85,11 @@ remote URL 漂移**。规则：
 
 判定必须可机械执行，不能靠错误字符串匹配。两条条件：
 
-1. **能不能连上远端** —— `git2::Error::class()` 属于 `ErrorClass::Network` /
-   `Http` / `Ssl` / `Timeout` 的，是传输层，**保留镜像**；
+1. **能不能连上远端** —— `git2::Error::class()` 属于 `ErrorClass::Net` /
+   `Http` / `Ssl` 的，是传输层，**保留镜像**。注意 git2 里没有
+   `ErrorClass::Network`（正确名是 `Net`），也没有 `ErrorClass::Timeout`：
+   超时是 `ErrorCode::Timeout`（`err.code() == ErrorCode::Timeout`），
+   而 libgit2 通常以 `Net` class 报出超时，所以 class 判定已覆盖它；
 2. **连上了但目标 ref 缺失** —— fetch 本身没报错，而之后 `revparse_single(tag)`
    在镜像里找不到目标，那才是"对象缺失"，**重建镜像**。
 
@@ -138,8 +143,11 @@ prepared base 的完整 DSH 树（含 node_modules 与构建产物）、sealed t
 - 镜像只留**对象**，不做 checkout —— 不产生工作树；
 - `git gc` / 限制历史深度是候选，但**需要实测取舍**：浅历史能省空间，会失去
   "以后能取到任意旧 tag"的能力；
-- 提供"删除镜像"的入口：`dshbox template mirror purge` 子命令（CLI 一处即可，
-  镜像是缓存不是用户数据，不需要 UI 按钮）。
+- 提供"删除镜像"的入口：`dshbox template mirror purge`。CLI 的 `template` 命令只按
+  **第一个 token** 分发（`src/cli/template.rs:14`，动词表在 :43-59，未知动词报
+  `unknown template action`），所以这需要**新增 `mirror` 动词做两级分发**
+  （`mirror` → `purge`），并同步更新 help 文本里的动词清单（:16、:21-37）。
+  镜像是缓存不是用户数据，不需要 UI 按钮。
 
 ## 不在范围
 
@@ -156,6 +164,7 @@ prepared base 的完整 DSH 树（含 node_modules 与构建产物）、sealed t
 src-tauri/crates/box-runtime/src/lib.rs      +ensure_bare_mirror / +fetch_ref_to_mirror
 src-tauri/crates/dshboxd/src/versions.rs     pull_template_with_cancel 改走镜像
 src-tauri/crates/dshboxd/src/dispatch.rs     +harness-mirror 资源 key
+src-tauri/src/cli/template.rs              +mirror 动词（purge 子动作）+ help 文本
 docs/design/2026-11-04-shared-harness-mirror.md   本文件
 ```
 
