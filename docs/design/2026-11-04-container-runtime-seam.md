@@ -75,7 +75,9 @@ Drop 兜底强杀不变）。
 ### libkrun 的已知缺口（进程组已在 fix/libkrun-vmm-pgroup 修好；仅 virtiofs/console 缺口留后续 Linux 实机分支）
 
 - **VMM 子进程进程组**：`dshboxd --vmm-run` 起初用裸 `Command::spawn`，Unix 下继承 daemon 的进程组；而 `TrackedChild::kill_tree` 发的是 `kill(-pgid, SIGTERM)`（`box-runtime/src/process/lifecycle.rs`），停止一个 VM 容器会把 daemon 与所有 host 容器一起 TERM。现复用 `configure_non_interactive(&mut cmd, true)` 做 setsid；Linux 实机实测：无 setsid 时子 pgid = 父 pgid 558，setsid 后子 pgid = 自身 pid 598。
-- **virtiofs 不会自动挂载**：libkrun 1.9 的 guest init 只挂 `/dev /proc /sys /dev/pts /dev/shm`，`krun_add_virtiofs` 仅注册设备。config 里的 `/dsh`、`/home`、`/container` 挂载点与 `mount -t virtiofs` 必须由 guest init 显式完成，否则 `workdir /dsh`、`apps/cli/lib/bin.js`、`/container/box-web.patch.yml`、`DSH_HOME=/home` 全部不存在。此外 `krun_set_console_output` 是 VMM 侧文件，DSH 的 `dsh web:` 行不会自动追加到宿主 `logs/host.log`，`parse_announced_host_url` 因此拿不到 authenticated URL。**Libkrun 分支在本机无 libkrun.so，尚未实机验证，不能视为可用后端**；路线图 C 阶段按「供给适配器 + helper 在 guest 内挂载/启动」重做这条路径。
+- **virtiofs 不会自动挂载**：libkrun 1.9 的 guest init 只挂 `/dev /proc /sys /dev/pts /dev/shm`，`krun_add_virtiofs` 仅注册设备。config 里的 `/dsh`、`/home`、`/container` 挂载点与 `mount -t virtiofs` 必须由 guest init 显式完成，否则 `workdir /dsh`、`apps/cli/lib/bin.js`、`/container/box-web.patch.yml`、`DSH_HOME=/home` 全部不存在，guest exec 根本起不来。
+- **console 链路未实机验证**：`krun_set_console_output` 的上游语义是把 console output 写到指定文件，guest init 再把 stdout 接到 virtio-console；但本机没有 libkrun.so，无法确认这条链路是否真把 `dsh web:` 行落进宿主 `logs/host.log`。`parse_announced_host_url` 依赖该日志行拿 authenticated URL，因此**不能保证**该 URL 探测在 libkrun 上成立。这里只陈述「未验证」，不宣称 API 一定不写文件。
+- **Libkrun 分支在本机无 libkrun.so，尚未实机验证，不能视为可用后端**；路线图 C 阶段按「供给适配器 + helper 在 guest 内挂载/启动」重做这条路径。
 
 ### 下一步（本分支之后，独立规划）
 
