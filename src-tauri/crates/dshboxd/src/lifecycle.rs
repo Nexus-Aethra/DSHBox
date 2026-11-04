@@ -12,12 +12,15 @@ use box_containers::container_directory;
 use box_foundation::{is_safe_identifier, read_config};
 use box_runtime::process::{self, ExecutionKind, ProcessSpec, TrackedChild};
 use box_scheduler::TaskContext;
+// The health watcher's `kill -0` probe is Unix-only; on Windows Stdio is
+// not referenced, so an unconditional import warns there.
+#[cfg(unix)]
+use std::process::Stdio;
 use std::{
     collections::BTreeMap,
     fs,
     net::TcpListener,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{mpsc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},

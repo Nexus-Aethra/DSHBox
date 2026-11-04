@@ -10,7 +10,7 @@
 //! localhost forwarding exposes the guest's `127.0.0.1:<port>` on the host,
 //! which is the loopback contract.
 //!
-//! A keeper child (`wsl -d <distro> -- sleep infinity`) serves three
+//! A keeper child (`wsl -d <distro> --exec sleep infinity`) serves three
 //! purposes at once: it gives `host.pid` a real PID to observe, it binds
 //! the utility VM's lifetime to the daemon, and its `try_wait` is the
 //! backend's liveness answer.
@@ -165,6 +165,24 @@ fn ensure_base_tarball() -> Result<PathBuf, String> {
     Ok(base)
 }
 
+/// Cleanup guard for a failed start. Only unregisters a distro this
+/// invocation imported; an existing distro may hold user state and must
+/// never be deleted because a start failed.
+struct StartCleanup {
+    distro: String,
+    imported_here: bool,
+}
+
+impl StartCleanup {
+    fn clean(&self) {
+        if !self.imported_here {
+            return;
+        }
+        let _ = wsl_output(&["--terminate", &self.distro]);
+        let _ = wsl_output(&["--unregister", &self.distro]);
+    }
+}
+
 /// One started WSL2 container.
 pub struct WslVm {
     distro: String,
@@ -182,6 +200,35 @@ impl WslVm {
         // lifecycle before the backend is invoked.
         _port: u16,
         task: Option<&box_scheduler::TaskContext>,
+    ) -> Result<WslVm, String> {
+        // Any failure after the distro was imported must not leave a
+        // half-provisioned distro (and its vhdx) behind: the next start would
+        // otherwise reuse it. A guard owns the cleanup until start succeeds.
+        let mut cleanup = StartCleanup {
+            distro: distro_name(container_id),
+            imported_here: false,
+        };
+        let result = Self::start_inner(
+            container_id, container_directory, profile, task, &mut cleanup,
+        );
+        match result {
+            Ok(vm) => {
+                cleanup.imported_here = false; // defuse
+                Ok(vm)
+            }
+            Err(error) => {
+                cleanup.clean();
+                Err(error)
+            }
+        }
+    }
+
+    fn start_inner(
+        container_id: &str,
+        container_directory: &Path,
+        profile: &str,
+        task: Option<&box_scheduler::TaskContext>,
+        cleanup: &mut StartCleanup,
     ) -> Result<WslVm, String> {
         available()?;
         let distro = distro_name(container_id);
@@ -202,6 +249,7 @@ impl WslVm {
                 &vm_dir.join("distro").to_string_lossy(),
                 &base.to_string_lossy(),
             ])?;
+            cleanup.imported_here = true;
             // The fresh rootfs has no Node yet. Drop the Windows-side marker
             // so a re-import (manual unregister, WSL reset) actually
             // re-provisions instead of launching a guest without node.
@@ -274,9 +322,15 @@ impl WslVm {
         let keeper = TrackedChild::wrap(keeper);
 
         let vm = WslVm { distro, keeper };
-        vm.launch_dsh(container_id, container_directory, profile)?;
+        if let Err(error) = vm.launch_dsh(container_id, container_directory, profile) {
+            // The keeper's Drop force-kills the wsl.exe, but the guest and
+            // the imported distro still need an explicit teardown.
+            let _ = wsl_output(&["--terminate", &vm.distro]);
+            return Err(error);
+        }
         Ok(vm)
     }
+
 
     /// Launch the DSH host inside the distro. The guest sees the prepared
     /// directory through drvfs, binds `127.0.0.1:<port>` inside the VM, and

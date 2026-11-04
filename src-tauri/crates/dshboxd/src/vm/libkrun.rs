@@ -1,4 +1,4 @@
-//! Linux backend: one libkrun microVM per container, driven in-process.
+//! Linux backend: one libkrun microVM per container, driven by a VMM child.
 //!
 //! libkrun (1.9.x) bundles its own Linux kernel, so there is no image to
 //! manage — only a guest root directory (`krun_set_root`), the container's
