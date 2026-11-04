@@ -202,6 +202,9 @@ pub(crate) struct DaemonState {
     /// container id. A session holds a live DevTools socket, so it is kept
     /// between calls and torn down on close or daemon exit.
     pub(crate) browser: Mutex<crate::debug::Sessions>,
+    /// Node registry (roadmap stage A). Shared with connection threads and
+    /// the background sweep; clones share the same in-memory sessions.
+    pub(crate) nodes: std::sync::Arc<crate::nodes::NodeManager>,
 }
 
 impl DaemonState {
@@ -234,13 +237,22 @@ impl DaemonState {
             },
         };
         let _ = manager.restore(&paths);
+        let events = std::sync::Arc::new(crate::events::DaemonEvents::new());
+        // Replaced by main.rs once the ephemeral listener is bound.
+        let control_url = String::new();
+        let nodes = std::sync::Arc::new(crate::nodes::NodeManager::load(
+            &paths,
+            control_url,
+            events.clone(),
+        ));
         Ok(Self {
             manager,
             paths: RwLock::new(paths),
             containers: Arc::new(ContainerManager::default()),
             resources: ResourceStateManager::default(),
-            events: std::sync::Arc::new(crate::events::DaemonEvents::new()),
+            events,
             browser: Mutex::new(crate::debug::Sessions::new()),
+            nodes,
         })
     }
 

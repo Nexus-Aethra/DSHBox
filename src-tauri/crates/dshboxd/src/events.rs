@@ -55,6 +55,20 @@ pub enum DaemonEvent {
     /// exists, and pushing the whole state here would be a second shape of
     /// the same data to keep in step.
     UpdateState,
+    /// A box-helper completed its registration handshake.
+    NodeRegistered {
+        id: String,
+        kind: String,
+        platform: String,
+    },
+    /// A node changed status (online / offline / removed).
+    NodeStatus { id: String, status: String },
+    /// A helper reported a log line to the control plane.
+    NodeLog {
+        id: String,
+        level: String,
+        line: String,
+    },
 }
 
 impl DaemonEvent {
@@ -72,6 +86,9 @@ impl DaemonEvent {
             Self::ResourceUpdated { .. } => "resource_updated",
             Self::TagsFetched { .. } => "tags_fetched",
             Self::UpdateState => "update_state",
+            Self::NodeRegistered { .. } => "node_registered",
+            Self::NodeStatus { .. } => "node_status",
+            Self::NodeLog { .. } => "node_log",
         }
     }
 }

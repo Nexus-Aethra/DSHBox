@@ -16,6 +16,8 @@ mod events;
 mod extensions;
 mod host;
 mod lifecycle;
+mod nodes;
+mod nodes_rpc;
 mod plugins;
 mod resolve;
 mod resources;
@@ -114,6 +116,21 @@ pub fn run() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind DSH Box daemon TCP");
     let port = listener.local_addr().expect("get local port").port();
     let discovery = write_discovery(port).expect("write server discovery");
+    state
+        .nodes
+        .set_control_url(format!("http://127.0.0.1:{port}"));
+    // Sweep stale helpers off the online list. Cooperative: the thread ends
+    // with the daemon process, no join handle is kept.
+    let sweep_nodes = state.nodes.clone();
+    std::thread::spawn(move || loop {
+        for _ in 0..60 {
+            if process::shutdown_requested() {
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        sweep_nodes.sweep();
+    });
 
     info!("listening on 127.0.0.1:{port} (pid {})", std::process::id());
 
@@ -253,7 +270,22 @@ fn handle_http(mut stream: TcpStream, state: Arc<DaemonState>, token: &str) {
                     None
                 }
             });
-        if query_token.as_deref() != Some(token) {
+        let is_main = query_token.as_deref() == Some(token);
+        // A helper's session token may subscribe too; it must carry the
+        // current epoch so tokens from an older daemon cannot linger.
+        let epoch = path
+            .split('?')
+            .nth(1)
+            .unwrap_or("")
+            .split('&')
+            .find_map(|pair| {
+                let mut kv = pair.splitn(2, '=');
+                (kv.next()? == "epoch").then(|| kv.next().unwrap_or("").parse::<u64>().ok()).flatten()
+            })
+            .unwrap_or(0);
+        let is_session = !is_main
+            && state.nodes.validate_session(query_token.as_deref(), None, epoch);
+        if !is_main && !is_session {
             let _ = write!(
                 stream,
                 "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -295,7 +327,7 @@ fn handle_http(mut stream: TcpStream, state: Arc<DaemonState>, token: &str) {
         return;
     };
 
-    let Ok(request) = serde_json::from_str::<serde_json::Value>(&body) else {
+    let Ok(mut request) = serde_json::from_str::<serde_json::Value>(&body) else {
         let _ = write!(
             stream,
             "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -303,12 +335,46 @@ fn handle_http(mut stream: TcpStream, state: Arc<DaemonState>, token: &str) {
         return;
     };
 
-    if request["token"].as_str() != Some(token) {
+    let supplied = request["token"].as_str();
+    let method = request["method"].as_str().unwrap_or("");
+    let is_main = supplied == Some(token);
+    // A session token is scoped to the node RPCs. It is never accepted for
+    // control-plane methods, so a leaked helper credential cannot drive
+    // containers, templates or tasks.
+    let epoch = request["epoch"].as_u64().unwrap_or(0);
+    // Resolve the session first (valid token + current epoch), THEN decide
+    // whether the method is allowed. Filtering inside this block would turn
+    // a valid-session/forbidden-method request into a 401 instead of 403.
+    let session_node = if is_main {
+        None
+    } else {
+        state.nodes.session_node_for(supplied, epoch)
+    };
+    // node_register is the one exception: it carries a one-shot enroll
+    // grant instead of a session token, and the handler validates it.
+    let is_register = method == "node_register"
+        && request["enrollToken"].as_str().is_some_and(|v| !v.is_empty());
+    let is_session = session_node.is_some();
+    if !is_main && !is_session && !is_register {
         let _ = write!(
             stream,
             "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
         return;
+    }
+    if is_session
+        && !crate::nodes::NodeManager::is_node_method(method)
+        && method != "node_register"
+    {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        return;
+    }
+    // Bind the session to its node so handlers never trust a body-supplied id.
+    if let Some(node_id) = &session_node {
+        request["__nodeId"] = serde_json::json!(node_id);
     }
 
     let response_value = dispatch::dispatch(&state, &request);
@@ -345,6 +411,7 @@ fn handle_sse(mut stream: TcpStream, state: &DaemonState) {
     let snapshot = serde_json::json!({
         "tasks": state.manager.list().unwrap_or_default(),
         "resources": {},
+        "nodes": state.nodes.list().unwrap_or_default(),
     });
     let _ = writeln!(stream, "event: snapshot\ndata: {}\n", snapshot);
     let _ = stream.flush();

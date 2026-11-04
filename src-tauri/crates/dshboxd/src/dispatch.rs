@@ -93,6 +93,14 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
     let method = request["method"].as_str().unwrap_or("?");
     debug!(method, "rpc request received");
     let result: Result<HandlerResult, String> = match request["method"].as_str() {
+        Some("node_enroll") => crate::nodes_rpc::node_enroll(state, request).map(Sync),
+        Some("node_register") => crate::nodes_rpc::node_register(state, request).map(Sync),
+        Some("node_heartbeat") => crate::nodes_rpc::node_heartbeat(state, request).map(Sync),
+        Some("node_list") => crate::nodes_rpc::node_list(state, request).map(Sync),
+        Some("node_get") => crate::nodes_rpc::node_get(state, request).map(Sync),
+        Some("node_echo") => crate::nodes_rpc::node_echo(state, request).map(Sync),
+        Some("node_report") => crate::nodes_rpc::node_report(state, request).map(Sync),
+        Some("node_deregister") => crate::nodes_rpc::node_deregister(state, request).map(Sync),
         Some("ping") => Ok(Sync(json!({
             "pid": std::process::id(),
             "status": "running",
@@ -1844,12 +1852,18 @@ mod tests {
         // discovery file) using the same fields DaemonState::load wires up.
         let config = read_config().unwrap();
         let paths = BoxPaths::from_config(&config).unwrap();
+        let events = Arc::new(crate::events::DaemonEvents::new());
         let state = DaemonState {
             manager: box_scheduler::TaskManager::memory(),
             paths: RwLock::new(paths),
             containers: Arc::new(ContainerManager::default()),
             resources: box_state::ResourceStateManager::default(),
-            events: Arc::new(crate::events::DaemonEvents::new()),
+            nodes: Arc::new(crate::nodes::NodeManager::load(
+                &BoxPaths { config: std::path::PathBuf::from("/nonexistent"), runtime: None },
+                String::new(),
+                events.clone(),
+            )),
+            events,
             browser: std::sync::Mutex::new(crate::debug::Sessions::new()),
         };
         (state, id, home, runtime)

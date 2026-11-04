@@ -29,6 +29,7 @@ members = [
   "crates/box-template-core",
   "crates/box-updates",
   "crates/dshboxd",
+  "crates/box-helper",
   "tools/runtime-packager",
 ]
 resolver = "2"
