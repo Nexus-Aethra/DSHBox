@@ -216,6 +216,9 @@ pub(crate) fn pull_template_with_cancel(
         ("publish", "Publishing prepared base", 40),
     ]);
     task.stage_started("clone");
+    // Which stage is running right now, so every error path can mark it
+    // failed instead of leaving a bar that reads as running on a dead task.
+    let stage_now = std::cell::RefCell::new("clone");
     // One guard per running stage: dropping it (on the happy path or on a `?`)
     // stops the timer, so no stage keeps ticking after it is done or failed.
     let _clone_tick = StageTicker::start(task, "clone");
@@ -243,6 +246,7 @@ pub(crate) fn pull_template_with_cancel(
         let log_path = staged.join("prepare.log");
         drop(_clone_tick);
         task.stage_done("clone");
+        *stage_now.borrow_mut() = "install";
         task.stage_started("install");
         let _install_tick = StageTicker::start(task, "install");
         task.log("installing DSH dependencies in prepared-base staging");
@@ -267,6 +271,7 @@ pub(crate) fn pull_template_with_cancel(
         // (native addon, host/client libraries, web frontend).
         drop(_install_tick);
         task.stage_done("install");
+        *stage_now.borrow_mut() = "build";
         task.stage_started("build");
         let _build_tick = StageTicker::start(task, "build");
         task.log("building DSH client artifacts (native addon, host/client libs, web frontend); this is the slow step");
@@ -300,6 +305,7 @@ pub(crate) fn pull_template_with_cancel(
         task.check_cancelled()?;
 
         task.stage_done("build");
+        *stage_now.borrow_mut() = "validate";
         task.stage_started("validate");
         let _validate_tick = StageTicker::start(task, "validate");
         validate_prepared_harness(&harness)?;
@@ -325,6 +331,7 @@ pub(crate) fn pull_template_with_cancel(
     let mut record = match prepare {
         Ok(record) => record,
         Err(error) => {
+            mark_stage_outcome(task, &stage_now, &error);
             // Staging is deliberately ephemeral, but the user-facing error
             // points at the pnpm transcript. Retain that transcript before
             // cleanup so a failed template pull is diagnosable after the task
@@ -373,27 +380,35 @@ pub(crate) fn pull_template_with_cancel(
         size_bytes: record.size_bytes,
         validated_at: now_seconds(),
     };
-    write_template_manifest(&staged, &manifest)?;
-    task.stage_done("validate");
-    task.stage_started("publish");
-    let _publish_tick = StageTicker::start(task, "publish");
-    let destination =
-        layout.prepared_base_dir(record.id.strip_prefix("base-").unwrap_or(&record.id))?;
-    if destination.exists() {
-        let _ = fs::remove_dir_all(&staged);
-        return Err(format!(
-            "prepared base already exists at {}",
-            destination.display()
-        ));
+    let publish_result = (|| -> Result<(), String> {
+        write_template_manifest(&staged, &manifest)?;
+        task.stage_done("validate");
+        *stage_now.borrow_mut() = "publish";
+        task.stage_started("publish");
+        let _publish_tick = StageTicker::start(task, "publish");
+        let destination =
+            layout.prepared_base_dir(record.id.strip_prefix("base-").unwrap_or(&record.id))?;
+        if destination.exists() {
+            let _ = fs::remove_dir_all(&staged);
+            return Err(format!(
+                "prepared base already exists at {}",
+                destination.display()
+            ));
+        }
+        layout.publish_staged_tree(&staged, &destination)?;
+        record.directory = destination.to_string_lossy().into_owned();
+        index.insert(record.version.clone(), record.clone());
+        write_prepared_base_index(&layout, &index)?;
+        let mut updated = read_config()?;
+        updated.selected_dsh_version = Some(record.version.clone());
+        write_config(&updated)?;
+        task.stage_done("publish");
+        Ok(())
+    })();
+    if let Err(error) = publish_result {
+        mark_stage_outcome(task, &stage_now, &error);
+        return Err(error);
     }
-    layout.publish_staged_tree(&staged, &destination)?;
-    record.directory = destination.to_string_lossy().into_owned();
-    index.insert(record.version.clone(), record.clone());
-    write_prepared_base_index(&layout, &index)?;
-    let mut updated = read_config()?;
-    updated.selected_dsh_version = Some(record.version.clone());
-    write_config(&updated)?;
-    task.stage_done("publish");
     task.log(&format!(
         "prepared base {} ({}) is ready",
         record.version, record.id
@@ -403,6 +418,18 @@ pub(crate) fn pull_template_with_cancel(
         ref_value, record.version
     );
     Ok(())
+}
+
+/// Mark the stage that was running when the pull failed, so a dead task never
+/// leaves a stage bar reading as still running. A cancellation is not a
+/// failure: the stage is skipped, anything else records the failure detail.
+fn mark_stage_outcome(task: &TaskContext, stage_now: &std::cell::RefCell<&'static str>, error: &str) {
+    let stage = *stage_now.borrow();
+    if error == "task cancelled" {
+        task.stage_skipped(stage);
+    } else {
+        task.stage_failed(stage, error);
+    }
 }
 
 /// pnpm's lockfile resolver needs an explicit supported-architectures entry

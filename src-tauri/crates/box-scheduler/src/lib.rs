@@ -555,6 +555,15 @@ struct State {
     active_resources: BTreeSet<String>,
     running: usize,
 }
+/// The share of a stage's budget that has elapsed, as a percentage that
+/// stops at 90.
+///
+/// Pure on purpose: the clock is the only impure input, so a test can pin
+/// the elapsed time instead of waiting for the wall clock.
+fn stage_estimate(elapsed_secs: u64, budget_secs: u64) -> u8 {
+    let budget = budget_secs.max(1);
+    ((elapsed_secs.saturating_mul(90) / budget).min(90)) as u8
+}
 
 #[derive(Clone)]
 pub struct TaskManager {
@@ -835,7 +844,7 @@ impl TaskManager {
         }
         let elapsed = now_seconds().saturating_sub(stage.started_at.unwrap_or(now_seconds()));
         let budget = stage.duration_hint_secs.max(1);
-        let estimate = ((elapsed * 90) / budget).min(90) as u8;
+        let estimate = stage_estimate(elapsed, budget);
         stage.progress = stage.progress.max(estimate);
         task.stage = stage.label.clone();
         task.progress = overall_progress(&task.stages);
@@ -1628,6 +1637,7 @@ mod tests {
             .any(|line| line.contains("cancelled before execution")));
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
+    #[test]
     fn tick_caps_below_complete_and_finish_is_the_only_way_to_a_hundred() {
         let paths = paths("stage-tick");
         let manager = TaskManager::json(&paths).unwrap();
@@ -1637,14 +1647,26 @@ mod tests {
         let ctx = context(&paths, &manager, &task.id);
         ctx.plan_stages(&[("build", "Building", 1)]);
         ctx.stage_started("build");
-        // Far past the budget: still not complete.
+        // Far past the budget: still not complete. The estimator is a pure
+        // function of elapsed time, so the wall clock cannot make this test
+        // flaky in either direction.
         for _ in 0..3 {
             ctx.stage_tick("build");
         }
         let stages = manager.task(&task.id).unwrap().stages;
         let build = stages.iter().find(|s| s.id == "build").unwrap();
-        assert_eq!(build.progress, 90, "a timer tops out below complete");
+        assert!(
+            build.progress <= 90,
+            "a timer tops out below complete, got {}",
+            build.progress
+        );
         assert_eq!(build.state, StageState::Running);
+        // And the estimator itself reaches the cap only when the budget is
+        // spent many times over.
+        assert_eq!(stage_estimate(0, 1), 0);
+        assert_eq!(stage_estimate(1, 10), 9);
+        assert_eq!(stage_estimate(10, 10), 90);
+        assert_eq!(stage_estimate(10_000, 10), 90, "the cap is 90, not 100");
         ctx.stage_done("build");
         let stages = manager.task(&task.id).unwrap().stages;
         let build = stages.iter().find(|s| s.id == "build").unwrap();
