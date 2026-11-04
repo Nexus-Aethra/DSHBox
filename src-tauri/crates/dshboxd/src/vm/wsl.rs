@@ -115,8 +115,11 @@ fn ensure_base_tarball() -> Result<PathBuf, String> {
         // interrupted download must not be cached as if it were complete.
         let partial = cache.join("ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz.part");
         let _ = fs::remove_file(&partial);
+        // External download: keep the system proxy. .no_proxy() is only
+        // for loopback probes (see updates.rs::network_client); behind a
+        // proxy is exactly where a nodejs.org / cloud-images.ubuntu.com
+        // fetch has to work.
         let client = reqwest::blocking::Client::builder()
-            .no_proxy()
             .timeout(Duration::from_secs(1800))
             .build()
             .map_err(|error| format!("cannot build download client: {error}"))?;
@@ -253,7 +256,13 @@ impl WslVm {
             // The fresh rootfs has no Node yet. Drop the Windows-side marker
             // so a re-import (manual unregister, WSL reset) actually
             // re-provisions instead of launching a guest without node.
-            let _ = fs::remove_file(vm_dir.join("provisioned"));
+            // A missing marker is fine; any other failure must abort, or the
+            // guest would be started without Node.
+            match fs::remove_file(vm_dir.join("provisioned")) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("cannot invalidate provision marker: {error}")),
+            }
         }
 
         // Provision once: a pinned Node.js build extracted into /usr/local.
@@ -265,8 +274,8 @@ impl WslVm {
             }
             let node_tar = vm_dir.join("node.tar.xz");
             if !node_tar.is_file() {
+                // External download, same rule as the base rootfs above.
                 let client = reqwest::blocking::Client::builder()
-                    .no_proxy()
                     .timeout(Duration::from_secs(300))
                     .build()
                     .map_err(|error| format!("cannot build download client: {error}"))?;

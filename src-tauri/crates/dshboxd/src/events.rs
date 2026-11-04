@@ -55,6 +55,20 @@ pub enum DaemonEvent {
     /// exists, and pushing the whole state here would be a second shape of
     /// the same data to keep in step.
     UpdateState,
+    /// A box-helper completed its registration handshake.
+    NodeRegistered {
+        id: String,
+        kind: String,
+        platform: String,
+    },
+    /// A node changed status (online / offline / removed).
+    NodeStatus { id: String, status: String },
+    /// A helper reported a log line to the control plane.
+    NodeLog {
+        id: String,
+        level: String,
+        line: String,
+    },
 }
 
 impl DaemonEvent {
@@ -72,6 +86,45 @@ impl DaemonEvent {
             Self::ResourceUpdated { .. } => "resource_updated",
             Self::TagsFetched { .. } => "tags_fetched",
             Self::UpdateState => "update_state",
+            Self::NodeRegistered { .. } => "node_registered",
+            Self::NodeStatus { .. } => "node_status",
+            Self::NodeLog { .. } => "node_log",
+        }
+    }
+
+    /// Whether this event belongs to the node surface. A helper session
+    /// token may subscribe to the event stream, but only to what its
+    /// whitelist grants it; task and resource events are control-plane
+    /// state, not node state.
+    ///
+    /// Written as an exhaustive match rather than a wildcard so a new
+    /// variant forces a decision here instead of defaulting to "not a node
+    /// event" and vanishing from the surface without anyone noticing.
+    pub fn is_node_event(&self) -> bool {
+        match self {
+            Self::NodeRegistered { .. } | Self::NodeStatus { .. } | Self::NodeLog { .. } => true,
+            Self::TaskStage { .. }
+            | Self::TaskLog { .. }
+            | Self::TaskFinished { .. }
+            | Self::RollbackStarted { .. }
+            | Self::RollbackFinished { .. }
+            | Self::RollbackFailed { .. }
+            | Self::ResourceAdded { .. }
+            | Self::ResourceRemoved { .. }
+            | Self::ResourceUpdated { .. }
+            | Self::TagsFetched { .. }
+            | Self::UpdateState => false,
+        }
+    }
+
+    /// The node this event belongs to, so a subscriber can be shown its
+    /// own node events only.
+    pub fn node_id(&self) -> Option<&str> {
+        match self {
+            Self::NodeRegistered { id, .. }
+            | Self::NodeStatus { id, .. }
+            | Self::NodeLog { id, .. } => Some(id),
+            _ => None,
         }
     }
 }
@@ -117,5 +170,63 @@ impl DaemonEvents {
     pub fn broadcast(&self, event: DaemonEvent) {
         let mut subs = self.subs.lock().unwrap();
         subs.retain(|_id, tx| tx.send(event.clone()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every node event, spelled out. A helper session token can subscribe
+    /// to the event stream, so this list is the whole surface reachable from
+    /// inside a guest: adding to it is a decision, not an accident.
+    fn node_events() -> Vec<DaemonEvent> {
+        vec![
+            DaemonEvent::NodeRegistered {
+                id: String::from("n1"),
+                kind: String::from("wsl2"),
+                platform: String::from("linux-x64"),
+            },
+            DaemonEvent::NodeStatus { id: String::from("n1"), status: String::from("online") },
+            DaemonEvent::NodeLog {
+                id: String::from("n1"),
+                level: String::from("info"),
+                line: String::from("hi"),
+            },
+        ]
+    }
+
+    #[test]
+    fn the_node_surface_is_exactly_the_node_events() {
+        for event in node_events() {
+            assert!(event.is_node_event(), "{} must be a node event", event.event_name());
+            assert_eq!(event.node_id(), Some("n1"));
+        }
+        let control = [
+            DaemonEvent::TaskStage { task_id: String::from("t"), stage: String::from("s"), progress: 1 },
+            DaemonEvent::TaskLog { task_id: String::from("t"), line: String::from("l") },
+            DaemonEvent::TaskFinished { task_id: String::from("t"), status: String::from("done"), error: None },
+            DaemonEvent::RollbackStarted { task_id: String::from("t") },
+            DaemonEvent::RollbackFinished { task_id: String::from("t") },
+            DaemonEvent::RollbackFailed { task_id: String::from("t"), error: String::from("e") },
+            DaemonEvent::ResourceAdded { id: String::from("r"), r#type: String::from("credentials"), name: String::from("c") },
+            DaemonEvent::ResourceRemoved { id: String::from("r") },
+            DaemonEvent::ResourceUpdated { id: String::from("r"), status: String::from("deleted") },
+            DaemonEvent::TagsFetched { tags: vec![] },
+            DaemonEvent::UpdateState,
+        ];
+        for event in control {
+            assert!(!event.is_node_event(), "{} must not reach a session subscriber", event.event_name());
+            assert_eq!(event.node_id(), None);
+        }
+    }
+
+    #[test]
+    fn node_event_names_are_the_wire_names() {
+        // The UI switches on these strings and the helper prints them; a
+        // rename is a silent drop on both sides, so the wire spelling is
+        // pinned here rather than remembered.
+        let names: Vec<&str> = node_events().iter().map(|e| e.event_name()).collect();
+        assert_eq!(names, vec!["node_registered", "node_status", "node_log"]);
     }
 }

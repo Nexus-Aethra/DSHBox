@@ -68,6 +68,7 @@ mod tests {
     /// and a test that mutates HOME has to hold the process-global env lock for
     /// it. Resolution only ever needs `paths.runtime`.
     fn state_at_with(root: &Path, runtime: Option<std::path::PathBuf>) -> DaemonState {
+        let events = Arc::new(crate::events::DaemonEvents::new());
         DaemonState {
             manager: TaskManager::memory(),
             paths: RwLock::new(BoxPaths {
@@ -76,7 +77,12 @@ mod tests {
             }),
             containers: Arc::new(ContainerManager::default()),
             resources: ResourceStateManager::default(),
-            events: Arc::new(crate::events::DaemonEvents::new()),
+            nodes: Arc::new(crate::nodes::NodeManager::load(
+                &BoxPaths { config: root.join("config.json"), runtime: None },
+                String::new(),
+                events.clone(),
+            )),
+            events,
             browser: Mutex::new(crate::debug::Sessions::new()),
         }
     }
