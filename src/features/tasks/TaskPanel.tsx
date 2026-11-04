@@ -5,8 +5,9 @@ import { Button } from '../../ui/Button'
 import { Card } from '../../ui/Card'
 import { Dialog } from '../../ui/Dialog'
 import { Stack } from '../../ui/Stack'
+import { StageList } from './TaskStages'
 
-type TaskText = { tasks: string; taskRunning: string; recentTasks: string; cancel: string; retry: string; viewLog: string; close: string; refresh: string; remove: string; confirmTitle: string; dialogCancel: string; dialogConfirm: string; deleteTaskConfirm: string }
+type TaskText = { tasks: string; taskRunning: string; recentTasks: string; cancel: string; retry: string; viewLog: string; close: string; refresh: string; remove: string; confirmTitle: string; dialogCancel: string; dialogConfirm: string; deleteTaskConfirm: string; stages: string; stageElapsed: string; stageBudget: string; stageRetries: string; stageFailedAt: string }
 
 export function TaskPanel({ tasks, logs, text, onClose, onCancel, onRetry, onLog, onDelete }: { tasks: TaskRecord[]; logs: Record<string, string>; text: TaskText; onClose: () => void; onCancel: (id: string) => Promise<void>; onRetry: (id: string) => Promise<void>; onLog: (id: string) => Promise<void>; onDelete: (id: string) => Promise<void> }) {
   const [expanded, setExpanded] = useState<string | null>(null)
@@ -44,7 +45,12 @@ export function TaskPanel({ tasks, logs, text, onClose, onCancel, onRetry, onLog
           <strong>{task.kind.replaceAll('-', ' ')}</strong>
           <span>{task.stage} · {task.resourceKeys.join(', ')}</span>
           {task.error !== null && <span className="task-error">{task.error}</span>}
-          <div className="task-progress"><i style={{ width: `${task.progress}%` }} /></div>
+          {/* Stages when the task declared them; the single bar otherwise, so a
+              record written before stages existed still renders instead of
+              showing an empty card. */}
+          {task.stages && task.stages.length > 0
+            ? <StageList stages={task.stages} text={text} />
+            : <div className="task-progress"><i style={{ width: `${task.progress}%` }} /></div>}
           {expanded === task.id && <div className="task-inline-log">
             <div className="task-inline-log-head"><span>{text.viewLog}</span><Button variant="secondary" size="sm" onClick={() => { void onLog(task.id) }}>{text.refresh}</Button></div>
             <pre ref={logRef}>{logs[task.id] || 'No log output yet.'}</pre>

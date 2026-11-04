@@ -301,6 +301,18 @@ impl TaskNotifier for DaemonNotifier {
                 stage: stage.to_owned(),
                 progress,
             });
+        // The per-stage picture travels in its own event, so a client does not
+        // have to poll to learn that one stage advanced while another finished.
+        if let Ok(task) = self.manager.task(task_id) {
+            if !task.stages.is_empty() {
+                self.events
+                    .broadcast(crate::events::DaemonEvent::TaskStages {
+                        task_id: task_id.to_owned(),
+                        stages: serde_json::to_value(&task.stages)
+                            .unwrap_or(serde_json::Value::Null),
+                    });
+            }
+        }
     }
 
     fn log(&self, task_id: &str, line: &str) {

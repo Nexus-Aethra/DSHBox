@@ -204,7 +204,21 @@ pub(crate) fn pull_template_with_cancel(
         ));
     }
 
-    task.update("Cloning Harness source", 10);
+    // Declare the whole shape up front so the UI can show what is still to
+    // come, not just what is happening now. Budgets come from measurement:
+    // `pnpm run build` takes 433-471 s on this machine, which is most of the
+    // elapsed time, so the three build sub-steps carry most of the budget.
+    task.plan_stages(&[
+        ("clone", "Cloning Harness source", 20),
+        ("install", "Installing DSH dependencies", 120),
+        ("build", "Building DSH client artifacts", 450),
+        ("validate", "Validating prepared base", 15),
+        ("publish", "Publishing prepared base", 40),
+    ]);
+    task.stage_started("clone");
+    // One guard per running stage: dropping it (on the happy path or on a `?`)
+    // stops the timer, so no stage keeps ticking after it is done or failed.
+    let _clone_tick = StageTicker::start(task, "clone");
     task.log(&format!("cloning {ref_value} into private staging"));
     let staged = layout.create_staging_dir("template_pull")?;
     let harness = staged.join("harness");
@@ -227,7 +241,10 @@ pub(crate) fn pull_template_with_cancel(
         configure_staged_pnpm_platform(&harness)?;
         let pnpm = resolve_toolchain("pnpm")?;
         let log_path = staged.join("prepare.log");
-        task.update("Installing DSH dependencies", 35);
+        drop(_clone_tick);
+        task.stage_done("clone");
+        task.stage_started("install");
+        let _install_tick = StageTicker::start(task, "install");
         task.log("installing DSH dependencies in prepared-base staging");
         run_pnpm_task(
             &pnpm,
@@ -248,10 +265,18 @@ pub(crate) fn pull_template_with_cancel(
         // and the platform — not on the profile's plugins — so a prepared base
         // can carry it for every template built from it. This is the slow step
         // (native addon, host/client libraries, web frontend).
-        task.update("Building DSH client artifacts", 50);
+        drop(_install_tick);
+        task.stage_done("install");
+        task.stage_started("build");
+        let _build_tick = StageTicker::start(task, "build");
         task.log("building DSH client artifacts (native addon, host/client libs, web frontend); this is the slow step");
         let build_started = std::time::Instant::now();
-        run_pnpm_task_with(
+        // `pnpm run build` is one child process, so its internal order is not
+        // observable from here. Rather than invent sub-steps, the ticker above
+        // advances the stage from elapsed time against its budget: the bar then
+        // moves because time is really passing, and a stuck build freezes at 90%
+        // with the elapsed time still climbing — which is the honest report.
+        let build_result = run_pnpm_task_with(
             &pnpm,
             &harness,
             ["run", "build"],
@@ -259,7 +284,14 @@ pub(crate) fn pull_template_with_cancel(
             task,
             "prepared-base client build",
             &[("DSH_CLIENT_COMMIT_HASH", commit.as_str())],
-        )?;
+        );
+        // Stop the ticker before reporting the outcome, so a finished stage
+        // cannot be overwritten by a late tick.
+        drop(_build_tick);
+        if let Err(error) = build_result {
+            task.stage_failed("build", &error);
+            return Err(error);
+        }
         task.log(&format!(
             "client artifacts built in {}s",
             build_started.elapsed().as_secs()
@@ -267,8 +299,11 @@ pub(crate) fn pull_template_with_cancel(
         crate::sealed::write_client_artifact_marker(&harness, &commit)?;
         task.check_cancelled()?;
 
-        task.update("Validating prepared base", 60);
+        task.stage_done("build");
+        task.stage_started("validate");
+        let _validate_tick = StageTicker::start(task, "validate");
         validate_prepared_harness(&harness)?;
+        drop(_validate_tick);
         let runtime = bundled_runtime()?;
         let created_at = now_seconds();
         let digest = box_dsh_versions::template_content_hash(&format!(
@@ -339,7 +374,9 @@ pub(crate) fn pull_template_with_cancel(
         validated_at: now_seconds(),
     };
     write_template_manifest(&staged, &manifest)?;
-    task.update("Publishing prepared base", 84);
+    task.stage_done("validate");
+    task.stage_started("publish");
+    let _publish_tick = StageTicker::start(task, "publish");
     let destination =
         layout.prepared_base_dir(record.id.strip_prefix("base-").unwrap_or(&record.id))?;
     if destination.exists() {
@@ -356,7 +393,7 @@ pub(crate) fn pull_template_with_cancel(
     let mut updated = read_config()?;
     updated.selected_dsh_version = Some(record.version.clone());
     write_config(&updated)?;
-    task.update("Prepared base ready", 100);
+    task.stage_done("publish");
     task.log(&format!(
         "prepared base {} ({}) is ready",
         record.version, record.id
@@ -407,6 +444,45 @@ fn configure_staged_pnpm_platform(harness: &Path) -> Result<(), String> {
     .map_err(|error| format!("cannot write {}: {error}", workspace.display()))
 }
 
+/// A stage that ticks itself while it runs.
+///
+/// Drives `stage_tick` on a timer so a stage's bar moves because time really
+/// is passing, not because a number was written once. Dropping it stops the
+/// timer, which is why every stage below holds one in a local binding until
+/// it is done: the guard is the lifetime, so a `?` on an error path stops the
+/// ticking too instead of leaving a thread behind.
+struct StageTicker {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StageTicker {
+    fn start(task: &TaskContext, stage_id: &str) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = stop.clone();
+        let context = task.clone();
+        let id = stage_id.to_owned();
+        let handle = std::thread::spawn(move || {
+            while flag.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                context.stage_tick(&id);
+            }
+        });
+        Self { stop, handle: Some(handle) }
+    }
+}
+
+impl Drop for StageTicker {
+    fn drop(&mut self) {
+        self.stop.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 fn run_pnpm_task<const N: usize>(
     pnpm: &crate::toolchains::ResolvedToolchain,
     directory: &Path,

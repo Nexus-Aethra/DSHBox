@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { boxApi } from '../shared/api/box-api'
-import type { TaskRecord } from '../shared/types/domain'
+import type { TaskRecord, TaskStage } from '../shared/types/domain'
 
 /** Payload the desktop event subscriber forwards from the daemon's SSE
  *  stream. Every daemon state transition arrives here so the UI can react
@@ -9,6 +9,7 @@ import type { TaskRecord } from '../shared/types/domain'
 type DaemonEvent =
   | { event: 'snapshot'; payload: { tasks?: TaskRecord[] } }
   | { event: 'task_stage'; payload: { task_id: string; stage: string; progress: number } }
+  | { event: 'task_stages'; payload: { task_id: string; stages: TaskStage[] } }
   | { event: 'task_log'; payload: { task_id: string; line: string } }
   | { event: 'task_finished'; payload: { task_id: string; status: string } }
   // Everything else the daemon broadcasts. These carry no task record of their
@@ -75,6 +76,16 @@ export function useTasks(refreshers: TaskRefreshers, onError: (message: string |
         case 'task_stage': {
           const { task_id: taskId, stage, progress } = payload.payload
           setTasks((current) => current.map((task) => task.id === taskId ? { ...task, stage, progress } : task))
+          break
+        }
+        case 'task_stages': {
+          // The per-stage picture arrives as its own frame (`task_stages`,
+          // `{task_id, stages}`), so the panel does not have to poll to learn
+          // that one stage advanced while another finished.
+          const { task_id: taskId, stages } = payload.payload
+          if (taskId && Array.isArray(stages)) {
+            setTasks((current) => current.map((task) => task.id === taskId ? { ...task, stages } : task))
+          }
           break
         }
         case 'task_log': {

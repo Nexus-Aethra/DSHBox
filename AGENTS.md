@@ -399,6 +399,22 @@ command as done only once the installed app has run it.
   to act, `dshbox container resource read <id> <path> [--section a.b]` to see a
   container file as a tree of key paths. Unknown keys in an apply document are
   an error, not a silent no-op.
+- **A task declares its stages up front, and each stage has its own bar.**
+  `TaskRecord.stages` is `Vec<TaskStage>` (`#[serde(default)]`, so a record
+  written before stages existed still loads and the UI falls back to the single
+  overall bar). A stage carries `state`, its own `progress`, `durationHintSecs`,
+  `attempts` and `failureDetail`. Two rules make it honest rather than
+  decorative, and both are load-bearing: **a stage's bar never reaches 100% on a
+  timer** (`tick_stage` caps at 90; only `finish_stage` completes), and **the
+  overall figure is weighted by budget and rounded, not truncated** — a 20 s
+  stage at 18% inside a 645 s total is 0.5% of the whole, which truncation
+  reported as 0 and made the bar look dead while work was visibly happening.
+  Every stage transition must call `TaskContext::publish_stages`, which reads
+  the record back and emits both the one-line summary and the `task_stages`
+  event; a stage method that writes but does not publish is persisted and
+  invisible. And do not invent sub-steps for work the daemon cannot observe —
+  `pnpm run build` is one child process, so splitting it into native/host/web
+  would be a guess, and a guessed bar is exactly what this replaced.
 - **Task logs are the UI's only window into a long task.** A daemon task's log
   file is written by `TaskContext::append_log` and by nothing else — a notifier
   that writes it too doubles every line. Stage changes (`task.update`) only move

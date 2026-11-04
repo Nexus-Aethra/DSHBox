@@ -93,6 +93,9 @@ mod tests {
             status: "succeeded".to_owned(),
             stage: "Completed".to_owned(),
             progress: 100,
+            // A legacy record predates stage plans, which is exactly the shape the
+            // `#[serde(default)]` on this field has to tolerate.
+            stages: Vec::new(),
             created_at: 1_700_000_000,
             started_at: Some(1_700_000_050),
             finished_at: Some(1_700_000_100),

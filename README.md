@@ -23,7 +23,7 @@ DSH Box is a lightweight desktop shell built with [Tauri 2](https://tauri.app) t
 - **Boxfiles** — `FROM` + `ADD` describes a template; build once, run many.
 - **Portable templates** — every payload is materialised into the template, so containers depend on nothing mutable.
 - **Bundles** — group plugins and skills, then export quick (URLs kept) or full (one archive).
-- **Tasks you can watch** — queued, logged with timings, cancellable, with history.
+- **Tasks you can watch** — every task declares its stages up front, and each stage carries its own bar, its elapsed time and its budget, so a step that is taking minutes looks different from one that has hung. Cancellable, logged, with history.
 - **A slow daemon never freezes the window** — commands run off the main thread and every RPC is bounded.
 - **An older server is kept, and said so** — a service from a previous build keeps running, with a topbar line naming both.
 - **Our own window chrome** — a custom title bar that blends into the page: drag to move, double-click to maximize, drawn min/max/close; a maximized window stays inside the work area, clear of the taskbar.
@@ -113,7 +113,9 @@ This means the same HTTP surface serves every consumer — the desktop app's Tau
 
 A task's log file is the UI's only window into it: the daemon writes it, the desktop streams the lines into the panel, and a step the user waits minutes for says what it is doing and how long it took.
 
-![The task panel: a container start with its log expanded, one line per step with timings](docs/images/tasks.png)
+A task also **declares its stages up front**, and each stage gets its own bar with its elapsed time against a budget. This is not decoration: one overall bar sits still for the seven minutes a Harness build takes, and a bar that does not move cannot be told apart from a crash. A stage that is merely slow shows a rising elapsed time; a stage whose budget is exceeded turns amber; and a bar that never reaches 100% on its own is the honest signal that only finishing means finished.
+
+![The task panel: per-stage bars with elapsed time and budget, the log expanded underneath](docs/images/tasks.png)
 
 ### Boxfile and the built-template pipeline
 
