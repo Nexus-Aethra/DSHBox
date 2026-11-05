@@ -245,6 +245,7 @@ name = "box-foundation"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "libc",
  "serde",
  "serde_json",
  "windows-sys 0.45.0",
@@ -978,7 +979,7 @@ dependencies = [
 
 [[package]]
 name = "dshbox"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "box-api",
  "box-client",

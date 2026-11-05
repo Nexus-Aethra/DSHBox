@@ -182,9 +182,13 @@ Where the work happens is deliberate:
 
 | Step | What it does | Cost |
 |---|---|---|
-| `dshbox pull template` | clones the Harness commit, installs its dependencies **and builds the client artifacts** (native addon, host/client libraries, web frontend) into a prepared base, recording the revision and platform they were built for | once per Harness version, per platform |
+| `dshbox pull template` | serves the Harness commit from the **shared source mirror**, installs its dependencies **and builds the client artifacts** (native addon, host/client libraries, web frontend) into a prepared base, recording the revision and platform they were built for | once per Harness version, per platform |
 | `dshbox build` | copies that base — artifacts included — and installs the profile's plugins into a sealed template | once per template |
 | `dshbox run` | copies the sealed tree, links dependencies from the pnpm store, materialises Box's context plugin, starts the host | **~10s** per container |
+
+Every pull is served from one bare mirror at `<runtime>/harness-mirror.git`, which holds upstream source objects only — never a checkout, never a template. The first version transfers what it needs (~45 MB measured, 10 s); a later version transfers just what it adds (measured: 1,228 objects, 2.2 s); a version already mirrored is checked out with no network at all. The checkout borrows the mirror's object database rather than copying it and then drops its `.git`, because a prepared base is source and must not depend on a cache: a failed pull therefore no longer throws away what it downloaded.
+
+The mirror is a **cache, not user data**: it is not exported, not copied into any template or container, and not counted as your data. `dshbox template mirror` shows it; `dshbox template mirror purge` deletes it and the next pull rebuilds it.
 
 A base that predates this is repaired in place the first time a template is built from it, and a template carrying no artifacts for this commit and platform (an old one, or one imported from another OS) is rebuilt at container creation instead — the task log says which path was taken. The full storage, transaction, and migration contract is in [`docs/specs/prepared-template-runtime.md`](docs/specs/prepared-template-runtime.md). This is a schema break: legacy shared `runtimes/<version>/source` layouts are not used by new builds.
 

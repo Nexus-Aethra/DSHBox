@@ -8,6 +8,7 @@ use std::{
 };
 
 pub mod bundled;
+pub mod mirror;
 pub mod process;
 
 /// Add `directory` to the user's PATH (HKCU\Environment\Path on

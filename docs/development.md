@@ -39,6 +39,7 @@ The runtime root uses the prepared/sealed model:
 
 ```text
 runtime-root/
+  harness-mirror.git/                # shared bare cache of upstream Harness objects
   staging/<task-id>/                 # task-private and disposable
   repository/plugins/<digest>/       # metadata + immutable artifact.tgz
   templates/base-<digest>/harness/   # prepared Harness source/dependency cache
@@ -48,12 +49,24 @@ runtime-root/
   logs/
 ```
 
-Pulling a root Harness template clones to staging, runs bundled `pnpm install`,
+Pulling a root Harness template fetches the requested version into
+`harness-mirror.git` (shallow, so a new version transfers only what it adds),
+checks that version out of the mirror into staging, runs bundled `pnpm install`,
 validates the dependency cache, then atomically publishes a prepared base.
 Building a Boxfile copies source without `node_modules` and records local plugin
 tarballs in a sealed recipe. Creating a container copies that recipe to its final
 path, runs offline install, adds artifacts, and builds the frontend. Starting a
 prepared container only runs bundled `pnpm dsh web` from its local Harness directory.
+
+The mirror is the one exception to "no shared state below the runtime root", and
+it is deliberately narrow: it holds upstream git objects, it is never checked out
+in place, never copied into a template or container, and it is not part of any
+resource's addressing — prepared bases are still addressed by digest alone.
+A prepared base's Harness tree carries no `.git` at all: the checkout borrows the
+mirror's object database through a git alternate, which records an absolute path
+into a cache the user may purge, so the caller removes it before publishing. It
+is a cache, not user data: `dshbox template mirror purge` deletes it and the next
+pull rebuilds it, and `prune_orphaned_data` does not scan it.
 
 Do not introduce a launch-time dependency install/build, a shared mutable
 Harness checkout, workspace-path injection, or a symlink/junction from a

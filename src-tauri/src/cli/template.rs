@@ -13,7 +13,7 @@ use super::rpc;
 pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
     let Some(action) = arguments.first().map(String::as_str) else {
         return Err(
-            "expected template install|uninstall|list|show|info|import|export|rm|prune"
+            "expected template install|uninstall|list|show|info|import|export|rm|prune|mirror"
                 .to_owned(),
         );
     };
@@ -35,6 +35,8 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         println!(
             "dshbox template prune             GC data-store snapshots no built template uses"
         );
+        println!("dshbox template mirror            the shared Harness source mirror: size, path, state");
+        println!("dshbox template mirror purge      delete it; the next pull rebuilds it (a cache, not user data)");
         return Ok(());
     }
     // Everything after the verb, so a read verb can take its own flags and
@@ -56,6 +58,9 @@ pub(crate) fn command(arguments: &[String]) -> Result<(), String> {
         ),
         "rm" | "remove" => remove(arguments.get(1).ok_or("expected a template name")?),
         "prune" => prune(&rest),
+        // Two-level, because `mirror` is a thing with sub-actions rather than
+        // a verb of its own; a bare `mirror` reports its state.
+        "mirror" => mirror(&rest),
         other => Err(format!("unknown template action: {other}")),
     }
 }
@@ -211,6 +216,42 @@ fn prune(rest: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `dshbox template mirror [purge]` — the shared Harness source mirror.
+///
+/// The mirror is a cache, not user state: it holds upstream git objects so a
+/// second Harness version does not re-download the first one's. `purge` is the
+/// honest way to get the disk back, and it is a task on the daemon because the
+/// directory must not be deleted under a running pull.
+fn mirror(rest: &[String]) -> Result<(), String> {
+    let action = rest.first().map(String::as_str).unwrap_or("");
+    match action {
+        "" => {
+            super::read_flags(rest, &[])?;
+            let client = rpc::connect()?;
+            let value = rpc::call(&client, "harness_mirror_info", json!({}))?;
+            let present = value["present"].as_bool().unwrap_or(false);
+            let size_mb = value["sizeBytes"].as_u64().unwrap_or(0) / (1024 * 1024);
+            println!("path:     {}", value["path"].as_str().unwrap_or("-"));
+            println!("present:  {present}");
+            println!("size:     {size_mb} MB");
+            if present {
+                println!("note:     a cache - `dshbox template mirror purge` frees it");
+            }
+            Ok(())
+        }
+        "purge" | "rm" | "clear" => {
+            super::read_flags(&rest[1..], &[])?;
+            let client = rpc::connect()?;
+            rpc::run_task(&client, "purge_harness_mirror", json!({}))?;
+            println!("purged the shared Harness mirror; the next pull rebuilds it");
+            Ok(())
+        }
+        other => Err(format!(
+            "unknown mirror action: {other} (expected `mirror` or `mirror purge`)"
+        )),
+    }
 }
 
 fn info(name: &str, rest: &[String]) -> Result<(), String> {

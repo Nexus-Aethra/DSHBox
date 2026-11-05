@@ -18,8 +18,8 @@ use box_foundation::{
     PublishedResourceKind, RuntimeLayout, TemplateManifest, STORAGE_SCHEMA_VERSION,
 };
 use box_runtime::{
+    mirror::{MirrorCallbacks, MirrorError},
     process::{ExecutionKind, ProcessSpec},
-    shallow_clone_with_cancel,
 };
 use box_scheduler::TaskContext;
 use serde::{Deserialize, Serialize};
@@ -216,7 +216,10 @@ pub(crate) fn pull_template_with_cancel(
     // `pnpm run build` takes 433-471 s on this machine, which is most of the
     // elapsed time, so the three build sub-steps carry most of the budget.
     task.plan_stages(&[
-        ("clone", "Cloning Harness source", 20),
+        // Measured after the shared mirror landed (2026-11-05): a first
+        // version costs ~10 s to fetch and ~60 s to check out, a repeat costs
+        // nothing but the checkout.
+        ("clone", "Fetching Harness source from the shared mirror", 75),
         ("install", "Installing DSH dependencies", 120),
         ("build", "Building DSH client artifacts", 450),
         ("validate", "Validating prepared base", 15),
@@ -229,18 +232,26 @@ pub(crate) fn pull_template_with_cancel(
     // One guard per running stage: dropping it (on the happy path or on a `?`)
     // stops the timer, so no stage keeps ticking after it is done or failed.
     let _clone_tick = StageTicker::start(task, "clone");
-    task.log(&format!("cloning {ref_value} into private staging"));
+    task.log(&format!(
+        "serving {ref_value} from the shared Harness mirror"
+    ));
     let staged = layout.create_staging_dir("template_pull")?;
     let harness = staged.join("harness");
     let prepare = (|| -> Result<PreparedBaseRecord, String> {
         let mirror = read_config().ok().and_then(|config| config.github_mirror);
         let target = mirror_url(&parsed.url, mirror.as_deref());
         let revision = parsed.tag.as_deref().filter(|tag| *tag != "latest");
-        let commit = shallow_clone_with_cancel(&target, &harness, revision, {
+        // Every pull goes through the one shared mirror, so a version already
+        // held costs no network at all and a new version costs only the objects
+        // it does not share with the versions already there. The mirror lives
+        // outside staging, so a failed pull keeps what it downloaded.
+        let cancelled = {
             let flag = std::sync::Arc::clone(&cancel_flag);
             move || flag.lock().map(|guard| guard()).unwrap_or(true)
-        })
+        };
+        let commit = stage_mirrored_checkout(task, &layout, &target, revision, &harness, cancelled)
             .map_err(|error| {
+                let error = error.into_message();
                 if error.contains("SSL") {
                     format!(
                         "pull template failed: {error}\nhint: github.com may be blocked on this network; configure a mirror with `dshbox config set mirror <prefix>` (e.g. https://gh-proxy.com)"
@@ -430,6 +441,72 @@ pub(crate) fn pull_template_with_cancel(
         ref_value, record.version
     );
     Ok(())
+}
+
+/// Serve one requested Harness version out of the shared mirror.
+///
+/// Three cases, in the order they are cheapest:
+///
+/// 1. the mirror already holds the commit (a second container of a version
+///    installed before, or a retry after a failed build) - resolve it locally
+///    and check out with no network call at all;
+/// 2. the mirror is there but lacks the version - fetch just that ref;
+/// 3. anything else - create the mirror, fetch, and check out.
+///
+/// A transport failure is not a reason to discard the mirror, so it is reported
+/// with its own flag; a fetch that succeeded and still cannot resolve the ref
+/// means the objects really are incomplete, and only then is the mirror rebuilt.
+/// The mirror is named in the task log on the path that was taken: a user
+/// wondering why a pull was fast or slow needs to see which one it was.
+fn stage_mirrored_checkout(
+    task: &TaskContext,
+    layout: &RuntimeLayout,
+    target: &str,
+    revision: Option<&str>,
+    harness: &Path,
+    cancelled: impl Fn() -> bool,
+) -> Result<String, MirrorError> {
+    // Both callbacks run inside libgit2's own transfer loop, so the task handle
+    // has to be owned rather than borrowed from this frame.
+    let progress = {
+        let task = task.clone();
+        move |percent: u8| task.stage_progress("clone", percent)
+    };
+    let callbacks = MirrorCallbacks::new(&cancelled).with_progress(&progress);
+    let root = layout.root();
+    let mirror = box_runtime::mirror::ensure_bare_mirror(root, target, &callbacks)?;
+    // The cheap path first: a version this mirror already holds needs no network.
+    if let Ok(commit) = box_runtime::mirror::resolve_in_mirror(&mirror, revision) {
+        task.log(&format!(
+            "shared mirror already holds {}; checking out without network access",
+            revision.unwrap_or("the default branch")
+        ));
+        box_runtime::mirror::checkout_from_mirror(&mirror, harness, &commit, &callbacks)?;
+        box_runtime::mirror::drop_checkout_metadata(harness);
+        return Ok(commit);
+    }
+    let added = box_runtime::mirror::fetch_ref_to_mirror(&mirror, target, revision, &callbacks)?;
+    task.log(&format!(
+        "fetched {} through the shared mirror ({} new objects; mirror is {} MB)",
+        revision.unwrap_or("the default branch"),
+        added,
+        box_runtime::mirror::mirror_size_bytes(&mirror) / (1024 * 1024)
+    ));
+    let commit = match box_runtime::mirror::resolve_in_mirror(&mirror, revision) {
+        Ok(commit) => commit,
+        Err(_) => {
+            // The fetch succeeded, so the remote is reachable and the ref
+            // should be here: the mirror itself is incomplete. Rebuild once,
+            // which is the only repair the design allows.
+            task.log("shared mirror is incomplete for this version; rebuilding it once");
+            let mirror = box_runtime::mirror::rebuild_bare_mirror(root, target, &callbacks)?;
+            box_runtime::mirror::fetch_ref_to_mirror(&mirror, target, revision, &callbacks)?;
+            box_runtime::mirror::resolve_in_mirror(&mirror, revision)?
+        }
+    };
+    box_runtime::mirror::checkout_from_mirror(&mirror, harness, &commit, &callbacks)?;
+    box_runtime::mirror::drop_checkout_metadata(harness);
+    Ok(commit)
 }
 
 /// Mark the stage that was running when the pull failed, so a dead task never

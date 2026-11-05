@@ -163,9 +163,13 @@ ADD skill team-conventions
 
 | 步骤 | 做什么 | 代价 |
 |---|---|---|
-| `dshbox pull template` | 克隆 Harness 提交，安装依赖**并构建客户端产物**（native 插件、宿主/客户端库、Web 前端）到 prepared base，同时记录构建时的 revision 与平台 | 每个 Harness 版本、每个平台一次 |
+| `dshbox pull template` | 从**共享源码镜像**取出 Harness 提交，安装依赖**并构建客户端产物**（native 插件、宿主/客户端库、Web 前端）到 prepared base，同时记录构建时的 revision 与平台 | 每个 Harness 版本、每个平台一次 |
 | `dshbox build` | 复制该 base（含产物），安装 profile 的插件，产出封存模板 | 每个模板一次 |
 | `dshbox run` | 复制封存树、从 pnpm store 链接依赖、物化 Box 的上下文插件、启动宿主 | 每个容器 **~10 秒** |
+
+每次拉取都由 `<runtime>/harness-mirror.git` 这一个 bare 镜像提供，它只存上游源码对象——不是 checkout，也不是模板。第一个版本传自己需要的量（实测约 45 MB、10 秒），后续版本只传新增部分（实测 1228 个对象、2.2 秒），镜像里已有的版本则完全不联网地本地检出。检出借用镜像的对象库而不复制它，之后再把 `.git` 删掉：prepared base 是源码，不能依赖一个用户随时可清的缓存。因此**一次失败的拉取不再把已下载的字节丢掉**。
+
+镜像**是缓存不是用户数据**：不进导出、不进任何模板或容器、不计入你的数据统计。`dshbox template mirror` 查看它，`dshbox template mirror purge` 删除它（下次拉取会重建）。
 
 早于这个改动创建的 base 会在第一次用它构建模板时原地补齐；树里没有「本提交 + 本平台」产物的模板（旧的，或从别的系统导入的）则在创建容器时重建——任务日志会说明走了哪条路。完整的存储、事务与迁移约定见 [`docs/specs/prepared-template-runtime.md`](docs/specs/prepared-template-runtime.md)。注意这是一次 schema 变更：旧的共享 `runtimes/<version>/source` 布局不再被新构建使用。
 
