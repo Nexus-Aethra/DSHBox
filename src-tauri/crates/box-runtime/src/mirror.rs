@@ -443,6 +443,60 @@ pub fn count_objects(repository: &git2::Repository) -> usize {
     count
 }
 
+/// The branch a mirror should be treated as "latest" for.
+///
+/// Order: a HEAD that resolves (the clone-free case where someone set it
+/// explicitly), then a branch literally named `main` or `master`, then the
+/// single head if there is only one. Anything else is an honest miss: picking
+/// an arbitrary branch for `latest` would resolve a version the user never
+/// asked for, which is worse than asking them to name a tag.
+fn resolve_default_branch(repository: &git2::Repository) -> Result<git2::Object<'_>, MirrorError> {
+    if let Some(oid) = repository
+        .head()
+        .ok()
+        .and_then(|head| head.target())
+    {
+        return repository.find_object(oid, None).map_err(|error| {
+            MirrorError::local(format!("cannot read the shared mirror's HEAD commit: {error}"))
+        });
+    }
+    let mut heads: Vec<String> = Vec::new();
+    if let Ok(references) = repository.references() {
+        for reference in references.flatten() {
+            if let Some(name) = reference.name().and_then(|name| name.strip_prefix("refs/heads/")) {
+                heads.push(name.to_owned());
+            }
+        }
+    }
+    for candidate in ["main", "master"] {
+        if heads.iter().any(|head| head == candidate) {
+            return resolve_branch(repository, candidate);
+        }
+    }
+    match heads.as_slice() {
+        [only] => resolve_branch(repository, only),
+        _ => Err(MirrorError::local(format!(
+            "the shared mirror has no default branch; ask for a version tag instead (branches present: {})",
+            if heads.is_empty() {
+                "none".to_owned()
+            } else {
+                heads.join(", ")
+            }
+        ))),
+    }
+}
+
+fn resolve_branch<'repo>(
+    repository: &'repo git2::Repository,
+    branch: &str,
+) -> Result<git2::Object<'repo>, MirrorError> {
+    repository
+        .revparse_single(&format!("refs/heads/{branch}"))
+        .map_err(|error| {
+            MirrorError::local(format!("cannot resolve the mirror's `{branch}` branch: {error}"))
+        })
+}
+
 /// Resolve one requested reference inside the mirror.
 ///
 /// This never touches the network, which is what makes an offline pull of an
@@ -458,16 +512,13 @@ pub fn resolve_in_mirror(mirror: &Path, revision: Option<&str>) -> Result<String
             .map_err(|error| {
                 MirrorError::local(format!("the shared mirror has no tag {tag}: {error}"))
             })?,
-        None => {
-            // The bare mirror's HEAD points at a branch the heads-to-heads
-            // refspec keeps in step with the remote's default branch.
-            let head = repository.head().map_err(|error| {
-                MirrorError::local(format!("the shared mirror has no HEAD: {error}"))
-            })?;
-            head.peel(git2::ObjectType::Any).map_err(|error| {
-                MirrorError::local(format!("cannot resolve the shared mirror's HEAD: {error}"))
-            })?
-        }
+        // No tag asked for: the remote's default branch. The mirror's own HEAD
+        // is not trustworthy here - `Repository::init_bare` sets it to whatever
+        // `init.defaultBranch` says (master on most machines), which is a
+        // *different* branch from a remote whose default is `main`. So a HEAD
+        // that does not resolve falls back to the branch this mirror actually
+        // has, preferring the two names a default branch is called in practice.
+        None => resolve_default_branch(&repository)?,
     };
     let commit = object.peel_to_commit().map_err(|error| {
         MirrorError::local(format!(
@@ -845,6 +896,38 @@ mod tests {
         );
         assert!(resolve_in_mirror(&mirror, Some("v1")).is_ok());
         assert!(resolve_in_mirror(&mirror, Some("other")).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_default_branch_uses_the_remotes_branch_not_the_local_default() {
+        let root = temporary_root("default-branch");
+        // A source whose default branch is `main`; `init_bare` on most
+        // machines would point the mirror's HEAD at `master`, so resolving
+        // "the default branch" must not trust HEAD alone.
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let repository = Repository::init(&source).unwrap();
+        repository.set_head("refs/heads/main").unwrap();
+        let signature = Signature::now("DSH Box", "box@example.invalid").unwrap();
+        fs::write(source.join("README.md"), "main").unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        index.write().unwrap();
+        let tree = repository.find_tree(index.write_tree().unwrap()).unwrap();
+        repository
+            .commit(Some("refs/heads/main"), &signature, &signature, "main", &tree, &[])
+            .unwrap();
+
+        let never = || false;
+        let callbacks = MirrorCallbacks::new(&never);
+        let mirror = ensure_bare_mirror(&root, source.to_str().unwrap(), &callbacks).unwrap();
+        fetch_ref_to_mirror(&mirror, source.to_str().unwrap(), None, &callbacks).unwrap();
+        let commit = resolve_in_mirror(&mirror, None).unwrap();
+        assert_eq!(commit.len(), 40);
+        // And it must be the commit that is actually on `main`.
+        let expected = repository.find_reference("refs/heads/main").unwrap().target().unwrap();
+        assert_eq!(commit, expected.to_string());
         let _ = fs::remove_dir_all(root);
     }
 
