@@ -168,6 +168,17 @@ impl RuntimeLayout {
         self.root.join("templates")
     }
 
+    /// The one shared source mirror for the Harness repository.
+    ///
+    /// A bare git repository, deliberately outside `templates/` and
+    /// `repository/`: it is a cache of the upstream objects, not a resource any
+    /// container, template or export is built from. It exists so a second
+    /// Harness version costs an incremental fetch plus a local checkout instead
+    /// of another full clone.
+    pub fn harness_mirror_dir(&self) -> PathBuf {
+        self.root.join("harness-mirror.git")
+    }
+
     pub fn prepared_base_dir(&self, digest: &str) -> BoxResult<PathBuf> {
         validated_digest_path(self.templates_dir(), "base", digest)
     }
@@ -686,6 +697,67 @@ pub fn normalize_optional_url(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+/// Free bytes available to this user on the volume holding `path`.
+///
+/// Used as a pre-flight check before a large write (a full source clone, a
+/// copied tree): the honest failure is "not enough space", raised before
+/// anything is written, rather than a half-written tree that looks like a
+/// corrupt clone. Returns `None` when the volume cannot be queried, so a
+/// caller on an exotic filesystem degrades to "cannot check" instead of
+/// refusing to work.
+pub fn available_disk_space(path: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        // The root is what matters: any path on the volume reports the same
+        // free space, and a path that does not exist yet still has a parent
+        // volume to ask about.
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut available: u64 = 0;
+        let mut total: u64 = 0;
+        let mut free: u64 = 0;
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free)
+        };
+        if ok == 0 {
+            None
+        } else {
+            Some(available)
+        }
+    }
+    #[cfg(unix)]
+    {
+        // statvfs: the same "free bytes available to this user" figure, with no
+        // external command. The path must be a NUL-terminated C string -
+        // `as_encoded_bytes` is *not*, and handing its pointer to C would read
+        // past the end of the buffer - so it goes through `CString` first.
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+            // A path containing a NUL byte cannot be a real path; treat it the
+            // same as an unmeasurable volume rather than alarming the caller.
+            return None;
+        };
+        let mut info = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        let ok = unsafe { libc::statvfs(path.as_ptr(), info.as_mut_ptr()) };
+        if ok != 0 {
+            return None;
+        }
+        let info = unsafe { info.assume_init() };
+        Some(info.f_bavail as u64 * info.f_frsize as u64)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// Prevents a child process from opening a console window on Windows. The

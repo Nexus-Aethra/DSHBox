@@ -218,6 +218,10 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("save_runtime_directory") => save_runtime_directory_rpc(state, request).map(Sync),
         Some("refresh_dsh_catalog") => enqueue_dsh_catalog_refresh(state),
         Some("pull_template") => enqueue_pull_template(state, request),
+        Some("harness_mirror_info") => harness_mirror_info_rpc(),
+        // Purge goes through the scheduler like every other long job: the mirror
+        // must not be deleted while a pull is writing to it.
+        Some("purge_harness_mirror") => enqueue_purge_harness_mirror(state),
         Some("import_repository_extension") => enqueue_repository_import(state, request),
         Some("export_repository_extension") => enqueue_repository_export(state, request),
         Some("container_plugin_add") => enqueue_container_plugin_add(state, request),
@@ -776,6 +780,11 @@ fn enqueue_pull_template(state: &DaemonState, request: &Value) -> Result<Handler
         "template-pull",
         vec![
             format!("runtime:{version}"),
+            // The shared mirror is written by every pull, so pulls serialize on
+            // it rather than each racing its own clone. It stays a *third* key:
+            // a pull already holds two, and the scheduler's resource set is
+            // deliberately small enough to read (see the design doc).
+            "harness-mirror".to_owned(),
             "repository:dsh-versions".to_owned(),
         ],
         params,
@@ -794,6 +803,49 @@ fn enqueue_pull_template(state: &DaemonState, request: &Value) -> Result<Handler
                 },
                 task,
             )
+        },
+    )
+    .map(HandlerResult::Async)
+}
+
+/// The shared Harness mirror as the CLI and the UI need to see it: whether it
+/// exists, how big it is, and where it points.
+///
+/// Read-only and cheap (one directory walk), so it answers inline.
+fn harness_mirror_info_rpc() -> Result<HandlerResult, String> {
+    let root = read_config()?
+        .runtime_directory
+        .ok_or("DSH Box storage is not configured")?;
+    let mirror = box_runtime::mirror::mirror_path(std::path::Path::new(&root));
+    let present = box_runtime::mirror::is_usable(&mirror);
+    let size_bytes = box_runtime::mirror::mirror_size_bytes(&mirror);
+    Ok(HandlerResult::Sync(json!({
+        "present": present,
+        "path": mirror.to_string_lossy(),
+        "sizeBytes": size_bytes,
+        // The mirror is a cache: reporting it as user data would make "purge"
+        // look like deleting something the user owns.
+        "cache": true,
+    })))
+}
+
+fn enqueue_purge_harness_mirror(state: &DaemonState) -> Result<HandlerResult, String> {
+    enqueue_task_worker(
+        state,
+        "harness-mirror-purge",
+        vec!["harness-mirror".to_owned()],
+        json!({}),
+        |task| {
+            let root = read_config()?
+                .runtime_directory
+                .ok_or("DSH Box storage is not configured")?;
+            let freed = box_runtime::mirror::purge(std::path::Path::new(&root))
+                .map_err(|error| error.into_message())?;
+            task.log(&format!(
+                "removed the shared Harness mirror ({} MB freed); the next pull rebuilds it",
+                freed / (1024 * 1024)
+            ));
+            Ok(())
         },
     )
     .map(HandlerResult::Async)
@@ -1920,6 +1972,50 @@ mod tests {
         assert_eq!(response["status"], "stopped");
         assert!(response["url"].is_null());
         assert!(response["hostPid"].is_null());
+        cleanup(&home, &runtime);
+    }
+
+    #[test]
+    fn harness_mirror_info_reports_an_absent_mirror_as_absent() {
+        let _guard = env_lock();
+        let (state, _id, home, runtime) = setup(false);
+        let response = harness_mirror_info_rpc().unwrap();
+        let response = match response {
+            HandlerResult::Sync(value) => value,
+            HandlerResult::Async(_) => panic!("harness_mirror_info must be sync"),
+        };
+        assert_eq!(response["present"], false);
+        assert_eq!(response["cache"], true);
+        assert_eq!(response["sizeBytes"], 0);
+        // The path is named even when the mirror is not there, so a user
+        // looking for it does not have to guess where it would live.
+        let path = response["path"].as_str().unwrap();
+        assert!(path.ends_with("harness-mirror.git"), "got {path}");
+        assert!(path.contains(runtime.to_str().unwrap()), "got {path}");
+        cleanup(&home, &runtime);
+    }
+
+    #[test]
+    fn harness_mirror_info_reports_a_present_mirror_and_its_size() {
+        let _guard = env_lock();
+        let (_state, _id, home, runtime) = setup(false);
+        // Build a usable mirror by hand: the info RPC must read what is there,
+        // not require a pull to have created it.
+        let mirror = box_runtime::mirror::mirror_path(&runtime);
+        let never = || false;
+        box_runtime::mirror::ensure_bare_mirror(
+            &runtime,
+            "https://example.invalid/repo.git",
+            &box_runtime::mirror::MirrorCallbacks::new(&never),
+        )
+        .unwrap();
+        let response = harness_mirror_info_rpc().unwrap();
+        let response = match response {
+            HandlerResult::Sync(value) => value,
+            HandlerResult::Async(_) => panic!("harness_mirror_info must be sync"),
+        };
+        assert_eq!(response["present"], true);
+        assert!(response["sizeBytes"].as_u64().unwrap() > 0);
         cleanup(&home, &runtime);
     }
 

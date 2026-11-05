@@ -286,6 +286,7 @@ fn print_help() {
     println!("  dshbox template export <name> [dest]    write a template to a tarball");
     println!("  dshbox template rm <name>              remove a template (refuses if in use)");
     println!("  dshbox template prune                  GC data-store snapshots no template uses");
+    println!("  dshbox template mirror [purge]         the shared Harness source cache (a cache, not user data)");
     println!();
     println!("Plugins and skills:");
     println!("  dshbox plugin <action>     manage repository entries (ls / import / export / rm / prune / install)");
