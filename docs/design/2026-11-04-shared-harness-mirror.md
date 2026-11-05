@@ -107,6 +107,16 @@ fetch 下载，因为那一步才知道用户到底要哪个版本。
 取消检查点是 libgit2 的 `transfer_progress`（传输）与 `CheckoutBuilder::notify`
 （checkout，返回 false 即中止）；clone 之后的 `task.check_cancelled()` 是第二道闸。
 
+> **实测修正（评审发现）**：`CheckoutBuilder` 的 `notify_flags` 默认是**空**，只注册
+> `notify()` 而不调 `notify_on(CheckoutNotificationType::all())` 时，libgit2 在
+> `checkout.c` 里因为 `(why & notify_flags) == 0` 直接跳过回调 —— 实测回调被调用 **0 次**
+> （加上 `notify_on(all())` 后 3 次）。所以 `notify_on` 是必需的，否则 checkout 阶段对
+> 取消完全不敏感。
+>
+> 还有一个更隐蔽的：**取消不是错误**。回调返回 false 后 `checkout_tree` 仍然返回
+> `Ok`（实测），于是一次被取消的 checkout 会写出半棵树然后被当成成功。因此
+> `checkout_from_mirror` 在 checkout 之后必须再问一次取消标志，`Ok` 不代表完成。
+
 ### 4. 离线行为（关键）
 
 **离线时不得删除镜像。** 先查镜像，再谈网络 —— 顺序就是离线能力本身：
@@ -115,18 +125,31 @@ fetch 下载，因为那一步才知道用户到底要哪个版本。
 ensure_bare_mirror → resolve_in_mirror(镜像里已有？)
     是 → checkout，全程零网络
     否 → fetch_ref_to_mirror → resolve_in_mirror
-            仍失败 → 重建一次镜像（这是唯一允许重建的情形）
+            仍失败 → remote_has_revision(远端到底有没有这个 tag？)
+                没有 → 报「这个版本不存在」并保留镜像
+                有   → 重建一次镜像（这是唯一允许重建的情形）
 ```
+
+> **实测修正（评审发现的 BLOCKER，已修）**：初稿把「fetch 成功但 ref 缺失」直接当成
+> 镜像损坏，这是**会删掉用户整个缓存**的 bug。实测：对不存在的 tag 用显式 refspec
+> fetch（`+refs/tags/dsh-v9.9.9-typo:refs/tags/...`）返回 **Ok 且 0 个对象**，错误根本
+> 不发生 —— 于是「版本号拼错」「上游删了 tag」「当前 mirror 源看不到这个 tag」全都长得
+> 和「镜像不完整」一样，重建路径会把多个版本一起删掉。现在重建之前先用
+> `remote_has_revision`（ls-remote 式 `remote.list()`）确认远端是否真的 advertise 了这个
+> ref：没有就报错、保留镜像；查不到（传输失败）同样保留镜像。
 
 | 情况 | 判定（可机械执行） | 动作 |
 |---|---|---|
-| 网络不可达 | `git2::Error::class()` ∈ `ErrorClass::Net` / `Http` / `Ssl` | **保留镜像**，报错 |
-| 连上了但 ref 缺失 | fetch 本身成功，`revparse_single(tag)` 在镜像里找不到 | 重建一次 |
+| 网络不可达 | fetch 报错的 `git2::Error::class()` ∈ `ErrorClass::Net` / `Http` / `Ssl` / `Os` | **保留镜像**，报错（错误文案标注 `(network)`） |
+| 远端没有这个 tag | `remote_has_revision` 返回 `Ok(false)` | **保留镜像**，报「不是远端提供的版本」 |
+| 远端有、镜像没有 | `remote_has_revision` 返回 `Ok(true)` 而 `revparse_single` 仍找不到 | 重建一次 |
 
 判定靠 `ErrorClass` 这个真实枚举，不靠错误字符串匹配。注意 git2 里没有
 `ErrorClass::Network`（正确名是 `Net`），也没有 `ErrorClass::Timeout`：超时以 `Net`
-class 报出，所以 class 判定已覆盖它。`ErrorClass::Odb` / `Os` 既可能传输失败也可能
-存储损坏，因此**不能单看 class 删镜像**：判定顺序是「先问连没连上，再问 ref 在不在」。
+class 报出。**`ErrorClass::Os` 也要算传输类**：实测 DNS 解析失败（断网最常见形态）报的
+就是 `Os` 而不是 `Net`，把它当「镜像坏了」正是会误删缓存的错。
+`MirrorError.transport` 现在有真实读用：`versions.rs` 用它把网络类失败标成
+`(network)`，用户因此知道「等会儿重试可能有用」而不是去查缓存。
 
 ### 5. 磁盘预检
 
@@ -136,7 +159,10 @@ class 报出，所以 class 判定已覆盖它。`ErrorClass::Odb` / `Os` 既可
 > **实测修正（初稿的 8.8 GB 是旧数字）**：设计当天 D: 只剩 4.58 GiB。数量级上
 > 镜像首版本约 46 MB，checkout 峰值约 145 MB（工作树 + 2.5 MB stub），已与
 > 一次网络克隆（172 MB `.git`）相当甚至更省，所以这不是新的占用大头。
-> 门槛取 `MIRROR_MIN_FREE_BYTES = 320 MB`、`CHECKOUT_MIN_FREE_BYTES = 320 MB`。
+> 门槛取 `MIRROR_MIN_FREE_BYTES = 320 MB`、`CHECKOUT_MIN_FREE_BYTES = 320 MB`，
+> **fetch 与 checkout 前各查一次**。（评审发现初稿只写不做的部分已补：`fetch_ref_to_mirror`
+> 开头也调 `require_free_space`，否则写满盘会留下半截 pack，而 `is_usable` 只校验
+> bare + origin，会把这种镜像当可用。）
 
 ### 6. 删除入口
 
@@ -173,7 +199,7 @@ class 报出，所以 class 判定已覆盖它。`ErrorClass::Odb` / `Os` 既可
 
 ```
 src-tauri/crates/box-foundation/src/lib.rs   +harness_mirror_dir / +available_disk_space
-src-tauri/crates/box-runtime/src/mirror.rs   新增：镜像是实现主体（含 7 个单测）
+src-tauri/crates/box-runtime/src/mirror.rs   新增：镜像是实现主体（含 10 个单测）
 src-tauri/crates/dshboxd/src/versions.rs     pull 改走 mirror::stage_mirrored_checkout
 src-tauri/crates/dshboxd/src/dispatch.rs     +harness-mirror key / +harness_mirror_info / +purge
 src-tauri/src/cli/template.rs                +mirror 动词（purge 子动作）+ help 文本
@@ -183,9 +209,13 @@ docs/design/2026-11-04-shared-harness-mirror.md   本文件
 
 ## 验收
 
-1. **第二个版本不再全量**：单测
-   `mirror::tests::fetch_ref_to_mirror_is_incremental_across_versions` 断言
-   `second < first`，且重复 fetch 同一版本新增对象数为 **0**。
+1. **第二个版本不再全量**：实测（真仓库经 gh-proxy）：首版本 22591 个对象 / 10.0 s，
+   第二版本 1228 个对象 / 2.2 s，重复版本 0 个对象、镜像体积从 45.7 MB 只涨到 46.0 MB。
+   单测 `fetch_ref_to_mirror_adds_a_new_version_and_repeats_for_free` 断言新增版本必须
+   传输 > 0、重复 fetch 为 0；**但「第二版本比第一版本少」这条不在单测里断言** ——
+   libgit2 的本地 transport 忽略 depth 且会把所有可达 ref 一次性打包（评审实测：
+   fetch v1 后 v2 的 tag 和 commit 已经在镜像里，第二次计数为 0），所以本地 fixture
+   证明不了网络协商的节省。这条只能靠对真仓库的实测数字支撑，代码里已注明原因。
 2. **UI 与 CLI 同一条镜像路径**：两者都经 `versions.rs` 的 `stage_mirrored_checkout`；
    实测一次真实 pull 的 task log 是三行：
    `serving … from the shared Harness mirror`、
@@ -194,13 +224,18 @@ docs/design/2026-11-04-shared-harness-mirror.md   本文件
 3. **离线可用**：`resolve_in_mirror` 全程不联网（单测
    `resolve_in_mirror_reports_a_missing_version_without_network`）；镜像里已有的版本
    直接 checkout，git 不会发起任何请求。
-4. **损坏会重建一次**：fetch 成功但 ref 仍缺 → `rebuild_bare_mirror`；单测
+4. **损坏才重建、拼错不重建**：重建前必须 `remote_has_revision` 返回 `Ok(true)`。
+   单测 `a_tag_the_remote_never_advertised_is_not_a_reason_to_rebuild` 断言远端没
+   advertise 的 tag 不算「镜像损坏」（这是评审抓到的 BLOCKER，修前会删掉整个镜像）；
    `purge_removes_the_mirror_and_reports_the_bytes_freed` 覆盖删除/重算，
    `fetch_into_a_moved_remote_url_repoints_the_mirror` 覆盖换源不丢失对象。
-5. **取消仍然有效**：`MirrorCallbacks` 的取消闭包同时接到 transfer 与 checkout；
-   单测 `a_cancelled_fetch_stops_and_a_cancelled_checkout_writes_nothing` 断言取消不会
-   删掉已有镜像。
-6. **磁盘不足明确报错**：`require_free_space` 在写入前抛错，且「无法测量」不拦。
+5. **取消仍然有效**：`MirrorCallbacks` 的取消闭包接到 transfer 与 checkout，
+   checkout 端需要 `notify_on(all())` 才真的被调用，且**取消后 `checkout_tree` 仍返回
+   `Ok`**（实测），所以 `checkout_from_mirror` 事后必须再问一次取消标志。两个单测分别钉住
+   这两半：`a_cancelled_fetch_leaves_the_existing_mirror_alone`（取消不删已有镜像）、
+   `a_cancelled_checkout_does_not_finish_the_tree`（取消不会静默完成）。
+6. **磁盘不足明确报错**：`require_free_space` 在 fetch 与 checkout 前各抛一次错，
+   且「无法测量」不拦。
 7. `cargo test --workspace` + `pnpm build` 全绿。
 
 ## 风险
@@ -208,10 +243,12 @@ docs/design/2026-11-04-shared-harness-mirror.md   本文件
 | 风险 | 对策 |
 |---|---|
 | 镜像挤占运行盘（设计时 D: 仅 4.58 GiB） | 实测首版本 46 MB、checkout 峰值 145 MB，均不大于它取代的网络克隆；落盘前预检；只留对象不留工作树；提供 `mirror purge` |
-| 镜像损坏 | 对象层错误 → 删除重建一次；传输层错误 → 保留镜像并明确报错 |
-| 离线时误删镜像 | 先查镜像再谈网络；重建只在「fetch 成功但 ref 缺失」时发生 |
+| 镜像损坏 | 只在 `remote_has_revision == true` 且仍解析不到时才重建一次；传输层错误一律保留镜像 |
+| 拼错版本号 / 上游删 tag 误删整个缓存 | **已修**：重建前 ls-remote 确认远端是否 advertise 该 ref；不 advertise 就报错并保留镜像 |
+| 离线时误删镜像 | 先查镜像再谈网络；`ErrorClass::Os` 也算传输类（断网报的就是 `Os`） |
 | `config set mirror` 让 remote URL 漂移 | `MIRROR_SOURCE_URL` 比对 + `remote_set_url`，不因换源重建 |
 | 锁粒度限制：整任务持锁，checkout 也被串行化 | 已记录为已知限制，拆两个任务列为后续 |
+| 首拉仍然不便宜，容易被读成「10 秒搞定」 | 文档/README 明确写：首版本 = 10 s fetch + ~60 s checkout + install/build（433-471 s），省的是**每次重拉**而不是第一次 |
 | 本地 clone 复制 375 MB（Windows libgit2 不硬链接） | 改用 alternate 借用对象库：`.git` 2.5 MB |
 | 镜像缓存被误当用户数据 | 明确是缓存：不进导出/拷贝/统计；`prune_orphaned_data` 不扫它 |
 | 浅镜像失去「取任意旧 tag」能力 | 有意取舍：只要 fetch 过该 tag 就有；未 fetch 过的按需浅取，代价与一次克隆同量级 |

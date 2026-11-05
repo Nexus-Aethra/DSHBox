@@ -249,17 +249,28 @@ pub(crate) fn pull_template_with_cancel(
             let flag = std::sync::Arc::clone(&cancel_flag);
             move || flag.lock().map(|guard| guard()).unwrap_or(true)
         };
-        let commit = stage_mirrored_checkout(task, &layout, &target, revision, &harness, cancelled)
-            .map_err(|error| {
-                let error = error.into_message();
-                if error.contains("SSL") {
+        let commit = match stage_mirrored_checkout(task, &layout, &target, revision, &harness, cancelled) {
+            Ok(commit) => commit,
+            Err(error) => {
+                // A transport failure means the network (or the mirror source) is
+                // unreachable, not that the cache is damaged: say which, so the
+                // user knows whether retrying later can work.
+                let transport = error.transport;
+                let message = error.into_message();
+                // The SSL case keeps its configure-a-mirror hint: it is a
+                // transport failure with a known fix, so the generic "(network)"
+                // wording would be a step backwards from what users already get.
+                return Err(if message.contains("SSL") {
                     format!(
-                        "pull template failed: {error}\nhint: github.com may be blocked on this network; configure a mirror with `dshbox config set mirror <prefix>` (e.g. https://gh-proxy.com)"
+                        "pull template failed: {message}\nhint: github.com may be blocked on this network; configure a mirror with `dshbox config set mirror <prefix>` (e.g. https://gh-proxy.com)"
                     )
+                } else if transport {
+                    format!("pull template failed (network; the shared mirror was kept): {message}")
                 } else {
-                    format!("pull template failed: {error}")
-                }
-            })?;
+                    format!("pull template failed: {message}")
+                });
+            }
+        };
         task.check_cancelled()?;
 
         configure_staged_pnpm_platform(&harness)?;
@@ -494,14 +505,37 @@ fn stage_mirrored_checkout(
     ));
     let commit = match box_runtime::mirror::resolve_in_mirror(&mirror, revision) {
         Ok(commit) => commit,
-        Err(_) => {
-            // The fetch succeeded, so the remote is reachable and the ref
-            // should be here: the mirror itself is incomplete. Rebuild once,
-            // which is the only repair the design allows.
-            task.log("shared mirror is incomplete for this version; rebuilding it once");
+        Err(missing) => {
+            // Do NOT rebuild yet. A fetch of an explicit refspec for a tag the
+            // remote does not have returns Ok with zero objects (measured), so
+            // "the fetch succeeded but the ref is missing" is also exactly what
+            // a mistyped version number or a deleted upstream tag looks like.
+            // Deleting the mirror there would throw away every version it holds
+            // because somebody typed a version wrong, so the remote is asked
+            // whether the ref exists before any repair happens.
+            let advertised = box_runtime::mirror::remote_has_revision(&mirror, target, revision)?;
+            if !advertised {
+                return Err(MirrorError {
+                    transport: false,
+                    message: format!(
+                        "{} is not a version this remote advertises ({}); the shared mirror was kept as-is",
+                        revision.unwrap_or("the default branch"),
+                        target,
+                    ),
+                });
+            }
+            // The remote does advertise it and the mirror still cannot resolve
+            // it, so the objects really are incomplete. Rebuild once - the only
+            // repair the design allows - and say so in the log.
+            task.log("shared mirror is missing objects for a version the remote advertises; rebuilding it once");
             let mirror = box_runtime::mirror::rebuild_bare_mirror(root, target, &callbacks)?;
             box_runtime::mirror::fetch_ref_to_mirror(&mirror, target, revision, &callbacks)?;
-            box_runtime::mirror::resolve_in_mirror(&mirror, revision)?
+            box_runtime::mirror::resolve_in_mirror(&mirror, revision).map_err(|error| {
+                MirrorError {
+                    transport: false,
+                    message: format!("{}; rebuilding did not fix it: {}", missing.message, error.message),
+                }
+            })?
         }
     };
     box_runtime::mirror::checkout_from_mirror(&mirror, harness, &commit, &callbacks)?;

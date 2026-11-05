@@ -734,10 +734,19 @@ pub fn available_disk_space(path: &Path) -> Option<u64> {
     }
     #[cfg(unix)]
     {
-        // statvfs on the containing directory: the same "free bytes available
-        // to this user" figure, and it needs no external command.
+        // statvfs: the same "free bytes available to this user" figure, with no
+        // external command. The path must be a NUL-terminated C string -
+        // `as_encoded_bytes` is *not*, and handing its pointer to C would read
+        // past the end of the buffer - so it goes through `CString` first.
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+            // A path containing a NUL byte cannot be a real path; treat it the
+            // same as an unmeasurable volume rather than alarming the caller.
+            return None;
+        };
         let mut info = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        let ok = unsafe { libc::statvfs(path.as_os_str().as_encoded_bytes().as_ptr() as *const _, info.as_mut_ptr()) };
+        let ok = unsafe { libc::statvfs(path.as_ptr(), info.as_mut_ptr()) };
         if ok != 0 {
             return None;
         }

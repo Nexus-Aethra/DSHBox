@@ -228,9 +228,16 @@ fn mirror(rest: &[String]) -> Result<(), String> {
     let action = rest.first().map(String::as_str).unwrap_or("");
     match action {
         "" => {
-            super::read_flags(rest, &[])?;
+            let as_json = super::read_flags(rest, &[])?;
             let client = rpc::connect()?;
             let value = rpc::call(&client, "harness_mirror_info", json!({}))?;
+            if as_json {
+                // `--json` must actually change the output, not be validated and
+                // then dropped: a caller parsing this as JSON would fail elsewhere
+                // with a message about the wrapper rather than about this verb.
+                println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+                return Ok(());
+            }
             let present = value["present"].as_bool().unwrap_or(false);
             let size_mb = value["sizeBytes"].as_u64().unwrap_or(0) / (1024 * 1024);
             println!("path:     {}", value["path"].as_str().unwrap_or("-"));
@@ -241,7 +248,7 @@ fn mirror(rest: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        "purge" | "rm" | "clear" => {
+        "purge" => {
             super::read_flags(&rest[1..], &[])?;
             let client = rpc::connect()?;
             rpc::run_task(&client, "purge_harness_mirror", json!({}))?;
