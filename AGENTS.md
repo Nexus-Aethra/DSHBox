@@ -541,6 +541,14 @@ command as done only once the installed app has run it.
   may copy a second `dist/` over it. `build.rs` used to mirror the repo-root
   `dist/` in, which silently shipped a months-old frontend — a stale bundle
   looks exactly like "the feature was never implemented".
+  A release build of the desktop now refuses to produce the other failure mode: a
+  binary with no frontend embedded at all. `build.rs` panics when `PROFILE=release`
+  without the `custom-protocol` feature, and panics when `src-tauri/dist/index.html`
+  references no `assets/*.js` that exists on disk — a build that packages nothing
+  still starts, still answers the daemon, and shows a blank window. So the only
+  supported hand-run invocation is `cargo build --release -p dshbox --features
+  custom-protocol` after `pnpm build`, and a script that needs the release `dshbox`
+  binary must pass the feature too.
 - **The title bar is ours, not the OS's.** Windows/Linux run the main window
   with `decorations: false` and macOS with `titleBarStyle: "Overlay"`, so the
   React `.titlebar` is the window chrome. The buttons call the core window API
