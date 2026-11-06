@@ -1,36 +1,10 @@
+#[path = "build_assets.rs"]
+mod build_assets;
+
 use std::env;
 use std::path::Path;
 
-/// Count the hashed frontend assets that `index.html` references, verifying
-/// each one exists on disk.
-///
-/// A desktop binary whose bundle carries no JavaScript still starts, still
-/// answers the daemon, and renders a blank window - which reads as "that
-/// feature was never implemented" rather than "this build never packaged the
-/// frontend".
-fn embedded_asset_count(dist: &Path, html: &str) -> Result<usize, String> {
-    let mut count = 0usize;
-    for segment in html.split('"') {
-        let relative = segment.trim_start_matches('/');
-        if !relative.starts_with("assets/") {
-            continue;
-        }
-        if !dist.join(relative).is_file() {
-            return Err(format!(
-                "src-tauri/dist/index.html references {relative}, but that file is not on disk"
-            ));
-        }
-        if relative.ends_with(".js") || relative.ends_with(".css") {
-            count += 1;
-        }
-    }
-    if count == 0 {
-        return Err(
-            "src-tauri/dist/index.html references no assets/*.js or assets/*.css".to_string(),
-        );
-    }
-    Ok(count)
-}
+use build_assets::{embedded_asset_count, embeds_frontend};
 
 fn main() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -40,33 +14,37 @@ fn main() {
     // the repo-root `dist/` here - as this script used to - silently replaced a
     // fresh frontend with whatever stale bundle happened to sit at the root.
 
-    // `custom-protocol` is what switches the window from `devUrl`
-    // (http://localhost:1420) to the embedded bundle. `pnpm tauri build` sets it
-    // automatically; a hand-run `cargo build --release -p dshbox` does not, and
-    // yields a release binary with no frontend at all that still launches - it
-    // just points at a dev server nobody runs. 0.1.10 was installed exactly that
-    // way: the CLI, the daemon and every RPC worked while the window stayed
-    // blank, so the guard is a build failure that names the command to use.
+    // Two separate ways to ship a desktop binary with no frontend, both of which
+    // start fine, answer the daemon, and render a blank window (0.1.10 was
+    // installed that way). `embeds_frontend` is `tauri`'s own dev/production
+    // switch; see `build_assets.rs` for why it is the flag to read and the
+    // `custom-protocol` alias is not.
+    // `PROFILE = "release"` is only what makes a bad build fail *early* - the
+    // invariant is `embeds_frontend`. A bench or a custom profile that inherits
+    // release is therefore not covered by the first check, but it is still
+    // covered by the second whenever it embeds.
     let profile = env::var("PROFILE").unwrap_or_default();
-    let custom_protocol = env::var("CARGO_FEATURE_CUSTOM_PROTOCOL").is_ok();
-    if profile == "release" && !custom_protocol {
+    let embedding = embeds_frontend();
+    if profile == "release" && !embedding {
         panic!(
-            "a release build of dshbox must enable `custom-protocol`, or the desktop embeds \
-             no frontend and opens the unreachable dev URL. Build it with \
-             `cargo build --release -p dshbox --features custom-protocol`, or run \
-             `pnpm tauri build`, which passes the feature for you."
+            "this release build of dshbox embeds no frontend: `tauri` is in dev mode, so the \
+             window would open the dev URL http://localhost:1420 - nothing serves that in an \
+             installed layout - and render blank. Build it with `cargo build --release -p \
+             dshbox --features tauri/custom-protocol`, or run `pnpm tauri build`, which passes \
+             that feature for you."
         );
     }
 
-    // Embedding also requires the bundle to be real: a `dist/` whose index.html
-    // points at assets that are not there, or references none at all, produces
-    // the same blank window and would otherwise pass silently.
-    if custom_protocol {
+    // The other shape: embedding is on, but the bundle it would embed is empty or
+    // incomplete. Checking it here is what turns `pnpm build` into a hard
+    // prerequisite of a release build instead of a step people forget.
+    if embedding {
         let dist = manifest_dir.join("dist");
         let html_path = dist.join("index.html");
+        println!("cargo:rerun-if-changed={}", html_path.display());
         let html = std::fs::read_to_string(&html_path).unwrap_or_else(|err| {
             panic!(
-                "custom-protocol is on but {} cannot be read ({err}); \
+                "this build embeds the frontend, but {} cannot be read ({err}); \
                  run `pnpm build` first",
                 html_path.display()
             )

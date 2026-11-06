@@ -542,13 +542,23 @@ command as done only once the installed app has run it.
   `dist/` in, which silently shipped a months-old frontend — a stale bundle
   looks exactly like "the feature was never implemented".
   A release build of the desktop now refuses to produce the other failure mode: a
-  binary with no frontend embedded at all. `build.rs` panics when `PROFILE=release`
-  without the `custom-protocol` feature, and panics when `src-tauri/dist/index.html`
-  references no `assets/*.js` that exists on disk — a build that packages nothing
-  still starts, still answers the daemon, and shows a blank window. So the only
-  supported hand-run invocation is `cargo build --release -p dshbox --features
-  custom-protocol` after `pnpm build`, and a script that needs the release `dshbox`
-  binary must pass the feature too.
+  binary with no frontend embedded at all. The switch is `tauri`'s own
+  `custom-protocol` feature: `tauri`'s build script derives `dev =
+  !custom-protocol` from it and publishes `cargo:dev`, which `build.rs` reads back
+  as `DEP_TAURI_DEV` (`tauri` declares `links = "Tauri"`). It is *not* this
+  package's `custom-protocol` alias: `pnpm tauri build` passes `--features
+  tauri/custom-protocol` and never enables the alias, and `tauri`'s `default`
+  features omit it too — so a bare `cargo build --release -p dshbox` embeds
+  nothing. `build.rs` panics when a release build is one `tauri` considers dev
+  (that is the blank-window build), and separately checks the bundle: every
+  `assets/*` that `src-tauri/dist/index.html` references must exist on disk, and
+  at least one of them must be a `.js` — a build that packages nothing still
+  starts, still answers the daemon, and shows a blank window. So the supported
+  hand-run invocation is `cargo build --release -p dshbox --features
+  tauri/custom-protocol` (or the `custom-protocol` alias, which forwards to it)
+  after `pnpm build`. The checks live in `src-tauri/build_assets.rs` and are pinned
+  by `src-tauri/tests/frontend_embed_guard.rs`: a build script is never compiled
+  by `cargo test`, so logic that only exists inside `build.rs` cannot be tested.
 - **The title bar is ours, not the OS's.** Windows/Linux run the main window
   with `decorations: false` and macOS with `titleBarStyle: "Overlay"`, so the
   React `.titlebar` is the window chrome. The buttons call the core window API
