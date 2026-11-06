@@ -44,7 +44,7 @@ pnpm server:prepare       # build the dshboxd sidecar
 pnpm tauri dev            # dev shell (frontend + Tauri)
 pnpm dev                  # frontend only, in a browser — see "Browser debugging" below
 pnpm build                # frontend typecheck + vite build (tsc --noEmit && vite build)
-pnpm tauri build          # desktop binary (needs `custom-protocol` feature in release)
+pnpm tauri build          # desktop binary (passes `--features tauri/custom-protocol`)
 
 # Per-platform installers
 pnpm bundle:windows       # MSI (runs scripts/bundle-windows.mjs)
@@ -56,9 +56,13 @@ cd src-tauri && cargo test --workspace            # full Rust suite (160+ passin
 scripts/e2e-*.sh                                   # sandbox-isolated end-to-end
 ```
 
-The `custom-protocol` Cargo feature (set automatically by `tauri build`)
-switches the main window from dev URL `http://localhost:1420` to the embedded
-frontend. Manual `cargo build` for release needs it explicitly.
+`tauri`'s `custom-protocol` feature switches the main window from the dev URL
+`http://localhost:1420` to the embedded frontend, and `tauri build` passes it as
+`--features tauri/custom-protocol` — it does **not** enable this package's
+`custom-protocol` alias, and `tauri`'s own `default` features omit it. A manual
+release `cargo build` therefore has to pass it, and `build.rs` refuses a release
+build that `tauri` considers dev; see the `src-tauri/dist/` gotcha under Known
+gotchas for the exact invocation and the bundle checks that go with it.
 
 ## Architecture rules
 
@@ -541,6 +545,27 @@ command as done only once the installed app has run it.
   may copy a second `dist/` over it. `build.rs` used to mirror the repo-root
   `dist/` in, which silently shipped a months-old frontend — a stale bundle
   looks exactly like "the feature was never implemented".
+  A release build of the desktop now refuses to produce the other failure mode: a
+  binary with no frontend embedded at all. The switch is `tauri`'s own
+  `custom-protocol` feature: `tauri`'s build script derives `dev =
+  !custom-protocol` from it and publishes `cargo:dev`, which `build.rs` reads back
+  as `DEP_TAURI_DEV` (`tauri` declares `links = "Tauri"`). It is *not* this
+  package's `custom-protocol` alias: `pnpm tauri build` passes `--features
+  tauri/custom-protocol` and never enables the alias, and `tauri`'s `default`
+  features omit it too — so a bare `cargo build --release -p dshbox` embeds
+  nothing. `build.rs` panics when a release build is one `tauri` considers dev
+  (that is the blank-window build), and separately checks the bundle: every
+  `assets/*` that `src-tauri/dist/index.html` references must exist on disk, and
+  at least one of them must be a `.js` — a build that packages nothing still
+  starts, still answers the daemon, and shows a blank window. So the supported
+  hand-run invocation is `cargo build --release -p dshbox --features
+  tauri/custom-protocol` (or the `custom-protocol` alias, which forwards to it)
+  after `pnpm build`. `PROFILE = "release"` is only what makes a bad build
+  fail early - the invariant is the dev flag, so a `bench` or a custom profile
+  inheriting release is caught by the bundle checks rather than the first one.
+  The checks live in `src-tauri/build_assets.rs` and are pinned
+  by `src-tauri/tests/frontend_embed_guard.rs`: a build script is never compiled
+  by `cargo test`, so logic that only exists inside `build.rs` cannot be tested.
 - **The title bar is ours, not the OS's.** Windows/Linux run the main window
   with `decorations: false` and macOS with `titleBarStyle: "Overlay"`, so the
   React `.titlebar` is the window chrome. The buttons call the core window API
