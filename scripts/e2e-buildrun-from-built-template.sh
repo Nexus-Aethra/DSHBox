@@ -24,7 +24,7 @@ RUNTIME="$SANDBOX/runtime"
 mkdir -p "$RUNTIME"
 
 if [ ! -x "$DSHBOXD" ] || [ ! -x "$DSHBOX" ]; then
-  echo "FATAL: build the workspace first: cargo +stable build --release -p dshboxd -p dshbox --features custom-protocol"
+  echo "FATAL: build the workspace first: pnpm build && cargo +stable build --release -p dshboxd -p dshbox --features custom-protocol"
   exit 2
 fi
 

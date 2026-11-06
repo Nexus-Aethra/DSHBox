@@ -25,7 +25,10 @@ use std::path::Path;
 pub fn embeds_frontend() -> bool {
     match env::var("DEP_TAURI_DEV") {
         Ok(dev) => dev != "true",
-        // An older `tauri` without that metadata: the alias is all we have.
+        // Older `tauri` without that metadata, or a future one that stops
+        // publishing it: fall back to our alias. Note the direction - if `tauri`
+        // ever drops `cargo:dev`, `tauri build` goes back to panicking here, so
+        // this branch is a compatibility net, not a second source of truth.
         Err(_) => env::var("CARGO_FEATURE_CUSTOM_PROTOCOL").is_ok(),
     }
 }
@@ -80,12 +83,19 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Once;
 
     /// A throwaway `dist/` holding one `.js` asset, plus whatever `index.html`
     /// the test needs.
     fn fixture(name: &str, html: &str) -> PathBuf {
+        // One base directory per test process, wiped once on first use, so a run
+        // leaves nothing behind for the next one.
+        static CLEANED: Once = Once::new();
         let dir = env::temp_dir().join(format!("dshbox-guard-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        CLEANED.call_once(|| {
+            let base = env::temp_dir().join(format!("dshbox-guard-{}", std::process::id()));
+            let _ = fs::remove_dir_all(base);
+        });
         fs::create_dir_all(dir.join("assets")).unwrap();
         fs::write(dir.join("assets/index-ABCDEFGH.js"), "console.log(1)").unwrap();
         fs::write(dir.join("assets/index-ABCDEFGH.css"), "body{}").unwrap();
@@ -144,13 +154,17 @@ mod tests {
         assert!(err.contains("not on disk"), "{err}");
     }
 
+    /// The checked-in copy of a real Vite build. The live `dist/` cannot serve
+    /// this purpose: `pnpm build` has not necessarily run, and a test that
+    /// silently returns when a directory is missing is a test that never runs in
+    /// CI - which is exactly where the shipped bundle is produced.
     #[test]
-    fn the_real_bundle_passes_when_it_has_been_built() {
-        let dist = Path::new(env!("CARGO_MANIFEST_DIR")).join("dist");
-        let Ok(html) = fs::read_to_string(dist.join("index.html")) else {
-            // `pnpm build` has not run in this checkout; nothing to assert.
-            return;
-        };
-        assert_eq!(embedded_asset_count(&dist, &html).is_ok(), true);
+    fn the_real_vite_output_shape_passes() {
+        let dist = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("frontend");
+        let html = fs::read_to_string(dist.join("index.html")).unwrap();
+        assert_eq!(embedded_asset_count(&dist, &html), Ok(2));
     }
 }
