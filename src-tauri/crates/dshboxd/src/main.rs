@@ -16,6 +16,7 @@ mod events;
 mod extensions;
 mod host;
 mod lifecycle;
+mod node_artifacts;
 mod nodes;
 mod nodes_rpc;
 mod plugins;

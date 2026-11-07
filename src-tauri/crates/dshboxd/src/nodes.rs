@@ -74,6 +74,10 @@ pub const NODE_METHODS: &[&str] = &[
     "node_report",
     "node_echo",
     "node_deregister",
+    // Stage B1: the artifact index is written only by the node that built the
+    // base, and only through this method. Leaving it out is a 403 on the
+    // helper's first report, not a silent no-op.
+    "node_artifact_report",
 ];
 
 /// Constant-time comparison of two bearer strings. Avoids leaking token
@@ -551,6 +555,11 @@ mod tests {
         assert!(!m.validate_session(None, Some(&id), epoch));
         // Whitelist: a session token cannot reach control-plane methods.
         assert!(NodeManager::is_node_method("node_heartbeat"));
+        // B1: a helper must be able to report a base it built, or its very
+        // first report is a 403 (design section 2.3). The index read stays on
+        // the control-plane side of the split.
+        assert!(NodeManager::is_node_method("node_artifact_report"));
+        assert!(!NodeManager::is_node_method("node_artifact_list"));
         assert!(!NodeManager::is_node_method("list_containers"));
         assert!(!NodeManager::is_node_method("delete_container"));
         let node = m.get(&id).unwrap().unwrap();

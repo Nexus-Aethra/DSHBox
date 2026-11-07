@@ -101,6 +101,15 @@ pub(crate) fn dispatch(state: &DaemonState, request: &Value) -> Value {
         Some("node_echo") => crate::nodes_rpc::node_echo(state, request).map(Sync),
         Some("node_report") => crate::nodes_rpc::node_report(state, request).map(Sync),
         Some("node_deregister") => crate::nodes_rpc::node_deregister(state, request).map(Sync),
+        // Stage B1: the control plane's index of prepared bases per node. The
+        // list is a control-plane read; the report is the only writer and is
+        // reachable only with a node session (see NODE_METHODS).
+        Some("node_artifact_list") => {
+            crate::nodes_rpc::node_artifact_list(state, request).map(Sync)
+        }
+        Some("node_artifact_report") => {
+            crate::nodes_rpc::node_artifact_report(state, request).map(Sync)
+        }
         Some("ping") => Ok(Sync(json!({
             "pid": std::process::id(),
             "status": "running",
@@ -1917,6 +1926,7 @@ mod tests {
             )),
             events,
             browser: std::sync::Mutex::new(crate::debug::Sessions::new()),
+            artifacts: crate::node_artifacts::ArtifactIndex::memory(),
         };
         (state, id, home, runtime)
     }
