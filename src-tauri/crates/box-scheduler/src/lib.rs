@@ -544,27 +544,30 @@ pub fn run_queued(
                 // them apart -- and waiting on the second leaks a thread that
                 // spins every 100 ms for as long as the process lives.
                 let record = manager.get(task_id).ok().flatten();
-                let closed = match &record {
-                    Some(task) => {
-                        TaskState::from_known(task.status.as_str()) != Some(TaskState::Queued)
-                    }
-                    // The record was deleted: there is nothing to wait for either.
-                    None => true,
-                };
-                if closed {
-                    let status = record
-                        .as_ref()
-                        .map(|task| task.status.as_str())
-                        .unwrap_or("cancelled");
-                    notifier.log(task_id, "not queued anymore; nothing to run");
-                    notifier.finished(
-                        task_id,
-                        status,
-                        record.as_ref().and_then(|task| task.error.as_deref()),
-                    );
-                    return;
+                if record.as_ref().is_some_and(|task| is_queued(&task.status)) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                // Nothing left to wait for -- and only some of these records have
+                // a result to report. `finished` is what closes a task on the far
+                // end, so it goes out for a record that really reached a final
+                // state and for nothing else. A `running` record belongs to
+                // another owner that will finish it, and a record that is gone
+                // has no status at all: reporting the deleted case as
+                // `cancelled` (the old fallback) put a result in the stream that
+                // no code ever wrote.
+                match record.as_ref() {
+                    Some(task) if is_finished_status(&task.status) => {
+                        notifier.log(task_id, "not queued anymore; nothing to run");
+                        notifier.finished(task_id, &task.status, task.error.as_deref());
+                    }
+                    Some(task) => notifier.log(
+                        task_id,
+                        &format!("not queued anymore ({}); its owner reports it", task.status),
+                    ),
+                    None => notifier.log(task_id, "the record is gone; nothing to run"),
+                }
+                return;
             }
             Err(_) => return,
         }
@@ -633,6 +636,26 @@ pub fn run_queued(
             _ => "failed; inspect the error summary",
         },
     );
+}
+
+/// Whether a record is still waiting for a slot.
+///
+/// `try_start` is what refuses to admit a closed record and `run_queued` is what
+/// stops waiting for one, so both have to answer the same question the same way.
+/// Two copies of the predicate drift silently: the gate refuses while the loop
+/// keeps polling, which is a thread that never ends. `from_known` rather than
+/// `From` keeps a status this build cannot spell apart from `failed` -- it is
+/// not queued either, but it is not a failure to report.
+fn is_queued(status: &str) -> bool {
+    TaskState::from_known(status) == Some(TaskState::Queued)
+}
+
+/// Whether a record reached a state there is nothing further to say about.
+///
+/// Unknown statuses are *not* final: this build cannot tell what such a record
+/// is doing, and claiming it finished is the one thing it must not guess.
+fn is_finished_status(status: &str) -> bool {
+    TaskState::from_known(status).is_some_and(|state| state.is_finished())
 }
 
 /// Whether a record still holds an execution slot and its resource locks.
@@ -908,7 +931,7 @@ impl TaskManager {
         // take a slot: the transition below would be refused, yet the slot and
         // the resource keys would already be taken and nothing would give them
         // back. Returning `None` leaves the record untouched.
-        if TaskState::from_known(task.status.as_str()) != Some(TaskState::Queued) {
+        if !is_queued(&task.status) {
             return Ok(None);
         }
         if state.running >= 2
@@ -1807,6 +1830,8 @@ mod tests {
     struct RecordingNotifier {
         stages: std::sync::Mutex<Vec<(String, u8)>>,
         logs: std::sync::Mutex<Vec<String>>,
+        /// `(task id, status)` of every `finished` notification.
+        finished: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl TaskNotifier for RecordingNotifier {
@@ -1818,6 +1843,12 @@ mod tests {
         }
         fn log(&self, task_id: &str, line: &str) {
             self.logs.lock().unwrap().push(format!("{task_id}:{line}"));
+        }
+        fn finished(&self, task_id: &str, status: &str, _error: Option<&str>) {
+            self.finished
+                .lock()
+                .unwrap()
+                .push((task_id.to_owned(), status.to_owned()));
         }
     }
 
@@ -2432,13 +2463,20 @@ mod tests {
         let worker_manager = manager.clone();
         let worker_paths = paths.clone();
         let worker_id = task.id.clone();
+        let notifier = std::sync::Arc::new(RecordingNotifier::default());
+        let worker_notifier = notifier.clone();
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran = executed.clone();
         std::thread::spawn(move || {
             run_queued(
                 &worker_manager,
                 &worker_paths,
-                std::sync::Arc::new(NoopNotifier),
+                worker_notifier,
                 &worker_id,
-                move |_: &TaskContext| Ok(()),
+                move |_: &TaskContext| {
+                    ran.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                },
                 None,
             );
             let _ = done.send(());
@@ -2458,9 +2496,80 @@ mod tests {
             .unwrap();
         assert_eq!(record.status, "miss", "and the record is left alone");
         assert!(
+            !executed.load(std::sync::atomic::Ordering::Relaxed),
+            "and the work never runs"
+        );
+        // The status handed to the far end is the one the record carries. An
+        // invented one would close the task on a result nothing wrote.
+        assert_eq!(
+            notifier.finished.lock().unwrap().clone(),
+            vec![(task.id.clone(), "miss".to_owned())],
+            "and the miss is the status reported"
+        );
+        assert!(
             manager.resource_idle("node:n1").unwrap(),
             "and nothing is held"
         );
+    }
+
+    /// A record another owner has already admitted must not be announced as
+    /// finished. It used to be: `try_start` answers `None` for every non-queued
+    /// record, which includes `running`, and the loop reported whatever the
+    /// status said -- so a task that was still executing reached the far end as
+    /// finished and stopped being watched.
+    #[test]
+    fn run_queued_reports_nothing_for_a_record_another_owner_holds() {
+        let paths = paths("run-owned-elsewhere");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = manager
+            .enqueue(&paths, "test", vec!["r".to_owned()], serde_json::json!({}))
+            .unwrap();
+        assert!(manager.try_start(&paths, &task.id).unwrap().is_some());
+        assert_eq!(running(&manager), 1, "the record holds a slot");
+
+        let notifier = std::sync::Arc::new(RecordingNotifier::default());
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran = executed.clone();
+        run_queued(
+            &manager,
+            &paths,
+            notifier.clone(),
+            &task.id,
+            move |_| {
+                ran.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+            None,
+        );
+
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::Relaxed),
+            "the work is not run a second time"
+        );
+        assert!(
+            notifier.finished.lock().unwrap().is_empty(),
+            "and no result is invented for a record that has not finished"
+        );
+        assert!(
+            notifier
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("its owner reports it")),
+            "the loop says why it stopped waiting"
+        );
+        assert_eq!(
+            manager.task(&task.id).unwrap().status,
+            "running",
+            "and the record is untouched"
+        );
+        assert_eq!(
+            running(&manager),
+            1,
+            "and the slot stays the other owner's"
+        );
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 }
 

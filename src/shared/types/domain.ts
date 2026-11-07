@@ -94,7 +94,28 @@ export type PluginGraph = {
   diagnostics: string[]
   scannedAt: number
 }
-export type TaskStatus = 'queued' | 'running' | 'waiting_input' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
+/** A task's status as it arrives from the daemon.
+ *
+ *  Three things this type has to admit, because the server really sends them:
+ *  `miss` (the node that held the task no longer does -- terminal, and not the
+ *  same thing as a failure), and two spellings each for the rollback states, as
+ *  `transition_to` writes the Rust `Display` form (`rolling_back`) while serde
+ *  writes the lowercase one (`rollingback`). Both are pinned by
+ *  `wire_format_tests` in `box-scheduler`; a name that only one of them
+ *  produces is a status the UI silently falls back on. */
+export type TaskStatus =
+  | 'queued'
+  | 'running'
+  | 'waiting_input'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted'
+  | 'miss'
+  | 'rolling_back'
+  | 'rollingback'
+  | 'rolled_back'
+  | 'rolledback'
 export type StageState = 'pending' | 'running' | 'done' | 'skipped' | 'failed'
 /** One declared step of a task, with its own progress bar. */
 export type TaskStage = {

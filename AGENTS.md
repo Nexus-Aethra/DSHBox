@@ -428,7 +428,20 @@ command as done only once the installed app has run it.
   does not, so an already rolled-back task was treated as live and rewritten to
   `interrupted`. Parse with `TaskState::from`, which accepts both. For the same
   reason `Miss` (a lost claim) is a state rather than a string: see
-  `docs/design/2026-11-07-node-persistence-and-placement.md`.
+  `docs/design/2026-11-07-node-persistence-and-placement.md`. The UI's
+  `TaskStatus` union in `src/shared/types/domain.ts` therefore has to list both
+  spellings and `miss`, or a status the server really sends is one the frontend
+  silently falls back on.
+  **Only a record that reached a final state may be announced as finished, and
+  the status announced is the record's own.** `run_queued` gives up on a record
+  that can never be queued again, and `TaskNotifier::finished` is what closes the
+  task on the far end — so a record another owner holds (`running`,
+  `rolling_back`) or that was removed gets a log line and no event. The old
+  fallback reported a removed record as `cancelled` and a `running` one as
+  finished, which puts a result in the stream that nothing wrote. And
+  `try_start`'s "may I admit this" and `run_queued`'s "is this still worth
+  waiting for" are one predicate (`is_queued`): two copies drift into a poll loop
+  that never ends.
   Every stage transition must call `TaskContext::publish_stages`, which reads
   the record back and emits both the one-line summary and the `task_stages`
   event; a stage method that writes but does not publish is persisted and

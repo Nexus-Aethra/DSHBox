@@ -78,7 +78,10 @@ async function openContainerFront(command: string, id: string): Promise<void> {
  * spin the UI forever.
  */
 async function waitForTask(id: string, timeoutMs: number): Promise<TaskRecord | null> {
-  const terminal = new Set(['succeeded', 'failed', 'cancelled', 'interrupted'])
+  // `miss` and the rollback ends are terminal too: a task whose node stopped
+  // holding it will never advance, so polling it out to the timeout reports a
+  // finished task as one that never finished.
+  const terminal = new Set(['succeeded', 'failed', 'cancelled', 'interrupted', 'miss', 'rolled_back', 'rolledback'])
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     let tasks: TaskRecord[] = []
