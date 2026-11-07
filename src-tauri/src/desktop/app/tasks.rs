@@ -172,8 +172,14 @@ pub(crate) fn run_queued_task(
         };
         let rollback: Option<Box<dyn FnOnce(&TaskContext) + Send + 'static>> = None;
         run_queued(&manager, &paths, std::sync::Arc::new(notifier), &task_id, work, rollback);
+        // `run_queued` also returns without executing anything when the record
+        // is held by another owner (a node claim) or was removed, so the record
+        // left on disk is not necessarily a result. Announcing `finished` for a
+        // `running` record ends the watch on work that is still going.
         if let Ok(task) = manager.task(&task_id) {
-            let _ = app.emit("task://finished", task);
+            if is_finished_status(&task.status) {
+                let _ = app.emit("task://finished", task);
+            }
         }
         refresh_global_state(&app);
     });

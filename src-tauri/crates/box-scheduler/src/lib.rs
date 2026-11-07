@@ -512,6 +512,18 @@ impl TaskContext {
 /// is called with the same `TaskContext` to undo partial changes. The rollback
 /// is executed while resource locks are still held (via `start_rollback` /
 /// `finish_rollback`), so the rollback has exclusive access to the resource.
+///
+/// **That path cannot start from the contract's own flow, and no caller passes
+/// `Some`.** When `work` fails the record is still `running`, and
+/// `start_rollback` only accepts `failed -> rolling_back`, so it answers an error
+/// and the rollback is skipped; a `work` closure that closes its own record can
+/// still reach it, which is how one of the tests gets there, and nothing outside
+/// a test does that. Making it properly reachable means deciding where the slot
+/// is released relative to the rollback -- it is held today for exclusive access,
+/// and `finish` is what releases it, while `is_live_record` does not count
+/// `rolling_back` -- which is a change of its own. Until then the branch below is
+/// kept honest rather than deleted, so that whoever wires it up does not also
+/// inherit an invented status.
 pub fn run_queued(
     manager: &TaskManager,
     paths: &BoxPaths,
@@ -530,8 +542,16 @@ pub fn run_queued(
                 // the box has already written off.
                 let state = TaskState::from(task.status.as_str());
                 if state != TaskState::Running {
+                    // `try_start` answers `Some` from exactly two places: it
+                    // admitted the task (`running`) or it closed a cancel
+                    // request (`cancelled`). So this status is final by that
+                    // contract -- and it is checked anyway, because the contract
+                    // lives in another function and a caller-visible event must
+                    // not rest on it.
                     notifier.log(task_id, &format!("{state} before execution"));
-                    notifier.finished(task_id, &task.status, task.error.as_deref());
+                    if is_finished_status(&task.status) {
+                        notifier.finished(task_id, &task.status, task.error.as_deref());
+                    }
                     return;
                 }
                 notifier.stage(task_id, &task.stage, task.progress);
@@ -544,27 +564,30 @@ pub fn run_queued(
                 // them apart -- and waiting on the second leaks a thread that
                 // spins every 100 ms for as long as the process lives.
                 let record = manager.get(task_id).ok().flatten();
-                let closed = match &record {
-                    Some(task) => {
-                        TaskState::from_known(task.status.as_str()) != Some(TaskState::Queued)
-                    }
-                    // The record was deleted: there is nothing to wait for either.
-                    None => true,
-                };
-                if closed {
-                    let status = record
-                        .as_ref()
-                        .map(|task| task.status.as_str())
-                        .unwrap_or("cancelled");
-                    notifier.log(task_id, "not queued anymore; nothing to run");
-                    notifier.finished(
-                        task_id,
-                        status,
-                        record.as_ref().and_then(|task| task.error.as_deref()),
-                    );
-                    return;
+                if record.as_ref().is_some_and(|task| is_queued(&task.status)) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                // Nothing left to wait for -- and only some of these records have
+                // a result to report. `finished` is what closes a task on the far
+                // end, so it goes out for a record that really reached a final
+                // state and for nothing else. A `running` record belongs to
+                // another owner that will finish it, and a record that is gone
+                // has no status at all: reporting the deleted case as
+                // `cancelled` (the old fallback) put a result in the stream that
+                // no code ever wrote.
+                match record.as_ref() {
+                    Some(task) if is_finished_status(&task.status) => {
+                        notifier.log(task_id, "not queued anymore; nothing to run");
+                        notifier.finished(task_id, &task.status, task.error.as_deref());
+                    }
+                    Some(task) => notifier.log(
+                        task_id,
+                        &format!("not queued anymore ({}); its owner reports it", task.status),
+                    ),
+                    None => notifier.log(task_id, "the record is gone; nothing to run"),
+                }
+                return;
             }
             Err(_) => return,
         }
@@ -589,7 +612,15 @@ pub fn run_queued(
     if result.is_err() {
         if let Some(rollback_fn) = rollback {
             // Mark as RollingBack so the UI shows the transition
-            if let Ok(record) = manager.start_rollback(paths, task_id) {
+            let started = manager.start_rollback(paths, task_id);
+            // A refusal used to be invisible: the branch simply did not run.
+            // Nothing reaches that state from the contract's own flow (see
+            // above), so if it ever happens the log is the only notice anyone
+            // gets.
+            if let Err(error) = &started {
+                notifier.log(task_id, &format!("rollback not started: {error}"));
+            }
+            if let Ok(record) = started {
                 notifier.stage(task_id, &record.stage, record.progress);
                 notifier.log(task_id, "rollback started");
                 rollback_fn(&context);
@@ -601,9 +632,20 @@ pub fn run_queued(
                     notifier.finished(task_id, &record.status, record.error.as_deref());
                     return;
                 }
-                // finish_rollback failed — the task stays in Failed state
-                notifier.log(task_id, "rollback finished unexpectedly");
-                notifier.finished(task_id, "failed", None);
+                // finish_rollback failed, so nothing has been reported yet and the
+                // record is left where the rollback put it. Reporting here would
+                // emit the task twice, because the standard finish below runs
+                // anyway -- and it is the better reporter: `finish` refuses to
+                // rewrite a record that already reached a state of its own
+                // (`rolled_back` stays `rolled_back`) and moves a still
+                // `rolling_back` one to `failed`, so whatever it reports is what
+                // the record says at the moment of reporting. The hard-coded
+                // `failed` that used to go out here announced a status the record
+                // never held.
+                notifier.log(
+                    task_id,
+                    "rollback finished unexpectedly; closing it as it stands",
+                );
             }
         }
     }
@@ -633,6 +675,35 @@ pub fn run_queued(
             _ => "failed; inspect the error summary",
         },
     );
+}
+
+/// Whether a record is still waiting for a slot.
+///
+/// `try_start` is what refuses to admit a closed record and `run_queued` is what
+/// stops waiting for one, so both have to answer the same question the same way.
+/// Two copies of the predicate drift silently: the gate refuses while the loop
+/// keeps polling, which is a thread that never ends. `from_known` rather than
+/// `From` keeps a status this build cannot spell apart from `failed` -- it is
+/// not queued either, but it is not a failure to report.
+fn is_queued(status: &str) -> bool {
+    TaskState::from_known(status) == Some(TaskState::Queued)
+}
+
+/// Whether a record's own status may be announced as a task's result.
+///
+/// `failed` counts: it is what `finish` writes for an error, and a caller
+/// waiting on the task treats it as over -- even though the state machine still
+/// allows a rollback from there, which reports again when it lands (with
+/// `rolled_back`, or with this function's answer a second time if the rollback
+/// itself failed).
+///
+/// Unknown statuses are *not* a result: this build cannot tell what such a
+/// record is doing, and claiming it finished is the one thing it must not guess.
+/// Public because the rule belongs to whoever emits the event, not only to
+/// `run_queued`: `DaemonNotifier` forwards the status verbatim into
+/// `TaskFinished`, so an invented one is not caught downstream.
+pub fn is_finished_status(status: &str) -> bool {
+    TaskState::from_known(status).is_some_and(|state| state.is_finished())
 }
 
 /// Whether a record still holds an execution slot and its resource locks.
@@ -908,7 +979,7 @@ impl TaskManager {
         // take a slot: the transition below would be refused, yet the slot and
         // the resource keys would already be taken and nothing would give them
         // back. Returning `None` leaves the record untouched.
-        if TaskState::from_known(task.status.as_str()) != Some(TaskState::Queued) {
+        if !is_queued(&task.status) {
             return Ok(None);
         }
         if state.running >= 2
@@ -1278,6 +1349,15 @@ impl TaskManager {
 
     /// Mark a rollback as completed (RollingBack → RolledBack) or failed
     /// (RollingBack → Failed with `rollback_error`). Releases resource locks.
+    ///
+    /// The release here is unconditional, unlike `finish`'s, because a rollback
+    /// is supposed to still hold its slot for exclusive access -- but
+    /// `is_live_record` does not count `rolling_back`, so a record whose slot
+    /// was already released (by `finish`, the only way into this state today)
+    /// gets it released a second time. That is part of the unfinished rollback
+    /// wiring described on `run_queued`, not something to fix by guarding this
+    /// release: the guard that looks right here would skip the release on the
+    /// flow the design intends.
     pub fn finish_rollback(
         &self,
         _paths: &BoxPaths,
@@ -1807,6 +1887,8 @@ mod tests {
     struct RecordingNotifier {
         stages: std::sync::Mutex<Vec<(String, u8)>>,
         logs: std::sync::Mutex<Vec<String>>,
+        /// `(task id, status)` of every `finished` notification.
+        finished: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl TaskNotifier for RecordingNotifier {
@@ -1818,6 +1900,17 @@ mod tests {
         }
         fn log(&self, task_id: &str, line: &str) {
             self.logs.lock().unwrap().push(format!("{task_id}:{line}"));
+        }
+        fn finished(&self, task_id: &str, status: &str, _error: Option<&str>) {
+            let mut finished = self.finished.lock().unwrap();
+            // One task, one result. `finish_rollback` and the standard finish
+            // path can both see the same record, and reporting in both places
+            // made a single task announce twice -- measured, not imagined.
+            assert!(
+                !finished.iter().any(|(id, _)| id == task_id),
+                "announced twice: {finished:?} then {status}"
+            );
+            finished.push((task_id.to_owned(), status.to_owned()));
         }
     }
 
@@ -1930,8 +2023,67 @@ mod tests {
             .unwrap()
             .iter()
             .any(|line| line.contains("cancelled before execution")));
+        assert_eq!(
+            notifier.finished.lock().unwrap().clone(),
+            vec![(task.id.clone(), "cancelled".to_owned())],
+            "the cancel path reports the status the record carries"
+        );
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
+
+    /// The rollback branch's report, which had no test: one task, one result,
+    /// and the status is the one `finish_rollback` just wrote. Getting here
+    /// needs a rollback the contract's own flow cannot start (see the doc on
+    /// `run_queued`), so the work closes its own record first -- the only way in
+    /// outside a store fault.
+    #[test]
+    fn a_completed_rollback_is_announced_once_with_the_records_status() {
+        let paths = paths("rollback-report");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = manager
+            .enqueue(&paths, "test", vec!["r".to_owned()], serde_json::json!({}))
+            .unwrap();
+        let notifier = std::sync::Arc::new(RecordingNotifier::default());
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rolled_back = ran.clone();
+        let rollback: Option<Box<dyn FnOnce(&TaskContext) + Send + 'static>> =
+            Some(Box::new(move |_: &TaskContext| {
+                rolled_back.store(true, std::sync::atomic::Ordering::Relaxed);
+            }));
+        run_queued(
+            &manager,
+            &paths,
+            notifier.clone(),
+            &task.id,
+            |context: &TaskContext| {
+                // Close the record, so `start_rollback` finds `failed`.
+                let _ = context.manager.finish(
+                    &context.paths,
+                    &context.task_id,
+                    &Err("boom".to_owned()),
+                );
+                Err("boom".to_owned())
+            },
+            rollback,
+        );
+
+        assert!(
+            ran.load(std::sync::atomic::Ordering::Relaxed),
+            "the rollback ran"
+        );
+        assert_eq!(manager.task(&task.id).unwrap().status, "rolled_back");
+        assert_eq!(
+            notifier.finished.lock().unwrap().clone(),
+            vec![(task.id.clone(), "rolled_back".to_owned())],
+            "announced once, with the status the record holds"
+        );
+        assert!(
+            manager.resource_idle("r").unwrap(),
+            "and the resource came back"
+        );
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
     #[test]
     fn tick_caps_below_complete_and_finish_is_the_only_way_to_a_hundred() {
         let paths = paths("stage-tick");
@@ -2432,13 +2584,20 @@ mod tests {
         let worker_manager = manager.clone();
         let worker_paths = paths.clone();
         let worker_id = task.id.clone();
+        let notifier = std::sync::Arc::new(RecordingNotifier::default());
+        let worker_notifier = notifier.clone();
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran = executed.clone();
         std::thread::spawn(move || {
             run_queued(
                 &worker_manager,
                 &worker_paths,
-                std::sync::Arc::new(NoopNotifier),
+                worker_notifier,
                 &worker_id,
-                move |_: &TaskContext| Ok(()),
+                move |_: &TaskContext| {
+                    ran.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                },
                 None,
             );
             let _ = done.send(());
@@ -2458,9 +2617,107 @@ mod tests {
             .unwrap();
         assert_eq!(record.status, "miss", "and the record is left alone");
         assert!(
+            !executed.load(std::sync::atomic::Ordering::Relaxed),
+            "and the work never runs"
+        );
+        // The status handed to the far end is the one the record carries. An
+        // invented one would close the task on a result nothing wrote.
+        assert_eq!(
+            notifier.finished.lock().unwrap().clone(),
+            vec![(task.id.clone(), "miss".to_owned())],
+            "and the miss is the status reported"
+        );
+        assert!(
             manager.resource_idle("node:n1").unwrap(),
             "and nothing is held"
         );
+    }
+
+    /// The predicate every emitter of a task's result depends on.
+    #[test]
+    fn is_finished_status_accepts_only_a_result() {
+        for status in [
+            "succeeded",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "miss",
+            "rolled_back",
+            // The other spelling serde writes.
+            "rolledback",
+        ] {
+            assert!(is_finished_status(status), "{status} carries a result");
+        }
+        // `failed` is a result even though the state machine still allows a
+        // rollback from it; what must not count is everything still going, and
+        // everything this build cannot parse.
+        for status in [
+            "queued",
+            "running",
+            "rolling_back",
+            "rollingback",
+            "waiting_input",
+            "",
+            "bogus",
+        ] {
+            assert!(!is_finished_status(status), "{status} is not a result");
+        }
+    }
+
+    /// A record another owner has already admitted must not be announced as
+    /// finished. It used to be: `try_start` answers `None` for every non-queued
+    /// record, which includes `running`, and the loop reported whatever the
+    /// status said -- so a task that was still executing reached the far end as
+    /// finished and stopped being watched.
+    #[test]
+    fn run_queued_reports_nothing_for_a_record_another_owner_holds() {
+        let paths = paths("run-owned-elsewhere");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = manager
+            .enqueue(&paths, "test", vec!["r".to_owned()], serde_json::json!({}))
+            .unwrap();
+        assert!(manager.try_start(&paths, &task.id).unwrap().is_some());
+        assert_eq!(running(&manager), 1, "the record holds a slot");
+
+        let notifier = std::sync::Arc::new(RecordingNotifier::default());
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran = executed.clone();
+        run_queued(
+            &manager,
+            &paths,
+            notifier.clone(),
+            &task.id,
+            move |_| {
+                ran.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+            None,
+        );
+
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::Relaxed),
+            "the work is not run a second time"
+        );
+        assert!(
+            notifier.finished.lock().unwrap().is_empty(),
+            "and no result is invented for a record that has not finished"
+        );
+        assert!(
+            notifier
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("its owner reports it")),
+            "the loop says why it stopped waiting"
+        );
+        assert_eq!(
+            manager.task(&task.id).unwrap().status,
+            "running",
+            "and the record is untouched"
+        );
+        assert_eq!(running(&manager), 1, "and the slot stays the other owner's");
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 }
 

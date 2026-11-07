@@ -8,7 +8,9 @@ use box_foundation::{
     now_seconds, read_config, strip_verbatim_prefix, write_config,
     BoxConfig, BoxPaths,
 };
-use box_scheduler::{run_queued, TaskContext, TaskManager, TaskNotifier, TaskRecord};
+use box_scheduler::{
+    is_finished_status, run_queued, TaskContext, TaskManager, TaskNotifier, TaskRecord,
+};
 use box_server_core::{
     install_tray_autostart, install_user_service, restart_user_service, service_status,
     start_user_service, stop_user_service, ServiceStatus,
