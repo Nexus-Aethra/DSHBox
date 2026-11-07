@@ -413,6 +413,14 @@ command as done only once the installed app has run it.
   overall figure is weighted by budget and rounded, not truncated** — a 20 s
   stage at 18% inside a 645 s total is 0.5% of the whole, which truncation
   reported as 0 and made the bar look dead while work was visibly happening.
+  **A task's status has two spellings per state, so never compare it to a string.**
+  `transition_to` writes the `Display` form (`rolling_back`); serde writes the
+  lowercase one (`rollingback`), which `wire_format_tests` pins. The shutdown
+  sweep used a hand-written list of wire strings and spelled one the way serde
+  does not, so an already rolled-back task was treated as live and rewritten to
+  `interrupted`. Parse with `TaskState::from`, which accepts both. For the same
+  reason `Miss` (a lost claim) is a state rather than a string: see
+  `docs/design/2026-11-07-node-persistence-and-placement.md`.
   Every stage transition must call `TaskContext::publish_stages`, which reads
   the record back and emits both the one-line summary and the `task_stages`
   event; a stage method that writes but does not publish is persisted and

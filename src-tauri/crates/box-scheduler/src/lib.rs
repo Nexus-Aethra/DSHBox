@@ -49,8 +49,7 @@ use box_foundation::{now_seconds, BoxPaths, BoxResult};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt,
-    fs,
+    fmt, fs,
     sync::{Arc, Mutex},
 };
 use tracing::{error, info, warn};
@@ -71,6 +70,13 @@ pub enum TaskState {
     Cancelled,
     /// Task was interrupted by daemon restart.
     Interrupted,
+    /// The node that claimed this task no longer holds it: its helper session
+    /// changed, or the node was removed. Deliberately not `Failed` (nothing
+    /// about the work necessarily went wrong) and not `Interrupted` (the
+    /// control plane did not go anywhere): the three want different actions
+    /// from the user. Terminal, and never requeued on its own -- the build it
+    /// lost may have written half an artifact.
+    Miss,
     /// Rollback is in progress (undoing partial changes from a failed task).
     RollingBack,
     /// Rollback completed successfully; the resource is clean.
@@ -87,18 +93,44 @@ impl TaskState {
     /// All valid next states from this state.
     pub fn valid_transitions(&self) -> Vec<TaskState> {
         match self {
-            Self::Queued => vec![Self::Running, Self::Succeeded, Self::Failed, Self::Cancelled, Self::Interrupted],
-            Self::Running => vec![Self::Succeeded, Self::Failed, Self::Cancelled, Self::Interrupted],
+            Self::Queued => vec![
+                Self::Running,
+                Self::Succeeded,
+                Self::Failed,
+                Self::Cancelled,
+                Self::Interrupted,
+                Self::Miss,
+            ],
+            Self::Running => vec![
+                Self::Succeeded,
+                Self::Failed,
+                Self::Cancelled,
+                Self::Interrupted,
+                Self::Miss,
+            ],
             Self::Failed => vec![Self::RollingBack],
-            Self::RollingBack => vec![Self::RolledBack, Self::Failed],
+            // A shutdown can land mid-rollback, so `Interrupted` is reachable
+            // from here: without it a task whose rollback was in flight when the
+            // daemon went away had no way out of `rolling_back` at all -- no
+            // worker to advance it, and the shutdown sweep skipped it.
+            Self::RollingBack => vec![Self::RolledBack, Self::Failed, Self::Interrupted],
             // Terminal states
-            Self::Succeeded | Self::Cancelled | Self::Interrupted | Self::RolledBack => vec![],
+            Self::Succeeded
+            | Self::Cancelled
+            | Self::Interrupted
+            | Self::RolledBack
+            | Self::Miss => {
+                vec![]
+            }
         }
     }
 
     /// Returns `true` if this is a terminal state (no further transitions).
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Succeeded | Self::Cancelled | Self::Interrupted | Self::RolledBack)
+        matches!(
+            self,
+            Self::Succeeded | Self::Cancelled | Self::Interrupted | Self::RolledBack | Self::Miss
+        )
     }
 
     /// Returns `true` if the task is still active (queued or running).
@@ -121,25 +153,45 @@ impl fmt::Display for TaskState {
             Self::Failed => write!(f, "failed"),
             Self::Cancelled => write!(f, "cancelled"),
             Self::Interrupted => write!(f, "interrupted"),
+            Self::Miss => write!(f, "miss"),
             Self::RollingBack => write!(f, "rolling_back"),
             Self::RolledBack => write!(f, "rolled_back"),
         }
     }
 }
 
-impl From<&str> for TaskState {
-    fn from(s: &str) -> Self {
-        match s {
+impl TaskState {
+    /// Parse a status string, telling "unknown" apart from "failed".
+    ///
+    /// `From` has to answer with *some* state and answers `Failed` for anything
+    /// it does not recognise -- correct on the wire, but a bad question to ask
+    /// in a guard: a record whose status this build cannot spell would read as a
+    /// finished failure and never be closed. Guards use this instead.
+    pub fn from_known(s: &str) -> Option<Self> {
+        Some(match s {
             "queued" => Self::Queued,
             "running" => Self::Running,
             "succeeded" => Self::Succeeded,
             "failed" => Self::Failed,
             "cancelled" => Self::Cancelled,
             "interrupted" => Self::Interrupted,
-            "rolling_back" => Self::RollingBack,
-            "rolled_back" => Self::RolledBack,
-            _ => Self::Failed, // unknown status → failed
-        }
+            "miss" => Self::Miss,
+            // Two spellings reach this function: `transition_to` writes the
+            // Display form (`rolling_back`) while serde writes the lowercase one
+            // (`rollingback`) that `wire_format_tests` pins.
+            "rolling_back" | "rollingback" => Self::RollingBack,
+            "rolled_back" | "rolledback" => Self::RolledBack,
+            _ => return None,
+        })
+    }
+}
+
+impl From<&str> for TaskState {
+    fn from(s: &str) -> Self {
+        Self::from_known(s).unwrap_or_else(|| {
+            warn!(status = s, "unknown task status; reading it as failed");
+            Self::Failed
+        })
     }
 }
 
@@ -191,7 +243,10 @@ pub enum StageState {
 /// we would still be producing. An unfinished stage contributes its own
 /// progress, so the overall bar moves whenever any stage observes movement.
 fn overall_progress(stages: &[TaskStage]) -> u8 {
-    let total: u64 = stages.iter().map(|s| u64::from(s.duration_hint_secs.max(1))).sum();
+    let total: u64 = stages
+        .iter()
+        .map(|s| u64::from(s.duration_hint_secs.max(1)))
+        .sum();
     if total == 0 {
         return 0;
     }
@@ -301,12 +356,7 @@ pub trait TaskNotifier: Send + Sync {
     /// Called when a task reaches a terminal state. Default is a no-op for
     /// implementations that only care about stage/log; `DaemonNotifier`
     /// broadcasts a `TaskFinished` SSE event here.
-    fn finished(
-        &self,
-        task_id: &str,
-        status: &str,
-        error: Option<&str>,
-    ) {
+    fn finished(&self, task_id: &str, status: &str, error: Option<&str>) {
         let _ = (task_id, status, error);
     }
 }
@@ -364,7 +414,9 @@ impl TaskContext {
                 failure_detail: None,
             })
             .collect();
-        let _ = self.manager.set_stages(&self.paths, &self.task_id, planned.clone());
+        let _ = self
+            .manager
+            .set_stages(&self.paths, &self.task_id, planned.clone());
         let _ = planned;
     }
 
@@ -408,7 +460,9 @@ impl TaskContext {
     }
 
     pub fn stage_done(&self, id: &str) {
-        let _ = self.manager.finish_stage(&self.paths, &self.task_id, id, None);
+        let _ = self
+            .manager
+            .finish_stage(&self.paths, &self.task_id, id, None);
         self.publish_stages();
     }
 
@@ -465,14 +519,17 @@ pub fn run_queued(
     task_id: &str,
     work: impl FnOnce(&TaskContext) -> BoxResult<()> + Send + 'static,
     rollback: Option<Box<dyn FnOnce(&TaskContext) + Send + 'static>>,
-) where
-{
+) {
     // Wait for resource locks
     loop {
         match manager.try_start(paths, task_id) {
             Ok(Some(task)) => {
+                // Anything that came back without reaching `Running` did not
+                // start: it was cancelled, lost its claim, or was already
+                // closed. Running the work anyway would spend minutes on a task
+                // the box has already written off.
                 let state = TaskState::from(task.status.as_str());
-                if state == TaskState::Cancelled || state == TaskState::Interrupted {
+                if state != TaskState::Running {
                     notifier.log(task_id, &format!("{state} before execution"));
                     notifier.finished(task_id, &task.status, task.error.as_deref());
                     return;
@@ -480,7 +537,35 @@ pub fn run_queued(
                 notifier.stage(task_id, &task.stage, task.progress);
                 break;
             }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Ok(None) => {
+                // `try_start` answers `None` for two unrelated situations: the
+                // gate is full, which is worth waiting for, and this record can
+                // never be queued again, which is not. Only the caller can tell
+                // them apart -- and waiting on the second leaks a thread that
+                // spins every 100 ms for as long as the process lives.
+                let record = manager.get(task_id).ok().flatten();
+                let closed = match &record {
+                    Some(task) => {
+                        TaskState::from_known(task.status.as_str()) != Some(TaskState::Queued)
+                    }
+                    // The record was deleted: there is nothing to wait for either.
+                    None => true,
+                };
+                if closed {
+                    let status = record
+                        .as_ref()
+                        .map(|task| task.status.as_str())
+                        .unwrap_or("cancelled");
+                    notifier.log(task_id, "not queued anymore; nothing to run");
+                    notifier.finished(
+                        task_id,
+                        status,
+                        record.as_ref().and_then(|task| task.error.as_deref()),
+                    );
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             Err(_) => return,
         }
     }
@@ -544,9 +629,43 @@ pub fn run_queued(
             TaskState::Succeeded => "completed",
             TaskState::Cancelled => "cancelled after the active operation returned",
             TaskState::RolledBack => "rolled back after failure",
+            TaskState::Miss => "the node that was running this no longer holds it",
             _ => "failed; inspect the error summary",
         },
     );
+}
+
+/// Whether a record still holds an execution slot and its resource locks.
+///
+/// `finish` releases them exactly once: `running` is the concurrency gate and
+/// `active_resources` is what `resource_idle` reads, so releasing twice hands a
+/// slot to a task that is not there. Anything this build cannot parse counts as
+/// live, so a shutdown can still close it.
+fn is_live_record(task: &TaskRecord) -> bool {
+    // Only `Running` holds a slot: `try_start` is what takes it, in the same
+    // critical section that moves the record to `Running`. A `Queued` task has
+    // never entered the gate, so releasing on its behalf would raise the
+    // concurrency limit by one every time it happens -- and a rollback releases
+    // its own locks in `finish_rollback`. An unrecognised status counts as live:
+    // leaking a slot is recoverable, wedging one is not.
+    match TaskState::from_known(task.status.as_str()) {
+        Some(TaskState::Running) => true,
+        Some(_) => false,
+        None => true,
+    }
+}
+
+/// Whether a shutdown must close this record.
+///
+/// Everything that has not reached a final state, which includes `rolling_back`
+/// -- a rollback in flight when the daemon stops has no worker to advance it and
+/// no other way out, so skipping it would park the task forever. `waiting_input`
+/// is live; `miss`, `failed` and the terminal states are history.
+fn needs_shutdown_close(task: &TaskRecord) -> bool {
+    match TaskState::from_known(task.status.as_str()) {
+        Some(state) => !state.is_finished(),
+        None => true,
+    }
 }
 
 #[derive(Default)]
@@ -626,11 +745,23 @@ impl TaskManager {
     pub fn restore(&self, _paths: &BoxPaths) -> BoxResult<()> {
         let mut tasks = self.store.load_all()?;
         for task in &mut tasks {
-            let current = TaskState::from(task.status.as_str());
-            if current.is_active() || task.status == "waiting_input" {
-                task.transition_to(TaskState::Interrupted).ok();
+            if !needs_shutdown_close(task) {
+                continue;
+            }
+            // Only rewrite when the record's own state allows the move. A status
+            // this build cannot parse has no edge to `interrupted`, and writing
+            // the fields anyway would relabel it on every start while leaving
+            // `status` untouched -- a record that reads as interrupted and
+            // reports as something else.
+            if task.transition_to(TaskState::Interrupted).is_ok() {
                 task.stage = "Interrupted by application restart".to_owned();
                 task.finished_at = Some(now_seconds());
+            } else {
+                warn!(
+                    task = %task.id,
+                    status = %task.status,
+                    "cannot close this task at start; leaving it as it is"
+                );
             }
         }
         self.state
@@ -641,6 +772,20 @@ impl TaskManager {
             .map(|task| (task.id.clone(), task))
             .collect();
         self.persist()
+    }
+
+    /// Read one record by id.
+    ///
+    /// Callers that only poll need this to tell "not ready yet" from "never going
+    /// to be ready": `try_start` answers `None` for both.
+    pub fn get(&self, id: &str) -> BoxResult<Option<TaskRecord>> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| "task manager lock failed")?
+            .tasks
+            .get(id)
+            .cloned())
     }
 
     pub fn list(&self) -> BoxResult<Vec<TaskRecord>> {
@@ -745,13 +890,26 @@ impl TaskManager {
         let task = state.tasks.get(id).cloned().ok_or("task not found")?;
         if task.cancel_requested {
             let task = state.tasks.get_mut(id).ok_or("task not found")?;
-            task.transition_to(TaskState::Cancelled).ok();
+            // Only close what can still be closed. A record that already reached
+            // a final state (a lost claim, say) must not be relabelled as
+            // "cancelled before execution" just because a flag arrived late.
+            if task.transition_to(TaskState::Cancelled).is_err() {
+                return Ok(None);
+            }
             task.stage = "Cancelled before execution".to_owned();
             task.finished_at = Some(now_seconds());
             let updated = task.clone();
             drop(state);
             self.persist()?;
             return Ok(Some(updated));
+        }
+        // Only a queued task may be admitted. Anything else -- a record closed
+        // by `mark_missed`, a rollback in progress, a finished task -- must not
+        // take a slot: the transition below would be refused, yet the slot and
+        // the resource keys would already be taken and nothing would give them
+        // back. Returning `None` leaves the record untouched.
+        if TaskState::from_known(task.status.as_str()) != Some(TaskState::Queued) {
+            return Ok(None);
         }
         if state.running >= 2
             || task
@@ -915,6 +1073,44 @@ impl TaskManager {
         Ok(updated)
     }
 
+    /// Close a task whose node no longer holds it.
+    ///
+    /// This is the one place a claim is given up. The execution slot and the
+    /// resource locks are released here exactly once (the same accounting
+    /// `finish` does), the record lands on `Miss`, and a second call changes
+    /// nothing. The control plane calls it when a node re-registers without
+    /// reporting the task it claimed, or when the node is removed.
+    pub fn mark_missed(&self, id: &str, reason: &str) -> BoxResult<TaskRecord> {
+        let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
+        let (keys, live) = {
+            let task = state.tasks.get(id).ok_or("task not found")?;
+            (task.resource_keys.clone(), is_live_record(task))
+        };
+        if live {
+            state.running = state.running.saturating_sub(1);
+            for key in keys {
+                state.active_resources.remove(&key);
+            }
+        }
+        let task = state.tasks.get_mut(id).ok_or("task not found")?;
+        if task.state().can_transition_to(&TaskState::Miss) {
+            task.transition_to(TaskState::Miss).ok();
+            task.stage = "Lost by its node".to_owned();
+            task.error = Some(reason.to_owned());
+            task.finished_at = Some(now_seconds());
+        } else if task.state() != TaskState::Miss {
+            warn!(
+                task = id,
+                status = %task.status,
+                "ignoring miss for a task its own state does not allow"
+            );
+        }
+        let updated = task.clone();
+        drop(state);
+        self.persist()?;
+        Ok(updated)
+    }
+
     /// Mark a task as finished, releasing all resource locks. The typed
     /// `TaskState` transition is validated before the status string is set.
     pub fn finish(
@@ -924,29 +1120,67 @@ impl TaskManager {
         result: &BoxResult<()>,
     ) -> BoxResult<TaskRecord> {
         let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
-        let keys = state
-            .tasks
-            .get(id)
-            .ok_or("task not found")?
-            .resource_keys
-            .clone();
-        state.running = state.running.saturating_sub(1);
-        for key in keys {
-            state.active_resources.remove(&key);
+        // Releasing the execution slot and the resource locks is *not* the same
+        // act as writing the result, and only the first is idempotent-safe to
+        // run once: `running` is the concurrency gate and `active_resources` is
+        // what `resource_idle` reads, so a second release hands a slot to a task
+        // that is not there and leaves a resource idle while it is not.
+        //
+        // Two finishes really happen: a rollback releases its own locks and can
+        // still fall through to here, and (from stage B on) a node that lost its
+        // claim can report after the record was already closed.
+        let (keys, live) = {
+            let task = state.tasks.get(id).ok_or("task not found")?;
+            (task.resource_keys.clone(), is_live_record(task))
+        };
+        if live {
+            state.running = state.running.saturating_sub(1);
+            for key in keys {
+                state.active_resources.remove(&key);
+            }
         }
         let task = state.tasks.get_mut(id).ok_or("task not found")?;
-        task.finished_at = Some(now_seconds());
-        if task.cancel_requested {
-            task.transition_to(TaskState::Cancelled).ok();
-            task.stage = "Cancellation requested".to_owned();
-        } else if let Err(error) = result {
-            task.transition_to(TaskState::Failed).ok();
-            task.stage = "Failed".to_owned();
-            task.error = Some(error.clone());
+        let target = if task.cancel_requested {
+            TaskState::Cancelled
+        } else if result.is_err() {
+            TaskState::Failed
         } else {
-            task.transition_to(TaskState::Succeeded).ok();
-            task.stage = "Completed".to_owned();
-            task.progress = 100;
+            TaskState::Succeeded
+        };
+        // The record is only rewritten when the state machine allows the move.
+        // `Miss` has no outgoing edge and a finished task cannot become
+        // `succeeded`, so a late report leaves the history alone instead of
+        // inventing a result. `waiting_input` is a live status with no variant,
+        // so it is written directly.
+        let from = task.state();
+        let waiting_input = task.status == "waiting_input";
+        if waiting_input || from == target || from.can_transition_to(&target) {
+            if waiting_input {
+                task.status = target.to_string();
+            } else {
+                task.transition_to(target.clone()).ok();
+            }
+            task.finished_at = Some(now_seconds());
+            match &target {
+                TaskState::Cancelled => task.stage = "Cancellation requested".to_owned(),
+                TaskState::Failed => {
+                    task.stage = "Failed".to_owned();
+                    task.error = match result {
+                        Err(error) => Some(error.clone()),
+                        Ok(()) => None,
+                    };
+                }
+                _ => {
+                    task.stage = "Completed".to_owned();
+                    task.progress = 100;
+                }
+            }
+        } else {
+            warn!(
+                task = id,
+                status = %task.status,
+                "ignoring a finish the task's own state does not allow"
+            );
         }
         let updated = task.clone();
         drop(state);
@@ -974,30 +1208,56 @@ impl TaskManager {
         let open: Vec<String> = state
             .tasks
             .values()
-            // `status` is the serialised (lower-case) form, so it is compared
-            // as a string. `TaskState` is the same enum behind a Display impl,
-            // and the Rust spelling matches none of the wire values.
-            .filter(|task| !matches!(
-                task.status.as_str(),
-                "succeeded" | "failed" | "cancelled" | "interrupted" | "rolledback"
-            ))
+            // `status` is the serialised form, so it is parsed back rather than
+            // compared to a hand-written list of strings: that list spelled one
+            // value (`rolledback`) that `transition_to` never writes (it writes
+            // `rolled_back`), so a rolled-back task was treated as open and
+            // rewritten to `Interrupted`. Anything that is not live is skipped,
+            // which is also what keeps `Miss` (added for lost claims) out of
+            // this sweep.
+            .filter(|task| needs_shutdown_close(task))
             .map(|task| task.id.clone())
             .collect();
         if open.is_empty() {
             return Ok(Vec::new());
         }
+        // Daemon shutdown: every worker is about to die with this process, so the
+        // counters and the lock set are cleared wholesale rather than per task.
+        // This is the only caller that may assume that -- a runtime "close these
+        // tasks" sweep would have to release per record, the way `finish` does.
         state.running = 0;
         state.active_resources.clear();
-        for id in &open {
-            let task = state.tasks.get_mut(id).ok_or("task not found")?;
-            task.transition_to(TaskState::Interrupted).ok();
-            task.stage = "Interrupted".to_owned();
+        let mut closed = Vec::new();
+        for id in open {
+            let task = state.tasks.get_mut(&id).ok_or("task not found")?;
+            // A rollback that was in flight is worth saying out loud: the
+            // resource may be half-undone, and "Interrupted" alone would read
+            // like an ordinary restart.
+            let mid_rollback =
+                TaskState::from_known(task.status.as_str()) == Some(TaskState::RollingBack);
+            // Rewrite only what the state machine allows. A status this build
+            // cannot parse has no edge to `interrupted`; writing the fields
+            // anyway would relabel it while leaving `status` alone.
+            if task.transition_to(TaskState::Interrupted).is_err() {
+                warn!(
+                    task = %task.id,
+                    status = %task.status,
+                    "cannot close this task; leaving it as it is"
+                );
+                continue;
+            }
+            task.stage = if mid_rollback {
+                "Interrupted during rollback".to_owned()
+            } else {
+                "Interrupted".to_owned()
+            };
             task.finished_at = Some(now_seconds());
             task.error = Some(reason.to_owned());
+            closed.push(id);
         }
         drop(state);
         self.persist()?;
-        Ok(open)
+        Ok(closed)
     }
     /// Transition a failed task into the `RollingBack` state. The resource
     /// locks are temporarily retained so the rollback has exclusive access.
@@ -1081,7 +1341,7 @@ pub fn task_state_machine_definition() -> serde_json::Value {
                 "name": "queued",
                 "label": "Queued",
                 "description": "Task is enqueued and waiting for resource locks",
-                "transitions": ["running", "succeeded", "failed", "cancelled", "interrupted"],
+                "transitions": ["running", "succeeded", "failed", "cancelled", "interrupted", "miss"],
                 "terminal": false,
                 "active": true,
             },
@@ -1089,7 +1349,7 @@ pub fn task_state_machine_definition() -> serde_json::Value {
                 "name": "running",
                 "label": "Running",
                 "description": "Task is executing with resource locks held",
-                "transitions": ["succeeded", "failed", "cancelled", "interrupted"],
+                "transitions": ["succeeded", "failed", "cancelled", "interrupted", "miss"],
                 "terminal": false,
                 "active": true,
             },
@@ -1126,12 +1386,22 @@ pub fn task_state_machine_definition() -> serde_json::Value {
                 "active": false,
             },
             {
+                "name": "miss",
+                "label": "Missed",
+                "description": "The node that claimed this task no longer holds it; not requeued automatically",
+                "transitions": [],
+                "terminal": true,
+                "active": false,
+            },
+            {
                 "name": "rolling_back",
                 "label": "Rolling Back",
                 "description": "Rollback is in progress (undoing partial changes from a failed task)",
-                "transitions": ["rolled_back", "failed"],
+                "transitions": ["rolled_back", "failed", "interrupted"],
                 "terminal": false,
-                "active": true,
+                // `is_active` says false: a rollback holds its locks on purpose,
+                // but it is not a slot the queue may hand to another task.
+                "active": false,
             },
             {
                 "name": "rolled_back",
@@ -1203,7 +1473,9 @@ impl TaskClient {
         }
         let boundary = match boundary {
             Some(pos) => pos,
-            None => return Err("daemon response parse error: missing header/body boundary".to_string()),
+            None => {
+                return Err("daemon response parse error: missing header/body boundary".to_string())
+            }
         };
 
         let status_line = response_str[..boundary].lines().next().unwrap_or("");
@@ -1218,10 +1490,13 @@ impl TaskClient {
         }
 
         let body_part = &response_str[boundary..];
-        let response: serde_json::Value =
-            serde_json::from_str(body_part).map_err(|error| format!("daemon response error: {error}"))?;
+        let response: serde_json::Value = serde_json::from_str(body_part)
+            .map_err(|error| format!("daemon response error: {error}"))?;
         if response["ok"].as_bool() != Some(true) {
-            return Err(response["error"].as_str().unwrap_or("unknown daemon error").to_owned());
+            return Err(response["error"]
+                .as_str()
+                .unwrap_or("unknown daemon error")
+                .to_owned());
         }
         Ok(response["result"].clone())
     }
@@ -1360,7 +1635,11 @@ mod tests {
             assert_eq!(record.status, "interrupted", "{}", record.id);
             assert_eq!(record.stage, "Interrupted");
             assert_eq!(record.error.as_deref(), Some("the daemon went away"));
-            assert!(record.finished_at.is_some(), "{} has no finish time", record.id);
+            assert!(
+                record.finished_at.is_some(),
+                "{} has no finish time",
+                record.id
+            );
         }
         assert!(manager.resource_idle("container:one").unwrap(), "lock held");
         assert!(manager.resource_idle("container:two").unwrap(), "lock held");
@@ -1538,10 +1817,7 @@ mod tests {
                 .push((format!("{task_id}:{stage}"), progress));
         }
         fn log(&self, task_id: &str, line: &str) {
-            self.logs
-                .lock()
-                .unwrap()
-                .push(format!("{task_id}:{line}"));
+            self.logs.lock().unwrap().push(format!("{task_id}:{line}"));
         }
     }
 
@@ -1554,12 +1830,19 @@ mod tests {
             .unwrap();
         let notifier = std::sync::Arc::new(RecordingNotifier::default());
         let rollback: Option<Box<dyn FnOnce(&TaskContext) + Send + 'static>> = None;
-        run_queued(&manager, &paths, notifier.clone(), &task.id, |context| {
-            context.update("Working", 50);
-            context.log("half way");
-            context.check_cancelled()?;
-            Ok(())
-        }, rollback);
+        run_queued(
+            &manager,
+            &paths,
+            notifier.clone(),
+            &task.id,
+            |context| {
+                context.update("Working", 50);
+                context.log("half way");
+                context.check_cancelled()?;
+                Ok(())
+            },
+            rollback,
+        );
         let finished = manager.task(&task.id).unwrap();
         assert_eq!(finished.status, "succeeded");
         assert_eq!(finished.progress, 100);
@@ -1593,9 +1876,14 @@ mod tests {
             .unwrap();
         let notifier = std::sync::Arc::new(RecordingNotifier::default());
         let rollback: Option<Box<dyn FnOnce(&TaskContext) + Send + 'static>> = None;
-        run_queued(&manager, &paths, notifier.clone(), &task.id, |_| {
-            Err("boom".to_owned())
-        }, rollback);
+        run_queued(
+            &manager,
+            &paths,
+            notifier.clone(),
+            &task.id,
+            |_| Err("boom".to_owned()),
+            rollback,
+        );
         assert_eq!(manager.task(&task.id).unwrap().status, "failed");
         assert_eq!(
             manager.task(&task.id).unwrap().error.as_deref(),
@@ -1623,10 +1911,17 @@ mod tests {
         let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran = executed.clone();
         let rollback: Option<Box<dyn FnOnce(&TaskContext) + Send + 'static>> = None;
-        run_queued(&manager, &paths, notifier.clone(), &task.id, move |_| {
-            ran.store(true, std::sync::atomic::Ordering::Relaxed);
-            Ok(())
-        }, rollback);
+        run_queued(
+            &manager,
+            &paths,
+            notifier.clone(),
+            &task.id,
+            move |_| {
+                ran.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+            rollback,
+        );
         assert!(!executed.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(manager.task(&task.id).unwrap().status, "cancelled");
         assert!(notifier
@@ -1684,7 +1979,11 @@ mod tests {
             .enqueue(&paths, "template-pull", vec![], serde_json::json!({}))
             .unwrap();
         let ctx = context(&paths, &manager, &task.id);
-        ctx.plan_stages(&[("clone", "Cloning", 20), ("build", "Building", 450), ("publish", "Publishing", 40)]);
+        ctx.plan_stages(&[
+            ("clone", "Cloning", 20),
+            ("build", "Building", 450),
+            ("publish", "Publishing", 40),
+        ]);
         ctx.stage_started("clone");
         ctx.stage_done("clone");
         ctx.stage_started("build");
@@ -1692,9 +1991,17 @@ mod tests {
         let stages = manager.task(&task.id).unwrap().stages;
         let build = stages.iter().find(|s| s.id == "build").unwrap();
         assert_eq!(build.state, StageState::Failed);
-        assert!(build.failure_detail.as_deref().unwrap_or("").contains("pnpm run build"));
+        assert!(build
+            .failure_detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("pnpm run build"));
         let publish = stages.iter().find(|s| s.id == "publish").unwrap();
-        assert_eq!(publish.state, StageState::Pending, "later stages must not look done");
+        assert_eq!(
+            publish.state,
+            StageState::Pending,
+            "later stages must not look done"
+        );
         assert_eq!(publish.progress, 0);
     }
 
@@ -1715,7 +2022,10 @@ mod tests {
         let install = stages.iter().find(|s| s.id == "install").unwrap();
         assert_eq!(install.attempts, 1);
         assert_eq!(install.state, StageState::Running);
-        assert!(install.failure_detail.is_none(), "a retry clears the previous detail");
+        assert!(
+            install.failure_detail.is_none(),
+            "a retry clears the previous detail"
+        );
     }
 
     /// The overall figure is weighted by budget, so the old single bar keeps
@@ -1723,8 +2033,28 @@ mod tests {
     #[test]
     fn overall_progress_is_weighted_and_never_reads_as_frozen() {
         let stages = vec![
-            TaskStage { id: "a".to_owned(), label: "a".to_owned(), state: StageState::Done, progress: 100, started_at: None, finished_at: None, duration_hint_secs: 100, attempts: 0, failure_detail: None },
-            TaskStage { id: "b".to_owned(), label: "b".to_owned(), state: StageState::Running, progress: 50, started_at: None, finished_at: None, duration_hint_secs: 300, attempts: 0, failure_detail: None },
+            TaskStage {
+                id: "a".to_owned(),
+                label: "a".to_owned(),
+                state: StageState::Done,
+                progress: 100,
+                started_at: None,
+                finished_at: None,
+                duration_hint_secs: 100,
+                attempts: 0,
+                failure_detail: None,
+            },
+            TaskStage {
+                id: "b".to_owned(),
+                label: "b".to_owned(),
+                state: StageState::Running,
+                progress: 50,
+                started_at: None,
+                finished_at: None,
+                duration_hint_secs: 300,
+                attempts: 0,
+                failure_detail: None,
+            },
         ];
         // 100% of 100 plus 50% of 300, over 400 total: 62.5, rounded to 63.
         assert_eq!(overall_progress(&stages), 63);
@@ -1734,15 +2064,43 @@ mod tests {
         // 18% inside a 645 s total is ~0.5% of the whole, which truncation
         // reported as 0 while the clone was demonstrably running.
         let opening = vec![
-            TaskStage { id: "clone".to_owned(), label: "c".to_owned(), state: StageState::Running, progress: 18, started_at: Some(1), finished_at: None, duration_hint_secs: 20, attempts: 0, failure_detail: None },
-            TaskStage { id: "build".to_owned(), label: "b".to_owned(), state: StageState::Pending, progress: 0, started_at: None, finished_at: None, duration_hint_secs: 625, attempts: 0, failure_detail: None },
+            TaskStage {
+                id: "clone".to_owned(),
+                label: "c".to_owned(),
+                state: StageState::Running,
+                progress: 18,
+                started_at: Some(1),
+                finished_at: None,
+                duration_hint_secs: 20,
+                attempts: 0,
+                failure_detail: None,
+            },
+            TaskStage {
+                id: "build".to_owned(),
+                label: "b".to_owned(),
+                state: StageState::Pending,
+                progress: 0,
+                started_at: None,
+                finished_at: None,
+                duration_hint_secs: 625,
+                attempts: 0,
+                failure_detail: None,
+            },
         ];
         assert_eq!(overall_progress(&opening), 1);
 
         // A stage that has only just started is still started work.
-        let just_started = vec![
-            TaskStage { id: "clone".to_owned(), label: "c".to_owned(), state: StageState::Running, progress: 0, started_at: Some(1), finished_at: None, duration_hint_secs: 20, attempts: 0, failure_detail: None },
-        ];
+        let just_started = vec![TaskStage {
+            id: "clone".to_owned(),
+            label: "c".to_owned(),
+            state: StageState::Running,
+            progress: 0,
+            started_at: Some(1),
+            finished_at: None,
+            duration_hint_secs: 20,
+            attempts: 0,
+            failure_detail: None,
+        }];
         assert_eq!(overall_progress(&just_started), 1);
     }
 
@@ -1757,32 +2115,462 @@ mod tests {
             "cancelRequested": false
         });
         let record: TaskRecord = serde_json::from_value(json).unwrap();
-        assert!(record.stages.is_empty(), "an old record has no stages, and the UI falls back");
+        assert!(
+            record.stages.is_empty(),
+            "an old record has no stages, and the UI falls back"
+        );
+    }
+
+    /// Drive a record to `target` without running the worker, so the sweep and
+    /// finish paths can be exercised against a state only a node produces.
+    fn force_state(manager: &TaskManager, id: &str, target: TaskState) {
+        let mut state = manager.state.lock().unwrap();
+        state
+            .tasks
+            .get_mut(id)
+            .expect("the task exists")
+            .transition_to(target)
+            .expect("the transition is allowed");
+    }
+
+    /// `miss` is terminal and has no outgoing edge: a lost claim is not the
+    /// same as a task waiting to be picked up again, and requeueing it would
+    /// race the process that may still be writing the artifact.
+    #[test]
+    fn a_missed_task_is_terminal_and_is_not_requeued() {
+        assert!(TaskState::Miss.is_terminal());
+        assert!(TaskState::Miss.is_finished());
+        assert!(!TaskState::Miss.is_active());
+        assert!(
+            TaskState::Miss.valid_transitions().is_empty(),
+            "no way out of miss"
+        );
+        assert!(TaskState::Running.can_transition_to(&TaskState::Miss));
+        assert!(TaskState::Queued.can_transition_to(&TaskState::Miss));
+        assert!(!TaskState::Miss.can_transition_to(&TaskState::Running));
+    }
+
+    fn running(manager: &TaskManager) -> usize {
+        manager.state.lock().unwrap().running
+    }
+
+    /// Giving up a claim releases the slot and the lock exactly once. `running`
+    /// is the concurrency gate and `active_resources` is what `resource_idle`
+    /// reads, so a second release would hand a slot to a task that is not there.
+    #[test]
+    fn mark_missed_releases_the_slot_and_the_lock_exactly_once() {
+        let paths = paths("miss-release");
+        let manager = TaskManager::json(&paths).unwrap();
+        let first = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n1".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let second = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n2".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        assert!(manager.try_start(&paths, &first.id).unwrap().is_some());
+        assert!(manager.try_start(&paths, &second.id).unwrap().is_some());
+        assert!(!manager.resource_idle("node:n1").unwrap());
+        assert_eq!(running(&manager), 2);
+
+        let missed = manager
+            .mark_missed(&first.id, "the node came back without it")
+            .unwrap();
+        assert_eq!(missed.status, "miss");
+        assert_eq!(
+            missed.error.as_deref(),
+            Some("the node came back without it")
+        );
+        assert!(
+            manager.resource_idle("node:n1").unwrap(),
+            "its lock is free"
+        );
+        assert_eq!(running(&manager), 1, "one slot back, not both");
+
+        // Idempotent: a second call must not free the other task's slot.
+        manager.mark_missed(&first.id, "again").unwrap();
+        assert_eq!(running(&manager), 1, "a repeated miss releases nothing");
+    }
+
+    /// A late report from a node that lost its claim changes nothing: the record
+    /// is history, and `mark_missed` already settled the accounting.
+    #[test]
+    fn finish_after_a_miss_changes_neither_the_record_nor_the_slots() {
+        let paths = paths("finish-after-miss");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n1".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        assert!(manager.try_start(&paths, &task.id).unwrap().is_some());
+        manager.mark_missed(&task.id, "lost").unwrap();
+        assert_eq!(running(&manager), 0);
+
+        let record = manager.finish(&paths, &task.id, &Ok(())).unwrap();
+        assert_eq!(
+            record.status, "miss",
+            "a late success does not rewrite a lost task"
+        );
+        assert_eq!(record.progress, 0, "and it does not fake progress");
+        assert_eq!(record.error.as_deref(), Some("lost"));
+        assert_eq!(running(&manager), 0, "and it releases nothing twice");
+    }
+
+    /// A rollback that was in flight when the daemon stopped has no worker to
+    /// advance it -- before this it had no way out of `rolling_back` at all --
+    /// so the shutdown sweep must close it, and say that it was mid-rollback.
+    #[test]
+    fn interrupt_running_closes_a_rollback_that_was_in_flight() {
+        let paths = paths("interrupt-rollback");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n1".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        force_state(&manager, &task.id, TaskState::Failed);
+        force_state(&manager, &task.id, TaskState::RollingBack);
+
+        let closed = manager.interrupt_running("the daemon shut down").unwrap();
+        assert_eq!(
+            closed,
+            vec![task.id.clone()],
+            "a half-done rollback is closed"
+        );
+        let record = manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == task.id)
+            .unwrap();
+        assert_eq!(record.status, "interrupted");
+        assert_eq!(record.stage, "Interrupted during rollback");
+    }
+
+    /// Final states are history: a `miss` and a rolled-back task are left alone.
+    #[test]
+    fn interrupt_running_leaves_finished_tasks_untouched() {
+        let paths = paths("interrupt-final");
+        let manager = TaskManager::json(&paths).unwrap();
+        let missed = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n1".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        manager.mark_missed(&missed.id, "lost").unwrap();
+        let rolled = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n2".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        force_state(&manager, &rolled.id, TaskState::Failed);
+        force_state(&manager, &rolled.id, TaskState::RollingBack);
+        force_state(&manager, &rolled.id, TaskState::RolledBack);
+
+        let closed = manager.interrupt_running("the daemon shut down").unwrap();
+        assert!(closed.is_empty(), "nothing live to close: {closed:?}");
+        let statuses: Vec<String> = manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|task| task.status)
+            .collect();
+        assert!(
+            statuses.iter().any(|status| status == "miss"),
+            "{statuses:?}"
+        );
+        assert!(
+            statuses.iter().any(|status| status == "rolled_back"),
+            "{statuses:?}"
+        );
+        assert!(
+            statuses.iter().all(|status| status != "interrupted"),
+            "{statuses:?}"
+        );
+    }
+
+    /// Only a `Running` record holds a slot: `try_start` takes it in the same
+    /// critical section that moves the record to `Running`. A queued task that
+    /// loses its claim was never admitted, so closing it must not raise the
+    /// concurrency limit -- stage B makes `queued -> miss` a normal path (a
+    /// removed node), and one widened slot per removal would quietly double the
+    /// gate.
+    #[test]
+    fn mark_missed_on_a_queued_task_leaves_the_gate_alone() {
+        let paths = paths("miss-queued");
+        let manager = TaskManager::json(&paths).unwrap();
+        let first = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n1".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let second = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n2".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        assert!(manager.try_start(&paths, &first.id).unwrap().is_some());
+        assert!(manager.try_start(&paths, &second.id).unwrap().is_some());
+        assert_eq!(running(&manager), 2, "the gate is full");
+
+        let queued = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n3".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        manager
+            .mark_missed(&queued.id, "its node was removed")
+            .unwrap();
+        assert_eq!(running(&manager), 2, "a queued task never took a slot");
+
+        let third = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n4".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        assert!(
+            manager.try_start(&paths, &third.id).unwrap().is_none(),
+            "the gate did not widen"
+        );
+    }
+
+    /// A record that was closed must not be admitted. `try_start` moves the
+    /// record to `Running` while taking the slot; if that transition is refused,
+    /// the slot and the resource keys would never be given back, and the worker
+    /// would spend minutes on a task the box has already written off.
+    #[test]
+    fn try_start_does_not_admit_a_closed_task() {
+        let paths = paths("admit-closed");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n1".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        manager
+            .mark_missed(&task.id, "its node was removed")
+            .unwrap();
+
+        assert!(
+            manager.try_start(&paths, &task.id).unwrap().is_none(),
+            "a missed task is not started"
+        );
+        assert_eq!(running(&manager), 0, "and it takes no slot");
+        assert!(
+            manager.resource_idle("node:n1").unwrap(),
+            "nor its resource"
+        );
+        let record = manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == task.id)
+            .unwrap();
+        assert_eq!(record.status, "miss", "and the record is untouched");
+        assert_eq!(record.stage, "Lost by its node");
+    }
+
+    /// A worker must give up on a record that can never be queued again. Before
+    /// this, `try_start` answered `None` for both "the gate is full" and "this
+    /// task is closed", so the polling loop spun every 100 ms for as long as the
+    /// process lived -- a leaked thread per closed task, and invisible to a test
+    /// that only looks at `try_start`'s return value.
+    #[test]
+    fn run_queued_returns_instead_of_spinning_on_a_closed_task() {
+        let paths = paths("spin-closed");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n1".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        manager
+            .mark_missed(&task.id, "its node was removed")
+            .unwrap();
+
+        let (done, waited) = std::sync::mpsc::channel();
+        let worker_manager = manager.clone();
+        let worker_paths = paths.clone();
+        let worker_id = task.id.clone();
+        std::thread::spawn(move || {
+            run_queued(
+                &worker_manager,
+                &worker_paths,
+                std::sync::Arc::new(NoopNotifier),
+                &worker_id,
+                move |_: &TaskContext| Ok(()),
+                None,
+            );
+            let _ = done.send(());
+        });
+
+        assert!(
+            waited
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok(),
+            "run_queued has to return for a task that can never start"
+        );
+        let record = manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == task.id)
+            .unwrap();
+        assert_eq!(record.status, "miss", "and the record is left alone");
+        assert!(
+            manager.resource_idle("node:n1").unwrap(),
+            "and nothing is held"
+        );
     }
 }
 
 #[cfg(test)]
 mod wire_format_tests {
-    use super::TaskState;
+    use super::{task_state_machine_definition, TaskState};
 
-    /// The spelling a caller sees on the wire, pinned here because a task
-    /// poll is written against it. The Rust spelling is not it: a caller
-    /// comparing against `Succeeded` matches nothing, and a finished task is
-    /// then never recognised as finished.
+    /// Every state this crate can produce, beside the spelling it takes on the
+    /// wire. Each test below iterates this list, so a variant added to the enum
+    /// cannot be left behind by one of them; and the literal is the contract --
+    /// `domain.ts`'s `TaskStatus` and the agent plugin compare against these
+    /// exact strings, so "it is lower case and parses back" would not be a pin.
+    const ALL_STATES: [(TaskState, &str); 9] = [
+        (TaskState::Queued, "queued"),
+        (TaskState::Running, "running"),
+        (TaskState::Succeeded, "succeeded"),
+        (TaskState::Failed, "failed"),
+        (TaskState::Cancelled, "cancelled"),
+        (TaskState::Interrupted, "interrupted"),
+        (TaskState::Miss, "miss"),
+        (TaskState::RollingBack, "rollingback"),
+        (TaskState::RolledBack, "rolledback"),
+    ];
+
+    fn name(state: &TaskState) -> String {
+        state.to_string()
+    }
+
+    /// The spelling a caller sees on the wire, pinned here because a task poll
+    /// is written against it. The Rust spelling is not it: a caller comparing
+    /// against `Succeeded` matches nothing, and a finished task is then never
+    /// recognised as finished.
     #[test]
     fn task_state_serialises_in_lower_case() {
-        for (state, wire) in [
-            (TaskState::Queued, "queued"),
-            (TaskState::Running, "running"),
-            (TaskState::Succeeded, "succeeded"),
-            (TaskState::Failed, "failed"),
-            (TaskState::Cancelled, "cancelled"),
-            (TaskState::Interrupted, "interrupted"),
-            (TaskState::RollingBack, "rollingback"),
-            (TaskState::RolledBack, "rolledback"),
-        ] {
-            let encoded = serde_json::to_string(&state).expect("a task state encodes");
+        for (state, wire) in ALL_STATES.iter() {
+            let encoded = serde_json::to_string(state).expect("a task state encodes");
             assert_eq!(encoded, format!("\"{wire}\""), "{state:?} on the wire");
+        }
+    }
+
+    /// Both spellings that reach a record parse back to the state they came
+    /// from: serde writes `rollingback`, `transition_to` writes `rolling_back`,
+    /// and a lost claim adds `miss`. A reader that knows only one of them
+    /// silently reclassifies a finished task.
+    #[test]
+    fn every_spelling_parses_back_to_its_state() {
+        for (state, wire) in ALL_STATES.iter() {
+            assert_eq!(
+                TaskState::from_known(wire).map(|parsed| name(&parsed)),
+                Some(name(state)),
+                "{wire} parses back"
+            );
+            assert_eq!(
+                TaskState::from_known(name(state).as_str()).map(|parsed| name(&parsed)),
+                Some(name(state)),
+                "{state:?} through Display"
+            );
+        }
+    }
+
+    /// `task_state_machine_definition` is served over RPC and is what a client
+    /// renders. A state missing from it is a state no client can show; a flag
+    /// that disagrees with the predicates is worse than no flag; and a
+    /// `transitions` list that drifted from `valid_transitions` is a diagram
+    /// that lies about what can follow what.
+    #[test]
+    fn the_advertised_state_machine_matches_the_enum() {
+        let definition = task_state_machine_definition();
+        let states = definition["states"].as_array().expect("states is an array");
+        let advertised: Vec<String> = states
+            .iter()
+            .map(|state| {
+                state["name"]
+                    .as_str()
+                    .expect("every state is named")
+                    .to_owned()
+            })
+            .collect();
+        let expected: Vec<String> = ALL_STATES.iter().map(|(state, _)| name(state)).collect();
+        assert_eq!(
+            advertised, expected,
+            "the RPC's state list drifted from the enum"
+        );
+
+        for (state, _) in ALL_STATES.iter() {
+            let label = name(state);
+            let entry = states
+                .iter()
+                .find(|entry| entry["name"].as_str() == Some(label.as_str()))
+                .expect("every state is advertised");
+            assert_eq!(
+                entry["terminal"].as_bool(),
+                Some(state.is_terminal()),
+                "{label} terminal"
+            );
+            assert_eq!(
+                entry["active"].as_bool(),
+                Some(state.is_active()),
+                "{label} active"
+            );
+            let mut advertised_edges: Vec<String> = entry["transitions"]
+                .as_array()
+                .expect("transitions is an array")
+                .iter()
+                .map(|edge| edge.as_str().expect("an edge is a string").to_owned())
+                .collect();
+            let mut real_edges: Vec<String> = state.valid_transitions().iter().map(name).collect();
+            advertised_edges.sort();
+            real_edges.sort();
+            assert_eq!(advertised_edges, real_edges, "{label} transitions");
         }
     }
 }
