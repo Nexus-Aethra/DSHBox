@@ -537,7 +537,35 @@ pub fn run_queued(
                 notifier.stage(task_id, &task.stage, task.progress);
                 break;
             }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Ok(None) => {
+                // `try_start` answers `None` for two unrelated situations: the
+                // gate is full, which is worth waiting for, and this record can
+                // never be queued again, which is not. Only the caller can tell
+                // them apart -- and waiting on the second leaks a thread that
+                // spins every 100 ms for as long as the process lives.
+                let record = manager.get(task_id).ok().flatten();
+                let closed = match &record {
+                    Some(task) => {
+                        TaskState::from_known(task.status.as_str()) != Some(TaskState::Queued)
+                    }
+                    // The record was deleted: there is nothing to wait for either.
+                    None => true,
+                };
+                if closed {
+                    let status = record
+                        .as_ref()
+                        .map(|task| task.status.as_str())
+                        .unwrap_or("cancelled");
+                    notifier.log(task_id, "not queued anymore; nothing to run");
+                    notifier.finished(
+                        task_id,
+                        status,
+                        record.as_ref().and_then(|task| task.error.as_deref()),
+                    );
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             Err(_) => return,
         }
     }
@@ -746,6 +774,20 @@ impl TaskManager {
         self.persist()
     }
 
+    /// Read one record by id.
+    ///
+    /// Callers that only poll need this to tell "not ready yet" from "never going
+    /// to be ready": `try_start` answers `None` for both.
+    pub fn get(&self, id: &str) -> BoxResult<Option<TaskRecord>> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| "task manager lock failed")?
+            .tasks
+            .get(id)
+            .cloned())
+    }
+
     pub fn list(&self) -> BoxResult<Vec<TaskRecord>> {
         Ok(self
             .state
@@ -848,7 +890,12 @@ impl TaskManager {
         let task = state.tasks.get(id).cloned().ok_or("task not found")?;
         if task.cancel_requested {
             let task = state.tasks.get_mut(id).ok_or("task not found")?;
-            task.transition_to(TaskState::Cancelled).ok();
+            // Only close what can still be closed. A record that already reached
+            // a final state (a lost claim, say) must not be relabelled as
+            // "cancelled before execution" just because a flag arrived late.
+            if task.transition_to(TaskState::Cancelled).is_err() {
+                return Ok(None);
+            }
             task.stage = "Cancelled before execution".to_owned();
             task.finished_at = Some(now_seconds());
             let updated = task.clone();
@@ -2354,6 +2401,62 @@ mod tests {
             .unwrap();
         assert_eq!(record.status, "miss", "and the record is untouched");
         assert_eq!(record.stage, "Lost by its node");
+    }
+
+    /// A worker must give up on a record that can never be queued again. Before
+    /// this, `try_start` answered `None` for both "the gate is full" and "this
+    /// task is closed", so the polling loop spun every 100 ms for as long as the
+    /// process lived -- a leaked thread per closed task, and invisible to a test
+    /// that only looks at `try_start`'s return value.
+    #[test]
+    fn run_queued_returns_instead_of_spinning_on_a_closed_task() {
+        let paths = paths("spin-closed");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n1".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        manager
+            .mark_missed(&task.id, "its node was removed")
+            .unwrap();
+
+        let (done, waited) = std::sync::mpsc::channel();
+        let worker_manager = manager.clone();
+        let worker_paths = paths.clone();
+        let worker_id = task.id.clone();
+        std::thread::spawn(move || {
+            run_queued(
+                &worker_manager,
+                &worker_paths,
+                std::sync::Arc::new(NoopNotifier),
+                &worker_id,
+                move |_: &TaskContext| Ok(()),
+                None,
+            );
+            let _ = done.send(());
+        });
+
+        assert!(
+            waited
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok(),
+            "run_queued has to return for a task that can never start"
+        );
+        let record = manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == task.id)
+            .unwrap();
+        assert_eq!(record.status, "miss", "and the record is left alone");
+        assert!(
+            manager.resource_idle("node:n1").unwrap(),
+            "and nothing is held"
+        );
     }
 }
 
