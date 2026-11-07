@@ -466,6 +466,15 @@ mod tests {
         assert_eq!(back, row);
     }
 
+    /// The base id shape is coupled to the producer: versions.rs:353 formats
+    /// template_content_hash as 16 lowercase hex. A change to either side must
+    /// fail here, not silently produce rows the node's directory would reject.
+    #[test]
+    fn the_base_id_rule_accepts_what_the_producer_makes() {
+        let produced = format!("base-{}", box_dsh_versions::template_content_hash("x"));
+        assert!(is_base_id(&produced), "{produced:?}");
+        assert_eq!(produced.strip_prefix("base-").unwrap().len(), 16);
+    }
     #[test]
     fn the_scope_is_the_one_the_design_names() {
         assert_eq!(ARTIFACT_SCOPE, "node-artifacts");

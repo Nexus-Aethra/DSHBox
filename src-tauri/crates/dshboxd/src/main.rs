@@ -768,7 +768,6 @@ mod gateway_tests {
         assert_eq!(rows[0].id, format!("{a}|base-9c1f00d4a1b2c3d4"));
     }
 
-
     /// `node_register` is the one route with no session but body-supplied
     /// fields. Stripping the reserved key must not break it: the helper's
     /// platform has to reach the record, and the enroll grant still works.

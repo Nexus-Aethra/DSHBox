@@ -565,7 +565,6 @@ mod tests {
         )
     }
 
-
     /// Design section 2.7: the platform is a small closed set in the
     /// `{OS}-{ARCH}` spelling. These are the values the reviewers' live probes
     /// showed the old enroll accepting, which made I1 pass on free text.
@@ -574,7 +573,7 @@ mod tests {
         let m = manager();
         for bad in [
             "banana",
-            "linux-x64",   // a package target, not a platform
+            "linux-x64", // a package target, not a platform
             "LINUX-X86_64",
             "",
             "win-x64",
@@ -618,7 +617,10 @@ mod tests {
             .register(&grant, None, Some("banana".to_owned()))
             .unwrap_err();
         assert!(error.contains("platform"), "{error}");
-        assert!(m.get(&id).unwrap().is_none(), "a refused register writes no record");
+        assert!(
+            m.get(&id).unwrap().is_none(),
+            "a refused register writes no record"
+        );
     }
 
     /// No helper platform keeps the grant's (validated) value, so a helper
