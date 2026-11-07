@@ -2077,6 +2077,10 @@ mod tests {
             vec![(task.id.clone(), "rolled_back".to_owned())],
             "announced once, with the status the record holds"
         );
+        assert!(
+            manager.resource_idle("r").unwrap(),
+            "and the resource came back"
+        );
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 
