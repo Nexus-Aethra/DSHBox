@@ -109,7 +109,11 @@ impl TaskState {
                 Self::Miss,
             ],
             Self::Failed => vec![Self::RollingBack],
-            Self::RollingBack => vec![Self::RolledBack, Self::Failed],
+            // A shutdown can land mid-rollback, so `Interrupted` is reachable
+            // from here: without it a task whose rollback was in flight when the
+            // daemon went away had no way out of `rolling_back` at all -- no
+            // worker to advance it, and the shutdown sweep skipped it.
+            Self::RollingBack => vec![Self::RolledBack, Self::Failed, Self::Interrupted],
             // Terminal states
             Self::Succeeded
             | Self::Cancelled
@@ -156,9 +160,15 @@ impl fmt::Display for TaskState {
     }
 }
 
-impl From<&str> for TaskState {
-    fn from(s: &str) -> Self {
-        match s {
+impl TaskState {
+    /// Parse a status string, telling "unknown" apart from "failed".
+    ///
+    /// `From` has to answer with *some* state and answers `Failed` for anything
+    /// it does not recognise -- correct on the wire, but a bad question to ask
+    /// in a guard: a record whose status this build cannot spell would read as a
+    /// finished failure and never be closed. Guards use this instead.
+    pub fn from_known(s: &str) -> Option<Self> {
+        Some(match s {
             "queued" => Self::Queued,
             "running" => Self::Running,
             "succeeded" => Self::Succeeded,
@@ -166,16 +176,22 @@ impl From<&str> for TaskState {
             "cancelled" => Self::Cancelled,
             "interrupted" => Self::Interrupted,
             "miss" => Self::Miss,
-            // Two spellings reach this function. `transition_to` writes the
-            // Display form (`rolling_back`), while serde writes the lowercase
-            // one (`rollingback`) that `wire_format_tests` pins. Accepting
-            // only one of them made a rolled-back task read as `Failed`, which
-            // is how `interrupt_running`'s hand-written string filter ended up
-            // rewriting one that had already finished.
+            // Two spellings reach this function: `transition_to` writes the
+            // Display form (`rolling_back`) while serde writes the lowercase one
+            // (`rollingback`) that `wire_format_tests` pins.
             "rolling_back" | "rollingback" => Self::RollingBack,
             "rolled_back" | "rolledback" => Self::RolledBack,
-            _ => Self::Failed, // unknown status → failed
-        }
+            _ => return None,
+        })
+    }
+}
+
+impl From<&str> for TaskState {
+    fn from(s: &str) -> Self {
+        Self::from_known(s).unwrap_or_else(|| {
+            warn!(status = s, "unknown task status; reading it as failed");
+            Self::Failed
+        })
     }
 }
 
@@ -581,9 +597,36 @@ pub fn run_queued(
             TaskState::Succeeded => "completed",
             TaskState::Cancelled => "cancelled after the active operation returned",
             TaskState::RolledBack => "rolled back after failure",
+            TaskState::Miss => "the node that was running this no longer holds it",
             _ => "failed; inspect the error summary",
         },
     );
+}
+
+/// Whether a record still holds an execution slot and its resource locks.
+///
+/// `finish` releases them exactly once: `running` is the concurrency gate and
+/// `active_resources` is what `resource_idle` reads, so releasing twice hands a
+/// slot to a task that is not there. Anything this build cannot parse counts as
+/// live, so a shutdown can still close it.
+fn is_live_record(task: &TaskRecord) -> bool {
+    match TaskState::from_known(task.status.as_str()) {
+        Some(state) => state.is_active(),
+        None => true,
+    }
+}
+
+/// Whether a shutdown must close this record.
+///
+/// Everything that has not reached a final state, which includes `rolling_back`
+/// -- a rollback in flight when the daemon stops has no worker to advance it and
+/// no other way out, so skipping it would park the task forever. `waiting_input`
+/// is live; `miss`, `failed` and the terminal states are history.
+fn needs_shutdown_close(task: &TaskRecord) -> bool {
+    match TaskState::from_known(task.status.as_str()) {
+        Some(state) => !state.is_finished(),
+        None => true,
+    }
 }
 
 #[derive(Default)]
@@ -663,8 +706,7 @@ impl TaskManager {
     pub fn restore(&self, _paths: &BoxPaths) -> BoxResult<()> {
         let mut tasks = self.store.load_all()?;
         for task in &mut tasks {
-            let current = TaskState::from(task.status.as_str());
-            if current.is_active() || task.status == "waiting_input" {
+            if needs_shutdown_close(task) {
                 task.transition_to(TaskState::Interrupted).ok();
                 task.stage = "Interrupted by application restart".to_owned();
                 task.finished_at = Some(now_seconds());
@@ -952,6 +994,44 @@ impl TaskManager {
         Ok(updated)
     }
 
+    /// Close a task whose node no longer holds it.
+    ///
+    /// This is the one place a claim is given up. The execution slot and the
+    /// resource locks are released here exactly once (the same accounting
+    /// `finish` does), the record lands on `Miss`, and a second call changes
+    /// nothing. The control plane calls it when a node re-registers without
+    /// reporting the task it claimed, or when the node is removed.
+    pub fn mark_missed(&self, id: &str, reason: &str) -> BoxResult<TaskRecord> {
+        let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
+        let (keys, live) = {
+            let task = state.tasks.get(id).ok_or("task not found")?;
+            (task.resource_keys.clone(), is_live_record(task))
+        };
+        if live {
+            state.running = state.running.saturating_sub(1);
+            for key in keys {
+                state.active_resources.remove(&key);
+            }
+        }
+        let task = state.tasks.get_mut(id).ok_or("task not found")?;
+        if task.state().can_transition_to(&TaskState::Miss) {
+            task.transition_to(TaskState::Miss).ok();
+            task.stage = "Lost by its node".to_owned();
+            task.error = Some(reason.to_owned());
+            task.finished_at = Some(now_seconds());
+        } else if task.state() != TaskState::Miss {
+            warn!(
+                task = id,
+                status = %task.status,
+                "ignoring miss for a task its own state does not allow"
+            );
+        }
+        let updated = task.clone();
+        drop(state);
+        self.persist()?;
+        Ok(updated)
+    }
+
     /// Mark a task as finished, releasing all resource locks. The typed
     /// `TaskState` transition is validated before the status string is set.
     pub fn finish(
@@ -961,41 +1041,67 @@ impl TaskManager {
         result: &BoxResult<()>,
     ) -> BoxResult<TaskRecord> {
         let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
-        // A record that already reached a final state is history. A node that
-        // lost its claim can still report afterwards (`miss`, then a late
-        // success); rewriting that record would turn "we never got the work"
-        // into "completed 100%", which is the one thing the state is for.
-        let current = TaskState::from(state.tasks.get(id).ok_or("task not found")?.status.as_str());
-        if current.is_finished() {
-            warn!(
-                task = id,
-                "ignoring finish for a task already in a final state"
-            );
-            return Ok(state.tasks.get(id).ok_or("task not found")?.clone());
-        }
-        let keys = state
-            .tasks
-            .get(id)
-            .ok_or("task not found")?
-            .resource_keys
-            .clone();
-        state.running = state.running.saturating_sub(1);
-        for key in keys {
-            state.active_resources.remove(&key);
+        // Releasing the execution slot and the resource locks is *not* the same
+        // act as writing the result, and only the first is idempotent-safe to
+        // run once: `running` is the concurrency gate and `active_resources` is
+        // what `resource_idle` reads, so a second release hands a slot to a task
+        // that is not there and leaves a resource idle while it is not.
+        //
+        // Two finishes really happen: a rollback releases its own locks and can
+        // still fall through to here, and (from stage B on) a node that lost its
+        // claim can report after the record was already closed.
+        let (keys, live) = {
+            let task = state.tasks.get(id).ok_or("task not found")?;
+            (task.resource_keys.clone(), is_live_record(task))
+        };
+        if live {
+            state.running = state.running.saturating_sub(1);
+            for key in keys {
+                state.active_resources.remove(&key);
+            }
         }
         let task = state.tasks.get_mut(id).ok_or("task not found")?;
-        task.finished_at = Some(now_seconds());
-        if task.cancel_requested {
-            task.transition_to(TaskState::Cancelled).ok();
-            task.stage = "Cancellation requested".to_owned();
-        } else if let Err(error) = result {
-            task.transition_to(TaskState::Failed).ok();
-            task.stage = "Failed".to_owned();
-            task.error = Some(error.clone());
+        let target = if task.cancel_requested {
+            TaskState::Cancelled
+        } else if result.is_err() {
+            TaskState::Failed
         } else {
-            task.transition_to(TaskState::Succeeded).ok();
-            task.stage = "Completed".to_owned();
-            task.progress = 100;
+            TaskState::Succeeded
+        };
+        // The record is only rewritten when the state machine allows the move.
+        // `Miss` has no outgoing edge and a finished task cannot become
+        // `succeeded`, so a late report leaves the history alone instead of
+        // inventing a result. `waiting_input` is a live status with no variant,
+        // so it is written directly.
+        let from = task.state();
+        let waiting_input = task.status == "waiting_input";
+        if waiting_input || from == target || from.can_transition_to(&target) {
+            if waiting_input {
+                task.status = target.to_string();
+            } else {
+                task.transition_to(target.clone()).ok();
+            }
+            task.finished_at = Some(now_seconds());
+            match &target {
+                TaskState::Cancelled => task.stage = "Cancellation requested".to_owned(),
+                TaskState::Failed => {
+                    task.stage = "Failed".to_owned();
+                    task.error = match result {
+                        Err(error) => Some(error.clone()),
+                        Ok(()) => None,
+                    };
+                }
+                _ => {
+                    task.stage = "Completed".to_owned();
+                    task.progress = 100;
+                }
+            }
+        } else {
+            warn!(
+                task = id,
+                status = %task.status,
+                "ignoring a finish the task's own state does not allow"
+            );
         }
         let updated = task.clone();
         drop(state);
@@ -1030,12 +1136,7 @@ impl TaskManager {
             // rewritten to `Interrupted`. Anything that is not live is skipped,
             // which is also what keeps `Miss` (added for lost claims) out of
             // this sweep.
-            .filter(|task| {
-                let current = TaskState::from(task.status.as_str());
-                // `waiting_input` is a live status with no enum variant: a task
-                // parked on a prompt. A shutdown closes it too.
-                current.is_active() || task.status == "waiting_input"
-            })
+            .filter(|task| needs_shutdown_close(task))
             .map(|task| task.id.clone())
             .collect();
         if open.is_empty() {
@@ -1045,8 +1146,17 @@ impl TaskManager {
         state.active_resources.clear();
         for id in &open {
             let task = state.tasks.get_mut(id).ok_or("task not found")?;
+            // A rollback that was in flight is worth saying out loud: the
+            // resource may be half-undone, and "Interrupted" alone would read
+            // like an ordinary restart.
+            let mid_rollback =
+                TaskState::from_known(task.status.as_str()) == Some(TaskState::RollingBack);
             task.transition_to(TaskState::Interrupted).ok();
-            task.stage = "Interrupted".to_owned();
+            task.stage = if mid_rollback {
+                "Interrupted during rollback".to_owned()
+            } else {
+                "Interrupted".to_owned()
+            };
             task.finished_at = Some(now_seconds());
             task.error = Some(reason.to_owned());
         }
@@ -1136,7 +1246,7 @@ pub fn task_state_machine_definition() -> serde_json::Value {
                 "name": "queued",
                 "label": "Queued",
                 "description": "Task is enqueued and waiting for resource locks",
-                "transitions": ["running", "succeeded", "failed", "cancelled", "interrupted"],
+                "transitions": ["running", "succeeded", "failed", "cancelled", "interrupted", "miss"],
                 "terminal": false,
                 "active": true,
             },
@@ -1144,7 +1254,7 @@ pub fn task_state_machine_definition() -> serde_json::Value {
                 "name": "running",
                 "label": "Running",
                 "description": "Task is executing with resource locks held",
-                "transitions": ["succeeded", "failed", "cancelled", "interrupted"],
+                "transitions": ["succeeded", "failed", "cancelled", "interrupted", "miss"],
                 "terminal": false,
                 "active": true,
             },
@@ -1181,12 +1291,22 @@ pub fn task_state_machine_definition() -> serde_json::Value {
                 "active": false,
             },
             {
+                "name": "miss",
+                "label": "Missed",
+                "description": "The node that claimed this task no longer holds it; not requeued automatically",
+                "transitions": [],
+                "terminal": true,
+                "active": false,
+            },
+            {
                 "name": "rolling_back",
                 "label": "Rolling Back",
                 "description": "Rollback is in progress (undoing partial changes from a failed task)",
-                "transitions": ["rolled_back", "failed"],
+                "transitions": ["rolled_back", "failed", "interrupted"],
                 "terminal": false,
-                "active": true,
+                // `is_active` says false: a rollback holds its locks on purpose,
+                // but it is not a slot the queue may hand to another task.
+                "active": false,
             },
             {
                 "name": "rolled_back",
@@ -1935,14 +2055,18 @@ mod tests {
         assert!(!TaskState::Miss.can_transition_to(&TaskState::Running));
     }
 
-    /// The reason `miss` needs the terminal guard in `finish`: a node that lost
-    /// its claim can still come back and report. That report must not turn a
-    /// lost task into "Completed 100%".
+    fn running(manager: &TaskManager) -> usize {
+        manager.state.lock().unwrap().running
+    }
+
+    /// Giving up a claim releases the slot and the lock exactly once. `running`
+    /// is the concurrency gate and `active_resources` is what `resource_idle`
+    /// reads, so a second release would hand a slot to a task that is not there.
     #[test]
-    fn finish_after_a_miss_leaves_the_record_alone() {
-        let paths = paths("finish-after-miss");
+    fn mark_missed_releases_the_slot_and_the_lock_exactly_once() {
+        let paths = paths("miss-release");
         let manager = TaskManager::json(&paths).unwrap();
-        let queued = manager
+        let first = manager
             .enqueue(
                 &paths,
                 "node-build-artifact",
@@ -1950,22 +2074,103 @@ mod tests {
                 serde_json::json!({}),
             )
             .unwrap();
-        force_state(&manager, &queued.id, TaskState::Miss);
+        let second = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n2".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        assert!(manager.try_start(&paths, &first.id).unwrap().is_some());
+        assert!(manager.try_start(&paths, &second.id).unwrap().is_some());
+        assert!(!manager.resource_idle("node:n1").unwrap());
+        assert_eq!(running(&manager), 2);
 
-        let record = manager.finish(&paths, &queued.id, &Ok(())).unwrap();
+        let missed = manager
+            .mark_missed(&first.id, "the node came back without it")
+            .unwrap();
+        assert_eq!(missed.status, "miss");
+        assert_eq!(
+            missed.error.as_deref(),
+            Some("the node came back without it")
+        );
+        assert!(
+            manager.resource_idle("node:n1").unwrap(),
+            "its lock is free"
+        );
+        assert_eq!(running(&manager), 1, "one slot back, not both");
+
+        // Idempotent: a second call must not free the other task's slot.
+        manager.mark_missed(&first.id, "again").unwrap();
+        assert_eq!(running(&manager), 1, "a repeated miss releases nothing");
+    }
+
+    /// A late report from a node that lost its claim changes nothing: the record
+    /// is history, and `mark_missed` already settled the accounting.
+    #[test]
+    fn finish_after_a_miss_changes_neither_the_record_nor_the_slots() {
+        let paths = paths("finish-after-miss");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n1".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        assert!(manager.try_start(&paths, &task.id).unwrap().is_some());
+        manager.mark_missed(&task.id, "lost").unwrap();
+        assert_eq!(running(&manager), 0);
+
+        let record = manager.finish(&paths, &task.id, &Ok(())).unwrap();
         assert_eq!(
             record.status, "miss",
             "a late success does not rewrite a lost task"
         );
         assert_eq!(record.progress, 0, "and it does not fake progress");
-        assert!(record.error.is_none());
+        assert_eq!(record.error.as_deref(), Some("lost"));
+        assert_eq!(running(&manager), 0, "and it releases nothing twice");
     }
 
-    /// The shutdown sweep closes live tasks only. It used to decide that from a
-    /// hand-written list of wire strings, so a task that had already finished
-    /// (and a `miss` once it existed) was rewritten to `interrupted`.
+    /// A rollback that was in flight when the daemon stopped has no worker to
+    /// advance it -- before this it had no way out of `rolling_back` at all --
+    /// so the shutdown sweep must close it, and say that it was mid-rollback.
     #[test]
-    fn interrupt_running_leaves_finished_and_missed_tasks_untouched() {
+    fn interrupt_running_closes_a_rollback_that_was_in_flight() {
+        let paths = paths("interrupt-rollback");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = manager
+            .enqueue(
+                &paths,
+                "node-build-artifact",
+                vec!["node:n1".to_owned()],
+                serde_json::json!({}),
+            )
+            .unwrap();
+        force_state(&manager, &task.id, TaskState::Failed);
+        force_state(&manager, &task.id, TaskState::RollingBack);
+
+        let closed = manager.interrupt_running("the daemon shut down").unwrap();
+        assert_eq!(
+            closed,
+            vec![task.id.clone()],
+            "a half-done rollback is closed"
+        );
+        let record = manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == task.id)
+            .unwrap();
+        assert_eq!(record.status, "interrupted");
+        assert_eq!(record.stage, "Interrupted during rollback");
+    }
+
+    /// Final states are history: a `miss` and a rolled-back task are left alone.
+    #[test]
+    fn interrupt_running_leaves_finished_tasks_untouched() {
         let paths = paths("interrupt-final");
         let manager = TaskManager::json(&paths).unwrap();
         let missed = manager
@@ -1976,7 +2181,7 @@ mod tests {
                 serde_json::json!({}),
             )
             .unwrap();
-        force_state(&manager, &missed.id, TaskState::Miss);
+        manager.mark_missed(&missed.id, "lost").unwrap();
         let rolled = manager
             .enqueue(
                 &paths,
@@ -2002,6 +2207,10 @@ mod tests {
             "{statuses:?}"
         );
         assert!(
+            statuses.iter().any(|status| status == "rolled_back"),
+            "{statuses:?}"
+        );
+        assert!(
             statuses.iter().all(|status| status != "interrupted"),
             "{statuses:?}"
         );
@@ -2010,27 +2219,43 @@ mod tests {
 
 #[cfg(test)]
 mod wire_format_tests {
-    use super::TaskState;
+    use super::{task_state_machine_definition, TaskState};
 
-    /// The spelling a caller sees on the wire, pinned here because a task
-    /// poll is written against it. The Rust spelling is not it: a caller
-    /// comparing against `Succeeded` matches nothing, and a finished task is
-    /// then never recognised as finished.
+    /// Every state this crate can produce, in one place: each test below
+    /// iterates it, so a variant added to the enum cannot be left behind by one
+    /// of them. Adding a state means touching `ALL_STATES` and the wire
+    /// spelling it produces, nothing else.
+    const ALL_STATES: [TaskState; 9] = [
+        TaskState::Queued,
+        TaskState::Running,
+        TaskState::Succeeded,
+        TaskState::Failed,
+        TaskState::Cancelled,
+        TaskState::Interrupted,
+        TaskState::Miss,
+        TaskState::RollingBack,
+        TaskState::RolledBack,
+    ];
+
+    /// The spelling a caller sees on the wire, pinned here because a task poll
+    /// is written against it. The Rust spelling is not it: a caller comparing
+    /// against `Succeeded` matches nothing, and a finished task is then never
+    /// recognised as finished.
     #[test]
     fn task_state_serialises_in_lower_case() {
-        for (state, wire) in [
-            (TaskState::Queued, "queued"),
-            (TaskState::Running, "running"),
-            (TaskState::Succeeded, "succeeded"),
-            (TaskState::Failed, "failed"),
-            (TaskState::Cancelled, "cancelled"),
-            (TaskState::Interrupted, "interrupted"),
-            (TaskState::Miss, "miss"),
-            (TaskState::RollingBack, "rollingback"),
-            (TaskState::RolledBack, "rolledback"),
-        ] {
-            let encoded = serde_json::to_string(&state).expect("a task state encodes");
-            assert_eq!(encoded, format!("\"{wire}\""), "{state:?} on the wire");
+        for state in &ALL_STATES {
+            let encoded = serde_json::to_string(state).expect("a task state encodes");
+            let wire = encoded.trim_matches('"');
+            assert_eq!(
+                wire,
+                wire.to_ascii_lowercase(),
+                "{state:?} on the wire is lower case"
+            );
+            assert_eq!(
+                TaskState::from_known(wire),
+                Some(state.clone()),
+                "{wire} parses back"
+            );
         }
     }
 
@@ -2040,25 +2265,57 @@ mod wire_format_tests {
     /// silently reclassifies a finished task.
     #[test]
     fn every_spelling_parses_back_to_its_state() {
-        for (state, spellings) in [
-            (TaskState::Queued, &["queued"][..]),
-            (TaskState::Running, &["running"][..]),
-            (TaskState::Succeeded, &["succeeded"][..]),
-            (TaskState::Failed, &["failed"][..]),
-            (TaskState::Cancelled, &["cancelled"][..]),
-            (TaskState::Interrupted, &["interrupted"][..]),
-            (TaskState::Miss, &["miss"][..]),
-            (TaskState::RollingBack, &["rolling_back", "rollingback"][..]),
-            (TaskState::RolledBack, &["rolled_back", "rolledback"][..]),
-        ] {
-            for spelling in spellings {
-                assert_eq!(TaskState::from(*spelling), state, "{spelling} parses");
-            }
-            // Whatever `transition_to` writes must parse back as the same state.
+        for state in &ALL_STATES {
             assert_eq!(
-                TaskState::from(state.to_string().as_str()),
-                state,
+                TaskState::from_known(state.to_string().as_str()),
+                Some(state.clone()),
                 "{state:?} via Display"
+            );
+            let wire = serde_json::to_string(state).expect("a task state encodes");
+            assert_eq!(
+                TaskState::from_known(wire.trim_matches('"')),
+                Some(state.clone()),
+                "{state:?} via serde"
+            );
+        }
+    }
+
+    /// `task_state_machine_definition` is served over RPC and is what a client
+    /// renders. A state missing from it is a state no client can show, and a
+    /// flag that disagrees with the predicates is worse than no flag at all.
+    #[test]
+    fn the_advertised_state_machine_matches_the_enum() {
+        let definition = task_state_machine_definition();
+        let states = definition["states"].as_array().expect("states is an array");
+        let advertised: Vec<String> = states
+            .iter()
+            .map(|state| {
+                state["name"]
+                    .as_str()
+                    .expect("every state is named")
+                    .to_owned()
+            })
+            .collect();
+        let expected: Vec<String> = ALL_STATES.iter().map(|state| state.to_string()).collect();
+        assert_eq!(
+            advertised, expected,
+            "the RPC's state list drifted from the enum"
+        );
+        for state in &ALL_STATES {
+            let name = state.to_string();
+            let entry = states
+                .iter()
+                .find(|entry| entry["name"].as_str() == Some(name.as_str()))
+                .expect("every state is advertised");
+            assert_eq!(
+                entry["terminal"].as_bool(),
+                Some(state.is_terminal()),
+                "{name} terminal"
+            );
+            assert_eq!(
+                entry["active"].as_bool(),
+                Some(state.is_active()),
+                "{name} active"
             );
         }
     }
