@@ -768,6 +768,44 @@ mod gateway_tests {
         assert_eq!(rows[0].id, format!("{a}|base-9c1f00d4a1b2c3d4"));
     }
 
+
+    /// `node_register` is the one route with no session but body-supplied
+    /// fields. Stripping the reserved key must not break it: the helper's
+    /// platform has to reach the record, and the enroll grant still works.
+    #[test]
+    fn a_helper_can_still_register_over_the_gateway_with_its_platform() {
+        let state = state();
+        let main = "main-token";
+        let (_, enroll) = rpc(
+            state.clone(),
+            main,
+            json!({
+                "method": "node_enroll",
+                "token": main,
+                "kind": "wsl2",
+                "platform": "windows-x86_64", // the supply adapter's guess
+                "nodeId": "node-a"
+            }),
+        );
+        assert_eq!(enroll["ok"], true, "{enroll}");
+        let grant = enroll["result"]["enrollToken"].as_str().unwrap().to_owned();
+
+        let (status, reply) = rpc(
+            state.clone(),
+            main,
+            json!({
+                "method": "node_register",
+                "enrollToken": grant,
+                "platform": "linux-x86_64", // what the helper actually runs on
+                "helperVersion": "0.1.10"
+            }),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(reply["ok"], true, "{reply}");
+        let node = state.nodes.get("node-a").unwrap().unwrap();
+        assert_eq!(node.platform, "linux-x86_64", "the helper's platform wins");
+    }
+
     /// The pure helper's rule: drop first, then bind. A unit test so removing
     /// the drop (the I3 bypass) fails without needing a socket.
     #[test]
