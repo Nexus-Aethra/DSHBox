@@ -40,7 +40,7 @@ Prereqs: Node 22.13+ with pnpm (the pinned `packageManager` needs `node:sqlite`)
 ```bash
 pnpm install
 pnpm runtime:prepare      # fetch bundled Node/pnpm runtime manifest
-pnpm server:prepare       # build the dshboxd sidecar
+pnpm server:prepare       # build the dshboxd sidecar and the node helper
 pnpm tauri dev            # dev shell (frontend + Tauri)
 pnpm dev                  # frontend only, in a browser — see "Browser debugging" below
 pnpm build                # frontend typecheck + vite build (tsc --noEmit && vite build)
@@ -151,6 +151,14 @@ worked). `command_surface` in `desktop/app.rs` diffs the command literals in
 command as done only once the installed app has run it.
 
 ## Known gotchas
+- **The node helper is built with the sidecar, never separately.**
+  `scripts/prepare-server.mjs` compiles `dshboxd` and `box-helper` in one cargo
+  invocation (so one build stamp covers both) and stages them at
+  `src-tauri/resources/{server,helper}/<target>/`; the platform confs bundle those
+  as `server/<target>/` and `helper/<target>/` inside the install, which is where
+  a node's binary is picked up from. It is not run by anything yet — stage B
+  (`docs/design/2026-11-07-node-persistence-and-placement.md` §12) is what starts
+  it. Building it apart from the sidecar is how the two drift apart silently.
 - **The libkrun backend is experimental and not yet proven.** Its VMM child must be spawned with `configure_non_interactive(&mut cmd, true)` (setsid): `TrackedChild::kill_tree` sends `kill(-pgid, SIGTERM)` on Unix, so a child that inherits the daemon's process group would take the daemon and every host container down when one VM stops. Also, libkrun 1.9 does not auto-mount virtiofs tags — `/dsh`, `/home`, `/container` need explicit guest-side mounts, so the guest exec cannot start as configured. The console chain (`krun_set_console_output` → virtio-console → host `logs/host.log`) has not been verified on a real VM, so it is not guaranteed that `parse_announced_host_url` sees the `dsh web:` line. See `docs/design/2026-11-04-container-runtime-seam.md`.
 - **VM runtime is experimental and WSL2 is not hard isolation.** A container with `runtime: "vm"` / `"vm:<backend>"` opts in; an absent field is host mode. On Windows Home, WHPX/Hyper-V are unavailable, so the only backend is one WSL2 distro per container: mnt/pid/uts namespaces are separate, but the kernel, boot id, hostname and **netns are shared** (a guest loopback port is reachable from the Windows host and from sibling distros). Do not describe it as a security boundary. Copying the 108k-file Harness tree over drvfs takes >25 min at ~1.3 MB/s, while `wsl --import` of a 1.3 GB tar takes 14.5 s — move whole images, not per-file trees. And `client_artifacts_present` compares the marker against the **host's** `build_platform()`, so a Windows-prepared base never satisfies a Linux guest; Linux artifacts must be built inside Linux.
 

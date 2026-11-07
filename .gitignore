@@ -4,9 +4,11 @@
 /src-tauri/resources/runtime/*
 /src-tauri/resources/server/*
 /src-tauri/resources/plugins/*
+/src-tauri/resources/helper/*
 !/src-tauri/resources/runtime/.gitkeep
 !/src-tauri/resources/server/.gitkeep
 !/src-tauri/resources/plugins/.gitkeep
+!/src-tauri/resources/helper/.gitkeep
 /src-tauri/crates/box-dsh-context/dsh-box-context/dist/
 /src-tauri/crates/box-dsh-context/dsh-box-context/node_modules/
 # Plugins under plugins/ are workspace packages with their own installs and

@@ -21,7 +21,12 @@ function readLocalDeps(manifestPath) {
 
 const target = process.env.DSH_BOX_RUNTIME_TARGET ?? ({ linux: { x64: 'linux-x64', arm64: 'linux-arm64' }, win32: { x64: 'win-x64', arm64: 'win-arm64' }, darwin: { x64: 'macos-x64', arm64: 'macos-arm64' } }[platform]?.[arch])
 if (!target) throw new Error(`unsupported server target: ${platform}-${arch}`)
-const destination = join('src-tauri', 'resources', 'server', target, `dshboxd${target.startsWith('win-') ? '.exe' : ''}`)
+const copyExtension = target.startsWith('win-') ? '.exe' : ''
+const destination = join('src-tauri', 'resources', 'server', target, `dshboxd${copyExtension}`)
+// The node helper ships beside the daemon so a node can be handed one binary
+// without a second build pipeline to version. Stage B of the node work is what
+// runs it; until then this only guarantees the artifact exists.
+const helperDestination = join('src-tauri', 'resources', 'helper', target, `box-helper${copyExtension}`)
 
 const force = process.argv.includes('--force')
 
@@ -36,7 +41,7 @@ const sources = [
   ...localDeps.map((name) => join('src-tauri', 'crates', name)),
   join('src-tauri', 'Cargo.lock'),
 ]
-if (!isFresh(destination, sources, force)) {
+if (!isFresh(destination, sources, force) || !isFresh(helperDestination, sources, force)) {
   // Stale → rebuild, skip the hash-cache short-circuit entirely.
   await rebuild(destination, target, force)
   process.exit(0)
@@ -54,7 +59,7 @@ const inputs = [
   join('src-tauri', 'crates', 'dshboxd', 'Cargo.toml'),
   ...walkRustFiles(join('src-tauri', 'crates', 'dshboxd', 'src')),
 ]
-if (hashInputs(cacheFile, inputs, force) && existsSync(destination)) {
+if (hashInputs(cacheFile, inputs, force) && existsSync(destination) && existsSync(helperDestination)) {
   console.log(`server sidecar inputs unchanged (hash cache hit at ${cacheFile}); skipping cargo build`)
   process.exit(0)
 }
@@ -95,12 +100,17 @@ async function rebuild(destination, target, force) {
   await writeFile(join('src-tauri', '.build-stamp'), `${stamp}\n`)
   console.log(`build stamp: ${stamp}`)
 
-  const cargoArgs = ['build', '--release', '--manifest-path', 'src-tauri/crates/dshboxd/Cargo.toml', '--bin', 'dshboxd']
+  // One cargo invocation for both artifacts: they share the dependency graph,
+  // and building them separately would compile it twice.
+  const cargoArgs = ['build', '--release', '--manifest-path', 'src-tauri/Cargo.toml', '-p', 'dshboxd', '-p', 'box-helper']
   if (rustTarget) cargoArgs.push('--target', rustTarget)
   const result = spawnSync('cargo', cargoArgs, { stdio: 'inherit', env: windows ? { ...env, CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: env.CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER ?? 'x86_64-w64-mingw32-gcc' } : env })
   if (result.status !== 0) process.exit(result.status ?? 1)
-  const copyExtension = windows ? '.exe' : ''
+  const binDir = join('src-tauri', 'target', ...(rustTarget ? [rustTarget] : []), 'release')
   await mkdir(join('src-tauri', 'resources', 'server', target), { recursive: true })
-  await copyFile(join('src-tauri', 'target', ...(rustTarget ? [rustTarget] : []), 'release', `dshboxd${copyExtension}`), destination)
+  await copyFile(join(binDir, `dshboxd${copyExtension}`), destination)
   console.log(`prepared server sidecar at ${destination}`)
+  await mkdir(join('src-tauri', 'resources', 'helper', target), { recursive: true })
+  await copyFile(join(binDir, `box-helper${copyExtension}`), helperDestination)
+  console.log(`prepared node helper at ${helperDestination}`)
 }
