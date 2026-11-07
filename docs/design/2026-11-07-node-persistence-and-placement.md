@@ -1,29 +1,34 @@
-# 2026-11-07 — Node 持久化与跨 node 调度：数据结构设计
+# 2026-11-07 — Node 持久化与跨 node 调度：数据结构设计（v3）
 
 > 状态：**设计，未实现**。前序：`docs/design/2026-11-04-node-architecture-roadmap.md`（A 已合并）、
 > `docs/design/2026-11-04-node-artifact.md`（B 的目标）、`docs/design/2026-11-04-shared-harness-mirror.md`（常量仓库）。
+> v3 按独立评审（PR #32）的意见修正：任务状态机补全、daemon 重启与节点失联彻底分开、
+> purge 与 tombstone 的可达性矛盾、异步边界的方向、以及 v1/v2 遗留的 8 条实现级缺口。
 > 本文只定数据与调度，不写代码；B1 的施工以本文为准。
 
 ## 0. 一句话模型
 
 每个 node 自带常量仓库与工具链，在本地完成 clone/install/build/run；控制层只持有**注册表、
-产物索引、任务队列、vhost 端口意向**四类记录，从不持有 node 本地路径的语义，也不替 node 做文件操作。
+产物索引、任务队列、relay 意向**四类记录，从不持有 node 本地路径的语义，也不替 node 做文件操作。
 
 ## 1. 存储分工：什么进 documents，什么留在文件
 
-现行 `DocumentStore` 是 `documents(scope, id, value)` 一张表，**没有二级索引**，只能整 scope 读回再过滤
-(`box-foundation/src/collection.rs`, `box-store/src/document.rs`)。所以判断标准只有一条：
+`DocumentStore` 是 `documents(scope, id, value)` 一张表，**没有二级索引**，只能整 scope 读回再过滤
+(`box-foundation/src/collection.rs:29-38`, `box-store/src/document.rs:16-23`)。判据只有一条：
 **权威数据归谁写**。
 
 | 数据 | 归属 | 落点 | 理由 |
 |---|---|---|---|
-| node 注册表 | 控制层 | documents `scope=nodes` | A 已如此；控制层是唯一写者 |
-| 产物索引 | 控制层（校验后写） | documents `scope=node-artifacts` | 摘要由控制层核对后才算数 |
-| 任务队列 | 控制层 | documents `scope=tasks` | 已有；调度器唯一写者 |
-| 容器身份 + 落点 | **执行侧**（文件即事实） | `instances/<id>/container.json` | 已有；容器目录本身就是它的生命 |
-| profile / 模板树 / 产物归档 | node | node 本地磁盘 | 控制层只存**不透明句柄**与摘要 |
+| node 注册表（含 tombstone） | 控制层 | documents `scope=nodes` | 控制层是唯一写者 |
+| 产物索引 | 控制层（校验格式后写） | documents `scope=node-artifacts` | 摘要与大小由 node 计算、控制层校验形状 |
+| 任务队列（含清理意向与结果） | 控制层 | documents `scope=tasks` | 调度器唯一写者；D4 之后所有 node 动作都在这里 |
+| 容器身份 + 落点 | 执行侧（文件即事实） | `instances/<id>/container.json` | 容器目录本身就是它的生命 |
+| 常量仓库 / 产物归档 / profile | node | node 本地磁盘 | 控制层只存**不透明句柄**与摘要 |
 
-由此得出一条硬规则：**控制层不许把 `archive` 当路径去 stat**。它是不透明句柄，只有产生它的 node 能解释。
+两条硬规则：
+
+1. **控制层不许把 `archive` 当路径去 stat**（I8）。它是句柄，只有产生它的 node 能解释。
+2. **清理意向与结果也是记录**：谁要删、删哪些、删成功几项，都在 `tasks` 里留痕（§3.6）。
 
 ## 2. 表结构
 
@@ -31,291 +36,335 @@
 
 ```jsonc
 {
-  "id": "host" | "node-3f9a",        // 主键；host 为内建，不可删
+  "id": "host" | "node-3f9a",          // 主键；host 内建，不可删
   "kind": "host|wsl2|libkrun|vz|docker",
-  "platform": "windows-x64|linux-x64",  // 产物 platform 取它，不取宿主 build_platform()
-  "status": "registering|online|offline|draining|failed",
+  "platform": "windows-x86_64|linux-x86_64",  // 见 §2.7 的拼法约定
+  "status": "registering|online|offline|draining|failed|removed",
   "capabilities": ["exec","build","image-export","copy","dsh-host"],
   "controlUrl": "http://127.0.0.1:5321" | null,
-  "sessionEpoch": 17,                  // 每次 daemon 启动 +1，旧 epoch 的请求一律拒绝
+  "sessionEpoch": 17,                  // 每次 daemon 启动 +1
+  "sessionId": 4,                      // 每次 register +1：区分「同一 daemon，换了 helper 会话」
   "enrolledAt": 1793, "lastSeen": 1794, "helperVersion": "0.1.10",
-  "backendRef": "Ubuntu-24.04" | null, // 仅供供给适配器读
+  "backendRef": "Ubuntu-24.04" | null,
   "hostNode": true,
-  // ── B 新增：node 自足执行所需的两项就绪状态 ──
-  "mirror": {                          // 常量仓库在 node 本地的现状
-    "path": "/var/dshbox/harness-mirror.git",
-    "commit": "0d1f500…",             // 本地镜像的 HEAD
-    "fetchedAt": 1793, "sizeBytes": 412000000
+  "mirror": { "path": "/var/dshbox/harness-mirror.git", "commit": "0d1f500…", "fetchedAt": 1793, "sizeBytes": 412000000 },
+  "toolchain": { "node": "22.13.0", "pnpm": "10.4.1", "platform": "linux-x86_64" },
+  "workload": {                        // node 心跳上报的摘要，控制层不去远端扫盘
+    "containers": 3, "runningHosts": 2, "diskFreeBytes": 8100000000
   },
-  "toolchain": {                       // 该平台可用的 node/pnpm
-    "node": "22.13.0", "pnpm": "10.4.1", "platform": "linux-x64"
-  },
-  "relay": null                        // P 阶段填：{ "listenerPortHint": 0, "lastTunnelAt": 1794 }
+  "relay": null,                       // P 阶段：{ "listenerPortHint": 0, "lastTunnelAt": 1794 }
+  "removedAt": null,                   // tombstone 时间；非 null 即 status=removed
+  "lastArtifacts": [                   // tombstone 清单：删索引行之后仍能枚举清理目标
+    { "baseId": "base-9c1f…", "archive": "/var/dshbox/artifacts/base-9c1f.tar", "sizeBytes": 1327000000 }
+  ]
 }
 ```
 
-**派生就绪（不落盘）**：`readyFor(base) = status==online && mirror.commit == base.sourceCommit
-                       && toolchain.platform == platform`。
-派活前一律用它判断，不另存布尔值——存了就会和三个来源不一致。
+**派生就绪（不落盘）**：`readyFor(base) = status==online && mirror.commit == base.sourceCommit && toolchain.platform == platform`。
 
 **状态机**：`registering →(register)→ online →(3 次心跳丢失)→ offline →(register)→ online`；
-`online →(drain)→ draining →(最後一task结束)→ offline`；任何状态 `→(helper 报不可恢复错误)→ failed`。
-`offline` 保留记录与已有产物（A 已实现），**只有显式移除才删**。
+`online →(drain)→ draining →(最后任务结束)→ offline`；任何状态 `→(不可恢复错误)→ failed`；
+`任一 →(node rm)→ removed`（tombstone，保留记录与 `lastArtifacts`）。
 
 ### 2.2 `node-artifacts`（B 新增）
 
-主键必须是单个字符串（`documents.id` 是 `TEXT`），因此用 `nodeId|baseId`：
+主键必须是单字符串（`documents.id` 是 `TEXT`），用 `nodeId|baseId`：
 
 ```jsonc
 {
-  "id": "node-3f9a|sealed-9c1f…",      // = nodeId + '|' + baseId
+  "id": "node-3f9a|base-9c1f…",       // nodeId + '|' + baseId
   "nodeId": "node-3f9a",
-  "baseId": "sealed-9c1f…",            // prepared base 的 digest/id
-  "sourceCommit": "0d1f500…",          // 冗余存，供 index 自洽检查
-  "platform": "linux-x64",             // 必须等于 node.platform
-  "archive": "/var/dshbox/artifacts/base-9c1f.tar",  // 不透明句柄，控制层不 stat
-  "sha256": "9f2c…64 hex",
+  "baseId": "base-9c1f…",             // prepared base 的 id，形如 base-<digest>（versions.rs:353）
+  "sourceCommit": "0d1f500…",
+  "platform": "linux-x86_64",          // 必须等于 node.platform
+  "archive": "/var/dshbox/artifacts/base-9c1f.tar",   // 不透明句柄
+  "sha256": "9f2c…（64 位小写十六进制）",
   "sizeBytes": 1327000000,
-  "builtAt": 1794, "verifiedAt": 1794
+  "builtAt": 1794
 }
 ```
 
-校验（写入前，全部拒绝式）：`nodeId` 存在于 `nodes`；`platform == node.platform`；
-`sha256` 为 64 位小写十六进制；`sizeBytes > 0`；`baseId` 非空且不含 `|`。
-**只有 `node_artifact_report` 成功走完校验才写行**；任务失败只留 `tasks` 记录。
+校验（写入前，拒绝式）：`nodeId` 存在于 `nodes` 且非 `removed`；`platform == node.platform`；
+`sha256` 为 64 位小写十六进制；`sizeBytes > 0`；`baseId` 以 `base-` 开头且不含 `|`。
+**只有 `node_artifact_report` 走完校验才写行**；任务失败只留 `tasks` 记录。
 
-为什么不按 node 分 scope（`node-artifacts:<nodeId>`）：`DocumentStore` 没有删 scope，
-删 node 会留下孤儿 scope；复合主键一行一产物，级联删除时按 `nodeId` 前缀扫一遍即可。
+不再存 `verifiedAt`：控制层不 stat node 路径（I8），所以它无法“核对归档摘要”。
+摘要由 node 在构建时计算并在使用时（C 阶段，真正解包前）复算；控制层只校验**形状**并记录。
+这是对 `node-artifact.md:62-65`（“控制层校验后再入库…核对磁盘上的实际摘要”）的修订，理由见 §11。
 
 ### 2.3 `tasks`（已有，B 扩展）
 
 ```jsonc
-{ "id": "task-…", "kind": "node_build_artifact",
-  "nodeId": "node-3f9a",            // 新增：派给谁。null = 控制层本地任务
-  "claimedBy": "node-3f9a",          // 新增：谁认领的（null = 未认领）
-  "claimEpoch": 17,                  // 新增：认领时的 sessionEpoch，防跨重启顶替
-  "resourceKeys": ["node:node-3f9a", "base:sealed-9c1f…"],
-  "params": { "baseId": "…", "sourceCommit": "…", "platform": "linux-x64" },
+{ "id": "task-…", "kind": "node_build_artifact|node_purge|node_sync_mirror|node_container_start|…",
+  "nodeId": "node-3f9a",          // 派给谁；"host" 表示控制层内执行（§2.6）
+  "claimedBy": "node-3f9a",        // 谁认领的；null = 未认领
+  "claimSession": 4,               // 认领时的 nodes.sessionId；与 node 当前 sessionId 不等即失联
+  "idempotencyKey": "opt-64字符内", // 调用方给，用于去重（§3.5）
+  "resourceKeys": ["node:node-3f9a", "base:base-9c1f…"],
+  "params": { "baseId": "…", "sourceCommit": "…", "platform": "linux-x86_64" },  // ≤ 4 KiB
   "status": "queued", … }
 ```
 
-`nodeId` 单独成字段而不是塞进 `resourceKeys`：`resourceKeys` 的语义是**锁范围**
-（同一 key 的任务互斥），调度归属是另一件事；两者混用会让「只允许一个 base 构建」和
-「只有这个 node 能领」变成同一种表达，日后必然打架。
-
-认领 = `queued --claim--> running`，同时写 `claimedBy/claimEpoch/startedAt`；
-任务结束时清空 `claimedBy` 但保留它作为历史（或写进 `params.finishedBy`）。
-
-### 2.5 任务状态机：新增 `miss`
-
-现有 `TaskState`（`box-scheduler/src/lib.rs`）有 queued/running/succeeded/failed/cancelled/
-interrupted/rollingback/rolledback。**认领后失联**这件事今天无处可去：写成 `failed` 会
-谎报"这项工作失败了"，写成 `interrupted` 会和"daemon 重启打断"混为一谈。新增：
-
-```rust
-Miss,   // 认领它的 node 不再持有它：epoch 变了、重注册时没上报、或 node 被移除
-```
-
-转移规则（要同步改 `valid_transitions`）：
-
-| 从 | 到 | 触发 |
-|---|---|---|
-| `running` | `miss` | node 重注册时未在 `abandonedTaskIds` 里提到该任务，或 `claimEpoch < currentEpoch` |
-| `queued` | `miss` | 目标 node 被移除（排给它的活没人能领） |
-| `miss` | — | 终止态；**不自动重排**（构建可能已写半个归档，重排会让两个 worker 抢同一产物） |
-
-`miss` 与既有状态的边界必须写进文档与 UI 文案：
-`interrupted` = 控制层自己重启打断；`miss` = 节点侧不再持有；`cancelled` = 用户要求停。
-三者在 UI 上是三种颜色/三种建议动作（重试 / 检查节点 / 无需处理）。
-
-挂点：`TaskState::from`、`valid_transitions`、`is_terminal`、CLI 的状态列、`src/i18n.ts` 的中英文案
-（漏一处就会出现任务永远显示"执行中"）。
+`nodeId` 单独成字段而不是塞进 `resourceKeys`：`resourceKeys` 的语义是**锁范围**（同一 key 的任务互斥），
+调度归属是另一件事；混用会让「同一 base 只编一次」和「只有这个 node 能领」变成同一种表达。
 
 ### 2.4 容器落点：`container.json` 增量
 
 ```jsonc
 { "id": "cnt-…", "name": "…", "profile": "web",
   "nodeId": "host",                 // 新增；缺省 = host（旧容器无需改动）
-  "runtime": "vm:wsl2" | null,       // 只有本文件存在；见 §5
-  "placement": {                     // 新增：绑定即事实，不做隐式迁移
-    "boundAt": 1794,
-    "pinned": true,                  // 用户显式指定 node，调度器不得改选
-    "reason": "pinned|auto|host-default"
-  } }
+  "runtime": "vm:wsl2" | null,       // 保留只读，见 §5
+  "placement": { "boundAt": 1794, "pinned": true, "reason": "pinned|auto|host-default" } }
 ```
 
-为什么放文件而不放 documents：容器目录本身就是它的存在证明（删目录=删容器），
-把落点写进 documents 就会出现「documents 有、目录没有」的二相性，而这正是
-`resolve.rs` 已经在处理的孤儿场景；两者都在文件里，一致性只需一次 `read_to_string`。
+为什么放文件：容器目录就是它的存在证明（删目录=删容器），写进 documents 会形成「记录在、目录没了」
+的二相性，而这正是 `resolve.rs` 已在处理的孤儿场景。
 
-**一个容器只在一个 node 上运行**：`container id` 是全局唯一且创建时固定的，落点因此是
-一对一关系，不存在"同一容器在两个 node 上各跑一份"。跨 node 复制 = **新建一个容器（新 id）
-在目标 node 上就位**，旧的原样留在原处；这与今天同机复制的语义一致（`free_record_id` 会给出 `-2`
-后缀而不是覆盖）。由此得出一条推论：**任何"迁移"都必须是显式的建新+删旧**，不存在原地搬家。
+**一个容器只在一个 node 上运行**：`container id` 全局唯一且创建时固定，落点是一对一关系。
+跨 node 复制 = **在目标 node 新建一个容器（新 id）**，旧的原样留着（与今天同机复制 `free_record_id` 给 `-2` 后缀一致）。
+推论：**任何“迁移”都是显式建新+删旧**，不存在原地搬家 —— 也因此 node 掉线时不自动迁移（§3.4）。
 
-## 3. 调度：三个不同的问题，三套规则
+### 2.5 任务状态机（完整版，含 `miss`）
+
+现有 `TaskState`（`box-scheduler/src/lib.rs:59-78`）有 queued/running/succeeded/failed/cancelled/
+interrupted/rollingback/rolledback。新增一个终态：
+
+```rust
+Miss,   // 认领它的 node 不再持有它：换会话、被移除、或控制层发现它已不可达
+```
+
+**三种“没做完”必须互斥**，否则 UI 无法给出正确建议：
+
+| 状态 | 含义 | 谁造成 | UI 建议 |
+|---|---|---|---|
+| `interrupted` | 控制层自己重启，任务被打断 | daemon | 重试 |
+| `miss` | node 侧不再持有该任务 | node | 检查节点 |
+| `cancelled` | 用户要求停 | 用户 | 无需处理 |
+
+完整转移表：
+
+| 从 | 到 | 触发条件 |
+|---|---|---|
+| `queued` | `running` | node 认领 |
+| `queued` | `miss` | 目标 node 被移除（`status=removed`）——这活没人能领了 |
+| `queued` | `cancelled` | 用户取消 |
+| `queued` | `interrupted` | daemon 重启 |
+| `running` | `succeeded`/`failed` | node 回报（且 `claimSession` 与当前一致） |
+| `running` | `miss` | 同一 node 以**新 sessionId** 重新注册，且该任务不在它上报的 `abandonedTaskIds` 里 |
+| `running` | `miss` | 同一 node 上报 `abandonedTaskIds` **包含**该任务（它自己承认丢了） |
+| `running` | `miss` | 目标 node 被移除 |
+| `running` | `cancelled` | 用户取消（经 §3.3 的取消通道送达 node） |
+| `running` | `interrupted` | daemon 重启（`restore()` 统一处理） |
+| `miss` | — | 终态，**不自动重排**（构建可能已写了半个归档，重排会让两个 worker 抢同一产物） |
+
+两条**状态机之外**的实现纪律（评审 B4 指出，当前代码不满足）：
+
+1. `finish()` 现在会 `transition_to().ok()` 吞掉转移错误再无条件写 `stage="Completed"`
+   （`box-scheduler/src/lib.rs:946-950`），于是 `miss` 之后迟到的回报会把记录写成
+   **miss + Completed + 100%**。B1 必须先判终态：终态任务收到 report/finish 一律**忽略并记日志**。
+2. `restore()` 在 daemon 启动时把 `running` 钉成 `interrupted`（终态），所以**“失联判 miss”的扫描
+   永远不会看到它们** —— 这是有意的：重启是控制层自己的原因，归 `interrupted`。`miss` 只在
+   daemon 存活期间由节点事件触发。两条路径不许互相认领。
+
+### 2.6 `host` node 的任务在控制层内执行
+
+`host` 是内建节点，**没有 helper、没有 session、无法认领任务**（A 的实现如此）。因此：
+
+- `tasks.nodeId == "host"` 由控制层内的本地执行器跑（沿用 `box_scheduler::run_queued` 的既有路径）；
+- `node_claim_task` 只对非 host 节点有效，host 节点调用返回明确错误而不是空列表；
+- 选址排序里 host 优先的前提是“本地执行器能跑这类任务”，`node_purge` 这类只对远端有意义的
+  动作在 host 上直接拒绝（本机文件用户自己就能删）。
+
+### 2.7 platform 拼法：统一，并且校验
+
+今天有**三种拼法**并存，是 B 里最容易出错的一处：
+
+| 出处 | 形式 | 例 |
+|---|---|---|
+| `nodes.rs:182`（host node） | `{OS}-{ARCH}`（`std::env::consts`） | `windows-x86_64` |
+| `bundled.rs`/打包目录 | 包目标名 | `win-x64` / `linux-x64` |
+| 早期文档 | 手写 | `windows-x64` |
+
+**约定**：`nodes.platform` 与 `node-artifacts.platform` **一律用 `{OS}-{ARCH}`**（即 `std::env::consts` 的拼法，
+取 helper 自己编译时的值，不取宿主），enroll 时用白名单校验（`^(linux|windows|macos)-(x86_64|aarch64)$`），
+不合法直接拒绝注册。打包目录名（`win-x64`）是**包目标**，与 node platform 是两个概念，不得混用。
+
+## 3. 调度
 
 ### 3.1 新建容器落在哪个 node（选址）
 
-输入：boxfile/CLI 的 `nodeId?`、`capabilities` 需求、模板的 `baseId`。
-
 ```
 若显式 nodeId：
-   node 不存在 → 报错  |  status != online → 报错（列出当前状态）
-   缺 capability 或平台不匹配 → 报错并列出缺哪一项
+   node 不存在 → 报错 | status 不在 {online,draining} → 报错（列出当前状态）
+   缺 capability / 平台不匹配 / base 产物缺失且无法构建 → 报错并列出缺哪一项
    → 绑定，pinned=true
 否则：
-   候选 = 所有 online 且 capability 满足的节点
-   排序：host 优先（无跨边界开销）
-        → readyFor(base) 已为真（产物已存在，省一次构建）
-        → 已运行容器数最少
-        → lastSeen 最新
-   绑定第一个；无候选 → 报错，逐候选给出拒绝原因（缺产物 / 平台不符 / 离线）
+   候选 = status==online 且 platform 兼容 且 capability 满足 的节点
+   排序：host 优先（本地执行器可跑）→ readyFor(base) 已真（省一次构建）
+        → 已运行容器数最少（nodes.workload）→ lastSeen 最新
+   绑定第一个；无候选 → 报错并逐候选给出拒绝原因
 ```
 
-产物缺失不是拒绝理由，而是**顺带派一个 `node_build_artifact`**（可等待、可后台）；
-容器创建本身不阻塞在构建上。
+**控制层不主动去远端数容器**：`nodes.workload` 由心跳携带（§2.1），所以排序只用控制层已有数字，
+不会因为某个 node 卡住而让 `list_containers` 变慢（桌面 3s 轮询不允许）。
 
 ### 3.2 产物在哪个 node 上构建（缓存）
 
-键 `(nodeId, baseId)`，一个 node 一个 base 只编一次。请求到来时：
-已有记录且 `platform == node.platform` → 直接复用；
-已有记录但平台不符 → 视为陈旧，重新派活（不删旧行，写入时同 id 覆盖）；
-无记录 → 派 `node_build_artifact`，`resourceKeys` 含 `base:<baseId>`，保证同一 base 不并发编两次。
+键 `(nodeId, baseId)`，一个 node 一个 base 只编一次：已有记录且 `platform` 相符 → 复用；
+已有记录但平台不符 → 视为陈旧重新派活（同 id 覆盖）；无记录 → 派 `node_build_artifact`，
+`resourceKeys` 含 `base:<baseId>`，保证同一 base 不并发编两次。跨 node 复制容器**不复制产物**，只搬 `profile/`。
 
-跨 node 复制容器时**不复制产物**：产物是 (node, base) 级别的，新 node 走自己的缓存键，
-只搬该容器的 `profile/`（约 62.5 MB）。
+### 3.3 认领、取消、以及“方向”
 
-### 3.3 长任务由谁执行（认领）
+**认领是 node → 控制层的同步调用**（node 问“有我的活吗”），不吃 §3.5 的异步规则：
+`node_claim_task` 在一个调度器锁内把 `queued → running` 并写 `claimedBy/claimSession/startedAt`，
+然后返回任务；返回后 helper 才开干。控制层的任务持久化必须由调度器的单一写者完成，
+不能在内存改完再整表 `persist()` 覆盖（评审 B7：认领写入会被覆盖）。
 
-拉取式：helper 用 session token 调 `node_claim_task`，daemon 取该 node 下最老的 `queued` 任务，
-在**一个事务语义**内写 `running + claimedBy + claimEpoch` 再返回；返回后 helper 才真正开干。
+断线重连、daemon 重启、事件丢帧都自愈：helper 重连后继续 claim。SSE 只用于“有新活”的提示，不承担可靠性。
 
-为什么拉取而不是推送：断线、daemon 重启、事件丢帧都能自愈——helper 重连后继续 claim；
-而推送要给每个 node 维护可重放的队列。SSE 只用来「有新活」的提示，不承担可靠性。
+**取消必须有到 node 的通道**（评审 B5）：认领响应同时带 `{ tasks: [...], cancels: [taskId…] }`，
+helper 每次轮询（心跳周期）都取一次待取消列表并对本地进程树发终止。没有这条通道，
+`cancel_requested` 只会写进记录，实际构建照跑。
 
-认领后的失联：`claimedBy` 非空且 `claimEpoch < currentEpoch`（daemon 重启过）的任务，
-启动时统一置 `failed(error="daemon restarted during task")`，**不自动重排**：
-构建可能已经写了一半个归档，重排会让两个 worker 同时写同一产物。
-
-### 3.4 node 掉线对既有容器意味着什么
+### 3.4 node 掉线、移除：先 tombstone，再谈清理
 
 | 情况 | 处理 | 明确不做 |
 |---|---|---|
-| node `offline` | 其容器在状态里标 `unreachable`（派生，不写盘），页面入口显示原因 | 不自动迁移容器 |
-| node 被移除 | 若仍有容器引用 → 拒绝，先 `container copy` 建新容器再删旧；移除时**默认删除产物索引行**；node 磁盘上的归档/缓存由 `node_purge` 异步任务清理（§3.6） | 不静默改绑到 host；不删 node 磁盘文件却报告已清理 |
+| node `offline` | 其容器在视图里标 `unreachable`（**只用控制层记录推导**，不现问 node） | 不自动迁移容器 |
+| node 有容器引用时移除 | 默认拒绝，提示先 `container copy` 建新容器再删旧 | 不静默改绑到 host |
+| node 被移除 | 转 `status=removed` 的 **tombstone**：保留 `backendRef/lastSeen/lastArtifacts`，清空 `controlUrl`；同时删产物索引行；其 `queued/running` 任务置 `miss` | 不删 node 磁盘文件却报告已清理 |
 | node `failed` | 同 offline，且拒绝新选址 | 不自动重装 node |
 
-不自动迁移的理由：迁移会改变网络边界与文件系统语义（WSL2 netns 共享、drvfs 慢），
-用户以为自己在一块盘上、其实换了一块，是最难查的一类 bug。迁移必须是显式动作。
+**为什么要 tombstone**：把「索引行」和「那台机器上的字节」分开记账。删索引行解决的是控制层视图，
+`lastArtifacts` 保留了清理所需的枚举依据，两者都不影响 `node rm` 恢复成干净状态。
 
-### 3.5 跨 node 动作一律异步，控制层不等待
+### 3.5 异步边界：控制层→node 才异步，node→控制层是同步
 
-凡是会碰到某个 node 的磁盘、进程或网络的动作，**接口形态统一为「返回 handle，结果靠事件」**：
+规则只约束**控制层发起、会等某个 node 的动作**：
 
 ```
-任何 node 侧动作（构建产物 / 清理磁盘 / 起停容器 / 同步镜像 / 开隧道）
-   → RPC 立即返回 { taskId }（不阻塞、不等待）
+控制层 → node（构建产物 / 清理磁盘 / 同步镜像 / 起停容器 / 开隧道）
+   → RPC 立即返回 { taskId }，绝不等待
    → 任务进 box-scheduler，nodeId 决定谁领
-   → 订阅 task_* 事件（task_stage / task_log / task_finished）取结果
-   → 幂等：同 (kind, nodeId, params) 的未完成任务直接返回既有 taskId
+   → 订阅 task_* 事件取结果
+node → 控制层（register / heartbeat / claim / report / artifact_report）
+   → 同步，天然短小；它们本身就是控制层状态的输入
+纯控制层读写（node_list/get、node_artifact_list）
+   → 同步
 ```
 
-只有**纯控制层的读写**可以同步：`node_list/get`、`node_artifact_list`、注册/心跳/上报。
-判据一句话：**会不会等一个 node**。会等的一律异步。
+两条附加约束，都是为了不让“异步”变成“卡死”：
 
-这条规则的直接好处是控制层永远没有「卡在某个 node 上」的线程——一个 node 的 SSH 挂了、
-WSL 卡了、docker daemon 无响应，都只表现为它自己的任务停在 `running`，其它 node 照常。
+1. **派生状态不得实时问 node**：`unreachable`、远端容器数、磁盘余量一律来自控制层已存字段
+   （心跳上报的 `workload`）；否则桌面 3s 轮询的 `list_containers` 会被一个卡住的 node 拖死。
+2. **幂等键由调用方给**（`idempotencyKey`，≤64 字符），不做 `params` 深比较（`params` 是自由 JSON，
+   深比较 + 整表 upsert 会破坏 §6 的毫秒级论证）。去重只针对**活跃态** `{queued, running}`；
+   `succeeded/failed/cancelled/interrupted/miss` 一律不阻止重派——否则一次 `miss` 会永久堵死同一 key。
+   另：`params` ≤ 4 KiB。
 
-### 3.6 node 磁盘上的东西，通过控制层发起清理
-
-删除 node 只删索引行（控制层本来就碰不到那些文件），但**清理必须可达**，否则用户没有
-手段回收一个已经不存在的 node 占着的几十 GB。因此提供一个异步动作：
+### 3.6 `node_purge`：清理 node 磁盘，接受可达性现实
 
 ```jsonc
-// method: node_purge   （主 token；控制层发起，node 执行）
+// method: node_purge（主 token；控制层发起，node 执行，异步返回 taskId）
 { "nodeId": "node-3f9a",
   "what": ["artifacts", "mirror", "workspaces", "logs"],   // 显式列举，不接受 "all"
-  "baseId": "sealed-9c1f…" }                               // 可选：只清某个 base 的产物
+  "baseId": "base-9c1f…" }                                 // 可选：只清某个 base 的产物
 → { "taskId": "task-…" }
 ```
 
-- **不接受通配 `all`**：删磁盘上的东西必须显式列举，避免一个笔误清掉整块工作区。
-- helper 执行、逐项回报（`node_report`），失败项留在结果里而不是静默跳过。
-- node 已不存在时调用必须报 `node not found`，**不允许**留「幽灵清理」。
-- 这一层今天先给 CLI 与 RPC；面向用户的资源控制界面在 D（面板）恢复时接上，接口形态不因此改变。
+**可达性是前提，不是细节**：磁盘在 node 上，node 不可达就没人能删。因此：
+
+| node 状态 | `node_purge` 行为 |
+|---|---|
+| `online` / `draining` | 派任务，逐项执行，失败项留在结果里（不静默跳过） |
+| `offline` / `failed` | 拒绝，返回可执行的后端命令（如 `wsl --unregister <distro>`）与剩余清单 |
+| `removed`（tombstone） | 同上；`lastArtifacts` 是返回清单的来源 |
+
+顺序：**先清磁盘、成功后再删 `lastArtifacts`/索引行**；索引先删就再没有枚举依据（评审 B1 指出的矛盾）。
+`node rm` 与 `node purge` 因此是两个动作：前者改变控制层视图（tombstone），后者负责字节。
+面向用户的资源控制界面（D 阶段恢复时）驱动同一个 `node_purge`，接口形态不因界面而变。
 
 ## 4. 不变量（每条都要有守护）
 
 | # | 不变量 | 守护方式 |
 |---|---|---|
-| I1 | `artifact.platform == node.platform` | 写入校验 + 单测（回归防线，容易写成宿主平台） |
+| I1 | `artifact.platform == node.platform` | 写入校验 + 单测（回归防线：写成宿主平台就复现原始 bug） |
 | I2 | 产物行只能由成功 report 产生 | 单测：任务失败后 `node_artifact_list` 为空 |
-| I3 | 一个 node 不能替别的 node 报产物 | `__nodeId` 服务端注入（A 已有机制）+ 实机探针 |
-| I4 | `(nodeId, baseId)` 唯一 | 主键编码 + 覆盖写语义 |
-| I5 | `nodes.host` 不可删、不可 deregister | A 已有 |
-| I6 | 容器引用的 node 必须存在 | 删除 node 前扫 `instances/*/container.json` |
-| I7 | 认领者必须持有当前 epoch 的 session | `claimEpoch` 比对 + 单测 |
-| I8 | 控制层不读 node 本地路径 | 代码评审约定：`archive` 只透传 |
-| I9 | 一个容器只属于一个 node（id 全局唯一，无副本） | 容器 id 创建时固定 + 跨 node 复制走「新建」路径 |
-| I10 | 跨 node 动作不阻塞控制层 | 接口评审：会等 node 的一律返回 `taskId` |
-| I11 | 认领后失联不伪装成 failed | `TaskState::Miss` 专用状态 + 转移表单测 |
+| I3 | 一个 node 不能替别的 node 报产物 | `__nodeId` 服务端注入（A 已有）+ 实机探针 |
+| I4 | `(nodeId, baseId)` 唯一 | 主键编码 + 覆盖写 |
+| I5 | `nodes.host` 不可删、不可 deregister、不参与 claim | A 已有 + §2.6 |
+| I6 | 容器引用的 node 必须存在且非 removed | 删除前查 `instances/*/container.json`（本机）+ 远端靠心跳 `workload` + 离线时拒绝删除 |
+| I7 | 认领者必须持有当前 `sessionId` 且 `sessionEpoch` 未变 | 认领时写入 + 单测 |
+| I8 | 控制层不读 node 本地路径 | 评审约定：`archive` 只透传；不存 `verifiedAt` |
+| I9 | 一个容器只属于一个 node（id 全局唯一，无副本） | 容器 id 创建时固定；跨 node 复制走新建 |
+| I10 | 控制层不等待 node | 接口评审：会等 node 的一律返回 `taskId`；派生状态不现问 |
+| I11 | 失联不伪装成 failed | `TaskState::Miss` + 完整转移表 + 单测 |
+| I12 | 终态任务不受迟到回报影响 | `finish()/stage_*` 先判终态；单测（miss 后 report 不改记录） |
+| I13 | 清理先于删索引 | `node_purge` 成功后才删 `lastArtifacts`/索引行；单测 |
 
-## 5. 迁移与兼容
+## 5. 迁移、兼容与回滚
 
-- **不动 `PRAGMA user_version`**：只新增 scope（`node-artifacts`）与可选字段，`documents` 表结构不变。
-- 所有新字段 `#[serde(default)]`；旧记录读出来就是「没有 nodeId」= host、"没有 mirror" = 未就绪。
-- `container.json` 的 `runtime` 字段保留只读（旧容器/旧模板仍可能写它）；C 阶段写入新容器时
-  同时写 `nodeId` 与 `runtime`，等确认没有旧版本再停写 `runtime`。
-- 回滚：删掉新 scope 与两个新 RPC 即可，容器文件里多出来的 `nodeId` 被旧代码忽略（未知字段不报错）。
+- **不动 `PRAGMA user_version`**：只新增 scope（`node-artifacts`）与可选字段；`MIGRATIONS` 仍只有 v1
+  （`box-store/src/document.rs:25-29`），新 scope 只是新行。
+- 所有新字段 `#[serde(default)]`；旧记录读出来 = 没有 `nodeId`（host）、没有 `mirror`（未就绪）、
+  没有 `sessionId`（按 0 处理，等效“从未注册”）。
+- `container.json` 的 `runtime` 保留只读；C 阶段新容器同时写 `nodeId` 与 `runtime`，确认没有旧版本后再停写。
+- **回滚不是完全无损**：`TaskState::from` 对未知状态回退 `Failed`（`box-scheduler/src/lib.rs:130-141`），
+  所以回滚到旧 daemon 后，`miss` 会被读成 `failed` —— 与 I11 冲突但不会崩。B1 的 PR 必须写清这一点，
+  并且**不与旧版本混跑**（daemon 与桌面同批重建的既有规定已经覆盖）。
 
 ## 6. 查询与规模
 
-`DocumentStore` 只能整 scope 读，因此每条查询的成本 = scope 大小。实际规模：
-nodes ≤ 10、node-artifacts ≤ nodes × DSH 版本数（~50）、containers ≤ 数百、tasks 有界（已清）。
-在这个量级下整读+过滤都在毫秒级。
+`DocumentStore` 只能整 scope 读，成本 = scope 大小。当前量级：nodes ≤ 10、node-artifacts ≤ ~50、
+containers ≤ 数百、tasks **会持续增长**。前三个是毫秒级；**tasks 必须有 prune**（按 `finishedAt` + 条数上限），
+否则 D4 之后每个 node 动作都留一行，`load_scope("tasks")` 会慢慢变成瓶颈（评审 d 指出“已清”缺依据）。
 
-**何时才需要真索引**：出现「按 node 查上万个 task」或「产物行 > 10k」时，
-再加一张 typed 表（`MIGRATIONS` 追加一个脚本），而不是现在预建。
+**何时才需要真索引**：出现「按 node 查上万 task」或「产物行 > 10k」时再加 typed 表（追加一个 migration），
+而不是现在预建。
 
 ## 7. 失败语义
 
 | 场景 | 行为 |
 |---|---|
-| daemon 重启 | `sessionEpoch++`；所有 node 降为 `registering/offline`（A 已实现）；已认领任务置 `interrupted`；产物行保留 |
-| node 断线重连 | 用 enroll 重新注册（新 epoch），`claimedBy` 旧值失配 → 该任务不再属于它 |
-| 产物平台不符 | 视为陈旧，重派构建；不复用、不删除旧行 |
-| 归档磁盘不足 | helper 侧导出前预检（D: 仅 ~8.8 GB），不足则不写 `.part` 并回报明确错误 |
-| 认领后 helper 崩溃 | 任务停在 `running`；**不按时间自动失败**。node 用新 epoch 重新注册时若没在 `abandonedTaskIds` 中认领它 → 置 `miss`（§2.5） |
+| daemon 重启 | `sessionEpoch++`；node 降为 `registering/offline`（A 已实现）；`running` 任务 → `interrupted`；产物行与 tombstone 保留 |
+| helper 崩溃后重新注册 | `sessionId++`（epoch 不变）；原 `claimSession` 失配的任务 → `miss`（`abandonedTaskIds` 只是佐证） |
+| node 被移除 | tombstone；其 `queued/running` → `miss`；索引行删除；`lastArtifacts` 留待清理 |
+| 产物平台不符 | 视为陈旧重派；不删旧行（同 id 覆盖） |
+| 归档磁盘不足 | helper 导出前预检（D: 仅 ~8.8 GB），不足则不写 `.part` 并回报明确错误 |
+| `miss` 之后迟到回报 | 忽略并记日志（I12） |
 
 ## 8. 明确不存
 
-- DSH 源码树、插件、profile（这些是 node 本地的，产物只按 base 缓存）
-- node 本地绝对路径的语义（`archive` 是不透明句柄）
-- DSH 宿主的端口号（每次启动随机，只存「意向」，真实端口由 node 侧在启动后回报）
-- 宿主的 `build_platform()` 结果（这是 B 里最容易写错的一行）
+- DSH 源码树、插件、profile（node 本地；产物只按 base 缓存）
+- node 本地绝对路径的语义（`archive` 是句柄）
+- DSH 宿主的端口号（每次启动随机；只存 relay 意向，真实端口由 node 回报）
+- 宿主的 `build_platform()` 结果（B 段最容易写错的一行）
 
 ## 9. 已定决策
 
 | # | 问题 | 决定 | 落点 |
 |---|---|---|---|
-| D1 | 容器能否在两个 node 上并存副本 | **不能**。container id 创建时固定，一个容器只在一个 node 上运行；跨 node 复制 = 新建容器（新 id），旧的原样留在原处 | §2.4、I9 |
-| D2 | 删 node 时产物与磁盘怎么处理 | 默认**删除索引行**；node 磁盘上的归档/镜像/工作区通过 `node_purge` 异步动作清理（显式列举，不接受 `all`）。将来提供面向用户的资源控制界面与操作接口来接这一层 | §3.4、§3.6 |
-| D3 | 认领后失联怎么表示 | **用状态机解决**：`TaskState` 增加 `miss`，与 `failed`/`interrupted`/`cancelled` 并列且语义互斥；不按时间自动失败 | §2.5、I11 |
-| D4 | 多节点管理的调用形态 | **统一异步**：凡会等某个 node 的动作一律返回 `taskId`，结果靠 `task_*` 事件；只有纯控制层读写同步 | §3.5、I10 |
-
-由 D3/D4 派生两条实现纪律：
-
-1. `miss` 必须同时改 `TaskState::from`、`valid_transitions`、`is_terminal`、CLI 状态列与
-   `src/i18n.ts` 中英文案——漏一处就会出现任务永远显示「执行中」。
-2. 任何新 RPC 先问一句「会不会等 node」；会等的就不许返回结果，只能返回 handle。
+| D1 | 容器能否在两个 node 上并存副本 | **不能**；id 创建时固定，跨 node 复制 = 新建容器 | §2.4、I9 |
+| D2 | 删 node 与磁盘清理 | 删 node = tombstone + 删索引行；磁盘字节由 `node_purge` 异步清理（显式列举、接受可达性现实、先清后删）；将来由资源控制界面驱动 | §3.4、§3.6、I13 |
+| D3 | 认领后失联 | 新增 `TaskState::Miss`，与 `failed`/`interrupted`/`cancelled` 互斥；不按时间自动失败 | §2.5、I11、I12 |
+| D4 | 多节点管理调用形态 | 控制层→node 一律异步返回 `taskId`；node→控制层与纯控制层读写同步 | §3.5、I10 |
 
 ## 10. 阶段落点
 
-| 阶段 | 用它做什么 |
+| 阶段 | 内容 |
 |---|---|
-| B1 | 建 `node-artifacts` scope；`node_build_artifact` / `node_artifact_list` / `node_artifact_report` / `node_claim_task` / `node_purge` 的 RPC 与 CLI；`tasks.nodeId/claimedBy/claimEpoch`；`TaskState::Miss` 与转移表；异步接口约定写进 `AGENTS.md` |
-| B2 | helper 认领并执行（clone→install→build→tar→sha256→report），实现 `node_purge`，写 `nodes.mirror` / `nodes.toolchain` |
-| C | `container.json` 增 `nodeId/placement`，选址与启动下沉 node；跨 node copy = 新建容器 |
+| B1 | `node-artifacts` scope；`node_build_artifact` / `node_artifact_list` / `node_artifact_report` / `node_claim_task`（同步）/ `node_purge`；`tasks.nodeId/claimedBy/claimSession/idempotencyKey`；`TaskState::Miss` + 完整转移表 + 终态保护；tombstone 与 `lastArtifacts`；`tasks` prune；异步优先写进 `AGENTS.md` |
+| B2 | helper 认领并执行（clone→install→build→tar→sha256→report）、执行 `node_purge`、上报 `mirror/toolchain/workload`、接收取消列表 |
+| C | `container.json` 增 `nodeId/placement`；选址与启动下沉 node；跨 node copy = 新建容器 |
 | P | `nodes.relay` 填值，页面通过隧道回传 |
-| D（可后置） | 面板与资源控制界面：node 在线状态、磁盘占用、`node_purge` 入口——接口在 B1 已经就位，这里只做界面 |
+| D（可后置） | 面板与资源控制界面：node 在线状态、磁盘占用、`node_purge` 入口——接口在 B1 已就位 |
+
+## 11. 与 `node-artifact.md` 的两处差异（需要同批更新那份文档）
+
+1. **信任模型**：那份文档写「控制层校验后再入库…按需核对归档在磁盘上的实际摘要」。控制层到不了
+   node 的路径（I8），所以改为：node 算摘要并上报，控制层校验**形状**（长度/字符集/大小/平台）；
+   真正解包前的复算发生在 node 侧（C 阶段）。原文的动机（“helper 说编好了不说明字节就是我们想要的”）
+   仍然成立，只是执行者从控制层换成了 node 自己 + 平台的构建可复现性。
+2. **`baseId` 拼法**：那份文档示例写作 `sealed-…`，实际 prepared base id 是 `base-<digest>`
+   （`versions.rs:353`），`sealed-*` 是**模板**（`sealed.rs:1035`）。按旧示例实现会把产物行数放大 N 倍。
