@@ -51,9 +51,14 @@ const sources = [
 ]
 
 // The mtime gate above only decides whether asking the hash cache is worth it;
-// the cache decides whether work is really needed. Keep the two lists in step:
-// a file in one and not the other is either a needless rebuild or, worse, a
-// silently stale artifact.
+// the cache decides whether work is really needed. The invariant that has to
+// hold is one-directional: **every hash input must also be watched by mtime**.
+// Then any real change trips the gate first, so the digest is never the only
+// thing standing between a user and a stale artifact. The reverse is deliberate
+// -- the twenty dependency crates are watched for mtime but not hashed, because
+// hashing them would cost more than the rebuild it might save. Hashing a file
+// nobody watches is what would be silent: a change there would not even be
+// looked at.
 const cacheRoot = join('.cache', 'dsh-box', 'server')
 await mkdir(cacheRoot, { recursive: true })
 const cacheFile = join(cacheRoot, `${target}.sha256`)
@@ -105,8 +110,21 @@ async function rebuild(destination, target, force) {
     // The helper will need the same treatment once something runs it on this
     // host. On Windows neither binary can be replaced while it is running
     // (EBUSY), which is why the stop lives in the Unix branch.
-    const kill = spawnSync('pkill', ['-f', 'dshboxd|box-helper'], { stdio: 'ignore' })
-    if (kill.status === null) {
+    // `-x` matches the process *name*, not the whole command line: `-f` with a
+    // pattern would also match this very build (`cargo build ... -p dshboxd -p
+    // box-helper`) and kill it. `pkill` exits 1 when nothing matched, so "nothing
+    // to stop" is a status; a null one means the tool did not run at all, which
+    // is when claiming there is nothing running would be a guess.
+    let stopped = 0
+    let unavailable = false
+    for (const name of ['dshboxd', 'box-helper']) {
+      const kill = spawnSync('pkill', ['-x', name], { stdio: 'ignore' })
+      if (kill.error) unavailable = true
+      else if (kill.status === 0) stopped += 1
+    }
+    if (unavailable) {
+      console.log('pkill unavailable; stop a running dshboxd or box-helper yourself')
+    } else if (stopped === 0) {
       console.log('no running dshboxd or box-helper to stop')
     }
   }
