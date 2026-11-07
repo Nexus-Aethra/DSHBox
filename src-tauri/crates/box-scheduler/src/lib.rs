@@ -1221,6 +1221,10 @@ impl TaskManager {
         if open.is_empty() {
             return Ok(Vec::new());
         }
+        // Daemon shutdown: every worker is about to die with this process, so the
+        // counters and the lock set are cleared wholesale rather than per task.
+        // This is the only caller that may assume that -- a runtime "close these
+        // tasks" sweep would have to release per record, the way `finish` does.
         state.running = 0;
         state.active_resources.clear();
         let mut closed = Vec::new();
