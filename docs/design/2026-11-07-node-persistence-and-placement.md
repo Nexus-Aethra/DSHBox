@@ -43,7 +43,7 @@
   "capabilities": ["exec","build","image-export","copy","dsh-host"],
   "controlUrl": "http://127.0.0.1:5321" | null,
   "sessionEpoch": 17,                  // 每次 daemon 启动 +1
-  "sessionId": 4,                      // 每次 register +1：区分「同一 daemon，换了 helper 会话」
+  "helperSession": "9f2c-…",           // helper 进程启动时自己生成的实例号（daemon 只比较，不发号）
   "enrolledAt": 1793, "lastSeen": 1794, "helperVersion": "0.1.10",
   "backendRef": "Ubuntu-24.04" | null,
   "hostNode": true,
@@ -98,7 +98,7 @@
 { "id": "task-…", "kind": "node_build_artifact|node_purge|node_sync_mirror|node_container_start|…",
   "nodeId": "node-3f9a",          // 派给谁；"host" 表示控制层内执行（§2.6）
   "claimedBy": "node-3f9a",        // 谁认领的；null = 未认领
-  "claimSession": 4,               // 认领时的 nodes.sessionId；与 node 当前 sessionId 不等即失联
+  "claimSession": "9f2c-…",        // 认领时 node 的 helperSession；与当前 helperSession 不等即失联
   "idempotencyKey": "opt-64字符内", // 调用方给，用于去重（§3.5）
   "resourceKeys": ["node:node-3f9a", "base:base-9c1f…"],
   "params": { "baseId": "…", "sourceCommit": "…", "platform": "linux-x86_64" },  // ≤ 4 KiB
@@ -133,6 +133,12 @@ interrupted/rollingback/rolledback。新增一个终态：
 Miss,   // 认领它的 node 不再持有它：换会话、被移除、或控制层发现它已不可达
 ```
 
+**`helperSession` 必须由 helper 生成，不能由 daemon 发号**：re-enroll 一个正在构建的节点是被测试固定过的
+合法路径（`nodes.rs:729-747`），控制层主动 re-enroll 会让“发号 +1”把一个活着的构建判成 `miss`，
+而 `miss` 是终态、完成后的 report 会被 I12 丢弃 —— 结果是产物没记账、磁盘上留一个没人管的归档。
+helper 在进程启动时生成一个实例号，注册时上报；daemon 只存与比较。进程换了实例 = 换了 `helperSession` = 原 claim 失联，
+这才是 `miss` 的正确判据。
+
 **三种“没做完”必须互斥**，否则 UI 无法给出正确建议：
 
 | 状态 | 含义 | 谁造成 | UI 建议 |
@@ -150,8 +156,8 @@ Miss,   // 认领它的 node 不再持有它：换会话、被移除、或控制
 | `queued` | `cancelled` | 用户取消 |
 | `queued` | `interrupted` | daemon 重启 |
 | `running` | `succeeded`/`failed` | node 回报（且 `claimSession` 与当前一致） |
-| `running` | `miss` | 同一 node 以**新 sessionId** 重新注册，且该任务不在它上报的 `abandonedTaskIds` 里 |
-| `running` | `miss` | 同一 node 上报 `abandonedTaskIds` **包含**该任务（它自己承认丢了） |
+| `running` | `miss` | 同一 node 带有**不同的 `helperSession`** 重新注册（进程换了实例），且该任务不在它上报的 `abandonedTaskIds` 里 |
+| `running` | `miss` | 同一 `helperSession` 上报 `abandonedTaskIds` **包含**该任务（它自己承认丢了） |
 | `running` | `miss` | 目标 node 被移除 |
 | `running` | `cancelled` | 用户取消（经 §3.3 的取消通道送达 node） |
 | `running` | `interrupted` | daemon 重启（`restore()` 统一处理） |
@@ -172,6 +178,8 @@ Miss,   // 认领它的 node 不再持有它：换会话、被移除、或控制
 
 - `tasks.nodeId == "host"` 由控制层内的本地执行器跑（沿用 `box_scheduler::run_queued` 的既有路径）；
 - `node_claim_task` 只对非 host 节点有效，host 节点调用返回明确错误而不是空列表；
+**新增的 node 侧方法必须同时进 `NODE_METHODS`**（`nodes.rs:72-77`）：`node_claim_task`、
+`node_artifact_report`。漏一个，helper 第一次调用就是 403 —— 这是 B1 实机验证的第一件事；
 - 选址排序里 host 优先的前提是“本地执行器能跑这类任务”，`node_purge` 这类只对远端有意义的
   动作在 host 上直接拒绝（本机文件用户自己就能删）。
 
@@ -188,6 +196,10 @@ Miss,   // 认领它的 node 不再持有它：换会话、被移除、或控制
 **约定**：`nodes.platform` 与 `node-artifacts.platform` **一律用 `{OS}-{ARCH}`**（即 `std::env::consts` 的拼法，
 取 helper 自己编译时的值，不取宿主），enroll 时用白名单校验（`^(linux|windows|macos)-(x86_64|aarch64)$`），
 不合法直接拒绝注册。打包目录名（`win-x64`）是**包目标**，与 node platform 是两个概念，不得混用。
+
+**平台值必须由 helper 自报**：今天 `platform` 是 enroll 调用方（供给适配器）填的（`nodes_rpc.rs:13` →
+grant → `nodes.rs:295-312`），helper 从来没被问过。B1 要求 `node_register` 报文里带 `platform`，
+daemon 用它覆盖 grant 里的值并与白名单比对；否则白名单校验的只是适配器打的字，不是在跑的那台机器。
 
 ## 3. 调度
 
@@ -231,10 +243,14 @@ helper 每次轮询（心跳周期）都取一次待取消列表并对本地进�
 
 | 情况 | 处理 | 明确不做 |
 |---|---|---|
-| node `offline` | 其容器在视图里标 `unreachable`（**只用控制层记录推导**，不现问 node） | 不自动迁移容器 |
+| node `offline` | 其容器在视图里标 `unreachable`（**只用控制层记录推导**，不现问 node）；其 `running` 任务要等 node 回来或 `node rm` 才离开 `running`（取消通道要 helper 轮询，helper 死了收不到） | 不自动迁移容器 |
 | node 有容器引用时移除 | 默认拒绝，提示先 `container copy` 建新容器再删旧 | 不静默改绑到 host |
-| node 被移除 | 转 `status=removed` 的 **tombstone**：保留 `backendRef/lastSeen/lastArtifacts`，清空 `controlUrl`；同时删产物索引行；其 `queued/running` 任务置 `miss` | 不删 node 磁盘文件却报告已清理 |
-| node `failed` | 同 offline，且拒绝新选址 | 不自动重装 node |
+| node 被移除 | 转 `status=removed` 的 **tombstone**：保留 `backendRef/lastSeen/lastArtifacts`，清空 `controlUrl`；**删产物索引行**（枚举从此走 `lastArtifacts`）；其 `queued/running` 任务置 `miss` | 不删 node 磁盘文件却报告已清理 |
+| node `failed` | 同 offline，且拒绝新选址；状态机里 **failed 没有出边**，排给它的 `queued` 只能靠用户取消或 `node rm` 释放 | 不自动重装 node |
+
+**产物路径按任务隔离**：归档落 `artifacts/base-<digest>-<taskId>.tar.part`，成功后 rename 成同名去 `.part`。
+这样「手动重试」与「自动重排」的危险就被结构消掉了 —— 两个任务各有自己的路径，不会有两个 worker 写同一 tar、
+摘要对着交错文件算。再加一道保险：helper 在 rename 前自检自己仍持有该 `claimSession`，不持有则丢弃产出并回报。
 
 **为什么要 tombstone**：把「索引行」和「那台机器上的字节」分开记账。删索引行解决的是控制层视图，
 `lastArtifacts` 保留了清理所需的枚举依据，两者都不影响 `node rm` 恢复成干净状态。
@@ -258,10 +274,10 @@ node → 控制层（register / heartbeat / claim / report / artifact_report）
 
 1. **派生状态不得实时问 node**：`unreachable`、远端容器数、磁盘余量一律来自控制层已存字段
    （心跳上报的 `workload`）；否则桌面 3s 轮询的 `list_containers` 会被一个卡住的 node 拖死。
-2. **幂等键由调用方给**（`idempotencyKey`，≤64 字符），不做 `params` 深比较（`params` 是自由 JSON，
+2. **幂等键由调用方给**（`idempotencyKey`，≤64 字符），去重元组是 **(kind, nodeId, idempotencyKey)** —— 只用 key 会让同一个 key 发给不同节点或不同动作时拿回不相关的 taskId。不做 `params` 深比较（`params` 是自由 JSON，
    深比较 + 整表 upsert 会破坏 §6 的毫秒级论证）。去重只针对**活跃态** `{queued, running}`；
    `succeeded/failed/cancelled/interrupted/miss` 一律不阻止重派——否则一次 `miss` 会永久堵死同一 key。
-   另：`params` ≤ 4 KiB。
+   另：`params` ≤ 4 KiB —— 今天没有执行点（`dispatch.rs` 的通用入队原样收参），B1 要在新 RPC 边界上真正拦。
 
 ### 3.6 `node_purge`：清理 node 磁盘，接受可达性现实
 
@@ -281,9 +297,21 @@ node → 控制层（register / heartbeat / claim / report / artifact_report）
 | `offline` / `failed` | 拒绝，返回可执行的后端命令（如 `wsl --unregister <distro>`）与剩余清单 |
 | `removed`（tombstone） | 同上；`lastArtifacts` 是返回清单的来源 |
 
-顺序：**先清磁盘、成功后再删 `lastArtifacts`/索引行**；索引先删就再没有枚举依据（评审 B1 指出的矛盾）。
+顺序：**清理成功之后才允许删 `lastArtifacts`**。产物**索引行**在 `node rm` 时就删（用户视图归零），
+枚举依据改由 tombstone 的 `lastArtifacts` 承担 —— 两者不是同一个东西：索引行是“控制层认为这个产物可用”，
+`lastArtifacts` 是“这台机器上曾经有什么、要清理时按这个清单来”。删索引行而留着清单，
+既让视图干净，又不丢清理依据。
+
+`lastArtifacts` 只列产物，不含 mirror/workspaces/logs。这不是漏洞：node 变成 tombstone 后
+**helper 已经不在了**，逐项清理无从执行；此时只有整机级清理——
+`node purge --backend`（走供给适配器，如 `wsl --unregister <backendRef>`）一次带走全部，
+
 `node rm` 与 `node purge` 因此是两个动作：前者改变控制层视图（tombstone），后者负责字节。
 面向用户的资源控制界面（D 阶段恢复时）驱动同一个 `node_purge`，接口形态不因界面而变。
+
+**tombstone 不能只增不减**：purge 成功（或用户显式 `node forget`）后删掉 tombstone，
+否则 §6 的「nodes ≤ 10」要把历史 removed 行算进去。**removed 的 id 不复用**：同一台机器重新加入时
+申请新 id，旧 tombstone 留着只为清理与审计。
 
 ## 4. 不变量（每条都要有守护）
 
@@ -301,7 +329,7 @@ node → 控制层（register / heartbeat / claim / report / artifact_report）
 | I10 | 控制层不等待 node | 接口评审：会等 node 的一律返回 `taskId`；派生状态不现问 |
 | I11 | 失联不伪装成 failed | `TaskState::Miss` + 完整转移表 + 单测 |
 | I12 | 终态任务不受迟到回报影响 | `finish()/stage_*` 先判终态；单测（miss 后 report 不改记录） |
-| I13 | 清理先于删索引 | `node_purge` 成功后才删 `lastArtifacts`/索引行；单测 |
+| I13 | 清理先于删 `lastArtifacts` | 成功的 purge 才可清 `lastArtifacts`；`node rm` 删索引行但**不**删清单；单测 |
 
 ## 5. 迁移、兼容与回滚
 
@@ -309,7 +337,7 @@ node → 控制层（register / heartbeat / claim / report / artifact_report）
   （`box-store/src/document.rs:25-29`），新 scope 只是新行。
 - 所有新字段 `#[serde(default)]`；旧记录读出来 = 没有 `nodeId`（host）、没有 `mirror`（未就绪）、
   没有 `sessionId`（按 0 处理，等效“从未注册”）。
-- `container.json` 的 `runtime` 保留只读；C 阶段新容器同时写 `nodeId` 与 `runtime`，确认没有旧版本后再停写。
+- `container.json` 的 `runtime` 保留只读；**C 阶段**（不是 B）新容器同时写 `nodeId` 与 `runtime`，确认没有旧版本后再停写。
 - **回滚不是完全无损**：`TaskState::from` 对未知状态回退 `Failed`（`box-scheduler/src/lib.rs:130-141`），
   所以回滚到旧 daemon 后，`miss` 会被读成 `failed` —— 与 I11 冲突但不会崩。B1 的 PR 必须写清这一点，
   并且**不与旧版本混跑**（daemon 与桌面同批重建的既有规定已经覆盖）。
@@ -349,13 +377,14 @@ containers ≤ 数百、tasks **会持续增长**。前三个是毫秒级；**ta
 | D2 | 删 node 与磁盘清理 | 删 node = tombstone + 删索引行；磁盘字节由 `node_purge` 异步清理（显式列举、接受可达性现实、先清后删）；将来由资源控制界面驱动 | §3.4、§3.6、I13 |
 | D3 | 认领后失联 | 新增 `TaskState::Miss`，与 `failed`/`interrupted`/`cancelled` 互斥；不按时间自动失败 | §2.5、I11、I12 |
 | D4 | 多节点管理调用形态 | 控制层→node 一律异步返回 `taskId`；node→控制层与纯控制层读写同步 | §3.5、I10 |
+| D5 | node 上的可执行体由谁投放 | 受管后端由供给适配器投放；用户设备装同一安装包后 `dshbox node join`；**控制面不主动连 node**（不做 ssh/scp 推送）。节点角色用无 Tauri 依赖的 `box-helper`，与 control 同包发布 | §12 |
 
 ## 10. 阶段落点
 
 | 阶段 | 内容 |
 |---|---|
-| B1 | `node-artifacts` scope；`node_build_artifact` / `node_artifact_list` / `node_artifact_report` / `node_claim_task`（同步）/ `node_purge`；`tasks.nodeId/claimedBy/claimSession/idempotencyKey`；`TaskState::Miss` + 完整转移表 + 终态保护；tombstone 与 `lastArtifacts`；`tasks` prune；异步优先写进 `AGENTS.md` |
-| B2 | helper 认领并执行（clone→install→build→tar→sha256→report）、执行 `node_purge`、上报 `mirror/toolchain/workload`、接收取消列表 |
+| B1 | `node-artifacts` scope；**把 A 的 `deregister` 从「删记录」改成「转 tombstone」**（会动既有测试 `nodes.rs:749-758`，需同批更新）；`node_build_artifact` / `node_artifact_list` / `node_artifact_report` / `node_claim_task`（同步）/ `node_purge`；`tasks.nodeId/claimedBy/claimSession/idempotencyKey`；`TaskState::Miss` + 完整转移表 + 终态保护；tombstone 与 `lastArtifacts`；`tasks` prune；异步优先写进 `AGENTS.md` |
+| B2 | helper 认领并执行（clone→install→build→tar→sha256→report）、执行 `node_purge`、上报 `mirror/toolchain/workload`、接收取消列表；**把 `box-helper` 纳入发布**（构建引用 + 安装包 + `dshbox node join` 薄壳） |
 | C | `container.json` 增 `nodeId/placement`；选址与启动下沉 node；跨 node copy = 新建容器 |
 | P | `nodes.relay` 填值，页面通过隧道回传 |
 | D（可后置） | 面板与资源控制界面：node 在线状态、磁盘占用、`node_purge` 入口——接口在 B1 已就位 |
@@ -368,3 +397,57 @@ containers ≤ 数百、tasks **会持续增长**。前三个是毫秒级；**ta
    仍然成立，只是执行者从控制层换成了 node 自己 + 平台的构建可复现性。
 2. **`baseId` 拼法**：那份文档示例写作 `sealed-…`，实际 prepared base id 是 `base-<digest>`
    （`versions.rs:353`），`sealed-*` 是**模板**（`sealed.rs:1035`）。按旧示例实现会把产物行数放大 N 倍。
+
+## 12. 节点怎么就位：谁来把可执行体放到那台机器上
+
+分层的代价是 node 上必须有东西在跑。三条可能的做法，结论先说：**控制面从不主动连 node，
+可执行体由「能进去的那一方」投放，用户设备走同装同 join。**
+
+### 12.1 三种投放路径
+
+| 路径 | 谁投放 | 怎么做 | 适用 |
+|---|---|---|---|
+| **受管后端** | 供给适配器 | WSL2 随 `wsl --import` 的 rootfs 带进去；docker 镜像 `COPY`；libkrun/VZ 的 rootfs 自带 | 控制面能创建/销毁的环境，用户零操作 |
+| **用户设备** | 用户自己 | 装同一个安装包（或解压绿色版），再跑 `dshbox node join --control <url> --grant <一次性 token>` | 另一台 PC、服务器、同事的机器 |
+| 控制面推（不做） | — | ssh/scp 到设备 | 要求 inbound 与长期凭据，破坏「节点只出站」的模型 |
+
+### 12.2 一个安装包，两种角色
+
+`dshbox` 今天把控制面（CLI + daemon + 桌面）与操作面熔在一起。分层之后同一个安装里需要两种角色：
+
+```
+控制角色  dshbox / dshboxd     注册表、派活、页面回传、桌面
+节点角色  box-helper           只注册/心跳/认领/执行/回报；不开窗口、不起 daemon、不监听入站
+```
+
+**节点角色用 `box-helper` 这个独立小二进制**（已存在，236 行，无 Tauri 依赖），而不是给 `dshbox` 加 `--headless`：
+
+- `dshbox` 无条件依赖 Tauri，Linux 上意味着要链接 webkit2gtk：docker 镜像与 WSL rootfs 会因此背几百 MB
+  运行时库，而节点角色一个窗口都不开；
+- `box-helper` 已是 workspace 成员，却**没有任何构建/打包引用**（`git grep box-helper -- scripts/ .github/` 为空）。
+  B2 要做的是把它编出来、放进安装包、再给 `dshbox node join` 一个薄壳（写配置 + 起进程，不重复实现注册逻辑）；
+- 版本一致性靠既有构建戳纪律（「daemon 与桌面同一批」），node 与 control 同包发布；注册时用 `helperVersion`
+  拒绝不兼容（roadmap 风险表已列）。
+
+### 12.3 节点还需要两样东西，不只是二进制
+
+| 需要 | 从哪来 | 时机 |
+|---|---|---|
+| 常量仓库（`harness-mirror.git`） | control 的 `GET /mirror.bundle`：node 拉、校验 sha256、解出裸库 | join 后第一个异步任务 |
+| 该平台工具链（node/pnpm） | 按 `runtime-lock.json` 的校验和从 control 取，或随安装包带 | 同上 |
+
+所以「把二进制传过去」实际是三件：**二进制 + 常量仓库 + 工具链**。后两件由 node 自己取，control 只给地址与摘要；
+这也让「节点在哪个网络里」变得无关——只要能出站连到 control，它就能把自己武装起来。
+
+### 12.4 安全与可达性
+
+- **node 只出站**：注册、心跳、认领、上报都由 node 发起；P 阶段的反向隧道也由 node 发起，control 只在 `127.0.0.1` 上监听给桌面用。
+- **grant 一次性、短 TTL**（A 已实现 `ENROLL_TTL_SECONDS = 300`），session token 只能调 `NODE_METHODS` 白名单里的方法。
+- **control 不信任 node 报的路径**（I8）：`archive` 是不透明句柄，`lastArtifacts` 只用于告诉用户还剩什么。
+- **用户设备的信任来自「用户自己装了它」**：grant 在 control 上生成、由用户带过去，不需要 control 有该设备的 SSH 凭据。
+
+### 12.5 什么时候需要第四种路径
+
+当用户希望 control 直接管一台只提供 inbound 的设备（例如内网服务器）时，再加一个 **SSH 供给适配器**；
+它只是「怎么供给一台 node」的另一种实现，不改变本文的任何数据结构。
+
