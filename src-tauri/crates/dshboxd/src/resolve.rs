@@ -84,6 +84,7 @@ mod tests {
             )),
             events,
             browser: Mutex::new(crate::debug::Sessions::new()),
+            artifacts: crate::node_artifacts::ArtifactIndex::memory(),
         }
     }
 

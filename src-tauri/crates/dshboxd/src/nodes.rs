@@ -37,7 +37,8 @@ pub struct NodeRecord {
     pub id: String,
     /// "host" | "wsl2" | "libkrun" | "vz" | "docker"
     pub kind: String,
-    /// e.g. "windows-x64" / "linux-x64"
+    /// `{OS}-{ARCH}`, e.g. "windows-x86_64" / "linux-x86_64". See
+    /// `is_node_platform`: a package target like "linux-x64" is not valid here.
     pub platform: String,
     pub status: NodeStatus,
     pub capabilities: Vec<String>,
@@ -61,6 +62,23 @@ fn node_key(record: &NodeRecord) -> &str {
     record.id.as_str()
 }
 
+/// One node platform, in the spelling the design fixes (section 2.7):
+/// `{OS}-{ARCH}` from `std::env::consts`, never a package target such as
+/// `linux-x64`. Refusing anything else at enroll is what keeps invariant I1
+/// meaningful: a free-text or empty `node.platform` would make the artifact
+/// platform check pass trivially on a string that names no platform at all.
+pub fn is_node_platform(value: &str) -> bool {
+    matches!(
+        value,
+        "linux-x86_64"
+            | "linux-aarch64"
+            | "windows-x86_64"
+            | "windows-aarch64"
+            | "macos-x86_64"
+            | "macos-aarch64"
+    )
+}
+
 pub const HOST_NODE_ID: &str = "host";
 pub const HEARTBEAT_SECONDS: u64 = 30;
 /// Three missed heartbeats before an online node is marked offline.
@@ -74,6 +92,10 @@ pub const NODE_METHODS: &[&str] = &[
     "node_report",
     "node_echo",
     "node_deregister",
+    // Stage B1: the artifact index is written only by the node that built the
+    // base, and only through this method. Leaving it out is a 403 on the
+    // helper's first report, not a silent no-op.
+    "node_artifact_report",
 ];
 
 /// Constant-time comparison of two bearer strings. Avoids leaking token
@@ -245,6 +267,14 @@ impl NodeManager {
         if kind.trim().is_empty() || !box_foundation::is_safe_identifier(kind) {
             return Err("invalid node kind".to_owned());
         }
+        // Design section 2.7: the platform is `{OS}-{ARCH}` and is checked at
+        // enroll. An empty or free-text value would make I1 (artifact platform
+        // == node platform) vacuously true on a string that names no platform.
+        if !is_node_platform(platform) {
+            return Err(format!(
+                "invalid node platform {platform:?}: expected {{OS}}-{{ARCH}}"
+            ));
+        }
         // "host" names this daemon process. A helper registering under it would
         // overwrite the built-in record with `host_node: false`, and the very
         // next `deregister` would then delete it — the protection that stops a
@@ -276,6 +306,7 @@ impl NodeManager {
         &self,
         enroll_token: &str,
         helper_version: Option<String>,
+        helper_platform: Option<String>,
     ) -> Result<(String, String, u64, u64), String> {
         let grant = {
             let mut grants = self.grants.lock().unwrap();
@@ -289,13 +320,29 @@ impl NodeManager {
             }
             grant
         };
+        // The helper reports the platform it actually runs on (section 2.7).
+        // It wins over the value the supply adapter typed at enroll: the daemon
+        // otherwise validates the adapter's spelling, not the machine's. A
+        // report without one keeps the grant's value, which was validated at
+        // enroll; a report with an invalid one is refused, not folded.
+        let platform = match helper_platform {
+            Some(value) => {
+                if !is_node_platform(&value) {
+                    return Err(format!(
+                        "invalid node platform {value:?}: expected {{OS}}-{{ARCH}}"
+                    ));
+                }
+                value
+            }
+            None => grant.platform.clone(),
+        };
         let epoch = self.current_epoch();
         let session = uuid::Uuid::new_v4().to_string();
         let now = now_seconds();
         let record = NodeRecord {
             id: grant.node_id.clone(),
             kind: grant.kind,
-            platform: grant.platform,
+            platform,
             // Written as `registering` and promoted below, so the record never
             // claims `online` in the window before its session exists. A crash
             // in that window leaves `registering`, which `sweep` expires — the
@@ -427,6 +474,11 @@ impl NodeManager {
         if record.host_node {
             return Err("the built-in host node cannot be deregistered".to_owned());
         }
+        // B1-b2 turns this into a tombstone AND deletes this node's rows from
+        // the node-artifacts scope. Until then a deregistered node leaves orphan
+        // rows behind: a later machine re-enrolling under the same id would
+        // inherit them and §3.2 could skip a build whose tar is on the old
+        // machine. Do not treat those rows as reusable before that batch lands.
         self.collection.remove(id).map_err(|e| e.to_string())?;
         self.sessions.lock().unwrap().remove(id);
         self.events.broadcast(crate::events::DaemonEvent::NodeStatus {
@@ -513,6 +565,74 @@ mod tests {
         )
     }
 
+    /// Design section 2.7: the platform is a small closed set in the
+    /// `{OS}-{ARCH}` spelling. These are the values the reviewers' live probes
+    /// showed the old enroll accepting, which made I1 pass on free text.
+    #[test]
+    fn enroll_refuses_any_platform_that_is_not_os_arch() {
+        let m = manager();
+        for bad in [
+            "banana",
+            "linux-x64", // a package target, not a platform
+            "LINUX-X86_64",
+            "",
+            "win-x64",
+            "linux-x86_64 ",
+        ] {
+            let error = m.enroll("wsl2", bad, vec![], None).unwrap_err();
+            assert!(error.contains("platform"), "{bad:?}: {error}");
+        }
+        for good in [
+            "linux-x86_64",
+            "linux-aarch64",
+            "windows-x86_64",
+            "windows-aarch64",
+            "macos-x86_64",
+            "macos-aarch64",
+        ] {
+            assert!(m.enroll("wsl2", good, vec![], None).is_ok(), "{good:?}");
+        }
+    }
+
+    /// The helper reports the platform it actually runs on, and that value
+    /// wins over the one the supply adapter typed at enroll. Without this,
+    /// the daemon validates the adapter's spelling, not the machine's.
+    #[test]
+    fn register_records_the_platform_the_helper_reported() {
+        let m = manager();
+        let (grant, id, _, _) = m.enroll("wsl2", "windows-x86_64", vec![], None).unwrap();
+        let (_, _, _, _) = m
+            .register(&grant, None, Some("linux-x86_64".to_owned()))
+            .unwrap();
+        assert_eq!(m.get(&id).unwrap().unwrap().platform, "linux-x86_64");
+    }
+
+    /// An invalid helper-reported platform is refused, not folded into the
+    /// grant's value: the grant was already validated at enroll.
+    #[test]
+    fn register_refuses_an_invalid_helper_platform() {
+        let m = manager();
+        let (grant, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], None).unwrap();
+        let error = m
+            .register(&grant, None, Some("banana".to_owned()))
+            .unwrap_err();
+        assert!(error.contains("platform"), "{error}");
+        assert!(
+            m.get(&id).unwrap().is_none(),
+            "a refused register writes no record"
+        );
+    }
+
+    /// No helper platform keeps the grant's (validated) value, so a helper
+    /// built before this field existed can still register.
+    #[test]
+    fn register_without_a_helper_platform_keeps_the_grants_value() {
+        let m = manager();
+        let (grant, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], None).unwrap();
+        m.register(&grant, None, None).unwrap();
+        assert_eq!(m.get(&id).unwrap().unwrap().platform, "linux-x86_64");
+    }
+
     #[test]
     fn node_status_is_lowercase_on_the_wire() {
         assert_eq!(serde_json::to_string(&NodeStatus::Online).unwrap(), "\"online\"");
@@ -532,17 +652,17 @@ mod tests {
     #[test]
     fn enroll_register_and_scoped_session() {
         let m = manager();
-        let (grant, id, epoch, _) = m.enroll("wsl2", "linux-x64", vec!["exec".to_owned()], None).unwrap();
-        assert!(m.enroll("wsl2", "linux-x64", vec![], None).is_ok());
+        let (grant, id, epoch, _) = m.enroll("wsl2", "linux-x86_64", vec!["exec".to_owned()], None).unwrap();
+        assert!(m.enroll("wsl2", "linux-x86_64", vec![], None).is_ok());
         let (session, hb) = {
-            let (rid, token, ep, hb) = m.register(&grant, Some("0.1.0".to_owned())).unwrap();
+            let (rid, token, ep, hb) = m.register(&grant, Some("0.1.0".to_owned()), None).unwrap();
             assert_eq!(rid, id);
             assert_eq!(ep, epoch);
             (token, hb)
         };
         assert_eq!(hb, HEARTBEAT_SECONDS);
         // A second use of the same one-shot grant must fail.
-        assert!(m.register(&grant, None).is_err());
+        assert!(m.register(&grant, None, None).is_err());
         // The session is valid for its own node and current epoch…
         assert!(m.validate_session(Some(&session), Some(&id), epoch));
         // …but not for another node, a stale epoch, or as a global token.
@@ -551,19 +671,24 @@ mod tests {
         assert!(!m.validate_session(None, Some(&id), epoch));
         // Whitelist: a session token cannot reach control-plane methods.
         assert!(NodeManager::is_node_method("node_heartbeat"));
+        // B1: a helper must be able to report a base it built, or its very
+        // first report is a 403 (design section 2.3). The index read stays on
+        // the control-plane side of the split.
+        assert!(NodeManager::is_node_method("node_artifact_report"));
+        assert!(!NodeManager::is_node_method("node_artifact_list"));
         assert!(!NodeManager::is_node_method("list_containers"));
         assert!(!NodeManager::is_node_method("delete_container"));
         let node = m.get(&id).unwrap().unwrap();
         assert_eq!(node.status, NodeStatus::Online);
         assert_eq!(node.kind, "wsl2");
-        assert_eq!(node.platform, "linux-x64");
+        assert_eq!(node.platform, "linux-x86_64");
     }
 
     #[test]
     fn heartbeat_updates_last_seen_and_stale_epoch_is_rejected() {
         let m = manager();
-        let (grant, id, epoch, _) = m.enroll("libkrun", "linux-x64", vec![], None).unwrap();
-        let (session, _, _, _) = m.register(&grant, None).unwrap();
+        let (grant, id, epoch, _) = m.enroll("libkrun", "linux-x86_64", vec![], None).unwrap();
+        let (session, _, _, _) = m.register(&grant, None, None).unwrap();
         let _ = session;
         assert_eq!(m.heartbeat(&id, epoch).unwrap(), NodeStatus::Online);
         assert!(m.heartbeat(&id, epoch + 1).is_err());
@@ -572,8 +697,8 @@ mod tests {
     #[test]
     fn sweep_marks_only_stale_non_host_nodes_offline() {
         let m = manager();
-        let (grant, id, _, _) = m.enroll("docker", "linux-x64", vec![], None).unwrap();
-        m.register(&grant, None).unwrap();
+        let (grant, id, _, _) = m.enroll("docker", "linux-x86_64", vec![], None).unwrap();
+        m.register(&grant, None, None).unwrap();
         // Force the record into the past without sleeping.
         let mut node = m.get(&id).unwrap().unwrap();
         node.last_seen = Some(now_seconds() - OFFLINE_AFTER_SECONDS - 1);
@@ -597,8 +722,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let paths = BoxPaths { config: root.join("config.json"), runtime: Some(root.clone()) };
         let first = NodeManager::load(&paths, "http://127.0.0.1:1".to_owned(), Arc::new(DaemonEvents::new()));
-        let (grant, id, _, _) = first.enroll("wsl2", "linux-x64", vec![], Some("survivor".to_owned())).unwrap();
-        first.register(&grant, None).unwrap();
+        let (grant, id, _, _) = first.enroll("wsl2", "linux-x86_64", vec![], Some("survivor".to_owned())).unwrap();
+        first.register(&grant, None, None).unwrap();
         assert_eq!(first.get(&id).unwrap().unwrap().status, NodeStatus::Online);
 
         let reloaded = NodeManager::load(&paths, "http://127.0.0.1:2".to_owned(), Arc::new(DaemonEvents::new()));
@@ -624,7 +749,7 @@ mod tests {
         let record = NodeRecord {
             id: "n1".to_owned(),
             kind: "wsl2".to_owned(),
-            platform: "linux-x64".to_owned(),
+            platform: "linux-x86_64".to_owned(),
             status: NodeStatus::Draining,
             capabilities: vec!["exec".to_owned()],
             control_url: Some("http://127.0.0.1:1".to_owned()),
@@ -649,7 +774,7 @@ mod tests {
         // assumes the id is not a helper's to take.
         let m = manager();
         let error = m
-            .enroll("wsl2", "linux-x64", vec![], Some(HOST_NODE_ID.to_owned()))
+            .enroll("wsl2", "linux-x86_64", vec![], Some(HOST_NODE_ID.to_owned()))
             .unwrap_err();
         assert!(error.contains("reserved"), "unexpected error: {error}");
         let host = m.get(HOST_NODE_ID).unwrap().unwrap();
@@ -663,20 +788,20 @@ mod tests {
         // register path is reachable without a credential, so telling them
         // apart tells a stranger which guesses were closer.
         let m = manager();
-        let unknown = m.register("no-such-grant", None).unwrap_err();
+        let unknown = m.register("no-such-grant", None, None).unwrap_err();
         let used = {
-            let grant = m.enroll("wsl2", "linux-x64", vec![], Some("g2".into())).unwrap().0;
-            m.register(&grant, None).unwrap();
-            m.register(&grant, None).unwrap_err()
+            let grant = m.enroll("wsl2", "linux-x86_64", vec![], Some("g2".into())).unwrap().0;
+            m.register(&grant, None, None).unwrap();
+            m.register(&grant, None, None).unwrap_err()
         };
         let expired = {
-            let grant = m.enroll("wsl2", "linux-x64", vec![], Some("g3".into())).unwrap().0;
+            let grant = m.enroll("wsl2", "linux-x86_64", vec![], Some("g3".into())).unwrap().0;
             if let Ok(mut grants) = m.grants.lock() {
                 if let Some(g) = grants.get_mut(&grant) {
                     g.expires_at = now_seconds() - 1;
                 }
             }
-            m.register(&grant, None).unwrap_err()
+            m.register(&grant, None, None).unwrap_err()
         };
         assert_eq!(unknown, used);
         assert_eq!(used, expired);
@@ -687,8 +812,8 @@ mod tests {
         // The record must never claim online before its session exists, so
         // the intermediate state has to be real and settled on success.
         let m = manager();
-        let (grant, id, _, _) = m.enroll("wsl2", "linux-x64", vec![], Some("promo".into())).unwrap();
-        m.register(&grant, None).unwrap();
+        let (grant, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("promo".into())).unwrap();
+        m.register(&grant, None, None).unwrap();
         assert_eq!(m.get(&id).unwrap().unwrap().status, NodeStatus::Online);
         assert!(m.has_session(&id), "a successful register leaves a live session");
     }
@@ -697,8 +822,8 @@ mod tests {
     fn a_deregistered_node_has_no_session_left() {
         // An open SSE stream asks exactly this to notice a revocation.
         let m = manager();
-        let (grant, id, _, _) = m.enroll("wsl2", "linux-x64", vec![], Some("revoked".into())).unwrap();
-        m.register(&grant, None).unwrap();
+        let (grant, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("revoked".into())).unwrap();
+        m.register(&grant, None, None).unwrap();
         assert!(m.has_session(&id));
         m.deregister(&id).unwrap();
         assert!(!m.has_session(&id), "revocation must revoke");
@@ -707,15 +832,15 @@ mod tests {
     #[test]
     fn sweep_expires_registering_and_purges_grants() {
         let m = manager();
-        let (grant, id, _, _) = m.enroll("wsl2", "linux-x64", vec![], Some("stuck".into())).unwrap();
-        m.register(&grant, None).unwrap();
+        let (grant, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("stuck".into())).unwrap();
+        m.register(&grant, None, None).unwrap();
         let mut rec = m.get(&id).unwrap().unwrap();
         rec.status = NodeStatus::Registering;
         rec.last_seen = Some(now_seconds() - OFFLINE_AFTER_SECONDS - 1);
         m.collection.upsert(&[rec]).unwrap();
         assert_eq!(m.sweep(), 1);
         assert_eq!(m.get(&id).unwrap().unwrap().status, NodeStatus::Offline);
-        let live = m.enroll("wsl2", "linux-x64", vec![], Some("purge".into())).unwrap().0;
+        let live = m.enroll("wsl2", "linux-x86_64", vec![], Some("purge".into())).unwrap().0;
         if let Ok(mut grants) = m.grants.lock() {
             if let Some(g) = grants.get_mut(&live) {
                 g.expires_at = now_seconds() - 1;
@@ -732,12 +857,12 @@ mod tests {
         // no longer the live credential — checking "a session exists for this
         // node" would keep saying yes forever.
         let m = manager();
-        let (g1, id, _, _) = m.enroll("wsl2", "linux-x64", vec![], Some("dup".into())).unwrap();
-        let (_, first, _, _) = m.register(&g1, None).unwrap();
+        let (g1, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("dup".into())).unwrap();
+        let (_, first, _, _) = m.register(&g1, None, None).unwrap();
         assert!(m.session_still_matches(&id, &first));
-        let (g2, id2, _, _) = m.enroll("wsl2", "linux-x64", vec![], Some("dup".into())).unwrap();
+        let (g2, id2, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("dup".into())).unwrap();
         assert_eq!(id, id2);
-        let (_, second, _, _) = m.register(&g2, None).unwrap();
+        let (_, second, _, _) = m.register(&g2, None, None).unwrap();
         assert_ne!(first, second);
         assert!(m.session_still_matches(&id, &second), "the new bearer is live");
         assert!(!m.session_still_matches(&id, &first), "the replaced bearer is not");
@@ -751,8 +876,8 @@ mod tests {
         // The window between writing the record and promoting it is real; a
         // deregister landing inside it must not be undone by the promote.
         let m = manager();
-        let (grant, id, _, _) = m.enroll("wsl2", "linux-x64", vec![], Some("win".into())).unwrap();
-        m.register(&grant, None).unwrap();
+        let (grant, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("win".into())).unwrap();
+        m.register(&grant, None, None).unwrap();
         m.deregister(&id).unwrap();
         assert!(m.get(&id).unwrap().is_none(), "a promote must not resurrect a deleted node");
     }
@@ -760,8 +885,10 @@ mod tests {
     #[test]
     fn register_records_the_epoch_and_enrol_time_the_promote_guards_on() {
         let m = manager();
-        let (grant, id, epoch, _) = m.enroll("wsl2", "linux-x64", vec![], Some("meta".into())).unwrap();
-        m.register(&grant, None).unwrap();
+        let (grant, id, epoch, _) = m
+            .enroll("wsl2", "linux-x86_64", vec![], Some("meta".into()))
+            .unwrap();
+        m.register(&grant, None, None).unwrap();
         let node = m.get(&id).unwrap().unwrap();
         assert_eq!(node.status, NodeStatus::Online);
         assert_eq!(node.session_epoch, epoch);

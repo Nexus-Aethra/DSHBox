@@ -85,8 +85,10 @@
 ```
 
 校验（写入前，拒绝式）：`nodeId` 存在于 `nodes` 且非 `removed`；`platform == node.platform`；
-`sha256` 为 64 位小写十六进制；`sizeBytes > 0`；`baseId` 以 `base-` 开头且不含 `|`。
-**只有 `node_artifact_report` 走完校验才写行**；任务失败只留 `tasks` 记录。
+`sha256` 为 64 位小写十六进制；`sizeBytes > 0`；`baseId` 形如 `base-<16 位小写 hex>`
+（B1-b1 实现按 `versions.rs:353` 的 `{:016x}` 与 `prepared_base_dir` 的字母表收紧为精确 16 位，
+比本文最初的「以 `base-` 开头且不含 `|`」更严：控制层不应持有 node 侧目录解析会拒绝的行）；
+文本字段非空且 ≤ 4 KiB。**只有 `node_artifact_report` 走完校验才写行**；任务失败只留 `tasks` 记录。
 
 不再存 `verifiedAt`：控制层不 stat node 路径（I8），所以它无法“核对归档摘要”。
 摘要由 node 在构建时计算并在使用时（C 阶段，真正解包前）复算；控制层只校验**形状**并记录。
@@ -325,7 +327,7 @@ node → 控制层（register / heartbeat / claim / report / artifact_report）
 |---|---|---|
 | I1 | `artifact.platform == node.platform` | 写入校验 + 单测（回归防线：写成宿主平台就复现原始 bug） |
 | I2 | 产物行只能由成功 report 产生 | 单测：任务失败后 `node_artifact_list` 为空 |
-| I3 | 一个 node 不能替别的 node 报产物 | `__nodeId` 服务端注入（A 已有）+ 实机探针 |
+| I3 | 一个 node 不能替别的 node 报产物 | `__nodeId` 是服务端保留字段：网关先剥离请求体的值，再用已验证 session 绑定（B1-b1 实现）；主 token 无 session 故根本不能报 + 真实 loopback 测试（删剥离即红）+ 实机探针 |
 | I4 | `(nodeId, baseId)` 唯一 | 主键编码 + 覆盖写 |
 | I5 | `nodes.host` 不可删、不可 deregister、不参与 claim | A 已有 + §2.6 |
 | I6 | 容器引用的 node 必须存在且非 removed | 删除前查 `instances/*/container.json`（本机）+ 远端靠心跳 `workload` + 离线时拒绝删除 |

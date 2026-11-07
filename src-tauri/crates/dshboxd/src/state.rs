@@ -205,6 +205,9 @@ pub(crate) struct DaemonState {
     /// Node registry (roadmap stage A). Shared with connection threads and
     /// the background sweep; clones share the same in-memory sessions.
     pub(crate) nodes: std::sync::Arc<crate::nodes::NodeManager>,
+    /// Which prepared bases exist on which node (stage B1). An index, not the
+    /// bytes: see the module doc for what is and is not verified here.
+    pub(crate) artifacts: crate::node_artifacts::ArtifactIndex,
 }
 
 impl DaemonState {
@@ -245,6 +248,7 @@ impl DaemonState {
             control_url,
             events.clone(),
         ));
+        let artifacts = crate::node_artifacts::ArtifactIndex::load(&paths);
         Ok(Self {
             manager,
             paths: RwLock::new(paths),
@@ -253,6 +257,7 @@ impl DaemonState {
             events,
             browser: Mutex::new(crate::debug::Sessions::new()),
             nodes,
+            artifacts,
         })
     }
 

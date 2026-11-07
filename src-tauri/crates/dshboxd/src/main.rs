@@ -16,6 +16,7 @@ mod events;
 mod extensions;
 mod host;
 mod lifecycle;
+mod node_artifacts;
 mod nodes;
 mod nodes_rpc;
 mod plugins;
@@ -221,6 +222,27 @@ fn graceful_shutdown(state: &DaemonState) {
 /// line), then reads exactly `Content-Length` bytes for the body. This
 /// avoids blocking on `read_to_string` which waits for the client to close
 /// the connection — in HTTP/1.1 the client waits for a response before
+
+/// Bind the server-owned node identity onto an RPC request.
+///
+/// `session_node` is the node the validated session belongs to, or `None` for
+/// a main-token (or one-shot register) caller. The body's `__nodeId` is always
+/// removed first: it is a reserved key, not a parameter, so a caller that can
+/// supply it is exactly the caller that must not be trusted with it. Handlers
+/// then see one value, from one source, and can reject a request with none.
+///
+/// Kept as a pure function so the gateway rule has a test that does not need a
+/// socket: deleting the call site in `handle_http` is a one-line regression
+/// that this test alone cannot catch, but deleting the drop inside here can.
+fn bind_request_node(request: &mut serde_json::Value, session_node: Option<&str>) {
+    if let Some(map) = request.as_object_mut() {
+        map.remove("__nodeId");
+        if let Some(node_id) = session_node {
+            map.insert("__nodeId".to_owned(), serde_json::json!(node_id));
+        }
+    }
+}
+
 /// Read the request line and headers of an incoming HTTP request. Returns
 /// the method and path on success, or `None` on parse error (the caller
 /// should write an error response and return).
@@ -385,10 +407,12 @@ fn handle_http(mut stream: TcpStream, state: Arc<DaemonState>, token: &str) {
         );
         return;
     }
-    // Bind the session to its node so handlers never trust a body-supplied id.
-    if let Some(node_id) = &session_node {
-        request["__nodeId"] = serde_json::json!(node_id);
-    }
+    // `__nodeId` is server-owned. Drop whatever the caller sent, THEN bind it
+    // from the validated session. A main-token caller has no session, so it has
+    // no `__nodeId` at all and node handlers reject the request. Without the
+    // unconditional drop a discovery-token holder could name any node in the
+    // body and write an artifact row on its behalf (I3, design section 2.2).
+    bind_request_node(&mut request, session_node.as_deref());
 
     let response_value = dispatch::dispatch(&state, &request);
     let response_str = serde_json::to_string(&response_value)
@@ -606,4 +630,197 @@ fn main() {
         }
     }
     run();
+}
+
+#[cfg(test)]
+mod gateway_tests {
+    use super::*;
+    use crate::state::DaemonState;
+    use box_foundation::BoxPaths;
+    use box_scheduler::TaskManager;
+    use box_state::ResourceStateManager;
+    use serde_json::{json, Value};
+    use std::io::{BufReader, Read, Write};
+    use std::sync::{Mutex, RwLock};
+
+    fn state() -> Arc<DaemonState> {
+        let events = Arc::new(crate::events::DaemonEvents::new());
+        let empty = BoxPaths {
+            config: std::path::PathBuf::from("/nonexistent"),
+            runtime: None,
+        };
+        Arc::new(DaemonState {
+            manager: TaskManager::memory(),
+            paths: RwLock::new(BoxPaths {
+                config: std::path::PathBuf::from("/nonexistent"),
+                runtime: None,
+            }),
+            containers: Arc::new(Default::default()),
+            resources: ResourceStateManager::default(),
+            events: events.clone(),
+            browser: Mutex::new(crate::debug::Sessions::new()),
+            nodes: Arc::new(crate::nodes::NodeManager::load(
+                &empty,
+                String::new(),
+                events,
+            )),
+            artifacts: crate::node_artifacts::ArtifactIndex::memory(),
+        })
+    }
+
+    /// Drive a request through the real HTTP gateway, not a handler. The
+    /// server thread runs `handle_http` with `main` as its discovery token.
+    fn rpc(state: Arc<DaemonState>, main: &str, body: Value) -> (u16, Value) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = main.to_owned();
+        let server_state = state.clone();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_http(stream, server_state, &token);
+        });
+        let payload = body.to_string();
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            client,
+            "POST /rpc HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            payload.len(),
+            payload
+        )
+        .unwrap();
+        client.flush().unwrap();
+        let mut raw = String::new();
+        BufReader::new(client).read_to_string(&mut raw).unwrap();
+        handle.join().unwrap();
+        let status = raw
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap_or("").trim())
+            .unwrap_or(json!({}));
+        (status, value)
+    }
+
+    fn report_body(node_id: &str) -> Value {
+        json!({
+            "method": "node_artifact_report",
+            "__nodeId": node_id,
+            "baseId": "base-9c1f00d4a1b2c3d4",
+            "sourceCommit": "0d1f500",
+            "platform": "linux-x86_64",
+            "archive": "/var/dshbox/artifacts/base.tar",
+            "sha256": format!("9f2c{}", "a".repeat(60)),
+            "sizeBytes": 1024,
+        })
+    }
+
+    /// The reserved key belongs to the server. A main-token caller cannot
+    /// name a node in the body: with no session there is nothing to bind and
+    /// the report is refused. This is the regression mutation B exposed.
+    #[test]
+    fn a_main_token_cannot_forge_a_node_identity_in_the_body() {
+        let state = state();
+        let main = "main-token";
+        let (grant, id, _, _) = state
+            .nodes
+            .enroll("wsl2", "linux-x86_64", vec![], Some("node-a".to_owned()))
+            .unwrap();
+        state.nodes.register(&grant, None, None).unwrap();
+
+        let mut body = report_body(&id);
+        body["token"] = json!(main);
+        let (status, reply) = rpc(state.clone(), main, body);
+        assert_eq!(status, 200);
+        assert_eq!(reply["ok"], false, "a forged identity must not write a row");
+        assert!(
+            state.artifacts.list(None, None).unwrap().is_empty(),
+            "the index stays empty"
+        );
+    }
+
+    /// A session caller's own forged `__nodeId` is dropped and replaced by
+    /// the session's node, even when the body names another node entirely.
+    #[test]
+    fn a_session_callers_forged_node_identity_is_replaced() {
+        let state = state();
+        let main = "main-token";
+        let (g1, a, _, _) = state
+            .nodes
+            .enroll("wsl2", "linux-x86_64", vec![], Some("node-a".to_owned()))
+            .unwrap();
+        let (_, session, epoch, _) = state.nodes.register(&g1, None, None).unwrap();
+        let (g2, b, _, _) = state
+            .nodes
+            .enroll("wsl2", "linux-x86_64", vec![], Some("node-b".to_owned()))
+            .unwrap();
+        state.nodes.register(&g2, None, None).unwrap();
+
+        let mut body = report_body(&b); // claims the OTHER node
+        body["token"] = json!(session);
+        body["epoch"] = json!(epoch);
+        let (status, reply) = rpc(state.clone(), main, body);
+        assert_eq!(status, 200);
+        assert_eq!(reply["ok"], true, "{reply}");
+        let rows = state.artifacts.list(None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].node_id, a, "the session wins, not the body");
+        assert_eq!(rows[0].id, format!("{a}|base-9c1f00d4a1b2c3d4"));
+    }
+
+    /// `node_register` is the one route with no session but body-supplied
+    /// fields. Stripping the reserved key must not break it: the helper's
+    /// platform has to reach the record, and the enroll grant still works.
+    #[test]
+    fn a_helper_can_still_register_over_the_gateway_with_its_platform() {
+        let state = state();
+        let main = "main-token";
+        let (_, enroll) = rpc(
+            state.clone(),
+            main,
+            json!({
+                "method": "node_enroll",
+                "token": main,
+                "kind": "wsl2",
+                "platform": "windows-x86_64", // the supply adapter's guess
+                "nodeId": "node-a"
+            }),
+        );
+        assert_eq!(enroll["ok"], true, "{enroll}");
+        let grant = enroll["result"]["enrollToken"].as_str().unwrap().to_owned();
+
+        let (status, reply) = rpc(
+            state.clone(),
+            main,
+            json!({
+                "method": "node_register",
+                "enrollToken": grant,
+                "platform": "linux-x86_64", // what the helper actually runs on
+                "helperVersion": "0.1.10"
+            }),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(reply["ok"], true, "{reply}");
+        let node = state.nodes.get("node-a").unwrap().unwrap();
+        assert_eq!(node.platform, "linux-x86_64", "the helper's platform wins");
+    }
+
+    /// The pure helper's rule: drop first, then bind. A unit test so removing
+    /// the drop (the I3 bypass) fails without needing a socket.
+    #[test]
+    fn bind_request_node_drops_before_it_binds() {
+        let mut forged = json!({ "__nodeId": "node-b", "method": "node_artifact_report" });
+        bind_request_node(&mut forged, None);
+        assert!(forged.get("__nodeId").is_none(), "no session, no identity");
+
+        bind_request_node(&mut forged, Some("node-a"));
+        assert_eq!(forged["__nodeId"], "node-a");
+
+        let mut session_forged = json!({ "__nodeId": "node-b" });
+        bind_request_node(&mut session_forged, Some("node-a"));
+        assert_eq!(
+            session_forged["__nodeId"], "node-a",
+            "the forged value is gone"
+        );
+    }
 }
