@@ -305,7 +305,7 @@ pnpm add @nexus-aethra/dsh-box-sandbox
 ```bash
 pnpm install
 pnpm runtime:prepare    # 获取 + 校验 + 解压捆绑的 Node/pnpm/Git 运行时
-pnpm server:prepare     # 构建 dshboxd sidecar
+pnpm server:prepare     # 构建 dshboxd sidecar 与 node helper
 pnpm tauri dev          # 开发模式运行
 ```
 

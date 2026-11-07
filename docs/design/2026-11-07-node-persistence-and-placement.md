@@ -390,7 +390,7 @@ containers ≤ 数百、tasks **会持续增长**。前三个是毫秒级；**ta
 | 阶段 | 内容 |
 |---|---|
 | B1 | `node-artifacts` scope；**把 A 的 `deregister` 从「删记录」改成「转 tombstone」**（会动既有测试 `nodes.rs:749-758`，需同批更新）；`node_build_artifact` / `node_artifact_list` / `node_artifact_report` / `node_claim_task`（同步）/ `node_purge`；`tasks.nodeId/claimedBy/claimSession/idempotencyKey`；`TaskState::Miss` + 完整转移表 + 终态保护；tombstone 与 `lastArtifacts`；`tasks` prune；异步优先写进 `AGENTS.md` |
-| B2 | helper 认领并执行（clone→install→build→tar→sha256→report）、执行 `node_purge`、上报 `mirror/toolchain/workload`、接收取消列表；`GET /mirror.bundle` 与该平台工具链的下载校验（sha256 由控制面生成时计算、写进响应头）；**把 `box-helper` 纳入发布**（构建引用 + 安装包 + 无头设备的节点载荷 + `dshbox node join` 薄壳） |
+| B2 | helper 认领并执行（clone→install→build→tar→sha256→report）、执行 `node_purge`、上报 `mirror/toolchain/workload`、接收取消列表；`GET /mirror.bundle` 与该平台工具链的下载校验（sha256 由控制面生成时计算、写进响应头）；`dshbox node join` 薄壳（`box-helper` 的构建与安装包投放已由 PR #34 完成，不在此阶段） |
 | C | `container.json` 增 `nodeId/placement`；选址与启动下沉 node；跨 node copy = 新建容器 |
 | P | `nodes.relay` 填值，页面通过隧道回传 |
 | D（可后置） | 面板与资源控制界面：node 在线状态、磁盘占用、`node_purge` 入口——接口在 B1 已就位 |
@@ -432,8 +432,9 @@ containers ≤ 数百、tasks **会持续增长**。前三个是毫秒级；**ta
 
 - `dshbox` 无条件依赖 Tauri，Linux 上意味着要链接 webkit2gtk：docker 镜像与 WSL rootfs 会因此背几百 MB
   运行时库，而节点角色一个窗口都不开；
-- `box-helper` 已是 workspace 成员，却**没有任何构建/打包引用**（`git grep box-helper -- scripts/ .github/` 为空）。
-  B2 要做的是把它编出来、放进安装包、再给 `dshbox node join` 一个薄壳（写配置 + 起进程，不重复实现注册逻辑）；
+- `box-helper` 已是 workspace 成员。**构建与打包已由 PR #34 补上**：`scripts/prepare-server.mjs` 与 sidecar
+  同一次 cargo 调用编出、作为 `helper/<target>/` 进入安装包（本节初稿曾写「没有任何构建/打包引用」，那是当时的事实，现已成历史）。
+  B2 剩下的活是 `dshbox node join` 的薄壳（写配置 + 起进程，不重复实现注册逻辑）与真正把它跑起来；
 - 版本一致性靠既有构建戳纪律（「daemon 与桌面同一批」），node 与 control 同包发布；注册时用 `helperVersion`
   拒绝不兼容（roadmap 风险表已列）。
 
