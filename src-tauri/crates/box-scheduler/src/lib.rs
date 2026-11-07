@@ -530,8 +530,16 @@ pub fn run_queued(
                 // the box has already written off.
                 let state = TaskState::from(task.status.as_str());
                 if state != TaskState::Running {
+                    // `try_start` answers `Some` from exactly two places: it
+                    // admitted the task (`running`) or it closed a cancel
+                    // request (`cancelled`). So this status is final by that
+                    // contract -- and it is checked anyway, because the contract
+                    // lives in another function and a caller-visible event must
+                    // not rest on it.
                     notifier.log(task_id, &format!("{state} before execution"));
-                    notifier.finished(task_id, &task.status, task.error.as_deref());
+                    if is_finished_status(&task.status) {
+                        notifier.finished(task_id, &task.status, task.error.as_deref());
+                    }
                     return;
                 }
                 notifier.stage(task_id, &task.stage, task.progress);
@@ -604,9 +612,18 @@ pub fn run_queued(
                     notifier.finished(task_id, &record.status, record.error.as_deref());
                     return;
                 }
-                // finish_rollback failed — the task stays in Failed state
+                // finish_rollback failed. The record, not this closure, knows
+                // what it became: a store write can fail after the in-memory
+                // record already moved to `rolled_back`, and the record may be
+                // gone entirely. The hard-coded `failed` that used to go out
+                // here announced a status the record never held.
                 notifier.log(task_id, "rollback finished unexpectedly");
-                notifier.finished(task_id, "failed", None);
+                match manager.get(task_id).ok().flatten() {
+                    Some(task) if is_finished_status(&task.status) => {
+                        notifier.finished(task_id, &task.status, task.error.as_deref());
+                    }
+                    _ => notifier.log(task_id, "the rollback's own result is unavailable"),
+                }
             }
         }
     }
@@ -650,11 +667,20 @@ fn is_queued(status: &str) -> bool {
     TaskState::from_known(status) == Some(TaskState::Queued)
 }
 
-/// Whether a record reached a state there is nothing further to say about.
+/// Whether a record's own status may be announced as a task's result.
 ///
-/// Unknown statuses are *not* final: this build cannot tell what such a record
-/// is doing, and claiming it finished is the one thing it must not guess.
-fn is_finished_status(status: &str) -> bool {
+/// `failed` counts: it is what `finish` writes for an error, and a caller
+/// waiting on the task treats it as over -- even though the state machine still
+/// allows a rollback from there, which reports again when it lands (with
+/// `rolled_back`, or with this function's answer a second time if the rollback
+/// itself failed).
+///
+/// Unknown statuses are *not* a result: this build cannot tell what such a
+/// record is doing, and claiming it finished is the one thing it must not guess.
+/// Public because the rule belongs to whoever emits the event, not only to
+/// `run_queued`: `DaemonNotifier` forwards the status verbatim into
+/// `TaskFinished`, so an invented one is not caught downstream.
+pub fn is_finished_status(status: &str) -> bool {
     TaskState::from_known(status).is_some_and(|state| state.is_finished())
 }
 
@@ -2564,11 +2590,7 @@ mod tests {
             "running",
             "and the record is untouched"
         );
-        assert_eq!(
-            running(&manager),
-            1,
-            "and the slot stays the other owner's"
-        );
+        assert_eq!(running(&manager), 1, "and the slot stays the other owner's");
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 }

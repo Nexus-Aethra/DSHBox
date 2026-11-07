@@ -432,16 +432,20 @@ command as done only once the installed app has run it.
   `TaskStatus` union in `src/shared/types/domain.ts` therefore has to list both
   spellings and `miss`, or a status the server really sends is one the frontend
   silently falls back on.
-  **Only a record that reached a final state may be announced as finished, and
-  the status announced is the record's own.** `run_queued` gives up on a record
-  that can never be queued again, and `TaskNotifier::finished` is what closes the
-  task on the far end — so a record another owner holds (`running`,
-  `rolling_back`) or that was removed gets a log line and no event. The old
-  fallback reported a removed record as `cancelled` and a `running` one as
-  finished, which puts a result in the stream that nothing wrote. And
-  `try_start`'s "may I admit this" and `run_queued`'s "is this still worth
-  waiting for" are one predicate (`is_queued`): two copies drift into a poll loop
-  that never ends.
+  **Only a record whose own status is a result may be announced as finished, and
+  the status announced is the record's own.** `TaskNotifier::finished` is what
+  closes the task on the far end, and `run_queued` returns without executing
+  anything in three different situations — the record was closed, another owner
+  holds it (`running`, a rollback in flight), or it is gone — so the status must
+  be checked first: `box_scheduler::is_finished_status` is that check, and every
+  emitter (the scheduler's three sites, the desktop's `task://finished`) uses it.
+  `DaemonNotifier` forwards whatever it is handed straight into `TaskFinished`,
+  so an invented status is not caught downstream — the two that used to be
+  invented were a removed record reported as `cancelled` and a `running` one
+  reported as finished. `try_start`'s "may I admit this" and `run_queued`'s "is
+  this still worth waiting for" are one predicate (`is_queued`) so that a later
+  edit to one cannot leave the other waiting on a record the gate will never
+  admit.
   Every stage transition must call `TaskContext::publish_stages`, which reads
   the record back and emits both the one-line summary and the `task_stages`
   event; a stage method that writes but does not publish is persisted and
