@@ -159,6 +159,17 @@ command as done only once the installed app has run it.
   a node's binary is picked up from. It is not run by anything yet — the B2 row
   of `docs/design/2026-11-07-node-persistence-and-placement.md` (§10) is what
   starts it. Building it apart from the sidecar is how the two drift apart silently.
+- **A node-side RPC method must be added to `NODE_METHODS`, and `__nodeId` is server-owned.**
+  A session token may call only the methods listed in `nodes::NODE_METHODS`;
+  omitting a new helper method is a 403 on its first call, not a silent no-op.
+  `__nodeId` is not a parameter: the HTTP gateway (`main.rs::bind_request_node`)
+  strips whatever the body supplied and then binds it from the validated session.
+  A main-token caller has no session, so node handlers see no identity and refuse.
+  A test that only calls the handler with a hand-set `__nodeId` does **not** pin this:
+  the daemon has real-loopback gateway tests, and deleting the strip turns them red.
+  Node platforms are `{OS}-{ARCH}` (`is_node_platform`), checked at enroll and
+  overridden by the helper's own report at `node_register` — otherwise I1
+  (`artifact.platform == node.platform`) is vacuously true on an empty string.
 - **The libkrun backend is experimental and not yet proven.** Its VMM child must be spawned with `configure_non_interactive(&mut cmd, true)` (setsid): `TrackedChild::kill_tree` sends `kill(-pgid, SIGTERM)` on Unix, so a child that inherits the daemon's process group would take the daemon and every host container down when one VM stops. Also, libkrun 1.9 does not auto-mount virtiofs tags — `/dsh`, `/home`, `/container` need explicit guest-side mounts, so the guest exec cannot start as configured. The console chain (`krun_set_console_output` → virtio-console → host `logs/host.log`) has not been verified on a real VM, so it is not guaranteed that `parse_announced_host_url` sees the `dsh web:` line. See `docs/design/2026-11-04-container-runtime-seam.md`.
 - **VM runtime is experimental and WSL2 is not hard isolation.** A container with `runtime: "vm"` / `"vm:<backend>"` opts in; an absent field is host mode. On Windows Home, WHPX/Hyper-V are unavailable, so the only backend is one WSL2 distro per container: mnt/pid/uts namespaces are separate, but the kernel, boot id, hostname and **netns are shared** (a guest loopback port is reachable from the Windows host and from sibling distros). Do not describe it as a security boundary. Copying the 108k-file Harness tree over drvfs takes >25 min at ~1.3 MB/s, while `wsl --import` of a 1.3 GB tar takes 14.5 s — move whole images, not per-file trees. And `client_artifacts_present` compares the marker against the **host's** `build_platform()`, so a Windows-prepared base never satisfies a Linux guest; Linux artifacts must be built inside Linux.
 

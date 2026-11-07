@@ -41,8 +41,13 @@ pub(crate) fn node_register(state: &DaemonState, request: &Value) -> Result<Valu
         return Err("expected enrollToken".to_owned());
     }
     let helper_version = request["helperVersion"].as_str().map(str::to_owned);
+    // The helper reports the platform it compiled for; the daemon validates and
+    // stores that, not the string the supply adapter typed at enroll (§2.7).
+    let helper_platform = request["platform"].as_str().map(str::to_owned);
     let (node_id, session_token, epoch, heartbeat_seconds) =
-        state.nodes.register(&enroll_token, helper_version)?;
+        state
+            .nodes
+            .register(&enroll_token, helper_version, helper_platform)?;
     Ok(json!({
         "nodeId": node_id,
         "sessionToken": session_token,
@@ -208,15 +213,15 @@ mod tests {
             .nodes
             .enroll("wsl2", "linux-x86_64", vec!["build".to_owned()], None)
             .unwrap();
-        state.nodes.register(&grant, None).unwrap();
+        state.nodes.register(&grant, None, None).unwrap();
 
-        let mut request = report_body("base-9c1f00d4", "linux-x86_64");
+        let mut request = report_body("base-9c1f00d4a1b2c3d4", "linux-x86_64");
         request["__nodeId"] = json!(id);
         request["nodeId"] = json!("node-attacker"); // forged; must be ignored
         let row = node_artifact_report(&state, &request).unwrap();
 
         assert_eq!(row["nodeId"], id, "the session wins, not the body");
-        assert_eq!(row["id"], format!("{id}|base-9c1f00d4"));
+        assert_eq!(row["id"], format!("{id}|base-9c1f00d4a1b2c3d4"));
         let rows = node_artifact_list(&state, &json!({ "nodeId": id })).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 1);
         assert_eq!(rows[0]["nodeId"], id);
@@ -232,9 +237,9 @@ mod tests {
             .nodes
             .enroll("wsl2", "linux-x86_64", vec!["build".to_owned()], None)
             .unwrap();
-        state.nodes.register(&grant, None).unwrap();
+        state.nodes.register(&grant, None, None).unwrap();
 
-        let mut request = report_body("base-9c1f00d4", "windows-x86_64");
+        let mut request = report_body("base-9c1f00d4a1b2c3d4", "windows-x86_64");
         request["__nodeId"] = json!(id);
         assert!(node_artifact_report(&state, &request).is_err());
         let rows = node_artifact_list(&state, &json!({})).unwrap();

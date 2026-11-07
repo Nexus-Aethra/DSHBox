@@ -20,6 +20,11 @@ use serde::{Deserialize, Serialize};
 /// schema version stays at v1 (design doc section 5).
 pub const ARTIFACT_SCOPE: &str = "node-artifacts";
 
+/// A text field on a report is a name or an opaque handle, not a payload.
+/// The design caps `tasks.params` at 4 KiB (section 3.5); this is a separate
+/// boundary with its own cap, so a broken helper cannot write an unbounded row.
+const MAX_TEXT_FIELD_BYTES: usize = 4096;
+
 /// One prepared base as it exists on one node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +43,9 @@ pub struct NodeArtifact {
     pub archive: String,
     pub sha256: String,
     pub size_bytes: u64,
+    /// When the control plane *received* the report (now_seconds), not when the
+    /// node finished the build: the report carries no build timestamp, and this
+    /// index makes no claim about the node's clock (design section 2.2).
     pub built_at: u64,
 }
 
@@ -65,15 +73,22 @@ pub struct ArtifactReport {
     pub size_bytes: u64,
 }
 
-/// A base id is base-<digest> and nothing else.
+/// A base id is `base-<digest>` and nothing else.
 ///
-/// The spelling matters: a prepared base is base-<digest> while a template is
-/// sealed-<digest>, and rows keyed by the template spelling would multiply by
-/// the number of templates built on one base (design doc section 11).
+/// Two spellings matter. A prepared base is `base-<digest>` while a template is
+/// `sealed-<digest>`, so rows keyed by the template spelling would multiply by
+/// the number of templates built on one base (design doc section 11). And the
+/// digest is exactly what `versions.rs:353` produces (16 lowercase hex digits)
+/// and `prepared_base_dir` will accept (`is_safe_identifier`): a looser shape
+/// here would let a report name a base the node's own directory resolution
+/// refuses — the control plane would hold a row for a base that cannot exist.
 pub fn is_base_id(value: &str) -> bool {
     match value.strip_prefix("base-") {
         Some(digest) => {
-            !digest.is_empty() && !digest.contains('|') && !digest.chars().any(char::is_whitespace)
+            digest.len() == 16
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         }
         None => false,
     }
@@ -127,11 +142,15 @@ impl ArtifactIndex {
 
     pub fn get(&self, node_id: &str, base_id: &str) -> BoxResult<Option<NodeArtifact>> {
         let id = artifact_id(node_id, base_id);
+        // The composite id is a single string, so a row whose fields disagree
+        // with it must not be returned as if it were that pair: `list` filters
+        // on the fields, and the two answers would otherwise diverge (design
+        // section 2.2; the separator has no escape in this encoding).
         Ok(self
             .collection
             .load_all()?
             .into_iter()
-            .find(|row| row.id == id))
+            .find(|row| row.id == id && row.node_id == node_id && row.base_id == base_id))
     }
 
     /// Record a build a node reports as done, or refuse it.
@@ -146,7 +165,7 @@ impl ArtifactIndex {
     ) -> Result<NodeArtifact, String> {
         if !is_base_id(&report.base_id) {
             return Err(format!(
-                "baseId must be base-<digest> with no '|' or whitespace: {:?}",
+                "baseId must be base-<16 lowercase hex digits>: {:?}",
                 report.base_id
             ));
         }
@@ -159,11 +178,21 @@ impl ArtifactIndex {
         if report.size_bytes == 0 {
             return Err("sizeBytes must be greater than zero".to_owned());
         }
-        if report.source_commit.trim().is_empty() {
-            return Err("sourceCommit is required".to_owned());
-        }
-        if report.archive.trim().is_empty() {
-            return Err("archive is required".to_owned());
+        for (name, value) in [
+            ("baseId", report.base_id.as_str()),
+            ("sourceCommit", report.source_commit.as_str()),
+            ("platform", report.platform.as_str()),
+            ("archive", report.archive.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("{name} is required"));
+            }
+            if value.len() > MAX_TEXT_FIELD_BYTES {
+                return Err(format!(
+                    "{name} exceeds {MAX_TEXT_FIELD_BYTES} bytes: {}",
+                    value.len()
+                ));
+            }
         }
         // Invariant I1, and the reason it is a rejection: an artifact's platform
         // is the node's. A helper that reports the platform it *runs on* (a WSL2
@@ -226,7 +255,7 @@ mod tests {
 
     fn sample(platform: &str) -> ArtifactReport {
         ArtifactReport {
-            base_id: "base-9c1f00d4".to_owned(),
+            base_id: "base-9c1f00d4a1b2c3d4".to_owned(),
             source_commit: "0d1f500".to_owned(),
             platform: platform.to_owned(),
             archive: "/var/dshbox/artifacts/base-9c1f00d4-task-1.tar".to_owned(),
@@ -240,15 +269,18 @@ mod tests {
         let index = ArtifactIndex::memory();
         let wsl = node("node-3f9a", "linux-x86_64");
         let row = index.report(&wsl, &sample("linux-x86_64")).unwrap();
-        assert_eq!(row.id, "node-3f9a|base-9c1f00d4");
+        assert_eq!(row.id, "node-3f9a|base-9c1f00d4a1b2c3d4");
         assert_eq!(row.node_id, "node-3f9a");
-        assert_eq!(row.base_id, "base-9c1f00d4");
+        assert_eq!(row.base_id, "base-9c1f00d4a1b2c3d4");
         assert_eq!(row.platform, "linux-x86_64");
         assert_eq!(row.sha256, sha());
         assert_eq!(row.size_bytes, 1_327_000_000);
         assert!(row.built_at > 0);
         assert_eq!(index.list(None, None).unwrap(), vec![row.clone()]);
-        assert_eq!(index.get("node-3f9a", "base-9c1f00d4").unwrap(), Some(row));
+        assert_eq!(
+            index.get("node-3f9a", "base-9c1f00d4a1b2c3d4").unwrap(),
+            Some(row)
+        );
     }
 
     /// Invariant I1, as a bug this repository has already written once: a row
@@ -272,18 +304,26 @@ mod tests {
         let index = ArtifactIndex::memory();
         let wsl = node("node-3f9a", "linux-x86_64");
 
-        let mut report = sample("linux-x86_64");
-        report.base_id = "sealed-9c1f00d4".to_owned();
-        assert!(index
-            .report(&wsl, &report)
-            .unwrap_err()
-            .contains("base-<digest>"));
-
-        let mut report = sample("linux-x86_64");
-        report.base_id = "base-9c1f|00d4".to_owned();
+        // The base id must be exactly what versions.rs:353 produces. These
+        // are the spellings the first review's truth table showed the loose
+        // validator accepting: a template id, a path-shaped digest, a package
+        // target, non-ASCII, uppercase, a separator, and a short digest.
+        for bad in [
+            "sealed-9c1f00d4a1b2c3d4",
+            "base-../../etc/passwd",
+            "base-中文中文中文中文中文中文中文",
+            "base-9C1F00D4A1B2C3D4",
+            "base-9c1f|00d4a1b2c3d",
+            "base-9c1f00d4",
+            "base-9c1f00d4a1b2c3d45",
+        ] {
+            let mut report = sample("linux-x86_64");
+            report.base_id = bad.to_owned();
+            assert!(index.report(&wsl, &report).is_err(), "{bad:?} was accepted");
+        }
         assert!(
-            index.report(&wsl, &report).is_err(),
-            "the key separator is reserved"
+            sample("linux-x86_64").base_id.len() == 21,
+            "test fixture is 16 hex"
         );
 
         let mut report = sample("linux-x86_64");
@@ -318,6 +358,37 @@ mod tests {
         );
     }
 
+    /// A report is a small record, not a channel for arbitrary bytes. The cap
+    /// is this RPC's own, not the tasks.params one from design section 3.5.
+    #[test]
+    fn a_text_field_longer_than_the_cap_is_refused() {
+        let index = ArtifactIndex::memory();
+        let wsl = node("node-3f9a", "linux-x86_64");
+        let mut report = sample("linux-x86_64");
+        report.archive = "a".repeat(MAX_TEXT_FIELD_BYTES + 1);
+        let error = index.report(&wsl, &report).unwrap_err();
+        assert!(error.contains("archive"), "{error}");
+        assert!(index.list(None, None).unwrap().is_empty());
+    }
+
+    /// `get` answers for a pair, not merely for a concatenated id, so a row
+    /// whose id and fields disagree is not silently returned as that pair.
+    #[test]
+    fn get_checks_the_fields_as_well_as_the_composite_id() {
+        let index = ArtifactIndex::memory();
+        let wsl = node("node-3f9a", "linux-x86_64");
+        let mut row = index.report(&wsl, &sample("linux-x86_64")).unwrap();
+        row.node_id = "node-forged".to_owned();
+        index.collection.upsert(&[row]).unwrap();
+        assert!(
+            index
+                .get("node-3f9a", &sample("linux-x86_64").base_id)
+                .unwrap()
+                .is_none(),
+            "the row no longer describes that pair"
+        );
+    }
+
     /// Invariant I4: one node, one base, one row. A rebuild for the same pair
     /// replaces it, which is what a stale-platform retry relies on.
     #[test]
@@ -334,7 +405,7 @@ mod tests {
         assert_eq!(rows[0].id, first.id);
         assert_eq!(rows[0].archive, retry.archive);
         assert_eq!(
-            index.get("node-3f9a", "base-9c1f00d4").unwrap(),
+            index.get("node-3f9a", "base-9c1f00d4a1b2c3d4").unwrap(),
             Some(second)
         );
     }
@@ -346,17 +417,23 @@ mod tests {
         let b = node("node-b", "linux-x86_64");
         index.report(&a, &sample("linux-x86_64")).unwrap();
         let mut other = sample("linux-x86_64");
-        other.base_id = "base-5e5e5e5e".to_owned();
+        other.base_id = "base-5e5e5e5e5e5e5e5e".to_owned();
         index.report(&a, &other).unwrap();
         index.report(&b, &sample("linux-x86_64")).unwrap();
 
         assert_eq!(index.list(None, None).unwrap().len(), 3);
         assert_eq!(index.list(Some("node-a"), None).unwrap().len(), 2);
         assert_eq!(index.list(Some("node-b"), None).unwrap().len(), 1);
-        assert_eq!(index.list(None, Some("base-9c1f00d4")).unwrap().len(), 2);
         assert_eq!(
             index
-                .list(Some("node-b"), Some("base-5e5e5e5e"))
+                .list(None, Some("base-9c1f00d4a1b2c3d4"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            index
+                .list(Some("node-b"), Some("base-5e5e5e5e5e5e5e5e"))
                 .unwrap()
                 .len(),
             0

@@ -1,7 +1,10 @@
 # 2026-11-04 — Node 产物（stage B）：异步「构筑虚拟机版」
 
-> 状态：**设计**。前一支 `feat/node-core`（A）已合并，本文件是 B 的施工依据。
+> 状态：**设计（B1-b1 已落地一部分）**。前一支 `feat/node-core`（A）已合并，本文件是 B 的施工依据。
 > 父文档：`docs/design/2026-11-04-node-architecture-roadmap.md`。
+> **权威设计以 [`2026-11-07-node-persistence-and-placement.md`](2026-11-07-node-persistence-and-placement.md) 为准**：
+> 本文的两处旧结论已被推翻，见文末「与 v3 设计的差异」。B1-b1 已实现产物索引、
+> `node_artifact_list` / `node_artifact_report` 两个 RPC 与平台校验；其余（任务派发、认领、清理）仍在 B1-b2 / B2。
 
 ## 要解决的问题
 
@@ -23,19 +26,21 @@ A 让节点能注册。B 让节点**干活并交出产物**：模板里「构筑
 
 ```rust
 pub struct NodeArtifact {
+    pub id: String,             // "<nodeId>|<baseId>"，documents 单列主键
     pub node_id: String,        // 哪个 node 编出来的
-    pub base_id: String,        // 哪个 prepared base（版本级）
+    pub base_id: String,        // base-<16 位小写 hex>，是 prepared base 不是 sealed 模板
     pub source_commit: String,  // 冗余存，便于 index 自洽检查
-    pub platform: String,       // 产物自身平台，如 linux-x86_64
-    pub archive: PathBuf,       // 该 node 可访问的路径
-    pub sha256: String,         // 产物归档摘要
+    pub platform: String,       // 必须等于 node.platform，{OS}-{ARCH} 拼法
+    pub archive: String,        // 不透明句柄；控制层不 stat、不拼路径（I8）
+    pub sha256: String,         // 64 位小写 hex；node 构建时算，C 阶段解包前复算
     pub size_bytes: u64,
-    pub built_at: u64,
+    pub built_at: u64,          // 控制层收到 report 的时刻，不是 node 构建完成时刻
 }
 ```
 
-键：`(node_id, base_id)`。落在现有 `DocumentStore` 的 `node-artifacts` collection，
-不引入 `PRAGMA user_version` 迁移（与 A 的 `NodeRecord` 同一策略）。
+键：`(node_id, base_id)`，编码为 `<nodeId>|<baseId>`。落在现有 `DocumentStore` 的
+`node-artifacts` scope，不引入 `PRAGMA user_version` 迁移（与 A 的 `NodeRecord` 同一策略）。
+**不存 `verifiedAt`**：控制层到不了 node 的路径，无从「核对磁盘上的实际摘要」。
 
 **不存什么**：不存 DSH 源码树、不存插件、不存 profile。一个 DSH 版本一个 base；
 一份 (node, base) 一份镜像；N 个 sealed 模板共享该 base。
@@ -44,13 +49,15 @@ pub struct NodeArtifact {
 
 | method | 凭证 | 参数 | 返回 |
 |---|---|---|---|
-| `node_artifact_report` | session | `{ baseId, platform, sha256, sizeBytes, archive }` | `{ ok, artifactId }` |
+| `node_artifact_report` | session | `{ baseId, sourceCommit, platform, sha256, sizeBytes, archive }` | `NodeArtifact` 行 |
 | `node_artifact_list` | 主 token | `{ nodeId? }` | `NodeArtifact[]` |
 | `node_build_artifact` | 主 token | `{ nodeId, baseId }` | `{ taskId }` |
 
-`node_artifact_report` 走 A 已建立的白名单机制：**加进 `NODE_METHODS`**，
-并且 `__nodeId` 由服务端注入 —— 一个 node 只能为自己的 id 报产物，
-不能替别的 node 声明「我编好了」。这一点 A 的测试已经钉住机制，B 只需复用。
+`node_artifact_report` 走 A 已建立的白名单机制：**加进 `NODE_METHODS`**（漏了就是 helper
+第一次调用 403），并且 `__nodeId` 是**服务端保留字段**：网关先无条件剥掉请求体里带来的值，
+再用已验证 session 的节点覆盖它。主 token 没有 session，因此根本不能替任何 node 报产物。
+网关层有真实 loopback 回归测试（删掉剥离那行，测试立刻红）——只在 handler 里读这个字段
+是不够的，调用方可以直接伪造请求体。
 
 `node_build_artifact` 是**控制层派活**：它进 `box-scheduler` 队列，
 resource key 加 `node:<id>`，再由 SSE 把任务推给该 node 的 helper（A 的流已经能把事件送到位）。
@@ -59,10 +66,11 @@ resource key 加 `node:<id>`，再由 SSE 把任务推给该 node 的 helper（A
 
 ### 1. 产物归属用 digest 而不是 trust
 
-helper 报上来的是 `sha256`。控制层**校验后再入库**：
-长度/字符集先查，然后按需（首次引用时）核对归档在磁盘上的实际摘要。
+helper 报上来的是 `sha256`。控制层**只校验形状后入库**（长度/字符集/大小/平台/节点归属）；
+真正解包前的摘要复算发生在 node 侧（C 阶段），因为控制层到不了 node 的路径（I8）。
 理由与 `latest.json` 那条规则同源：一个 tag 不说明字节，同理「helper 说编好了」
-也不说明那些字节就是我们想要的构建。
+也不说明那些字节就是我们想要的构建 —— 只是核对者从控制层换成了 node 自己。
+见 v3 设计 §11。
 
 ### 2. `platform` 与宿主解耦
 
@@ -119,3 +127,22 @@ docs/design/2026-11-04-node-artifact.md          本文件
 - 不做 docker 供给适配器（C 之后）。
 - 不做面板（D）。
 - 不改 `container.json` 的 `runtime` 字段（C）。
+
+## 与 v3 设计的差异（v3 为准）
+
+[`2026-11-07-node-persistence-and-placement.md`](2026-11-07-node-persistence-and-placement.md)
+§11 逐条修订了本文的两处旧结论，B1-b1 按 v3 实现：
+
+1. **信任模型**：本文原写「控制层核对磁盘上的实际摘要」。控制层到不了 node 的路径（I8），
+   改为 node 算摘要并上报、控制层校验形状；解包前复算在 node 侧。
+2. **`baseId` 拼法**：本文示例写作 `sealed-…`，实际 prepared base id 是 `base-<16 位小写 hex>`
+   （`versions.rs:353`），`sealed-*` 是模板。按旧示例实现会把产物行数放大 N 倍。
+
+另外两点在 v3 里收紧，本文当时未覆盖：
+
+3. **平台拼法**：`node.platform` 与 `artifact.platform` 一律 `{OS}-{ARCH}`，enroll 时白名单校验，
+   `node_register` 用 helper 自报的值覆盖 grant 里的值；否则「产物平台 == 节点平台」在空串或
+   自由文本上恒真，I1 形同虚设。
+4. **任务状态**：失联是 `miss`（终态），不伪装成 `failed`；终态任务不受迟到回报影响。
+   回滚到旧 daemon 时 `miss` 会被读成 `failed`（v3 §5），所以 daemon 与桌面必须同批重建，
+   不与旧版本混跑。
