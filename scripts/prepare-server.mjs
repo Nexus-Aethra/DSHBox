@@ -1,4 +1,4 @@
-import { copyFile, mkdir, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, utimes, writeFile } from 'node:fs/promises'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { arch, env, platform } from 'node:process'
 import { spawnSync } from 'node:child_process'
@@ -39,6 +39,11 @@ const force = process.argv.includes('--force')
 const localDeps = readLocalDeps(join('src-tauri', 'crates', 'dshboxd', 'Cargo.toml'))
 const sources = [
   ...localDeps.map((name) => join('src-tauri', 'crates', name)),
+  // The helper is staged by this script too, so its sources must count as
+  // staleness for both artifacts. Without this, editing only the helper left the
+  // previously staged copy in every installer -- the exact drift that building
+  // the two together exists to prevent.
+  join('src-tauri', 'crates', 'box-helper'),
   join('src-tauri', 'Cargo.lock'),
 ]
 if (!isFresh(destination, sources, force) || !isFresh(helperDestination, sources, force)) {
@@ -58,6 +63,8 @@ const inputs = [
   join('src-tauri', 'Cargo.lock'),
   join('src-tauri', 'crates', 'dshboxd', 'Cargo.toml'),
   ...walkRustFiles(join('src-tauri', 'crates', 'dshboxd', 'src')),
+  join('src-tauri', 'crates', 'box-helper', 'Cargo.toml'),
+  ...walkRustFiles(join('src-tauri', 'crates', 'box-helper', 'src')),
 ]
 if (hashInputs(cacheFile, inputs, force) && existsSync(destination) && existsSync(helperDestination)) {
   console.log(`server sidecar inputs unchanged (hash cache hit at ${cacheFile}); skipping cargo build`)
@@ -85,7 +92,10 @@ async function rebuild(destination, target, force) {
   // when tauri-build later copies resources/server/<target>/dshboxd. Stop it
   // before rebuilding so the copy succeeds.
   if (!windows) {
-    const kill = spawnSync('pkill', ['-f', 'dshboxd'], { stdio: 'ignore' })
+    // The helper will need the same treatment once something runs it on this
+    // host. On Windows neither binary can be replaced while it is running
+    // (EBUSY), which is why the stop lives in the Unix branch.
+    const kill = spawnSync('pkill', ['-f', 'dshboxd|box-helper'], { stdio: 'ignore' })
     if (kill.status === null) {
       console.log('no running dshboxd to stop')
     }
@@ -102,6 +112,12 @@ async function rebuild(destination, target, force) {
 
   // One cargo invocation for both artifacts: they share the dependency graph,
   // and building them separately would compile it twice.
+  // `-p` selects each package's default targets, which is one binary each today
+  // (dshboxd/Cargo.toml and box-helper/Cargo.toml declare a single `[[bin]]`) --
+  // that equality is the precondition for using `-p` instead of naming the bins.
+  // Naming them instead (`--bin dshboxd --bin box-helper`) does not work here:
+  // without a `-p` to scope it, cargo looks the name up in the default-run
+  // package and fails with "no bin target named `dshboxd`".
   const cargoArgs = ['build', '--release', '--manifest-path', 'src-tauri/Cargo.toml', '-p', 'dshboxd', '-p', 'box-helper']
   if (rustTarget) cargoArgs.push('--target', rustTarget)
   const result = spawnSync('cargo', cargoArgs, { stdio: 'inherit', env: windows ? { ...env, CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: env.CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER ?? 'x86_64-w64-mingw32-gcc' } : env })
@@ -112,5 +128,14 @@ async function rebuild(destination, target, force) {
   console.log(`prepared server sidecar at ${destination}`)
   await mkdir(join('src-tauri', 'resources', 'helper', target), { recursive: true })
   await copyFile(join(binDir, `box-helper${copyExtension}`), helperDestination)
+  // Stamp both staged copies with "now". `copyFile` keeps the source mtime and
+  // cargo only relinks a binary whose own sources changed, so a staged artifact
+  // would stay older than some watched file forever: the mtime gate above would
+  // be false on every run and the hash-cache shortcut unreachable, turning every
+  // `server:prepare` into a full rebuild. The gate only answers "is anything
+  // newer than what I staged"; the hash cache is what decides real work.
+  const stagedAt = new Date()
+  await utimes(destination, stagedAt, stagedAt)
+  await utimes(helperDestination, stagedAt, stagedAt)
   console.log(`prepared node helper at ${helperDestination}`)
 }

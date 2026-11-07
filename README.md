@@ -329,7 +329,7 @@ Prerequisites: [Node.js](https://nodejs.org) 22.13+ with pnpm (the pinned `packa
 ```bash
 pnpm install
 pnpm runtime:prepare    # fetch + verify + extract the bundled Node/pnpm/Git runtime
-pnpm server:prepare     # build the dshboxd sidecar
+pnpm server:prepare     # build the dshboxd sidecar and the node helper
 pnpm tauri dev          # run in development
 ```
 
