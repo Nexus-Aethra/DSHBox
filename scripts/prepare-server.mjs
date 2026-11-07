@@ -44,28 +44,38 @@ const sources = [
   // previously staged copy in every installer -- the exact drift that building
   // the two together exists to prevent.
   join('src-tauri', 'crates', 'box-helper'),
+  // Profiles, features and workspace dependencies live here; a change to any of
+  // them changes both artifacts, and neither gate used to look at this file.
+  join('src-tauri', 'Cargo.toml'),
   join('src-tauri', 'Cargo.lock'),
 ]
-if (!isFresh(destination, sources, force) || !isFresh(helperDestination, sources, force)) {
-  // Stale → rebuild, skip the hash-cache short-circuit entirely.
-  await rebuild(destination, target, force)
-  process.exit(0)
-}
 
-// mtime says fresh. Now ask the hash cache whether the daemon's own
-// sources actually changed since the last build — when they didn't,
-// save a 30+ second incremental cargo invocation. When the hash matches
-// but the binary is gone, fall through to a real rebuild.
+// The mtime gate above only decides whether asking the hash cache is worth it;
+// the cache decides whether work is really needed. Keep the two lists in step:
+// a file in one and not the other is either a needless rebuild or, worse, a
+// silently stale artifact.
 const cacheRoot = join('.cache', 'dsh-box', 'server')
 await mkdir(cacheRoot, { recursive: true })
 const cacheFile = join(cacheRoot, `${target}.sha256`)
 const inputs = [
+  join('src-tauri', 'Cargo.toml'),
   join('src-tauri', 'Cargo.lock'),
   join('src-tauri', 'crates', 'dshboxd', 'Cargo.toml'),
+  join('src-tauri', 'crates', 'dshboxd', 'build.rs'),
   ...walkRustFiles(join('src-tauri', 'crates', 'dshboxd', 'src')),
   join('src-tauri', 'crates', 'box-helper', 'Cargo.toml'),
   ...walkRustFiles(join('src-tauri', 'crates', 'box-helper', 'src')),
 ]
+
+if (!isFresh(destination, sources, force) || !isFresh(helperDestination, sources, force)) {
+  // Stale → rebuild. Record the digest *before* compiling, so it describes the
+  // inputs that are about to be built: written afterwards (as it was on the miss
+  // path below) the next unchanged run misses again, and every real edit cost two
+  // full rebuilds instead of one.
+  hashInputs(cacheFile, inputs, true)
+  await rebuild(destination, target, force)
+  process.exit(0)
+}
 if (hashInputs(cacheFile, inputs, force) && existsSync(destination) && existsSync(helperDestination)) {
   console.log(`server sidecar inputs unchanged (hash cache hit at ${cacheFile}); skipping cargo build`)
   process.exit(0)
@@ -97,7 +107,7 @@ async function rebuild(destination, target, force) {
     // (EBUSY), which is why the stop lives in the Unix branch.
     const kill = spawnSync('pkill', ['-f', 'dshboxd|box-helper'], { stdio: 'ignore' })
     if (kill.status === null) {
-      console.log('no running dshboxd to stop')
+      console.log('no running dshboxd or box-helper to stop')
     }
   }
 
@@ -120,6 +130,10 @@ async function rebuild(destination, target, force) {
   // package and fails with "no bin target named `dshboxd`".
   const cargoArgs = ['build', '--release', '--manifest-path', 'src-tauri/Cargo.toml', '-p', 'dshboxd', '-p', 'box-helper']
   if (rustTarget) cargoArgs.push('--target', rustTarget)
+  // Take the stamp before compiling, so that a file edited *during* the build is
+  // newer than what we are about to stage and the next run rebuilds. Taken after
+  // the copy, that window would be invisible.
+  const stagedAt = new Date()
   const result = spawnSync('cargo', cargoArgs, { stdio: 'inherit', env: windows ? { ...env, CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: env.CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER ?? 'x86_64-w64-mingw32-gcc' } : env })
   if (result.status !== 0) process.exit(result.status ?? 1)
   const binDir = join('src-tauri', 'target', ...(rustTarget ? [rustTarget] : []), 'release')
@@ -134,7 +148,6 @@ async function rebuild(destination, target, force) {
   // be false on every run and the hash-cache shortcut unreachable, turning every
   // `server:prepare` into a full rebuild. The gate only answers "is anything
   // newer than what I staged"; the hash cache is what decides real work.
-  const stagedAt = new Date()
   await utimes(destination, stagedAt, stagedAt)
   await utimes(helperDestination, stagedAt, stagedAt)
   console.log(`prepared node helper at ${helperDestination}`)
