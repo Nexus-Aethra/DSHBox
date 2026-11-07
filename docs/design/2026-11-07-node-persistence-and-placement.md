@@ -432,8 +432,9 @@ containers ≤ 数百、tasks **会持续增长**。前三个是毫秒级；**ta
 
 - `dshbox` 无条件依赖 Tauri，Linux 上意味着要链接 webkit2gtk：docker 镜像与 WSL rootfs 会因此背几百 MB
   运行时库，而节点角色一个窗口都不开；
-- `box-helper` 已是 workspace 成员，却**没有任何构建/打包引用**（`git grep box-helper -- scripts/ .github/` 为空）。
-  B2 要做的是把它编出来、放进安装包、再给 `dshbox node join` 一个薄壳（写配置 + 起进程，不重复实现注册逻辑）；
+- `box-helper` 已是 workspace 成员。**构建与打包已由 PR #34 补上**：`scripts/prepare-server.mjs` 与 sidecar
+  同一次 cargo 调用编出、作为 `helper/<target>/` 进入安装包（所以上句「没有任何构建/打包引用」已成历史）。
+  B2 剩下的活是 `dshbox node join` 的薄壳（写配置 + 起进程，不重复实现注册逻辑）与真正把它跑起来；
 - 版本一致性靠既有构建戳纪律（「daemon 与桌面同一批」），node 与 control 同包发布；注册时用 `helperVersion`
   拒绝不兼容（roadmap 风险表已列）。
 
