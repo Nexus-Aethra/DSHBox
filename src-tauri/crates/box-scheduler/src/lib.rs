@@ -513,14 +513,17 @@ impl TaskContext {
 /// is executed while resource locks are still held (via `start_rollback` /
 /// `finish_rollback`), so the rollback has exclusive access to the resource.
 ///
-/// **That path cannot start as things stand, and no caller passes `Some`.** When
-/// `work` fails the record is still `running`, and `start_rollback` only accepts
-/// `failed -> rolling_back`, so it answers an error and the rollback is skipped
-/// in silence. Making it reachable means deciding where the slot is released
-/// relative to the rollback -- it is held today for exclusive access, and
-/// `finish` is what releases it -- which is a change of its own. Until then the
-/// branch below is kept honest rather than deleted, so that whoever wires it up
-/// does not also inherit an invented status.
+/// **That path cannot start from the contract's own flow, and no caller passes
+/// `Some`.** When `work` fails the record is still `running`, and
+/// `start_rollback` only accepts `failed -> rolling_back`, so it answers an error
+/// and the rollback is skipped; a `work` closure that closes its own record can
+/// still reach it, which is how one of the tests gets there, and nothing outside
+/// a test does that. Making it properly reachable means deciding where the slot
+/// is released relative to the rollback -- it is held today for exclusive access,
+/// and `finish` is what releases it, while `is_live_record` does not count
+/// `rolling_back` -- which is a change of its own. Until then the branch below is
+/// kept honest rather than deleted, so that whoever wires it up does not also
+/// inherit an invented status.
 pub fn run_queued(
     manager: &TaskManager,
     paths: &BoxPaths,
@@ -609,7 +612,15 @@ pub fn run_queued(
     if result.is_err() {
         if let Some(rollback_fn) = rollback {
             // Mark as RollingBack so the UI shows the transition
-            if let Ok(record) = manager.start_rollback(paths, task_id) {
+            let started = manager.start_rollback(paths, task_id);
+            // A refusal used to be invisible: the branch simply did not run.
+            // Nothing reaches that state from the contract's own flow (see
+            // above), so if it ever happens the log is the only notice anyone
+            // gets.
+            if let Err(error) = &started {
+                notifier.log(task_id, &format!("rollback not started: {error}"));
+            }
+            if let Ok(record) = started {
                 notifier.stage(task_id, &record.stage, record.progress);
                 notifier.log(task_id, "rollback started");
                 rollback_fn(&context);
@@ -1338,6 +1349,15 @@ impl TaskManager {
 
     /// Mark a rollback as completed (RollingBack → RolledBack) or failed
     /// (RollingBack → Failed with `rollback_error`). Releases resource locks.
+    ///
+    /// The release here is unconditional, unlike `finish`'s, because a rollback
+    /// is supposed to still hold its slot for exclusive access -- but
+    /// `is_live_record` does not count `rolling_back`, so a record whose slot
+    /// was already released (by `finish`, the only way into this state today)
+    /// gets it released a second time. That is part of the unfinished rollback
+    /// wiring described on `run_queued`, not something to fix by guarding this
+    /// release: the guard that looks right here would skip the release on the
+    /// flow the design intends.
     pub fn finish_rollback(
         &self,
         _paths: &BoxPaths,
@@ -1882,10 +1902,15 @@ mod tests {
             self.logs.lock().unwrap().push(format!("{task_id}:{line}"));
         }
         fn finished(&self, task_id: &str, status: &str, _error: Option<&str>) {
-            self.finished
-                .lock()
-                .unwrap()
-                .push((task_id.to_owned(), status.to_owned()));
+            let mut finished = self.finished.lock().unwrap();
+            // One task, one result. `finish_rollback` and the standard finish
+            // path can both see the same record, and reporting in both places
+            // made a single task announce twice -- measured, not imagined.
+            assert!(
+                !finished.iter().any(|(id, _)| id == task_id),
+                "announced twice: {finished:?} then {status}"
+            );
+            finished.push((task_id.to_owned(), status.to_owned()));
         }
     }
 
@@ -1998,8 +2023,63 @@ mod tests {
             .unwrap()
             .iter()
             .any(|line| line.contains("cancelled before execution")));
+        assert_eq!(
+            notifier.finished.lock().unwrap().clone(),
+            vec![(task.id.clone(), "cancelled".to_owned())],
+            "the cancel path reports the status the record carries"
+        );
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
+
+    /// The rollback branch's report, which had no test: one task, one result,
+    /// and the status is the one `finish_rollback` just wrote. Getting here
+    /// needs a rollback the contract's own flow cannot start (see the doc on
+    /// `run_queued`), so the work closes its own record first -- the only way in
+    /// outside a store fault.
+    #[test]
+    fn a_completed_rollback_is_announced_once_with_the_records_status() {
+        let paths = paths("rollback-report");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = manager
+            .enqueue(&paths, "test", vec!["r".to_owned()], serde_json::json!({}))
+            .unwrap();
+        let notifier = std::sync::Arc::new(RecordingNotifier::default());
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rolled_back = ran.clone();
+        let rollback: Option<Box<dyn FnOnce(&TaskContext) + Send + 'static>> =
+            Some(Box::new(move |_: &TaskContext| {
+                rolled_back.store(true, std::sync::atomic::Ordering::Relaxed);
+            }));
+        run_queued(
+            &manager,
+            &paths,
+            notifier.clone(),
+            &task.id,
+            |context: &TaskContext| {
+                // Close the record, so `start_rollback` finds `failed`.
+                let _ = context.manager.finish(
+                    &context.paths,
+                    &context.task_id,
+                    &Err("boom".to_owned()),
+                );
+                Err("boom".to_owned())
+            },
+            rollback,
+        );
+
+        assert!(
+            ran.load(std::sync::atomic::Ordering::Relaxed),
+            "the rollback ran"
+        );
+        assert_eq!(manager.task(&task.id).unwrap().status, "rolled_back");
+        assert_eq!(
+            notifier.finished.lock().unwrap().clone(),
+            vec![(task.id.clone(), "rolled_back".to_owned())],
+            "announced once, with the status the record holds"
+        );
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
     #[test]
     fn tick_caps_below_complete_and_finish_is_the_only_way_to_a_hundred() {
         let paths = paths("stage-tick");
