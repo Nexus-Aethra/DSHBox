@@ -436,16 +436,21 @@ command as done only once the installed app has run it.
   the status announced is the record's own.** `TaskNotifier::finished` is what
   closes the task on the far end, and `run_queued` returns without executing
   anything in three different situations — the record was closed, another owner
-  holds it (`running`, a rollback in flight), or it is gone — so the status must
-  be checked first: `box_scheduler::is_finished_status` is that check, and every
-  emitter (the scheduler's three sites, the desktop's `task://finished`) uses it.
-  `DaemonNotifier` forwards whatever it is handed straight into `TaskFinished`,
-  so an invented status is not caught downstream — the two that used to be
-  invented were a removed record reported as `cancelled` and a `running` one
-  reported as finished. `try_start`'s "may I admit this" and `run_queued`'s "is
-  this still worth waiting for" are one predicate (`is_queued`) so that a later
-  edit to one cannot leave the other waiting on a record the gate will never
-  admit.
+  holds it (`running`, a rollback in flight), or it is gone — so a status has to
+  be checked before it is announced: `box_scheduler::is_finished_status` is that
+  check. Of the scheduler's four remaining sites, the two that report a record
+  they did not just write (the cancel path and the closed-record path) call it;
+  the other two report a record `finish` / `finish_rollback` has just written, so
+  it is a result by construction — which is also why the rollback-error path must
+  *not* report before falling through to `finish`, or one task emits twice. The
+  desktop's `task://finished` is guarded the same way. `DaemonNotifier` forwards
+  whatever it is handed straight into `TaskFinished`, so an invented status is
+  not caught downstream: three used to be invented — a removed record announced
+  as `cancelled`, a `running` one announced as finished, and a failed rollback
+  announced as `failed` whatever the record said. `try_start`'s "may I admit
+  this" and `run_queued`'s "is this still worth waiting for" are one predicate
+  (`is_queued`) so that a later edit to one cannot leave the other waiting on a
+  record the gate will never admit.
   Every stage transition must call `TaskContext::publish_stages`, which reads
   the record back and emits both the one-line summary and the `task_stages`
   event; a stage method that writes but does not publish is persisted and

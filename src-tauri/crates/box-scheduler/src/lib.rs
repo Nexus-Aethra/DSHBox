@@ -512,6 +512,15 @@ impl TaskContext {
 /// is called with the same `TaskContext` to undo partial changes. The rollback
 /// is executed while resource locks are still held (via `start_rollback` /
 /// `finish_rollback`), so the rollback has exclusive access to the resource.
+///
+/// **That path cannot start as things stand, and no caller passes `Some`.** When
+/// `work` fails the record is still `running`, and `start_rollback` only accepts
+/// `failed -> rolling_back`, so it answers an error and the rollback is skipped
+/// in silence. Making it reachable means deciding where the slot is released
+/// relative to the rollback -- it is held today for exclusive access, and
+/// `finish` is what releases it -- which is a change of its own. Until then the
+/// branch below is kept honest rather than deleted, so that whoever wires it up
+/// does not also inherit an invented status.
 pub fn run_queued(
     manager: &TaskManager,
     paths: &BoxPaths,
@@ -612,18 +621,20 @@ pub fn run_queued(
                     notifier.finished(task_id, &record.status, record.error.as_deref());
                     return;
                 }
-                // finish_rollback failed. The record, not this closure, knows
-                // what it became: a store write can fail after the in-memory
-                // record already moved to `rolled_back`, and the record may be
-                // gone entirely. The hard-coded `failed` that used to go out
-                // here announced a status the record never held.
-                notifier.log(task_id, "rollback finished unexpectedly");
-                match manager.get(task_id).ok().flatten() {
-                    Some(task) if is_finished_status(&task.status) => {
-                        notifier.finished(task_id, &task.status, task.error.as_deref());
-                    }
-                    _ => notifier.log(task_id, "the rollback's own result is unavailable"),
-                }
+                // finish_rollback failed, so nothing has been reported yet and the
+                // record is left where the rollback put it. Reporting here would
+                // emit the task twice, because the standard finish below runs
+                // anyway -- and it is the better reporter: `finish` refuses to
+                // rewrite a record that already reached a state of its own
+                // (`rolled_back` stays `rolled_back`) and moves a still
+                // `rolling_back` one to `failed`, so whatever it reports is what
+                // the record says at the moment of reporting. The hard-coded
+                // `failed` that used to go out here announced a status the record
+                // never held.
+                notifier.log(
+                    task_id,
+                    "rollback finished unexpectedly; closing it as it stands",
+                );
             }
         }
     }
@@ -2536,6 +2547,37 @@ mod tests {
             manager.resource_idle("node:n1").unwrap(),
             "and nothing is held"
         );
+    }
+
+    /// The predicate every emitter of a task's result depends on.
+    #[test]
+    fn is_finished_status_accepts_only_a_result() {
+        for status in [
+            "succeeded",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "miss",
+            "rolled_back",
+            // The other spelling serde writes.
+            "rolledback",
+        ] {
+            assert!(is_finished_status(status), "{status} carries a result");
+        }
+        // `failed` is a result even though the state machine still allows a
+        // rollback from it; what must not count is everything still going, and
+        // everything this build cannot parse.
+        for status in [
+            "queued",
+            "running",
+            "rolling_back",
+            "rollingback",
+            "waiting_input",
+            "",
+            "bogus",
+        ] {
+            assert!(!is_finished_status(status), "{status} is not a result");
+        }
     }
 
     /// A record another owner has already admitted must not be announced as
