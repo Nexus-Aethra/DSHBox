@@ -106,6 +106,31 @@
 认领 = `queued --claim--> running`，同时写 `claimedBy/claimEpoch/startedAt`；
 任务结束时清空 `claimedBy` 但保留它作为历史（或写进 `params.finishedBy`）。
 
+### 2.5 任务状态机：新增 `miss`
+
+现有 `TaskState`（`box-scheduler/src/lib.rs`）有 queued/running/succeeded/failed/cancelled/
+interrupted/rollingback/rolledback。**认领后失联**这件事今天无处可去：写成 `failed` 会
+谎报"这项工作失败了"，写成 `interrupted` 会和"daemon 重启打断"混为一谈。新增：
+
+```rust
+Miss,   // 认领它的 node 不再持有它：epoch 变了、重注册时没上报、或 node 被移除
+```
+
+转移规则（要同步改 `valid_transitions`）：
+
+| 从 | 到 | 触发 |
+|---|---|---|
+| `running` | `miss` | node 重注册时未在 `abandonedTaskIds` 里提到该任务，或 `claimEpoch < currentEpoch` |
+| `queued` | `miss` | 目标 node 被移除（排给它的活没人能领） |
+| `miss` | — | 终止态；**不自动重排**（构建可能已写半个归档，重排会让两个 worker 抢同一产物） |
+
+`miss` 与既有状态的边界必须写进文档与 UI 文案：
+`interrupted` = 控制层自己重启打断；`miss` = 节点侧不再持有；`cancelled` = 用户要求停。
+三者在 UI 上是三种颜色/三种建议动作（重试 / 检查节点 / 无需处理）。
+
+挂点：`TaskState::from`、`valid_transitions`、`is_terminal`、CLI 的状态列、`src/i18n.ts` 的中英文案
+（漏一处就会出现任务永远显示"执行中"）。
+
 ### 2.4 容器落点：`container.json` 增量
 
 ```jsonc
@@ -122,6 +147,11 @@
 为什么放文件而不放 documents：容器目录本身就是它的存在证明（删目录=删容器），
 把落点写进 documents 就会出现「documents 有、目录没有」的二相性，而这正是
 `resolve.rs` 已经在处理的孤儿场景；两者都在文件里，一致性只需一次 `read_to_string`。
+
+**一个容器只在一个 node 上运行**：`container id` 是全局唯一且创建时固定的，落点因此是
+一对一关系，不存在"同一容器在两个 node 上各跑一份"。跨 node 复制 = **新建一个容器（新 id）
+在目标 node 上就位**，旧的原样留在原处；这与今天同机复制的语义一致（`free_record_id` 会给出 `-2`
+后缀而不是覆盖）。由此得出一条推论：**任何"迁移"都必须是显式的建新+删旧**，不存在原地搬家。
 
 ## 3. 调度：三个不同的问题，三套规则
 
@@ -173,11 +203,47 @@
 | 情况 | 处理 | 明确不做 |
 |---|---|---|
 | node `offline` | 其容器在状态里标 `unreachable`（派生，不写盘），页面入口显示原因 | 不自动迁移容器 |
-| node 被移除 | 若仍有容器引用 → 拒绝；强制移除需先 `container copy` 到别处 | 不静默改绑到 host |
+| node 被移除 | 若仍有容器引用 → 拒绝，先 `container copy` 建新容器再删旧；移除时**默认删除产物索引行**；node 磁盘上的归档/缓存由 `node_purge` 异步任务清理（§3.6） | 不静默改绑到 host；不删 node 磁盘文件却报告已清理 |
 | node `failed` | 同 offline，且拒绝新选址 | 不自动重装 node |
 
 不自动迁移的理由：迁移会改变网络边界与文件系统语义（WSL2 netns 共享、drvfs 慢），
 用户以为自己在一块盘上、其实换了一块，是最难查的一类 bug。迁移必须是显式动作。
+
+### 3.5 跨 node 动作一律异步，控制层不等待
+
+凡是会碰到某个 node 的磁盘、进程或网络的动作，**接口形态统一为「返回 handle，结果靠事件」**：
+
+```
+任何 node 侧动作（构建产物 / 清理磁盘 / 起停容器 / 同步镜像 / 开隧道）
+   → RPC 立即返回 { taskId }（不阻塞、不等待）
+   → 任务进 box-scheduler，nodeId 决定谁领
+   → 订阅 task_* 事件（task_stage / task_log / task_finished）取结果
+   → 幂等：同 (kind, nodeId, params) 的未完成任务直接返回既有 taskId
+```
+
+只有**纯控制层的读写**可以同步：`node_list/get`、`node_artifact_list`、注册/心跳/上报。
+判据一句话：**会不会等一个 node**。会等的一律异步。
+
+这条规则的直接好处是控制层永远没有「卡在某个 node 上」的线程——一个 node 的 SSH 挂了、
+WSL 卡了、docker daemon 无响应，都只表现为它自己的任务停在 `running`，其它 node 照常。
+
+### 3.6 node 磁盘上的东西，通过控制层发起清理
+
+删除 node 只删索引行（控制层本来就碰不到那些文件），但**清理必须可达**，否则用户没有
+手段回收一个已经不存在的 node 占着的几十 GB。因此提供一个异步动作：
+
+```jsonc
+// method: node_purge   （主 token；控制层发起，node 执行）
+{ "nodeId": "node-3f9a",
+  "what": ["artifacts", "mirror", "workspaces", "logs"],   // 显式列举，不接受 "all"
+  "baseId": "sealed-9c1f…" }                               // 可选：只清某个 base 的产物
+→ { "taskId": "task-…" }
+```
+
+- **不接受通配 `all`**：删磁盘上的东西必须显式列举，避免一个笔误清掉整块工作区。
+- helper 执行、逐项回报（`node_report`），失败项留在结果里而不是静默跳过。
+- node 已不存在时调用必须报 `node not found`，**不允许**留「幽灵清理」。
+- 这一层今天先给 CLI 与 RPC；面向用户的资源控制界面在 D（面板）恢复时接上，接口形态不因此改变。
 
 ## 4. 不变量（每条都要有守护）
 
@@ -191,6 +257,9 @@
 | I6 | 容器引用的 node 必须存在 | 删除 node 前扫 `instances/*/container.json` |
 | I7 | 认领者必须持有当前 epoch 的 session | `claimEpoch` 比对 + 单测 |
 | I8 | 控制层不读 node 本地路径 | 代码评审约定：`archive` 只透传 |
+| I9 | 一个容器只属于一个 node（id 全局唯一，无副本） | 容器 id 创建时固定 + 跨 node 复制走「新建」路径 |
+| I10 | 跨 node 动作不阻塞控制层 | 接口评审：会等 node 的一律返回 `taskId` |
+| I11 | 认领后失联不伪装成 failed | `TaskState::Miss` 专用状态 + 转移表单测 |
 
 ## 5. 迁移与兼容
 
@@ -213,11 +282,11 @@ nodes ≤ 10、node-artifacts ≤ nodes × DSH 版本数（~50）、containers �
 
 | 场景 | 行为 |
 |---|---|
-| daemon 重启 | `sessionEpoch++`；所有 node 降为 `registering/offline`（A 已实现）；已认领任务置 `failed`；产物行保留 |
+| daemon 重启 | `sessionEpoch++`；所有 node 降为 `registering/offline`（A 已实现）；已认领任务置 `interrupted`；产物行保留 |
 | node 断线重连 | 用 enroll 重新注册（新 epoch），`claimedBy` 旧值失配 → 该任务不再属于它 |
 | 产物平台不符 | 视为陈旧，重派构建；不复用、不删除旧行 |
 | 归档磁盘不足 | helper 侧导出前预检（D: 仅 ~8.8 GB），不足则不写 `.part` 并回报明确错误 |
-| 认领后 helper 崩溃 | 任务停 `running`；epoch 未变时不重排，等 `node_claim_task` 的超时回收（见 §9 Q3） |
+| 认领后 helper 崩溃 | 任务停在 `running`；**不按时间自动失败**。node 用新 epoch 重新注册时若没在 `abandonedTaskIds` 中认领它 → 置 `miss`（§2.5） |
 
 ## 8. 明确不存
 
@@ -226,25 +295,27 @@ nodes ≤ 10、node-artifacts ≤ nodes × DSH 版本数（~50）、containers �
 - DSH 宿主的端口号（每次启动随机，只存「意向」，真实端口由 node 侧在启动后回报）
 - 宿主的 `build_platform()` 结果（这是 B 里最容易写错的一行）
 
-## 9. 未决问题（需要裁决）
+## 9. 已定决策
 
-**Q1 容器能否在两个 node 上并存副本？** 我倾向「不能」，`container copy` 到另一 node 是新建一个
-容器、旧的不动；两个同名副本会让 `container rm` 语义变模糊。
+| # | 问题 | 决定 | 落点 |
+|---|---|---|---|
+| D1 | 容器能否在两个 node 上并存副本 | **不能**。container id 创建时固定，一个容器只在一个 node 上运行；跨 node 复制 = 新建容器（新 id），旧的原样留在原处 | §2.4、I9 |
+| D2 | 删 node 时产物与磁盘怎么处理 | 默认**删除索引行**；node 磁盘上的归档/镜像/工作区通过 `node_purge` 异步动作清理（显式列举，不接受 `all`）。将来提供面向用户的资源控制界面与操作接口来接这一层 | §3.4、§3.6 |
+| D3 | 认领后失联怎么表示 | **用状态机解决**：`TaskState` 增加 `miss`，与 `failed`/`interrupted`/`cancelled` 并列且语义互斥；不按时间自动失败 | §2.5、I11 |
+| D4 | 多节点管理的调用形态 | **统一异步**：凡会等某个 node 的动作一律返回 `taskId`，结果靠 `task_*` 事件；只有纯控制层读写同步 | §3.5、I10 |
 
-**Q2 产物是否随 node 删除级联清理？** 我倾向：删 node 时删索引行，**不删** node 磁盘上的归档
-（控制层本来就碰不到），并在返回里说明「归档留在原机，可手工清理」。
+由 D3/D4 派生两条实现纪律：
 
-**Q3 认领后超时**：`running` 且 heartbeat 已断的 node 上的任务，多久回收？我倾向
-「不按时间自动失败」，而是由 node 重新注册时显式上报 `abandonedTaskIds`，避免时钟/网络抖动误杀。
-
-**Q4 `node_build_artifact` 是否等待完成？** 我倾向：RPC 立即返回 `taskId`，调用方（CLI/UI）自行订阅；
-容器创建路径顺带派活时也不等待。
+1. `miss` 必须同时改 `TaskState::from`、`valid_transitions`、`is_terminal`、CLI 状态列与
+   `src/i18n.ts` 中英文案——漏一处就会出现任务永远显示「执行中」。
+2. 任何新 RPC 先问一句「会不会等 node」；会等的就不许返回结果，只能返回 handle。
 
 ## 10. 阶段落点
 
 | 阶段 | 用它做什么 |
 |---|---|
-| B1 | 建 `node-artifacts` scope、`node_build_artifact/list/report`、`node_claim_task`、`tasks.nodeId/claimedBy/claimEpoch` |
-| B2 | helper 认领并执行，写 `nodes.mirror` / `nodes.toolchain` |
-| C | `container.json` 增 `nodeId/placement`，选址与启动下沉 node |
+| B1 | 建 `node-artifacts` scope；`node_build_artifact` / `node_artifact_list` / `node_artifact_report` / `node_claim_task` / `node_purge` 的 RPC 与 CLI；`tasks.nodeId/claimedBy/claimEpoch`；`TaskState::Miss` 与转移表；异步接口约定写进 `AGENTS.md` |
+| B2 | helper 认领并执行（clone→install→build→tar→sha256→report），实现 `node_purge`，写 `nodes.mirror` / `nodes.toolchain` |
+| C | `container.json` 增 `nodeId/placement`，选址与启动下沉 node；跨 node copy = 新建容器 |
 | P | `nodes.relay` 填值，页面通过隧道回传 |
+| D（可后置） | 面板与资源控制界面：node 在线状态、磁盘占用、`node_purge` 入口——接口在 B1 已经就位，这里只做界面 |
