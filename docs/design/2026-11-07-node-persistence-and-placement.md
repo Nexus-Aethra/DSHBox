@@ -401,14 +401,14 @@ containers ≤ 数百、tasks **会持续增长**。前三个是毫秒级；**ta
 | D2 | 删 node 与磁盘清理 | 删 node = tombstone + 删索引行；磁盘字节由 `node_purge` 异步清理（显式列举、接受可达性现实、先清后删）；将来由资源控制界面驱动 | §3.4、§3.6、I13 |
 | D3 | 认领后失联 | 新增 `TaskState::Miss`，与 `failed`/`interrupted`/`cancelled` 互斥；不按时间自动失败 | §2.5、I11、I12 |
 | D4 | 多节点管理调用形态 | 控制层→node 一律异步返回 `taskId`；node→控制层与纯控制层读写同步 | §3.5、I10 |
-| D5 | node 上的可执行体由谁投放 | 受管后端由**本机**供给适配器投放（操作进程/rootfs，属供给而非连接）；用户设备装节点载荷后 `dshbox node join`；控制面**不做网络入站连接**（不做 ssh/scp 推送）。节点角色用无 Tauri 依赖的 `box-helper`，与 control 同包发布 | §12 |
+| D5 | node 上的可执行体由谁投放 | 受管后端由**本机**供给适配器投放（操作进程/rootfs，属供给而非连接）；用户设备装节点载荷后 `dshbox node join`；控制面**默认不做网络入站连接**（不做 ssh/scp 推送；反向连自 2026-11-08 起是可选能力，见 `node-link` §6.4）。节点角色用无 Tauri 依赖的 `box-helper`，与 control 同包发布 | §12 |
 
 ## 10. 阶段落点
 
 | 阶段 | 内容 |
 |---|---|
 | B1 | `node-artifacts` scope；**把 A 的 `deregister` 从「删记录」改成「转 tombstone」**（会动既有测试 `nodes.rs:749-758`，需同批更新）；`node_build_artifact` / `node_artifact_list` / `node_artifact_report` / `node_claim_task`（同步）/ `node_purge`；`tasks.nodeId/claimedBy/claimSession/idempotencyKey`；`TaskState::Miss` + 完整转移表 + 终态保护；tombstone 与 `lastArtifacts`；`tasks` prune；异步优先写进 `AGENTS.md` |
-| B2 | helper 认领并执行（clone→install→build→tar→sha256→report）、执行 `node_purge`、上报 `mirror/toolchain/workload`、接收取消列表；`GET /mirror.bundle` 与该平台工具链的下载校验（sha256 由控制面生成时计算、写进响应头）；`dshbox node join` 薄壳（`box-helper` 的构建与安装包投放已由 PR #34 完成，不在此阶段） |
+| B2 | helper 认领并执行（clone→install→build→tar→sha256→report）、执行 `node_purge`、上报 `mirror/toolchain/workload`、接收取消列表（**2026-11-08 起改为下行帧直推，轮询作废**：`node-link` §6.2/L4）；`GET /mirror.bundle` 与该平台工具链的下载校验（sha256 由控制面生成时计算、写进响应头）；`dshbox node join` 薄壳（`box-helper` 的构建与安装包投放已由 PR #34 完成，不在此阶段） |
 | C | `container.json` 增 `nodeId/placement`；选址与启动下沉 node；跨 node copy = 新建容器 |
 | P | `nodes.relay` 填值，页面通过隧道回传 |
 | D（可后置） | 面板与资源控制界面：node 在线状态、磁盘占用、`node_purge` 入口——接口在 B1 已就位 |
@@ -424,8 +424,14 @@ containers ≤ 数百、tasks **会持续增长**。前三个是毫秒级；**ta
 
 ## 12. 节点怎么就位：谁来把可执行体放到那台机器上
 
-分层的代价是 node 上必须有东西在跑。三条可能的做法，结论先说：**控制面不做网络入站连接**——
-它不监听公网、也不去 dial 一个 node；可执行体由「能进去的那一方」投放。受管后端由**本机供给适配器**
+分层的代价是 node 上必须有东西在跑。三条可能的做法，结论先说：**控制面默认不做网络入站连接**——
+它不监听公网；可执行体由「能进去的那一方」投放。
+
+> **2026-11-08 变更**：原文这一句还写着「也不去 dial 一个 node」，已被
+> `docs/design/2026-11-08-node-link-session-and-crate-layering.md` §6.4 取代——反向连（control → node）
+> 作为**可选**能力存在（默认关闭、需显式绑定地址、走同一套握手认证）。ssh/scp 推送仍然不做。
+
+受管后端由**本机供给适配器**
 直接操作进程与 rootfs（那是供给，不是连接；`vm/wsl.rs` 的 `wsl -d … --exec` 与 `--unregister` 就是这一类），
 用户设备装好之后由 node 自己出站 join。
 
@@ -435,7 +441,7 @@ containers ≤ 数百、tasks **会持续增长**。前三个是毫秒级；**ta
 |---|---|---|---|
 | **受管后端** | 本机供给适配器 | 两条都可行：把 helper 打进 rootfs 再 `wsl --import`（需重打 rootfs），或沿用现状——导入官方 rootfs 后从宿主侧用 `wsl -d … --exec` 注入（`vm/wsl.rs:249,306`）。docker 镜像 `COPY`；libkrun/VZ 的 rootfs 自带 | 控制面能创建/销毁的环境，用户零操作 |
 | **用户设备** | 用户自己 | 装**节点载荷**（无头设备不必装带 webkit 的桌面包：直接拷 `box-helper`，或用安装包的 node 组件），再跑 `dshbox node join --control <url> --grant <一次性 token>` | 另一台 PC、服务器；需先开绑定地址（§12.4） |
-| 控制面推（不做） | — | ssh/scp 到设备 | 要求 inbound 与长期凭据，破坏「节点只出站」的模型 |
+| 控制面推（不做） | — | ssh/scp 到设备 | 要求长期凭据与 inbound 反向通道；**2026-11-08 起「反向连」另立为可选能力**（`node-link` §6.4，需显式开启、走握手认证），但 ssh/scp 这种「用控制面的凭据进设备」仍然不做 |
 
 ### 12.2 一个安装包，两种角色
 
@@ -443,7 +449,7 @@ containers ≤ 数百、tasks **会持续增长**。前三个是毫秒级；**ta
 
 ```
 控制角色  dshbox / dshboxd     注册表、派活、页面回传、桌面
-节点角色  box-helper           只注册/心跳/认领/执行/回报；不开窗口、不起 daemon、不监听入站
+节点角色  box-helper           只注册/心跳/认领/执行/回报；不开窗口、不起 daemon、**默认不监听入站**（§12.4 的可选反向连除外）
 ```
 
 **节点角色用 `box-helper` 这个独立小二进制**（已存在，236 行，无 Tauri 依赖），而不是给 `dshbox` 加 `--headless`：

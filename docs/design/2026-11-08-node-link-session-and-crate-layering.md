@@ -7,8 +7,9 @@
 > 本文解决两件在 B1-b2.2 之后浮出来的事：
 > 1. **node 与 control 的连接形态**：从「node 只出站 + 明文 HTTP」改成「可双向发起的一条加密封装会话」；
 >    这**推翻**了 11-07 文档 §12.4「控制面不做网络入站连接」的绝对化表述（见 §6.4 与那里的变更说明）。
-> 2. **crate 口径**：`src-tauri/crates/` 目前是 22 个平铺包，`dshboxd` 依赖其中 18 个、而 11 个包的
->    唯一消费者就是它。本文给出分层目录、三处合并与一条 CI 守卫，以及「不再新增小件」的判据。
+> 2. **crate 口径**：`src-tauri/crates/` 目前是 22 个平铺包，`dshboxd` 依赖其中 18 个；10 个包只有一个
+>    crate 消费者，其中 9 个的消费者就是它。本文给出分层目录、两处合并（+ 一处归位）、
+>    一条 CI 守卫，以及「不再新增小件」的判据。
 
 ## 0. 决策摘要（已定，可改但要有理由）
 
@@ -16,93 +17,130 @@
 |---|---|---|
 | 自己写握手，还是 TLS 传输 + PSK 认证 | **自己写握手**（方案 A），原语全部来自 `ring` | 节点侧不引入 TLS 栈；会话密钥要能在帧层轮换；代价是安全边界归我们（§9） |
 | 引导要素 | **PSK（长期）** 与 **token 链（限期）** 两种，可并存 | 长期设备用 PSK + 定期轮换；自动化/临时环境用 token |
-| token 形态 | **哈希链为默认**（一次性、防重放、可本地续链），签名 TTL 为兼容模式 | 链模式控制面只存链根与已用序号，节点离线也能续 |
-| 节点身份 | **从第一天就有**：节点 Ed25519 密钥 + 控制面签发并被 pin 的会话证书 | 纯对称秘密只认证一侧；证书让节点也能验控制面 |
+| token 形态 | **哈希链为默认**（一次性、防重放、可本地续链），签名 TTL 为兼容模式 | 链模式控制面只存链端与「已接受步数」，节点离线也能续 |
+| 节点身份 | **从第一天就有**：节点 Ed25519 密钥 + 控制面 Ed25519 身份 + 会话证书（首连 TOFU、之后比对） | 重连不再依赖引导秘密；证书负责长期身份与变更检测，首连的双向认证由 wrapKey 绑秘密提供 |
 | 双向都连上时谁活 | **先成功者为准**，后到者收 `already-connected` 并被关闭 | 幂等、可重连；不需要分布式仲裁 |
 | 反向连（control → node）默认值 | **默认关闭**，需要显式开关 | node 一旦监听入站就是新攻击面 |
 | 密钥与签发状态存哪 | **document store 的 `node-keys` scope，一行一节点** | 已有 SQLite；不引入秘密文件，不进 `config.json` |
 
 ## 1. 目标与明确不做
 
-**目标**：node 在任意一侧有入站能力的环境里都能建立会话；一条连接双向跑帧；握手用引导秘密认证、
-换成临时会话密钥后**丢弃**引导秘密；失效与吊销有明确语义。
+**目标**：node 在任意一侧有入站能力的环境里都能建立会话；一条连接双向跑帧；握手**双向认证**、
+换成临时会话密钥后丢弃引导秘密的会话副本；失效与吊销有明确语义。
 
 **不做**：
 - 不发明密码学。只定义**帧格式、用例、有效期**；原语一律用 `ring`（X25519 / HKDF-SHA256 /
   HMAC-SHA256 / ChaCha20-Poly1305 或 AES-256-GCM / OS 随机）。
 - 不做打洞/中继。两边都在 NAT 后面时双向都失败，那是 `nodes.relay`（P 阶段）的事，本文不承诺。
-- 不做证书链/CA。会话证书自签，靠 pin 指纹信任；不引入公网 CA。
+- 不做证书链/CA。会话证书自签：首连的指纹是 **TOFU**（记录、之后比对），不是首连的信任来源——
+  首连的双向认证由「引导秘密参与 wrapKey」提供（§5）。不引入公网 CA。
 
 ## 2. 三种引导要素
 
 | 要素 | 谁生成 | 怎么到节点 | 节点存哪 | 有效期 |
 |---|---|---|---|---|
 | **PSK** | 控制面（每节点 32B 随机 + nodeId） | 运维手工（文件/QR/粘贴） | `<root>/node.key`，0600 | 长期，建议 90 天轮换 |
-| **token 链** | 控制面（链尾 + 链根） | 运维或自动化下发 | `<root>/node.token`，0600 | 每环 15 分钟，链长上限可控 |
+| **token 链** | 控制面（链端 + 步数） | 运维或自动化下发 | `<root>/node.token`，0600 | 整链 `expiresAt`（建议 15 分钟~1 小时），一次性 |
 | **节点身份** | 节点首次启动自生成 Ed25519 | — | `<root>/node.id`，0600 | 长期；引导要素只负责**绑定**它 |
 
-绑定关系：第一次握手成功时，控制面把 `nodeId ↔ 节点公钥` 写进注册表；此后重连用节点私钥证明身份，
-引导要素只在「第一次」或「换钥」时出现。这样 token TTL 可以短到 15 分钟而不影响重连。
+绑定关系：第一次握手成功时，控制面把 `nodePubkey` 写进 `node-keys` 行（§8）并反映到注册表；
+此后重连走 `node-key` 模式（`nodeSig`），引导要素只在「第一次」或「换钥」时出现。
+这样 token 的有效期可以只覆盖绑定，而不影响重连。
 
 ## 3. token 链（哈希链，默认）
 
+链是**单向哈希链**：控制面选随机种子 `s`，定义 `c_0 = s`、`c_{i+1} = H(c_i)`、链长 `n`；
+控制面只存**链端** `c_n` 与「已接受的最小步数」`bestSteps`（初值 `n`）；节点只存种子 `s`。
+
 ```
-控制面取随机 s；t_n = s；t_i = H(t_{i+1})；只保存链根 t_0 与已用最高序号 used
-节点持 t_n，每次握手消费一环：报 t_k，控制面校验 H^k(t_k) == t_0 且 k > used，成功后 used = k
+第 k 次握手：节点报 c_k = H^k(s)（本地续链：c_{k+1} = H(c_k)，不需要控制面发新环）
+控制面校验：从收到的值反复 H，累计步数，必须在 n 步内等于 c_n；
+            且 steps = n-k < bestSteps；成功即 bestSteps = steps
 ```
 
-- **一次性**：成功用过的环不能再用（`used` 单调递增），因此抓到旧流量也重放不了。
-- **可离线续链**：节点本地派生 t_{k-1}，不需要控制面发新环；链用尽或节点丢状态 → 重新 enroll。
-- **过期**：每环带一个 TTL（节点与控制的时钟差用 `issuedAt + ttl` 判定，控制面为准），过期环作废。
-- **兼容模式**：签名 TTL token `{nodeId, exp, nonce}` + 控制面私钥签名，可复用、可乱序，但需要签发/吊销
-  状态表（同一行加 `issued_at/expires_at/revoked_at` 即可）。
+- **一次性**：`bestSteps` 严格递减 ⇒ 每个环只能用一次；重放旧环时 `steps` 不小于记录值，直接拒绝。
+- **可离线续链**：节点只需要 `H` 这个正向函数，不依赖任何反函数，也不用控制面下发新环。
+- **算力**：每次握手最多 `n` 次 SHA-256（n 取 64–256），相对握手频率可忽略。
+- **有效期**：环是裸哈希，本身不带时间戳（评审 N2 指出原文「每环带 TTL」不成立）。有效期挂在**整条链**上：
+  `expiresAt` 由控制面时钟判定，过期必须重新 enroll；另有会话最长生存期（§4）与「同一节点两次握手的
+  最小间隔」限流。
+- **兼容模式**：签名 TTL token `{nodeId, exp, nonce}` + 控制面 Ed25519 签名，可复用、可乱序，
+  但需要签发表与吊销表（同一行加 `issuedAt/expiresAt/revokedAt`）。
 
-## 4. 帧格式
+## 4. 帧格式与记录层
 
-一条 TCP 连接（TLS 由 §5 的握手自己建，不套 TLS 库）：
+一条 TCP 连接（不套 TLS 库：加密由 §5 的握手自己建）：
 
 ```
 帧 = u32 长度(BE，上限 1 MiB) | u8 类型 | payload
-类型 1 hello        2 hello-ack    3 request     4 response
-     5 event        6 rekey        7 close        （8.. 保留）
-payload = JSON，字段名 camelCase（与 RPC 一致）
+类型 1 hello  2 hello-ack  3 request  4 response  5 event  6 rekey  7 close
+payload = JSON（字段名 camelCase），加密后作为 AEAD 明文块
 ```
 
-- 版本与套件在 `hello` 里协商：`ver`（本文件 = 1）、`suite`（1 = X25519+HChaCha20Poly1305+SHA256）。
+**记录层的密钥与 nonce**——自研 AEAD 帧协议里唯一必须由我们自己写死的部分（评审 5）：
+
+- **方向分离**：`sessionKey_c2s` 与 `sessionKey_s2c` 是两把密钥（HKDF label 不同），永不互用。
+- **nonce 构造**：96 位 = `0x00000000`（4 字节）‖ `seq`（8 字节 BE）。`seq` 每方向独立，握手完成后从 0 起算。
+- **不重复**：同一把密钥下 `seq` 绝不复用；收到重复或倒退的 `seq` 视为攻击，立即关闭连接。
+- **上限与轮换**：单把密钥最多 `2^32` 帧（远低于回绕）或 5 分钟，先到者强制 `rekey`。`rekey` 帧本身用
+  **当前**密钥与当前 `seq` 加密并消耗一个序号；双方各出一个新临时公钥派生新密钥后 `seq` 归零、
+  旧密钥立即销毁。
+- **版本与套件**：`hello` 里协商 `ver`（本文 = 1）与 `suite`（1 = X25519 + HKDF-SHA256 + ChaCha20-Poly1305）。
+  ring 暴露的是 `CHACHA20_POLY1305`（评审 N1：原文写成 HChaCha20 是错的）；AES-256-GCM 可作为同套件变体。
   **未知版本/套件直接关闭，不降级**——与现有「`helperVersion` 不兼容就拒绝」的纪律一致。
-- 握手帧（hello/hello-ack）**不加密**，但带 `mac`/`sealer` 字段；握手完成后的所有帧都走会话密钥。
+- 握手帧（hello/hello-ack）**不加密**，携带 `mac`/`sealer`；握手完成后的所有帧都走会话密钥。
 - 读线程 + 写线程各一；写侧一把锁保证帧不交错。
 
 ## 5. 握手（引导秘密 → 会话密钥 → 丢弃）
 
 ```
-node → control  hello { ver, suite, nodeId, mode, clientNonce, ephA, mac }
-                mac = HMAC( HKDF(psk_or_token, "bootstrap"), transcript )
-                transcript = sha256(ver|suite|nodeId|clientNonce|ephA)
-control → node  hello-ack { serverNonce, ephB, sealer }
-                sealer = AEAD( HKDF( ecdh(ephA,ephB), "wrap" ), sessionCert )
-两侧             sessionKey = HKDF( ecdh(ephA,ephB), "session", transcript‖serverNonce )
-握手结束         引导秘密（PSK/当前 token 环）从内存丢弃；只保留 token 已用序号
+t1 = sha256("hello" | ver | suite | nodeId | mode | clientNonce | ephA | 模式字段)
+
+node → control  hello { ver, suite, nodeId, mode, clientNonce, ephA, 模式字段 }
+  mode = "psk"      : mac = HMAC( HKDF(psk, "bootstrap"), t1 )
+  mode = "token"    : chainValue = c_k, chainSteps = k, mac = HMAC( HKDF(c_k, "bootstrap"), t1 )
+  mode = "node-key" : nodePubkey, nodeSig = Ed25519( sk_node, t1 )      ← 重连，不需要引导秘密
+
+t2 = sha256( t1 | serverNonce | ephB )
+
+control → node  hello-ack { serverNonce, ephB, controlSig, sealer }
+  psk/token 模式 : wrapKey = HKDF( ecdh(ephA,ephB) ‖ HKDF(引导秘密,"bootstrap"), "wrap", t2 )
+                   controlSig 可省（wrapKey 已要求控制面知道同一秘密）
+  node-key 模式  : wrapKey = HKDF( ecdh(ephA,ephB), "wrap", t2 )
+                   controlSig = Ed25519( sk_control, t2 )   ← 节点用 pin 的控制面公钥校验
+  sealer = AEAD( wrapKey, seq=0, aad=t2, plaintext = sessionCert )
+
+两侧  sessionKey_c2s = HKDF( ecdh, "c2s", t2 )；sessionKey_s2c = HKDF( ecdh, "s2c", t2 )
+握手结束  临时私钥与 wrapKey 立即销毁；引导秘密的会话副本丢弃
 ```
 
-- **双向认证**：`mac` 证明「我是持有该秘密的节点」；`sealer` 里的 `sessionCert` 证明「对端是真控制面」
-  （节点用已 pin 的指纹校验）。少任何一半都只有单向认证。
-- **前向保密**：会话密钥来自 X25519 临时密钥，握手后引导秘密即丢弃，事后拿到 PSK 也解不开历史流量。
-- **防裁剪**：transcript（含两个 nonce 与两个临时公钥）进 AEAD 的 AAD；偏移或替换任一字段都会解封失败。
-- **轮换**：会话内按帧数或时间（建议 5 分钟）发 `rekey` 帧，用当前会话密钥 KDF 出下一把，
-  **不重跑握手**，引导秘密永不回流。
+- **双向认证（首连即是双向）**：`mac` 证明「节点持有该秘密」；`wrapKey` 里绑了**同一份**引导秘密，
+  因此能解开 `sealer` 的只可能是知道它的控制面。`node-key` 模式改用 `controlSig` 达到同一效果。
+  （评审 4 指出：原文让 sessionCert 单独承担「对端是真控制面」，首连时它只是未 pin 的自签证书，属过度声称。）
+- **证书的角色**：`sessionCert` 提供**长期身份与变更检测**，不是首连的信任来源——首连指纹是 TOFU，
+  记录下来之后每一轮比对，变了就拒绝。
+- **前向保密**：会话密钥来自 X25519 临时密钥，**FS 靠临时私钥销毁**（握手结束与每次 `rekey` 后立即
+  drop/zeroize），不是「丢弃引导秘密」。丢弃引导秘密的价值是缩小暴露面（评审 6）。
+- **控制面侧不「丢弃」引导秘密**：它必须长期保存 `node-keys.secret` 用于下次校验；能丢的只有会话副本。
+- **防裁剪与降级**：`t1` 只含客户端字段；`t2` 把 `serverNonce` 与 `ephB` 一起绑进 AAD 与派生 info，
+  替换任何一侧的 nonce 或公钥都会导致解封失败或会话密钥失配（评审 3 指出的漏绑）。
+- **轮换**：见 §4 的 `rekey`，不重跑握手，引导秘密永不回流。
 
 ## 6. 会话生命周期
 
 ### 6.1 建立与仲裁
 - 主路径 node → control（出站）；备路径 control → node（node 注册时上报 `listenAddrs`，默认关闭监听）。
 - 同一 `(nodeId, epoch)` 只允许一个会话：后到的连接收到 `close{already-connected}`。
-- 断线重连：指数退避（上限 30s），握手可重放无需新 grant；`epoch` 变化（控制面重启）时凭节点私钥重建。
+- **首连用引导秘密（psk/token），之后用节点私钥（`node-key` 模式）**：这样 token 只需短 TTL，重连不受它限制。
+  首次登记时把 `nodePubkey` 写进 `node-keys` 行与注册表（§8），此后 `nodeSig` 就是身份。
+- 断线重连：指数退避（上限 30s）；`epoch` 变化（控制面重启）时用 `nodeSig` 重建，不需要新 grant。
+- 首连的证书指纹是 **TOFU**：记录后每轮比对，变更即拒绝并告警（§5）。
 
-### 6.2 任务与取消（与 B1 的关系）
+### 6.2 任务与取消（与 B1/B2 的关系）
 - 有下行流之后，`cancel` 从「helper 轮询取消列表」变成**下行帧直推**，可以删掉一整块轮询逻辑。
+  这会让 11-07 文档 B2 里「接收取消列表」那一项作废，已在那份文档加日期说明（见 §10）。
 - `node_claim_task` 保留为「流上的一个 request」，**不等于**必须靠它才拿到活：控制面也可以 push。
-  两种都走同一个方法白名单，语义以 §5 的 B1 文档为准。
+  两种都走同一个方法白名单，语义仍以 11-07 §2.3/§3.5 为准。
 
 ### 6.3 鉴权不变
 会话绑定 `nodeId`（服务端绑定，沿用 `main.rs::bind_request_node` 剥掉客户端自报身份的纪律），
@@ -119,7 +157,7 @@ control → node  hello-ack { serverNonce, ephB, sealer }
 | 动作 | 控制面 | 节点 | 生效点 |
 |---|---|---|---|
 | 吊销 | `node-keys` 行写 `revokedAt`（不删，留审计） | — | 下一次握手拒绝；已建会话发下行 `close{revoked}` |
-| 换钥 | 覆盖 `secret` + 重置 `chainIndex/issuedAt` | 运维替换 `<root>/node.key` | 下一次握手 |
+| 换钥 | 覆盖 `secret` + 重置 `bestSteps/issuedAt` | 运维替换 `<root>/node.key` | 下一次握手 |
 | 过期 | `expiresAt` 到期即拒 | — | 同上 |
 | 剪枝 | 与 `tasks` prune 同节奏删掉「过期/吊销超过 N 天」的行 | 删自身旧文件 | — |
 
@@ -133,10 +171,11 @@ pub const NODE_KEY_SCOPE: &str = "node-keys";
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeKeyRecord {
-    pub id: String,               // = nodeId，一节点一行，换钥即覆盖
-    pub mode: String,             // "psk" | "token-chain" | "token-signed"
-    pub secret: String,           // PSK 或链根 t0（base64）；只有库里有，从不外发
-    pub chain_index: Option<u64>, // 哈希链已消费到第几环（防重放）
+    pub id: String,                // = nodeId，一节点一行，换钥即覆盖
+    pub mode: String,              // "psk" | "token-chain" | "token-signed"
+    pub secret: String,            // PSK 或链端 c_n（base64）；只有库里有，从不外发
+    pub best_steps: Option<u64>,   // 哈希链已接受的最小步数（严格递减 ⇒ 一次性）
+    pub node_pubkey: Option<String>, // 节点 Ed25519 公钥；首次登记写入，是 node-key 重连的身份
     pub issued_at: u64,
     pub expires_at: Option<u64>,
     pub revoked_at: Option<u64>,
@@ -144,33 +183,55 @@ pub struct NodeKeyRecord {
 }
 ```
 
-三条纪律：
-1. **秘密不出库、不进日志**：`Debug` 手写并 redact `secret`；RPC 对外只回 `{hasKey, mode, issuedAt,
-   expiresAt, revoked}`。整行禁止 `tracing` 打印。
-2. **不进库的三样**：会话密钥（内存/会话内）、节点私钥（节点侧 0600）、握手后被丢弃的引导秘密原文
-   （库里留的是链根与已用序号，那不是秘密原文）。
-3. **签发即出库一次**：`node_enroll` 生成后把 PSK/token 明文回给运维一次，此后只存校验依据。
+控制面自己的长期身份另开一行、单独 scope `control-identity`（一个 store 里的单行）：
+`{ id: "default", pubkey, seckey, fingerprint }`。它不跟节点行混在一起，因为「谁是谁」是两件事。
+
+四条纪律：
+1. **秘密不出库、不进日志**：`Debug` 手写并 redact `secret`/`seckey`；RPC 对外只回 `{hasKey, mode,
+   issuedAt, expiresAt, revoked, fingerprint}`。整行禁止 `tracing` 打印。
+2. **库文件本身要 0600**（评审 N3）：`<runtime>/state/dshbox.db` 是秘密的落点，创建/打开后收紧权限；
+   否则「不进日志」只是把秘密挪到了同目录可读的文件里。
+3. **不进库的三样**：会话密钥（内存/会话内）、节点私钥（节点侧 0600）、握手后被丢弃的引导秘密副本
+   （库里留的是链端与已接受步数，那不是可再用的秘密原文）。
+4. **签发即出库一次**：`node_enroll` 生成后把 PSK/token 明文回给运维一次，此后只存校验依据。
 
 ## 9. 安全边界：我们承担什么
 
 自研协议意味着审计责任在我们这边，因此约束写死：
 - 只用 `ring` 的原语，不自造分组密码/KDF/构造。
-- 每条必须有**负向测试**：篡改 transcript、重放已用 token 环、降级 suite、错误证书指纹、截断帧、
-  超长帧、过期环——七种都必须连接失败且不留半开会话。
+- **负向测试清单**（每条都必须连接失败、且不留半开会话）：
+  1. 篡改 `t1`/`t2`（改一个字节）；
+  2. 重放已用过的 token 环（`steps` 不小于 `bestSteps`）；
+  3. 降级 `ver`/`suite`；
+  4. 重连时证书指纹与 TOFU 记录不符；
+  5. 截断帧、超长帧（> 1 MiB）；
+  6. 过期链（`expiresAt`）；
+  7. 攻击者没有引导秘密却构造 `sealer`（wrapKey 里没有秘密的份额 ⇒ 解不开）；
+  8. `rekey` 重放／在旧密钥下重复使用同一 `seq`；
+  9. 收到重复或倒退的 `seq`。
+- **正向测试**：首连记录 TOFU 指纹 → 下一轮同指纹通过、换指纹拒绝；`node-key` 模式下 `nodeSig` 通过而
+  `controlSig` 缺失时拒绝。
 - 握手状态机是纯函数（输入：本端随机数/临时密钥/对端帧；输出：会话密钥或错误），便于用测试向量钉住。
 - 失败一律关闭连接，不「重试到成功」；日志只记 `nodeId/原因类别`，不记秘密。
 
-## 10. 分步落点
+## 10. 分步落点（链路轨道 L1–L4）
+
+**命名说明**（评审 N8）：仓库里已经在用 `B1-b2.1` / `B1-b2.2` 指任务模型与写路径两片，本文这条轨道改用
+**L1–L4**，避免「B2.1」和「B1-b2.2」是两条轴却看起来像同一个序列。
 
 | 步 | 内容 | 验收 |
 |---|---|---|
-| **B2.1** | `box-node-link` 帧层：把 helper 的 register/heartbeat/echo/report 从「每操作一个 HTTP POST」换成一条长连接 + 帧；方向仍只有 node→control，明文，无握手 | 同一套方法语义在新传输上跑通；`NODE_METHODS` 白名单不退化 |
-| **B2.2** | 握手 + 会话密钥 + `node-keys` 行 + 吊销；SSE 换成同一连接的 event 帧 | 抓包无明文；断线重连不依赖新 grant；吊销立即生效 |
-| **B2.3** | 反向发起（node 监听默认关 + control dial）+ 单会话仲裁 | 两个方向各自成会话；同时连只有一个存活 |
-| **B2.4** | 任务走流：claim 与 push 并存、取消改下行帧 | B1 的 claim 语义在流上仍成立；轮询取消列表的代码删除 |
+| **L1** | `box-node-link` 帧层：helper 的 register/heartbeat/echo/report 从「每操作一个 HTTP POST」换成一条长连接 + 帧；方向仍只有 node→control，明文，无握手 | 同一套方法语义在新传输上跑通；`NODE_METHODS` 白名单不退化 |
+| **L2** | 握手 + 双向会话密钥 + `rekey` + `node-keys` 行 + 吊销；SSE 换成同一连接的 event 帧 | 抓包无明文；断线重连不依赖新 grant；§9 的负向测试全绿 |
+| **L3** | 反向发起（node 监听默认关 + control dial）+ 单会话仲裁 | 两个方向各自成会话；同时连只有一个存活 |
+| **L4** | 任务走流：claim 与 push 并存、取消改下行帧 | B1 的 claim 语义在流上仍成立；轮询取消列表的代码删除 |
+
+**与 11-07 的 B2 是什么关系**：那份文档的 B2 是**能力轨道**（clone→install→build→report、`node_purge`、
+`GET /mirror.bundle`、`dshbox node join`），本文的 L1–L4 是**连接轨道**；两条可以并行，但顺序上 L1/L2 先行，
+B2 的「接收取消列表」在 L4 之后作废（已在那份文档的 B2 行加日期说明）。
 
 与既有一次性 enroll grant（`ENROLL_TTL_SECONDS = 300`）的关系：它就是 token 模式的第一环，
-不另起一套；绑定完成后由节点私钥接管。
+不另起一套；绑定完成后由节点私钥（`node-key` 模式）接管重连。
 
 ## 11. 已知代价
 
@@ -185,16 +246,21 @@ pub struct NodeKeyRecord {
 
 ## 12. 现状（2026-11-08 实测）
 
-22 个 crate + `dshbox` 二进制。`dshboxd` 21.8k 行、依赖 18 个 crate；**11 个 crate 的唯一消费者是 dshboxd**：
+22 个 crate + `dshbox` 二进制（Tauri 包）。`dshboxd` 21,783 行、依赖 18 个 crate。
+**10 个 crate 只有一个 crate 消费者，其中 9 个的消费者就是 `dshboxd`**——例外是 `box-data-scheduler`，
+它只被 `box-template-core` 用（评审 B9 纠正了原文「11 个」的口径）：
 
-| fan-in | crate |
+| crate 消费者数 | crate |
 |---|---|
-| 17 | `box-foundation` |
+| 16 | `box-foundation` |
 | 4 | `box-runtime`、`box-scheduler`、`box-dsh-versions` |
 | 3 | `box-api`、`box-containers`、`box-extensions`、`box-toolchains` |
 | 2 | `box-server-core` |
-| 1 | `box-logger`、`box-store`、`box-state`、`box-template-core`、`box-updates`、`box-data-scheduler`、`box-browser`、`box-image`、`box-resources`、`box-plugin-graph` |
-| 0 | `box-client`（只有桌面二进制用） |
+| 1 | `box-logger`、`box-store`、`box-state`、`box-template-core`、`box-updates`、`box-browser`、`box-image`、`box-resources`、`box-plugin-graph`（以上 9 个 → `dshboxd`）、`box-data-scheduler`（→ `box-template-core`） |
+| 0 | `box-client`（只被 `dshbox` 这个二进制包使用） |
+
+口径（评审 N6）：上表只数 **crate 之间**的依赖；`dshbox`（Tauri 包）不计入，若计入 `box-foundation` 是 17。
+行数按换行符重算过（`Measure-Object -Line` 会少算约 8%，不要用它核对这类数字）。
 
 结论：这些包没在买「依赖方向」，只在买「多一个编译单元、多一份测试入口、多一个会腐烂的边界」。
 
@@ -206,6 +272,10 @@ pub struct NodeKeyRecord {
 3. **它是二进制**（`dshboxd`、`box-helper`）。
 
 `box-logger`（125 行、1 个消费者、无边界价值）三条都不满足。
+
+合并之后必须守住的一条（评审 N7）：**`box-state` 永不反依赖 `box-template-core`**。
+`box-data-scheduler → box-state` 之所以不成环，唯一原因就是这条；一旦反过来，
+`box-template-core → box-state` 与 `box-state → box-template-core` 立刻成环，§18 的守卫要单独把它钉住。
 
 ## 14. 目标目录（四层）
 
@@ -271,6 +341,7 @@ src-tauri/crates/
   `box-state` 是聚合层，允许依赖 `domain/` 内的其它包；
 - `edge/` 不依赖 `apps/`；
 - `apps/` 之间不互相依赖；
+- **`box-state` 不依赖 `box-template-core`**（合并 `box-data-scheduler` 之后的成环风险，见 §13）；
 - 任何 crate 都不依赖 `dshbox`（Tauri 包只能被 `src-tauri` 自己用）。
 
 这条比目录更重要：目录只让方向可见，守卫才让它不可退化。
