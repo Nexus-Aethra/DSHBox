@@ -3187,8 +3187,9 @@ mod tests {
                 serde_json::json!({}),
             )
             .unwrap();
-            // Drive the record to the terminal state through the state
-            // machine rather than writing a status string by hand.
+            // Put the record in the terminal state. The status string is
+            // spelled by TaskState's Display, so each case uses the exact
+            // wire form a real transition would have written.
             let target = TaskState::from_known(status).unwrap();
             {
                 let mut state = manager.state.lock().unwrap();
