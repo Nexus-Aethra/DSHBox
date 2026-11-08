@@ -96,13 +96,15 @@ export type PluginGraph = {
 }
 /** A task's status as it arrives from the daemon.
  *
- *  Three things this type has to admit, because the server really sends them:
  *  `miss` (the node that held the task no longer does -- terminal, and not the
- *  same thing as a failure), and two spellings each for the rollback states, as
- *  `transition_to` writes the Rust `Display` form (`rolling_back`) while serde
- *  writes the lowercase one (`rollingback`). Both are pinned by
- *  `wire_format_tests` in `box-scheduler`; a name that only one of them
- *  produces is a status the UI silently falls back on. */
+ *  same thing as a failure) is written by `mark_missed`. The rollback states
+ *  also admit two spellings each: `transition_to` writes the Rust `Display`
+ *  form (`rolling_back`) -- which is what a `TaskRecord.status` actually holds,
+ *  since records are written by `transition_to` -- while serde's enum form is
+ *  the lowercase one (`rollingback`), pinned by `wire_format_tests`. The second
+ *  spelling is kept so a record written by another writer using the enum's
+ *  serde form is not silently dropped; a name this union omits is a status the
+ *  UI silently falls back on. */
 export type TaskStatus =
   | 'queued'
   | 'running'

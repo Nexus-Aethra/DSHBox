@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { boxApi } from '../shared/api/box-api'
+import { boxApi, taskFailed } from '../shared/api/box-api'
 import type { UpdatePolicy, UpdateState } from '../shared/types/domain'
 
 /**
@@ -67,7 +67,10 @@ async function waitForTask(
     if (task === undefined) throw new Error('the download task disappeared from the queue')
     onProgress({ stage: task.stage, progress: task.progress })
     if (task.status === 'succeeded') return
-    if (task.status === 'failed' || task.status === 'cancelled' || task.status === 'interrupted') {
+    // Every non-success terminal state is a failure here: a `miss` or a
+    // rollback end must not keep polling until the deadline and then be
+    // reported as a timeout. See box-api.ts taskFailed (design section 2.5).
+    if (taskFailed(task.status)) {
       throw new Error(task.error ?? 'the download did not finish')
     }
     if (Date.now() > deadline) throw new Error('the download took too long; check the task panel')

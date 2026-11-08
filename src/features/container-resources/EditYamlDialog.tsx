@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { boxApi } from '../../shared/api/box-api'
+import { boxApi, taskFailed } from '../../shared/api/box-api'
 import type { ResourceTree } from '../../shared/types/domain'
 import { Button } from '../../ui/Button'
 import { Dialog } from '../../ui/Dialog'
@@ -75,7 +75,7 @@ export function EditYamlDialog({ containerId, path, text, onClose }: Props) {
       const task = await boxApi.enqueueResourceWrite({ id: containerId, path, section, text: body, conflict })
       setQueued(task.id)
       const finished = await boxApi.waitForTask(task.id)
-      if (finished !== null && finished.status === 'failed') {
+      if (finished !== null && taskFailed(finished.status)) {
         setError(finished.error ?? finished.stage)
       } else {
         await load(section)

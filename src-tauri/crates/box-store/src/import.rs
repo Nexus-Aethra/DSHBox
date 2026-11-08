@@ -104,6 +104,10 @@ mod tests {
             params: serde_json::json!({ "k": "v" }),
             cancel_requested: false,
             rollback_error: None,
+            node_id: None,
+            claimed_by: None,
+            claim_session: None,
+            idempotency_key: None,
         }
     }
 

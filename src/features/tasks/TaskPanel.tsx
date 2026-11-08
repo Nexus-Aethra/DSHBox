@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { TaskRecord } from '../../shared/types/domain'
+import { taskFailed } from '../../shared/api/box-api'
 import { Badge } from '../../ui/Badge'
 import { Button } from '../../ui/Button'
 import { Card } from '../../ui/Card'
@@ -57,8 +58,11 @@ export function TaskPanel({ tasks, logs, text, onClose, onCancel, onRetry, onLog
           </div>}
         </Stack>
         <Stack gap={2} className="task-actions">
-          <Badge variant={task.status === 'succeeded' ? 'success' : task.status === 'failed' || task.status === 'cancelled' || task.status === 'interrupted' ? 'danger' : 'primary'}>{task.status}</Badge>
+          <Badge variant={task.status === 'succeeded' ? 'success' : taskFailed(task.status) ? 'danger' : 'primary'}>{task.status}</Badge>
           {(task.status === 'queued' || task.status === 'running') && <Button variant="secondary" size="sm" onClick={() => { void onCancel(task.id) }}>{text.cancel}</Button>}
+          {/* `miss` is deliberately NOT retried from here: a lost claim may
+              have left a half-written artifact, so a blind re-enqueue would put
+              two workers on the same tar. The user checks the node first. */}
           {['failed', 'cancelled', 'interrupted'].includes(task.status) && <Button variant="secondary" size="sm" onClick={() => { void onRetry(task.id) }}>{text.retry}</Button>}
           {terminal(task) && <Button variant="danger" size="sm" onClick={() => { setPendingDelete(task.id) }}>{text.remove}</Button>}
           <Button variant="secondary" size="sm" onClick={() => { if (expanded !== task.id) void onLog(task.id); setExpanded((current) => current === task.id ? null : task.id) }}>{text.viewLog}</Button>

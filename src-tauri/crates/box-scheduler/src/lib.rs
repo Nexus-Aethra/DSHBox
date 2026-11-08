@@ -54,6 +54,22 @@ use std::{
 };
 use tracing::{error, info, warn};
 
+/// A task's params are a small instruction, not a payload. The design caps
+/// them at 4 KiB (section 3.5): deep-comparing a free-form JSON blob plus a
+/// whole-scope upsert is what the millisecond-scale argument in section 6
+/// rules out. Enforced at the enqueue boundary, never left to the caller.
+pub const MAX_PARAMS_BYTES: usize = 4096;
+
+/// The idempotency key is caller-supplied and short (section 3.5 says 64
+/// *characters*, so CJK keys count by chars, not UTF-8 bytes).
+pub const MAX_IDEMPOTENCY_KEY_CHARS: usize = 64;
+
+fn params_size(params: &serde_json::Value) -> usize {
+    serde_json::to_vec(params)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
 /// Explicit task lifecycle states with validated transitions.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -316,6 +332,24 @@ pub struct TaskRecord {
     /// failure) and `rollback_error` (the rollback failure).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub rollback_error: Option<String>,
+    // ---- Node placement (roadmap stage B1, design section 2.3) ----
+    // All four default so a task written before node dispatch existed still
+    // loads as a plain host-side task: no schema migration, no downgrade path.
+    /// Which node the task is assigned to. `None` (and the legacy absent field)
+    /// means the daemon's own local worker, i.e. "host".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub node_id: Option<String>,
+    /// The node that claimed the task; `None` until `node_claim_task` writes it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub claimed_by: Option<String>,
+    /// The helper instance that claimed it. A different current instance means
+    /// the claim was lost, which is what `mark_missed` acts on (section 2.5).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub claim_session: Option<String>,
+    /// Caller-supplied dedup key. The tuple is (kind, nodeId, key) and only
+    /// active tasks dedup (section 3.5): a `miss` must not block a retry.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub idempotency_key: Option<String>,
 }
 
 impl TaskRecord {
@@ -907,6 +941,10 @@ impl TaskManager {
             params,
             cancel_requested: false,
             rollback_error: None,
+            node_id: None,
+            claimed_by: None,
+            claim_session: None,
+            idempotency_key: None,
         };
         fs::write(
             &task.log_path,
@@ -918,6 +956,123 @@ impl TaskManager {
             .map_err(|_| "task manager lock failed")?
             .tasks
             .insert(id, task.clone());
+        self.persist()?;
+        Ok(task)
+    }
+
+    /// Enqueue a task assigned to a node (roadmap stage B1, design 2.3/3.5).
+    ///
+    /// Everything is validated before a record is written, and the dedup check
+    /// shares the lock with the insert: two callers racing on the same
+    /// (kind, nodeId, key) must not both enqueue. Only `queued`/`running` tasks
+    /// dedup -- a finished, cancelled or `miss` record never blocks a retry.
+    pub fn enqueue_for_node(
+        &self,
+        paths: &BoxPaths,
+        kind: impl Into<String>,
+        node_id: impl Into<String>,
+        idempotency_key: Option<String>,
+        mut resource_keys: Vec<String>,
+        params: serde_json::Value,
+    ) -> BoxResult<TaskRecord> {
+        let kind = kind.into();
+        let node_id = node_id.into();
+        if kind.trim().is_empty() {
+            return Err("task kind is required".to_owned());
+        }
+        // A node id is used to build the `node:<id>` resource key and, from
+        // stage C on, a directory name. Reuse the registry's alphabet rather
+        // than accepting `a|b` or `../../etc` here and refusing them there.
+        if !box_foundation::is_safe_identifier(&node_id) {
+            return Err("nodeId is not a safe identifier".to_owned());
+        }
+        if let Some(key) = &idempotency_key {
+            let chars = key.chars().count();
+            if chars == 0 || chars > MAX_IDEMPOTENCY_KEY_CHARS {
+                return Err(format!(
+                    "idempotencyKey must be 1..{MAX_IDEMPOTENCY_KEY_CHARS} characters"
+                ));
+            }
+        }
+        let size = params_size(&params);
+        if size > MAX_PARAMS_BYTES {
+            return Err(format!("params exceed {MAX_PARAMS_BYTES} bytes: {size}"));
+        }
+        // `nodeId` is assignment, not a lock scope; the node key belongs in
+        // resourceKeys so two tasks for one node cannot claim the same slot.
+        // The base-level exclusion of section 3.2 (`base:<baseId>`) is the
+        // caller's to add -- it arrives with node_build_artifact, which this
+        // slice does not implement yet. Keep it a set, not a pile.
+        let node_key = format!("node:{node_id}");
+        if !resource_keys.iter().any(|key| key == &node_key) {
+            resource_keys.push(node_key);
+        }
+
+        // One predicate, reused by the fast pre-check and the decisive one.
+        // Only active tasks dedup: a `miss` must not permanently block a retry.
+        let is_duplicate = |existing: &&TaskRecord, key: &str| {
+            existing.kind == kind
+                && existing.node_id.as_deref() == Some(node_id.as_str())
+                && existing.idempotency_key.as_deref() == Some(key)
+                && matches!(
+                    TaskState::from_known(&existing.status),
+                    Some(TaskState::Queued) | Some(TaskState::Running)
+                )
+        };
+        // Fast path before any log is written, so a dedup hit leaves no
+        // orphan log file. The decisive check below repeats it under the same
+        // lock as the insert, so two racing callers cannot both enqueue.
+        if let Some(key) = &idempotency_key {
+            let state = self.state.lock().map_err(|_| "task manager lock failed")?;
+            if let Some(existing) = state.tasks.values().find(|t| is_duplicate(t, key)) {
+                return Ok(existing.clone());
+            }
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let log_path = paths.task_log(&id)?;
+        fs::create_dir_all(log_path.parent().ok_or("task log has no parent")?)
+            .map_err(|error| error.to_string())?;
+        let task = TaskRecord {
+            id: id.clone(),
+            kind: kind.clone(),
+            resource_keys,
+            status: TaskState::Queued.to_string(),
+            stage: "Queued".to_owned(),
+            progress: 0,
+            stages: Vec::new(),
+            created_at: now_seconds(),
+            started_at: None,
+            finished_at: None,
+            log_path: log_path.to_string_lossy().into_owned(),
+            error: None,
+            params,
+            cancel_requested: false,
+            rollback_error: None,
+            node_id: Some(node_id.clone()),
+            claimed_by: None,
+            claim_session: None,
+            idempotency_key: idempotency_key.clone(),
+        };
+        fs::write(
+            &task.log_path,
+            format!("[{}] queued {} for {}\n", task.created_at, kind, node_id),
+        )
+        .map_err(|error| error.to_string())?;
+
+        let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
+        if let Some(key) = &idempotency_key {
+            let existing = state.tasks.values().find(|t| is_duplicate(t, key)).cloned();
+            if let Some(existing) = existing {
+                // A concurrent caller won the race. The log we just wrote
+                // belongs to nobody; remove it rather than leaving an orphan.
+                drop(state);
+                let _ = fs::remove_file(&task.log_path);
+                return Ok(existing);
+            }
+        }
+        state.tasks.insert(id, task.clone());
+        drop(state);
         self.persist()?;
         Ok(task)
     }
@@ -2718,6 +2873,348 @@ mod tests {
         );
         assert_eq!(running(&manager), 1, "and the slot stays the other owner's");
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
+    // ---- Node placement (roadmap stage B1, design section 2.3/3.5) ----
+
+    /// A task written before node dispatch existed has none of the four new
+    /// fields. It must still deserialize as a plain host-side task: adding a
+    /// field to a persisted record is not a migration.
+    #[test]
+    fn a_legacy_task_without_node_fields_still_loads() {
+        let value = serde_json::json!({
+            "id": "legacy", "kind": "test", "resourceKeys": [],
+            "status": "succeeded", "stage": "Completed", "progress": 100,
+            "createdAt": 1_700_000_000, "startedAt": null, "finishedAt": null,
+            "logPath": "/tmp/x.log", "error": null, "params": {},
+            "cancelRequested": false
+        });
+        let task: TaskRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(task.node_id, None);
+        assert_eq!(task.claimed_by, None);
+        assert_eq!(task.claim_session, None);
+        assert_eq!(task.idempotency_key, None);
+    }
+
+    /// The four fields are camelCase on the wire and survive a round trip.
+    #[test]
+    fn node_fields_speak_camel_case_on_the_wire() {
+        let task = TaskRecord {
+            id: "t".to_owned(),
+            kind: "node_build_artifact".to_owned(),
+            resource_keys: vec!["node:n1".to_owned()],
+            status: "queued".to_owned(),
+            stage: "Queued".to_owned(),
+            progress: 0,
+            stages: Vec::new(),
+            created_at: 1,
+            started_at: None,
+            finished_at: None,
+            log_path: String::new(),
+            error: None,
+            params: serde_json::json!({}),
+            cancel_requested: false,
+            rollback_error: None,
+            node_id: Some("n1".to_owned()),
+            claimed_by: Some("n1".to_owned()),
+            claim_session: Some("s-1".to_owned()),
+            idempotency_key: Some("k-1".to_owned()),
+        };
+        let value = serde_json::to_value(&task).unwrap();
+        for key in ["nodeId", "claimedBy", "claimSession", "idempotencyKey"] {
+            assert!(value.get(key).is_some(), "{key} is on the wire: {value}");
+        }
+        assert_eq!(
+            serde_json::from_value::<TaskRecord>(value).unwrap().node_id,
+            task.node_id
+        );
+    }
+
+    fn node_task(
+        manager: &TaskManager,
+        paths: &BoxPaths,
+        kind: &str,
+        node: &str,
+        key: Option<String>,
+        params: serde_json::Value,
+    ) -> BoxResult<TaskRecord> {
+        manager.enqueue_for_node(paths, kind, node, key, vec![], params)
+    }
+
+    #[test]
+    fn enqueue_for_node_sets_assignment_and_adds_the_node_lock() {
+        let paths = paths("node-enqueue");
+        let manager = TaskManager::json(&paths).unwrap();
+        let task = node_task(
+            &manager,
+            &paths,
+            "node_build_artifact",
+            "n1",
+            None,
+            serde_json::json!({ "baseId": "base-0123456789abcdef" }),
+        )
+        .unwrap();
+        assert_eq!(task.node_id.as_deref(), Some("n1"));
+        assert_eq!(task.status, "queued");
+        assert_eq!(task.claimed_by, None);
+        assert!(task.resource_keys.iter().any(|k| k == "node:n1"));
+        assert_eq!(manager.store.load_all().unwrap()[0].node_id, task.node_id);
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
+    /// Params are an instruction, not a payload: the cap is enforced before
+    /// any log or row exists (design section 3.5).
+    #[test]
+    fn params_over_4kib_are_refused_before_anything_is_written() {
+        let paths = paths("node-params-cap");
+        let manager = TaskManager::json(&paths).unwrap();
+        let at_cap = serde_json::json!({ "blob": "x".repeat(MAX_PARAMS_BYTES - 12) });
+        assert!(
+            params_size(&at_cap) <= MAX_PARAMS_BYTES,
+            "test fixture is at the cap"
+        );
+        assert!(node_task(&manager, &paths, "k", "n1", None, at_cap).is_ok());
+        let over = serde_json::json!({ "blob": "x".repeat(MAX_PARAMS_BYTES) });
+        let error = node_task(&manager, &paths, "k", "n1", None, over).unwrap_err();
+        assert!(error.contains("exceed"), "{error}");
+        assert_eq!(
+            manager.list().unwrap().len(),
+            1,
+            "the refused call wrote nothing"
+        );
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
+    #[test]
+    fn an_empty_kind_node_or_overlong_key_is_refused() {
+        let paths = paths("node-enqueue-shape");
+        let manager = TaskManager::json(&paths).unwrap();
+        assert!(node_task(&manager, &paths, "", "n1", None, serde_json::json!({})).is_err());
+        assert!(node_task(&manager, &paths, "k", "", None, serde_json::json!({})).is_err());
+        // The alphabet is the same one the node registry uses (PR #36).
+        for bad_node in ["a|b", "../../etc", "node with space", "node/child"] {
+            assert!(
+                node_task(&manager, &paths, "k", bad_node, None, serde_json::json!({})).is_err(),
+                "{bad_node:?} was accepted"
+            );
+        }
+        assert!(node_task(
+            &manager,
+            &paths,
+            "k",
+            "n1",
+            Some(String::new()),
+            serde_json::json!({})
+        )
+        .is_err());
+        assert!(node_task(
+            &manager,
+            &paths,
+            "k",
+            "n1",
+            Some("x".repeat(MAX_IDEMPOTENCY_KEY_CHARS + 1)),
+            serde_json::json!({})
+        )
+        .is_err());
+        // Section 3.5 says 64 *characters*: a 64-CJK key is 192 UTF-8 bytes
+        // and must still be accepted. Counting bytes here would halve the
+        // limit for a Chinese caller.
+        let cjk_64 = "中".repeat(MAX_IDEMPOTENCY_KEY_CHARS);
+        assert!(cjk_64.chars().count() == MAX_IDEMPOTENCY_KEY_CHARS);
+        assert!(node_task(
+            &manager,
+            &paths,
+            "k",
+            "n1",
+            Some(cjk_64),
+            serde_json::json!({})
+        )
+        .is_ok());
+        assert!(node_task(
+            &manager,
+            &paths,
+            "k",
+            "n1",
+            Some("中".repeat(MAX_IDEMPOTENCY_KEY_CHARS + 1)),
+            serde_json::json!({})
+        )
+        .is_err());
+        assert_eq!(
+            manager.list().unwrap().len(),
+            1,
+            "only the valid CJK key wrote a record"
+        );
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
+    /// A dedup hit must not leave a log file for the task that was never
+    /// inserted: the first enqueue writes one log, the duplicate writes none.
+    #[test]
+    fn a_dedup_hit_leaves_no_orphan_log() {
+        let paths = paths("node-idem-log");
+        let manager = TaskManager::json(&paths).unwrap();
+        let first = node_task(
+            &manager,
+            &paths,
+            "k",
+            "n1",
+            Some("key".to_owned()),
+            serde_json::json!({}),
+        )
+        .unwrap();
+        let duplicate = node_task(
+            &manager,
+            &paths,
+            "k",
+            "n1",
+            Some("key".to_owned()),
+            serde_json::json!({}),
+        )
+        .unwrap();
+        assert_eq!(duplicate.id, first.id);
+        let log_dir = Path::new(&first.log_path).parent().unwrap();
+        let logs: Vec<_> = fs::read_dir(log_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(logs.len(), 1, "only the first task has a log: {logs:?}");
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
+    /// The dedup tuple is (kind, nodeId, key) and covers only active states:
+    /// a `miss` must not block a retry (design section 3.5).
+    #[test]
+    fn idempotency_dedups_only_active_tasks_with_the_same_tuple() {
+        let paths = paths("node-idem");
+        let manager = TaskManager::json(&paths).unwrap();
+        let first = node_task(
+            &manager,
+            &paths,
+            "k",
+            "n1",
+            Some("key".to_owned()),
+            serde_json::json!({}),
+        )
+        .unwrap();
+        let second = node_task(
+            &manager,
+            &paths,
+            "k",
+            "n1",
+            Some("key".to_owned()),
+            serde_json::json!({ "different": 1 }),
+        )
+        .unwrap();
+        assert_eq!(
+            second.id, first.id,
+            "active + same tuple returns the existing task"
+        );
+        assert_eq!(manager.list().unwrap().len(), 1);
+        assert_ne!(
+            node_task(
+                &manager,
+                &paths,
+                "k",
+                "n2",
+                Some("key".to_owned()),
+                serde_json::json!({})
+            )
+            .unwrap()
+            .id,
+            first.id
+        );
+        assert_ne!(
+            node_task(
+                &manager,
+                &paths,
+                "other",
+                "n1",
+                Some("key".to_owned()),
+                serde_json::json!({})
+            )
+            .unwrap()
+            .id,
+            first.id
+        );
+        assert_ne!(
+            node_task(&manager, &paths, "k", "n1", None, serde_json::json!({}))
+                .unwrap()
+                .id,
+            first.id
+        );
+        manager.mark_missed(&first.id, "node went away").unwrap();
+        assert_eq!(manager.task(&first.id).unwrap().status, "miss");
+        let retry = node_task(
+            &manager,
+            &paths,
+            "k",
+            "n1",
+            Some("key".to_owned()),
+            serde_json::json!({}),
+        )
+        .unwrap();
+        assert_ne!(
+            retry.id, first.id,
+            "a miss must not permanently block the key"
+        );
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
+    /// The whole terminal half of section 3.5, not just `miss`: adding any
+    /// finished state to the dedup set would make a retry silently return the
+    /// old taskId and never run the work again. A mutation that adds Succeeded
+    /// to `is_duplicate` must turn this red (review of PR #37).
+    #[test]
+    fn no_terminal_state_dedups_a_retry() {
+        for status in [
+            "succeeded",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "rolled_back",
+            "rolledback",
+            "miss",
+        ] {
+            let label = format!("terminal-{status}");
+            let paths = paths(&label);
+            let manager = TaskManager::json(&paths).unwrap();
+            let first = node_task(
+                &manager,
+                &paths,
+                "k",
+                "n1",
+                Some("key".to_owned()),
+                serde_json::json!({}),
+            )
+            .unwrap();
+            // Put the record in the terminal state. The status string is
+            // spelled by TaskState's Display, so each case uses the exact
+            // wire form a real transition would have written.
+            let target = TaskState::from_known(status).unwrap();
+            {
+                let mut state = manager.state.lock().unwrap();
+                let task = state.tasks.get_mut(&first.id).unwrap();
+                task.status = target.to_string();
+                task.finished_at = Some(now_seconds());
+            }
+            manager.persist().unwrap();
+            let retry = node_task(
+                &manager,
+                &paths,
+                "k",
+                "n1",
+                Some("key".to_owned()),
+                serde_json::json!({}),
+            )
+            .unwrap();
+            assert_ne!(retry.id, first.id, "{status} must not block a retry");
+            assert_eq!(
+                manager.list().unwrap().len(),
+                2,
+                "{status} retry was enqueued"
+            );
+            let _ = fs::remove_dir_all(paths.runtime.unwrap());
+        }
     }
 }
 
