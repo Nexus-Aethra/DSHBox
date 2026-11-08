@@ -67,6 +67,9 @@
 - **节点侧只需要正向 `H`**：种子 `s` 在节点手里，任意 `c_k = H^k(s)` 都能现算（O(n) 次哈希），
   也可以一次性缓存整条链；不需要反函数，也不需要控制面下发新环。
 - **链用尽**：`k` 走到 1 之后必须重新 enroll（或换 PSK）。
+- **节点侧必须先持久化再发送**（评审 nit 2）：节点把「已用到第 k 环」在**发出 hello 之前**落盘，任何失败、
+  超时或重试一律取**更小**的 `k`（把「已发送」当作「已消费」）。否则 `hello-ack` 丢失后重试同一个 `c_k`，
+  `H(c_k) = c_{k+1} ≠ lastAccepted` 会被**永久拒绝**，只能重新 enroll。这一条是 L2 的实现红线。
 - **节点侧泄露 = 剩余整条链泄露**：种子在节点文件里，谁能读它就能算完后续所有环（哈希链的固有性质，
   和 S/KEY 一样）。所以节点侧必须 0600、且提供「随时换链」——换链就是控制面重写该行的 `secret/lastAccepted`，
   并把新种子重新下发。
@@ -114,7 +117,7 @@ t2 = sha256( t1 | serverNonce | ephB )
 
 control → node  hello-ack { serverNonce, ephB, controlSig, sealer }
   controlSig = Ed25519( sk_control, t2 )      ← **所有模式都必带**，见下
-  psk 模式  : wrapKey = HKDF( ecdh(ephA,ephB) ‖ HKDF(psk,"bootstrap"), "wrap", t2 )   ← 纵深防御
+  psk 模式  : wrapKey = HKDF( ecdh(ephA,ephB) ‖ HKDF(psk,"bootstrap"), "wrap", t2 )   ← 独立证明（PSK 不在线上）
   token 模式: wrapKey = HKDF( ecdh(ephA,ephB) ‖ HKDF(c_k,"bootstrap"), "wrap", t2 )   ← 仅纵深防御，见下
   node-key  : wrapKey = HKDF( ecdh(ephA,ephB), "wrap", t2 )
   sealer = AEAD( wrapKey, seq=0, aad=t2, plaintext = sessionCert )
@@ -126,8 +129,9 @@ control → node  hello-ack { serverNonce, ephB, controlSig, sealer }
 - **节点侧认证**：`mac`（psk/token）或 `nodeSig`（node-key）证明节点身份。
 - **控制面侧认证**：靠 `controlSig` + 节点手里**离线拿到**的控制面公钥/指纹（引导材料里一起交付：
   运维给的文件或 QR 同时含 secret 与控制面指纹）。这条对三种模式都一样成立，因此首连就是双向的。
-  评审 R2 指出：token 模式下 `c_k` 本身就在不加密的 hello 里，**主动 MITM 能读到它**，所以
-  「把秘密绑进 wrapKey」不能单独当作控制面的认证依据（那是纵深防御，不是信任来源）。
+  - **psk 模式**：PSK 不在线路上，所以「wrapKey 里混了 PSK」本身就是控制面的**独立证明**（除了 `controlSig`）。
+  - **token 模式**：`c_k` 就写在不加密的 hello 里，主动 MITM 能读到，所以这里的绑定**只是纵深防御**，
+    不是认证依据（评审 R2 的根因）。认证由 `controlSig` + 离线指纹承担。
 - **证书的角色**：`sessionCert` 提供长期身份与变更检测；指纹首连即被离线指纹校验过，
   之后每轮比对，变了就拒绝。
 - **token 模式的残余风险（明写）**：环值在线上，主动 MITM 可以「转发」节点的一次握手（bearer 语义），
@@ -187,8 +191,9 @@ pub const NODE_KEY_SCOPE: &str = "node-keys";
 pub struct NodeKeyRecord {
     pub id: String,                // = nodeId，一节点一行，换钥即覆盖
     pub mode: String,              // "psk" | "token-chain" | "token-signed"
-    pub secret: String,            // PSK 或链端 c_n（base64）；只有库里有，从不外发
-    pub last_accepted: Option<String>, // 哈希链最近一次接受的值；下一个必须是它的前像 ⇒ 一次性
+    pub secret: String,            // psk: PSK；token: 留空（控制面不存种子 s，也就无从伪造下一环）
+                                   // signed-token: 控制面签名私钥的标识（不存私钥本身）
+    pub last_accepted: Option<String>, // 链端 c_n 起步；每次接受后换成收到的值；下一个必须是它的前像
     pub node_pubkey: Option<String>, // 节点 Ed25519 公钥；首次登记写入，是 node-key 重连的身份
     pub issued_at: u64,
     pub expires_at: Option<u64>,
@@ -205,8 +210,8 @@ pub struct NodeKeyRecord {
    issuedAt, expiresAt, revoked, fingerprint}`。整行禁止 `tracing` 打印。
 2. **库文件本身要 0600**（评审 N3）：`<runtime>/state/dshbox.db` 是秘密的落点，创建/打开后收紧权限；
    否则「不进日志」只是把秘密挪到了同目录可读的文件里。
-3. **不进库的三样**：会话密钥（内存/会话内）、节点私钥（节点侧 0600）、握手后被丢弃的引导秘密副本
-   （库里留的是链端与已接受步数，那不是可再用的秘密原文）。
+3. **不进库的三样**：会话密钥（内存/会话内）、节点私钥（节点侧 0600）、token 模式的种子 `s`
+   （控制面只留链端与最近接受的值，那不是可再用的秘密原文）。
 4. **签发即出库一次**：`node_enroll` 生成后把 PSK/token 明文回给运维一次，此后只存校验依据。
 
 ## 9. 安全边界：我们承担什么
@@ -224,7 +229,8 @@ pub struct NodeKeyRecord {
   8. `rekey` 重放／在旧密钥下重复使用同一 `seq`；
   9. 收到重复或倒退的 `seq`。
 - **正向测试**：首连用离线指纹校验 `controlSig` 通过 → 下一轮同指纹通过、换指纹拒绝；`node-key` 模式下
-  `nodeSig` 通过而 `controlSig` 缺失时拒绝。
+  `nodeSig` 通过而 `controlSig` 缺失时拒绝；**`hello-ack` 丢失后节点用更小的 `k` 重试能够成功**
+  （这条钉的是「先持久化再发送」，见 §3）。
 - 握手状态机是纯函数（输入：本端随机数/临时密钥/对端帧；输出：会话密钥或错误），便于用测试向量钉住。
 - 失败一律关闭连接，不「重试到成功」；日志只记 `nodeId/原因类别`，不记秘密。
 
