@@ -17,11 +17,12 @@
 |---|---|---|
 | 自己写握手，还是 TLS 传输 + PSK 认证 | **自己写握手**（方案 A），原语全部来自 `ring` | 节点侧不引入 TLS 栈；会话密钥要能在帧层轮换；代价是安全边界归我们（§9） |
 | 引导要素 | **PSK（长期）** 与 **token 链（限期）** 两种，可并存 | 长期设备用 PSK + 定期轮换；自动化/临时环境用 token |
-| token 形态 | **哈希链为默认**（一次性、防重放、可本地续链），签名 TTL 为兼容模式 | 链模式控制面只存链端与「已接受步数」，节点离线也能续 |
-| 节点身份 | **从第一天就有**：节点 Ed25519 密钥 + 控制面 Ed25519 身份 + 会话证书（首连 TOFU、之后比对） | 重连不再依赖引导秘密；证书负责长期身份与变更检测，首连的双向认证由 wrapKey 绑秘密提供 |
+| token 形态 | **哈希链为默认**（一次性、防重放、可本地续链），签名 TTL 为兼容模式 | 链模式控制面只存链端与最近接受的值，节点离线也能续 |
+| 节点身份 | **从第一天就有**：节点 Ed25519 密钥 + 控制面 Ed25519 身份 + 会话证书（指纹随引导材料离线交付、之后每轮比对） | 重连不再依赖引导秘密；证书负责长期身份与变更检测，首连的双向认证由 `controlSig` + 离线指纹提供 |
 | 双向都连上时谁活 | **先成功者为准**，后到者收 `already-connected` 并被关闭 | 幂等、可重连；不需要分布式仲裁 |
 | 反向连（control → node）默认值 | **默认关闭**，需要显式开关 | node 一旦监听入站就是新攻击面 |
 | 密钥与签发状态存哪 | **document store 的 `node-keys` scope，一行一节点** | 已有 SQLite；不引入秘密文件，不进 `config.json` |
+| 首连凭什么做双向认证 | `controlSig`（控制面 Ed25519 签 `t2`）+ **引导材料里离线交付的控制面指纹** | token 的环值在线上，不能单独当控制面的认证依据（评审 R2） |
 
 ## 1. 目标与明确不做
 
@@ -32,15 +33,15 @@
 - 不发明密码学。只定义**帧格式、用例、有效期**；原语一律用 `ring`（X25519 / HKDF-SHA256 /
   HMAC-SHA256 / ChaCha20-Poly1305 或 AES-256-GCM / OS 随机）。
 - 不做打洞/中继。两边都在 NAT 后面时双向都失败，那是 `nodes.relay`（P 阶段）的事，本文不承诺。
-- 不做证书链/CA。会话证书自签：首连的指纹是 **TOFU**（记录、之后比对），不是首连的信任来源——
-  首连的双向认证由「引导秘密参与 wrapKey」提供（§5）。不引入公网 CA。
+- 不做证书链/CA。会话证书自签：控制面指纹**随引导材料离线交付**，节点用它校验 `controlSig`，此后每轮比对；
+  只有「运维只给了 secret、没给指纹」的降级用法才退化成 TOFU（§5）。不引入公网 CA。
 
-## 2. 三种引导要素
+## 2. 三种引导要素（引导材料的交付总是「secret + 控制面指纹」两件）
 
 | 要素 | 谁生成 | 怎么到节点 | 节点存哪 | 有效期 |
 |---|---|---|---|---|
-| **PSK** | 控制面（每节点 32B 随机 + nodeId） | 运维手工（文件/QR/粘贴） | `<root>/node.key`，0600 | 长期，建议 90 天轮换 |
-| **token 链** | 控制面（链端 + 步数） | 运维或自动化下发 | `<root>/node.token`，0600 | 整链 `expiresAt`（建议 15 分钟~1 小时），一次性 |
+| **PSK** | 控制面（每节点 32B 随机 + nodeId） | 运维手工（文件/QR，**与控制面指纹一起给**） | `<root>/node.key`，0600 | 长期，建议 90 天轮换 |
+| **token 链** | 控制面（链端 + 种子） | 运维或自动化下发（**种子 + 控制面指纹**） | `<root>/node.token`，0600 | 整链 `expiresAt`（建议 15 分钟~1 小时），一次性 |
 | **节点身份** | 节点首次启动自生成 Ed25519 | — | `<root>/node.id`，0600 | 长期；引导要素只负责**绑定**它 |
 
 绑定关系：第一次握手成功时，控制面把 `nodePubkey` 写进 `node-keys` 行（§8）并反映到注册表；
@@ -49,18 +50,26 @@
 
 ## 3. token 链（哈希链，默认）
 
-链是**单向哈希链**：控制面选随机种子 `s`，定义 `c_0 = s`、`c_{i+1} = H(c_i)`、链长 `n`；
-控制面只存**链端** `c_n` 与「已接受的最小步数」`bestSteps`（初值 `n`）；节点只存种子 `s`。
+链是**单向哈希链**，方向必须让「下一个值」不可由「当前值」推出，否则一次窃听就能续完整条链
+（评审 R1：我上一版把方向写反了，攻击者看到 `c_k` 就能算 `c_{k+1}` 并自己续链）。
 
 ```
-第 k 次握手：节点报 c_k = H^k(s)（本地续链：c_{k+1} = H(c_k)，不需要控制面发新环）
-控制面校验：从收到的值反复 H，累计步数，必须在 n 步内等于 c_n；
-            且 steps = n-k < bestSteps；成功即 bestSteps = steps
+控制面取随机种子 s，按正向算到链端：c_{i+1} = H(c_i)，c_n = H^n(s)（n 取 64–256）
+控制面把**种子 s** 交给节点（0600），自己只存 c_n 作为 lastAccepted
+第 k 次握手（k 从 n-1 递减到 1）：节点报 c_k = H^k(s)
+控制面 O(1) 校验：H(received) == lastAccepted；成功后 lastAccepted = received
 ```
 
-- **一次性**：`bestSteps` 严格递减 ⇒ 每个环只能用一次；重放旧环时 `steps` 不小于记录值，直接拒绝。
-- **可离线续链**：节点只需要 `H` 这个正向函数，不依赖任何反函数，也不用控制面下发新环。
-- **算力**：每次握手最多 `n` 次 SHA-256（n 取 64–256），相对握手频率可忽略。
+- **一次性**：下一次被接受的必须是上一次的**前像**，所以同一个值只能用一次；重放任何旧值都不满足
+  `H(received) == lastAccepted`，直接拒绝。
+- **抗窃听续链**：窃听者拿到 `c_k` 只能向**前**算（`c_{k+1}…c_n`，全部都已被用过），算不回 `c_{k-1}`
+  —— 那需要 `H^{-1}`。所以拿到线上报文不能接管后续握手。
+- **节点侧只需要正向 `H`**：种子 `s` 在节点手里，任意 `c_k = H^k(s)` 都能现算（O(n) 次哈希），
+  也可以一次性缓存整条链；不需要反函数，也不需要控制面下发新环。
+- **链用尽**：`k` 走到 1 之后必须重新 enroll（或换 PSK）。
+- **节点侧泄露 = 剩余整条链泄露**：种子在节点文件里，谁能读它就能算完后续所有环（哈希链的固有性质，
+  和 S/KEY 一样）。所以节点侧必须 0600、且提供「随时换链」——换链就是控制面重写该行的 `secret/lastAccepted`，
+  并把新种子重新下发。
 - **有效期**：环是裸哈希，本身不带时间戳（评审 N2 指出原文「每环带 TTL」不成立）。有效期挂在**整条链**上：
   `expiresAt` 由控制面时钟判定，过期必须重新 enroll；另有会话最长生存期（§4）与「同一节点两次握手的
   最小间隔」限流。
@@ -98,27 +107,31 @@ t1 = sha256("hello" | ver | suite | nodeId | mode | clientNonce | ephA | 模式�
 
 node → control  hello { ver, suite, nodeId, mode, clientNonce, ephA, 模式字段 }
   mode = "psk"      : mac = HMAC( HKDF(psk, "bootstrap"), t1 )
-  mode = "token"    : chainValue = c_k, chainSteps = k, mac = HMAC( HKDF(c_k, "bootstrap"), t1 )
+  mode = "token"    : chainValue = c_k, mac = HMAC( HKDF(c_k, "bootstrap"), t1 )   ← k 由节点自己记
   mode = "node-key" : nodePubkey, nodeSig = Ed25519( sk_node, t1 )      ← 重连，不需要引导秘密
 
 t2 = sha256( t1 | serverNonce | ephB )
 
 control → node  hello-ack { serverNonce, ephB, controlSig, sealer }
-  psk/token 模式 : wrapKey = HKDF( ecdh(ephA,ephB) ‖ HKDF(引导秘密,"bootstrap"), "wrap", t2 )
-                   controlSig 可省（wrapKey 已要求控制面知道同一秘密）
-  node-key 模式  : wrapKey = HKDF( ecdh(ephA,ephB), "wrap", t2 )
-                   controlSig = Ed25519( sk_control, t2 )   ← 节点用 pin 的控制面公钥校验
+  controlSig = Ed25519( sk_control, t2 )      ← **所有模式都必带**，见下
+  psk 模式  : wrapKey = HKDF( ecdh(ephA,ephB) ‖ HKDF(psk,"bootstrap"), "wrap", t2 )   ← 纵深防御
+  token 模式: wrapKey = HKDF( ecdh(ephA,ephB) ‖ HKDF(c_k,"bootstrap"), "wrap", t2 )   ← 仅纵深防御，见下
+  node-key  : wrapKey = HKDF( ecdh(ephA,ephB), "wrap", t2 )
   sealer = AEAD( wrapKey, seq=0, aad=t2, plaintext = sessionCert )
 
 两侧  sessionKey_c2s = HKDF( ecdh, "c2s", t2 )；sessionKey_s2c = HKDF( ecdh, "s2c", t2 )
 握手结束  临时私钥与 wrapKey 立即销毁；引导秘密的会话副本丢弃
 ```
 
-- **双向认证（首连即是双向）**：`mac` 证明「节点持有该秘密」；`wrapKey` 里绑了**同一份**引导秘密，
-  因此能解开 `sealer` 的只可能是知道它的控制面。`node-key` 模式改用 `controlSig` 达到同一效果。
-  （评审 4 指出：原文让 sessionCert 单独承担「对端是真控制面」，首连时它只是未 pin 的自签证书，属过度声称。）
-- **证书的角色**：`sessionCert` 提供**长期身份与变更检测**，不是首连的信任来源——首连指纹是 TOFU，
-  记录下来之后每一轮比对，变了就拒绝。
+- **节点侧认证**：`mac`（psk/token）或 `nodeSig`（node-key）证明节点身份。
+- **控制面侧认证**：靠 `controlSig` + 节点手里**离线拿到**的控制面公钥/指纹（引导材料里一起交付：
+  运维给的文件或 QR 同时含 secret 与控制面指纹）。这条对三种模式都一样成立，因此首连就是双向的。
+  评审 R2 指出：token 模式下 `c_k` 本身就在不加密的 hello 里，**主动 MITM 能读到它**，所以
+  「把秘密绑进 wrapKey」不能单独当作控制面的认证依据（那是纵深防御，不是信任来源）。
+- **证书的角色**：`sessionCert` 提供长期身份与变更检测；指纹首连即被离线指纹校验过，
+  之后每轮比对，变了就拒绝。
+- **token 模式的残余风险（明写）**：环值在线上，主动 MITM 可以「转发」节点的一次握手（bearer 语义），
+  但拿不到后续环（§3 的抗窃听续链），重放旧环也会被 `H(received) == lastAccepted` 拒绝。
 - **前向保密**：会话密钥来自 X25519 临时密钥，**FS 靠临时私钥销毁**（握手结束与每次 `rekey` 后立即
   drop/zeroize），不是「丢弃引导秘密」。丢弃引导秘密的价值是缩小暴露面（评审 6）。
 - **控制面侧不「丢弃」引导秘密**：它必须长期保存 `node-keys.secret` 用于下次校验；能丢的只有会话副本。
@@ -134,7 +147,8 @@ control → node  hello-ack { serverNonce, ephB, controlSig, sealer }
 - **首连用引导秘密（psk/token），之后用节点私钥（`node-key` 模式）**：这样 token 只需短 TTL，重连不受它限制。
   首次登记时把 `nodePubkey` 写进 `node-keys` 行与注册表（§8），此后 `nodeSig` 就是身份。
 - 断线重连：指数退避（上限 30s）；`epoch` 变化（控制面重启）时用 `nodeSig` 重建，不需要新 grant。
-- 首连的证书指纹是 **TOFU**：记录后每轮比对，变更即拒绝并告警（§5）。
+- **首连的信任来自离线交付的控制面指纹**（随 PSK/token 一起给），不是 TOFU；会话证书指纹之后每轮比对，
+  变更即拒绝并告警（§5）。只有在「运维只给了 secret、没给指纹」的降级用法下才退化成 TOFU，且必须显式记录这个状态。
 
 ### 6.2 任务与取消（与 B1/B2 的关系）
 - 有下行流之后，`cancel` 从「helper 轮询取消列表」变成**下行帧直推**，可以删掉一整块轮询逻辑。
@@ -157,7 +171,7 @@ control → node  hello-ack { serverNonce, ephB, controlSig, sealer }
 | 动作 | 控制面 | 节点 | 生效点 |
 |---|---|---|---|
 | 吊销 | `node-keys` 行写 `revokedAt`（不删，留审计） | — | 下一次握手拒绝；已建会话发下行 `close{revoked}` |
-| 换钥 | 覆盖 `secret` + 重置 `bestSteps/issuedAt` | 运维替换 `<root>/node.key` | 下一次握手 |
+| 换钥 | 覆盖 `secret` + 重置 `lastAccepted/issuedAt` | 运维替换 `<root>/node.key` | 下一次握手 |
 | 过期 | `expiresAt` 到期即拒 | — | 同上 |
 | 剪枝 | 与 `tasks` prune 同节奏删掉「过期/吊销超过 N 天」的行 | 删自身旧文件 | — |
 
@@ -174,7 +188,7 @@ pub struct NodeKeyRecord {
     pub id: String,                // = nodeId，一节点一行，换钥即覆盖
     pub mode: String,              // "psk" | "token-chain" | "token-signed"
     pub secret: String,            // PSK 或链端 c_n（base64）；只有库里有，从不外发
-    pub best_steps: Option<u64>,   // 哈希链已接受的最小步数（严格递减 ⇒ 一次性）
+    pub last_accepted: Option<String>, // 哈希链最近一次接受的值；下一个必须是它的前像 ⇒ 一次性
     pub node_pubkey: Option<String>, // 节点 Ed25519 公钥；首次登记写入，是 node-key 重连的身份
     pub issued_at: u64,
     pub expires_at: Option<u64>,
@@ -201,16 +215,16 @@ pub struct NodeKeyRecord {
 - 只用 `ring` 的原语，不自造分组密码/KDF/构造。
 - **负向测试清单**（每条都必须连接失败、且不留半开会话）：
   1. 篡改 `t1`/`t2`（改一个字节）；
-  2. 重放已用过的 token 环（`steps` 不小于 `bestSteps`）；
+  2. 重放已用过的 token 环，或报一个不是 `lastAccepted` 前像的值；
   3. 降级 `ver`/`suite`；
-  4. 重连时证书指纹与 TOFU 记录不符；
+  4. 重连时控制面指纹与记录不符；
   5. 截断帧、超长帧（> 1 MiB）；
   6. 过期链（`expiresAt`）；
-  7. 攻击者没有引导秘密却构造 `sealer`（wrapKey 里没有秘密的份额 ⇒ 解不开）；
+  7. `hello-ack` 缺 `controlSig`，或用错密钥签名（三种模式都要测）；
   8. `rekey` 重放／在旧密钥下重复使用同一 `seq`；
   9. 收到重复或倒退的 `seq`。
-- **正向测试**：首连记录 TOFU 指纹 → 下一轮同指纹通过、换指纹拒绝；`node-key` 模式下 `nodeSig` 通过而
-  `controlSig` 缺失时拒绝。
+- **正向测试**：首连用离线指纹校验 `controlSig` 通过 → 下一轮同指纹通过、换指纹拒绝；`node-key` 模式下
+  `nodeSig` 通过而 `controlSig` 缺失时拒绝。
 - 握手状态机是纯函数（输入：本端随机数/临时密钥/对端帧；输出：会话密钥或错误），便于用测试向量钉住。
 - 失败一律关闭连接，不「重试到成功」；日志只记 `nodeId/原因类别`，不记秘密。
 
