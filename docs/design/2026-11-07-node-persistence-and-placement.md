@@ -168,11 +168,12 @@ helper 在进程启动时生成一个实例号，注册时上报；daemon 只存
 | `running` | `interrupted` | daemon 重启（`restore()` 统一处理） |
 | `miss` | — | 终态，**不自动重排**（构建可能已写了半个归档，重排会让两个 worker 抢同一产物） |
 
-两条**状态机之外**的实现纪律（评审 B4 指出，当前代码不满足）：
+两条**状态机之外**的实现纪律（评审 B4 指出）：
 
-1. `finish()` 现在会 `transition_to().ok()` 吞掉转移错误再无条件写 `stage="Completed"`
-   （`box-scheduler/src/lib.rs:946-950`），于是 `miss` 之后迟到的回报会把记录写成
-   **miss + Completed + 100%**。B1 必须先判终态：终态任务收到 report/finish 一律**忽略并记日志**。
+1. `finish()` 曾经会 `transition_to().ok()` 吞掉转移错误再无条件写 `stage="Completed"`，于是
+   `miss` 之后迟到的回报会把记录写成 **miss + Completed + 100%**。**已实现（#35）**：只有
+   `from.can_transition_to(target)` 成立才写状态，`Miss` 没有出边，终态任务收到迟到的 report
+   一律忽略并记日志（`tracing::warn!`）。
 2. `restore()` 在 daemon 启动时把 `running` 钉成 `interrupted`（终态），所以**“失联判 miss”的扫描
    永远不会看到它们** —— 这是有意的：重启是控制层自己的原因，归 `interrupted`。`miss` 只在
    daemon 存活期间由节点事件触发。两条路径不许互相认领。
@@ -234,7 +235,21 @@ daemon 用它覆盖 grant 里的值并与白名单比对；否则白名单校验
 **认领是 node → 控制层的同步调用**（node 问“有我的活吗”），不吃 §3.5 的异步规则：
 `node_claim_task` 在一个调度器锁内把 `queued → running` 并写 `claimedBy/claimSession/startedAt`，
 然后返回任务；返回后 helper 才开干。控制层的任务持久化必须由调度器的单一写者完成，
-不能在内存改完再整表 `persist()` 覆盖（评审 B7：认领写入会被覆盖）。
+不能在内存改完再整表 `persist()` 覆盖（评审 B7：认领写入会被覆盖；这个整表写方法现在**已经删除**，见下）。
+
+落地方式（已实现）：单条改动只写自己那一行——`TaskManager::persist_row`，在持锁期间完成；
+一次关闭多条的扫描（`interrupt_running`）写它改过的那一批 `persist_rows`；**整表写的方法已经
+删掉**（不是留着没人用，而是根本没得调），`restore()` 把整表读进来、只写它关掉的那几行。
+为什么不能“在锁里调整表写”：整表写内部会 `list()`（再取同一把锁），会死锁——这正是要单独有
+`persist_row` 的原因。测试：13 个单条写点由一张表逐点钉住（经由同一个 store 上的第二个
+`TaskManager` 推进某个任务，再改动另一个任务，磁盘上那一行必须还是别人写的），批量那条单独
+一条测试**从磁盘读回**（读 `manager.list()` 是自证的，测不到落盘）。`restore()` 也只写它自己关掉的那几行、并且只扫**本进程拥有**的任务（`Sweep`：
+daemon 扫全部，桌面端只扫自己入队的 kind）——桌面与 daemon 共用一个 store，整表扫会把 daemon
+正在跑的任务在库里写成 `interrupted`。事件通知器（daemon 的 `DaemonNotifier`、桌面端的
+`emit_task_update`）同样不写库：
+它们每个 stage tick 都会跑，且在事件里整表快照就等于把最高频的那条竞态路径重新装回去。
+唯一既有 caveat：行写失败时内存已经改过、错误照常上报，所以一条记录可能在内存里是新的、
+磁盘上还是旧的，直到下一次 mutation 重写它——这不是本设计引入的，但值得记住。
 
 断线重连、daemon 重启、事件丢帧都自愈：helper 重连后继续 claim。SSE 只用于“有新活”的提示，不承担可靠性。
 
@@ -285,7 +300,8 @@ node → 控制层（register / heartbeat / claim / report / artifact_report）
 2. **幂等键由调用方给**（`idempotencyKey`，≤64 字符），去重元组是 **(kind, nodeId, idempotencyKey)** —— 只用 key 会让同一个 key 发给不同节点或不同动作时拿回不相关的 taskId。不做 `params` 深比较（`params` 是自由 JSON，
    深比较 + 整表 upsert 会破坏 §6 的毫秒级论证）。去重只针对**活跃态** `{queued, running}`；
    `succeeded/failed/cancelled/interrupted/miss` 一律不阻止重派——否则一次 `miss` 会永久堵死同一 key。
-   另：`params` ≤ 4 KiB —— 今天没有执行点（`dispatch.rs` 的通用入队原样收参），B1 要在新 RPC 边界上真正拦。
+   另：`params` ≤ 4 KiB —— **已实现（#37）**：`enqueue_for_node` 与通用 `enqueue_task` RPC 都在边界拦，
+   超限直接拒绝（`MAX_PARAMS_BYTES` / `params_size`），拒绝时不留 log 文件、不入队。
 
 ### 3.6 `node_purge`：清理 node 磁盘，接受可达性现实
 

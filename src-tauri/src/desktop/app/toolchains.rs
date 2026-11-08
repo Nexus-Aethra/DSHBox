@@ -41,7 +41,7 @@ pub(crate) fn enqueue_toolchain_install(
     let task = queue_task(
         &manager,
         &app,
-        "toolchain-install",
+        LocalTaskKind::ToolchainInstall,
         vec![format!("toolchain:{id}")],
         serde_json::json!({ "id": id }),
     )?;

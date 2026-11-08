@@ -494,6 +494,41 @@ command as done only once the installed app has run it.
   invisible. And do not invent sub-steps for work the daemon cannot observe —
   `pnpm run build` is one child process, so splitting it into native/host/web
   would be a guess, and a guessed bar is exactly what this replaced.
+  **A single-record mutation writes its own row, and writes it inside the lock.**
+  `TaskManager::persist_row` upserts one record; a sweep that closes several
+  (`interrupt_running`) writes exactly the batch it changed (`persist_rows`).
+  **There is no whole-scope writer at all** — the method was deleted rather than
+  left available, because a caller who did not know the history would reach for
+  it; `restore()` reads the whole set but writes only the rows it closed. A
+  whole-scope snapshot is taken *after* the state lock is released, so
+  it rewrites every row from this process's in-memory copy — and a claim another
+  thread (from stage B on, another node's claim) has just written is silently
+  undone, leaving a task that reads after a restart as running with no owner
+  (design §3.3, review B7 of PR #37). Taking the snapshot before dropping the
+  lock instead is not the fix either: it goes through `list()`, which takes the
+  same lock, so it deadlocks — which is why the row writer exists.
+  `every_single_row_mutation_leaves_another_writers_row_alone` pins all thirteen
+  sites at once: each case prepares task A, lets a second `TaskManager` over the
+  same store claim task B, mutates A, then reads B back — a table rather than a
+  spot check, because a converted-but-unpinned site is one that can be reverted
+  silently (a reviewer proved exactly that for `begin_stage`). The two
+  hand-written tests beside it pin the two interesting shapes: a plain mutation
+  and the claim writer's close path, where the task the mutation does *not* touch
+  is what proves the point. **A restart sweep writes only the rows it closed, and
+  only for the kinds it owns** (`Sweep`): the daemon sweeps everything, the
+  desktop only the kinds it enqueues (`LocalTaskKind`, a type so a new call site
+  cannot forget to add one), because a blanket sweep
+  from a client shares one store with the daemon and writes its running tasks off
+  as `interrupted` on disk. The desktop's SIGTERM flush is gone for the same
+  reason — it had no durability value, only the ability to put back stale rows.
+  **Notifiers do not persist either**, and that
+  is the same rule one layer up: `DaemonNotifier::stage`/`finished` and the
+  desktop's `emit_task_update` fire on every stage tick, and each used to take a
+  whole-scope snapshot of its own — the highest-frequency way to lose a row,
+  since the desktop and the daemon share one store. They now only refresh the
+  resource snapshot and emit the event; the mutation behind them already wrote
+  the row. `dshboxd`'s `a_notification_does_not_rewrite_another_writers_row`
+  pins it.
 - **Task logs are the UI's only window into a long task.** A daemon task's log
   file is written by `TaskContext::append_log` and by nothing else — a notifier
   that writes it too doubles every line. Stage changes (`task.update`) only move

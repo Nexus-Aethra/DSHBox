@@ -305,7 +305,18 @@ fn run_inner() -> Result<(), String> {
                 }
             }
             if let Ok(paths) = task_paths() {
-                let _ = app.state::<TaskManager>().restore(&paths);
+                // Only the kinds this process enqueues: the desktop shares the
+                // task store with the daemon, so a blanket sweep would close the
+                // daemon's running tasks on disk while their workers are still
+                // going (review of PR #38).
+                let _ = app
+                    .state::<TaskManager>()
+                    .restore(
+                        &paths,
+                        box_scheduler::Sweep::only(
+                            LocalTaskKind::ALL.map(|kind| kind.as_str()),
+                        ),
+                    );
             }
             let handle = app.handle().clone();
             thread::spawn(move || refresh_global_state(&handle));
@@ -326,10 +337,13 @@ fn run_inner() -> Result<(), String> {
             // local (toolchain-install) task state so the next launch can
             // resume it. The daemon owns container hosts, so there is nothing
             // to stop here.
-            let shutdown_handle = app.handle().clone();
             ctrlc::set_handler(move || {
-                write_startup_log("shutdown signal received; persisting task state");
-                let _ = shutdown_handle.state::<TaskManager>().persist();
+                // Nothing to flush: every task mutation writes its own row under
+                // the scheduler's lock, so a whole-scope write here could only put
+                // back this process's copy of rows the daemon has changed since --
+                // the race the row writer exists to avoid (review of PR #38). The
+                // daemon owns the container hosts, so there is nothing to stop.
+                write_startup_log("shutdown signal received");
                 write_startup_log("shutdown complete");
                 std::process::exit(0);
             })

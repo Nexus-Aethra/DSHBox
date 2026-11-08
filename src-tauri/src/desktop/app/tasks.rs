@@ -26,14 +26,7 @@ pub(crate) fn refresh_global_state(app: &tauri::AppHandle) {
     }
     let versions = connection
         .as_ref()
-        .and_then(|client| {
-            call(
-                client,
-                "list_installed_dsh_versions",
-                serde_json::json!({}),
-            )
-            .ok()
-        })
+        .and_then(|client| call(client, "list_installed_dsh_versions", serde_json::json!({})).ok())
         .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
         .map(|names| {
             names
@@ -64,8 +57,7 @@ pub(crate) fn task_paths() -> Result<BoxPaths, String> {
 /// Desktop diagnostics are intentionally non-fatal, so an unusable store
 /// degrades to memory instead of blocking the shell.
 pub(crate) fn build_task_manager() -> TaskManager {
-    let collection =
-        task_paths().and_then(|paths| box_store::open_task_collection(&paths));
+    let collection = task_paths().and_then(|paths| box_store::open_task_collection(&paths));
     match collection {
         Ok(collection) => TaskManager::new(collection),
         Err(error) => {
@@ -77,18 +69,58 @@ pub(crate) fn build_task_manager() -> TaskManager {
     }
 }
 
-pub(crate) fn persist_tasks(manager: &TaskManager) -> Result<(), String> {
-    manager.persist()
+/// The task kinds this process enqueues, and therefore the only ones it owns.
+///
+/// The desktop shares the task store with the daemon, so its restart sweep must
+/// close only rows whose workers this process started: a blanket sweep writes
+/// off a daemon task that is still running (review of PR #38, the cross-process
+/// half of B7).
+///
+/// `queue_task` takes this enum instead of a string on purpose: a kind outside it
+/// would be closed by nobody (the daemon is the only other sweeper), and a new
+/// call site that forgot to add one must fail to compile rather than leave a row
+/// that reads `running` forever.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalTaskKind {
+    ToolchainInstall,
+    ImageCommit,
+    ImageLoad,
+}
+
+impl LocalTaskKind {
+    pub(crate) const ALL: [LocalTaskKind; 3] = [
+        LocalTaskKind::ToolchainInstall,
+        LocalTaskKind::ImageCommit,
+        LocalTaskKind::ImageLoad,
+    ];
+
+    /// The spelling a task record carries and the UI matches on. Written out
+    /// rather than derived from the variant name, because these strings are the
+    /// contract.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            LocalTaskKind::ToolchainInstall => "toolchain-install",
+            LocalTaskKind::ImageCommit => "image-commit",
+            LocalTaskKind::ImageLoad => "image-load",
+        }
+    }
+
+    /// Whether a stored record's kind is one this process runs, and can
+    /// therefore cancel or have swept. Routing one of these to the daemon
+    /// reports success for a cancel that never reaches the worker.
+    pub(crate) fn owns(kind: &str) -> bool {
+        Self::ALL.iter().any(|owned| owned.as_str() == kind)
+    }
 }
 
 pub(crate) fn queue_task(
     manager: &TaskManager,
     app: &tauri::AppHandle,
-    kind: &str,
+    kind: LocalTaskKind,
     resource_keys: Vec<String>,
     params: serde_json::Value,
 ) -> Result<TaskRecord, String> {
-    let task = manager.enqueue(&task_paths()?, kind, resource_keys, params)?;
+    let task = manager.enqueue(&task_paths()?, kind.as_str(), resource_keys, params)?;
     let state = app.state::<ResourceStateManager>();
     state.apply_task_update(task.clone());
     if let Ok(config) = read_config() {
@@ -101,7 +133,12 @@ pub(crate) fn queue_task(
     Ok(task)
 }
 
-pub(crate) fn append_task_log(manager: &TaskManager, app: &tauri::AppHandle, task_id: &str, message: &str) {
+pub(crate) fn append_task_log(
+    manager: &TaskManager,
+    app: &tauri::AppHandle,
+    task_id: &str,
+    message: &str,
+) {
     // The task context already wrote the line to the task's log file; this only
     // tells the UI about it. Writing it here too duplicated every line.
     let task = manager.task(task_id).ok();
@@ -118,7 +155,11 @@ pub(crate) fn emit_task_update(manager: &TaskManager, app: &tauri::AppHandle, ta
     if let Ok(task) = manager.task(task_id) {
         let _ = app.emit("task://updated", task);
     }
-    let _ = persist_tasks(manager);
+    // No whole-scope persist: every caller reaches here after a scheduler
+    // mutation that wrote its own row, and a snapshot from this process's
+    // memory would rewrite the rest of the table -- the desktop shares the
+    // store with the daemon, so that is exactly how a node claim would be
+    // undone (design section 3.3, review finding B7).
     let state = app.state::<ResourceStateManager>();
     if let Ok(task) = manager.task(task_id) {
         state.apply_task_update(task);
@@ -171,7 +212,14 @@ pub(crate) fn run_queued_task(
             app: app.clone(),
         };
         let rollback: Option<Box<dyn FnOnce(&TaskContext) + Send + 'static>> = None;
-        run_queued(&manager, &paths, std::sync::Arc::new(notifier), &task_id, work, rollback);
+        run_queued(
+            &manager,
+            &paths,
+            std::sync::Arc::new(notifier),
+            &task_id,
+            work,
+            rollback,
+        );
         // `run_queued` also returns without executing anything when the record
         // is held by another owner (a node claim) or was removed, so the record
         // left on disk is not necessarily a result. Announcing `finished` for a
@@ -195,10 +243,9 @@ pub(crate) fn list_tasks(
     // daemon is authoritative for ids it owns, so overlapping entries from
     // an earlier disk restore are dropped.
     let client = connect()?;
-    let mut tasks: Vec<TaskRecord> = serde_json::from_value(
-        call(&client, "list_tasks", serde_json::json!({}))?,
-    )
-    .map_err(|error| format!("invalid task list: {error}"))?;
+    let mut tasks: Vec<TaskRecord> =
+        serde_json::from_value(call(&client, "list_tasks", serde_json::json!({}))?)
+            .map_err(|error| format!("invalid task list: {error}"))?;
     for task in manager.list().map_err(|error| error.to_string())? {
         if !tasks.iter().any(|existing| existing.id == task.id) {
             tasks.push(task);
@@ -214,11 +261,14 @@ pub(crate) fn cancel_task(
     manager: tauri::State<'_, TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    // Local tasks (toolchain installs) cancel locally; daemon tasks cancel
-    // on the daemon, which owns their workers.
+    // A local task cancels locally; a daemon task cancels on the daemon, which
+    // owns its workers. Which one this is comes from the kind, and from all of
+    // them -- this used to compare against `toolchain-install` alone, so
+    // cancelling an `image-commit` was forwarded to a daemon that does not own
+    // it and the local worker kept running (review of PR #38, N1).
     if manager
         .task(&id)
-        .map(|task| task.kind == "toolchain-install")
+        .map(|task| LocalTaskKind::owns(task.kind.as_str()))
         .unwrap_or(false)
     {
         manager.request_cancel(&task_paths()?, &id)?;
@@ -276,10 +326,9 @@ pub(crate) fn retry_task(
         Ok(task) if task.kind == "toolchain-install" => task,
         _ => {
             let client = connect()?;
-            let tasks: Vec<TaskRecord> = serde_json::from_value(
-                call(&client, "list_tasks", serde_json::json!({}))?,
-            )
-            .map_err(|error| format!("invalid task list: {error}"))?;
+            let tasks: Vec<TaskRecord> =
+                serde_json::from_value(call(&client, "list_tasks", serde_json::json!({}))?)
+                    .map_err(|error| format!("invalid task list: {error}"))?;
             tasks
                 .into_iter()
                 .find(|task| task.id == id)
@@ -347,26 +396,57 @@ pub(crate) fn retry_task(
             app,
         ),
         "repository-extension-import" => enqueue_repository_extension_import(
-            ImportRepositoryExtensionRequest { source: previous.params["source"].as_str().ok_or("task has no extension source")?.to_owned() }, manager, app,
+            ImportRepositoryExtensionRequest {
+                source: previous.params["source"]
+                    .as_str()
+                    .ok_or("task has no extension source")?
+                    .to_owned(),
+            },
+            manager,
+            app,
         ),
         "workspace-extension-import" => enqueue_workspace_extension_import(
             ImportWorkspaceExtensionRequest {
-                id: previous.params["id"].as_str().ok_or("task has no container id")?.to_owned(),
-                relative_path: previous.params["relativePath"].as_str().ok_or("task has no workspace path")?.to_owned(),
-            }, manager, app,
+                id: previous.params["id"]
+                    .as_str()
+                    .ok_or("task has no container id")?
+                    .to_owned(),
+                relative_path: previous.params["relativePath"]
+                    .as_str()
+                    .ok_or("task has no workspace path")?
+                    .to_owned(),
+            },
+            manager,
+            app,
         ),
         "container-extension-copy" => enqueue_container_extension_copy(
             CopyRepositoryExtensionRequest {
-                id: previous.params["id"].as_str().ok_or("task has no container id")?.to_owned(),
+                id: previous.params["id"]
+                    .as_str()
+                    .ok_or("task has no container id")?
+                    .to_owned(),
                 profile: previous.params["profile"].as_str().map(str::to_owned),
-                repository_id: previous.params["repositoryId"].as_str().ok_or("task has no repository extension")?.to_owned(),
-            }, manager, app,
+                repository_id: previous.params["repositoryId"]
+                    .as_str()
+                    .ok_or("task has no repository extension")?
+                    .to_owned(),
+            },
+            manager,
+            app,
         ),
         "repository-extension-export" => enqueue_repository_extension_export(
             ExportRepositoryExtensionRequest {
-                repository_id: previous.params["repositoryId"].as_str().ok_or("task has no repository extension")?.to_owned(),
-                destination: previous.params["destination"].as_str().ok_or("task has no export destination")?.to_owned(),
-            }, manager, app,
+                repository_id: previous.params["repositoryId"]
+                    .as_str()
+                    .ok_or("task has no repository extension")?
+                    .to_owned(),
+                destination: previous.params["destination"]
+                    .as_str()
+                    .ok_or("task has no export destination")?
+                    .to_owned(),
+            },
+            manager,
+            app,
         ),
         _ => Err("this task type cannot be retried".to_owned()),
     }
