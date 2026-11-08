@@ -60,8 +60,9 @@ use tracing::{error, info, warn};
 /// rules out. Enforced at the enqueue boundary, never left to the caller.
 pub const MAX_PARAMS_BYTES: usize = 4096;
 
-/// The idempotency key is caller-supplied and short (section 3.5).
-pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 64;
+/// The idempotency key is caller-supplied and short (section 3.5 says 64
+/// *characters*, so CJK keys count by chars, not UTF-8 bytes).
+pub const MAX_IDEMPOTENCY_KEY_CHARS: usize = 64;
 
 fn params_size(params: &serde_json::Value) -> usize {
     serde_json::to_vec(params)
@@ -983,9 +984,10 @@ impl TaskManager {
             return Err("nodeId is required".to_owned());
         }
         if let Some(key) = &idempotency_key {
-            if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+            let chars = key.chars().count();
+            if chars == 0 || chars > MAX_IDEMPOTENCY_KEY_CHARS {
                 return Err(format!(
-                    "idempotencyKey must be 1..{MAX_IDEMPOTENCY_KEY_BYTES} bytes"
+                    "idempotencyKey must be 1..{MAX_IDEMPOTENCY_KEY_CHARS} characters"
                 ));
             }
         }
@@ -994,8 +996,10 @@ impl TaskManager {
             return Err(format!("params exceed {MAX_PARAMS_BYTES} bytes: {size}"));
         }
         // `nodeId` is assignment, not a lock scope; the node key belongs in
-        // resourceKeys so two tasks for the same base on that node cannot
-        // build concurrently (section 3.2). Keep it a set, not a pile.
+        // resourceKeys so two tasks for one node cannot claim the same slot.
+        // The base-level exclusion of section 3.2 (`base:<baseId>`) is the
+        // caller's to add -- it arrives with node_build_artifact, which this
+        // slice does not implement yet. Keep it a set, not a pile.
         let node_key = format!("node:{node_id}");
         if !resource_keys.iter().any(|key| key == &node_key) {
             resource_keys.push(node_key);
@@ -2998,11 +3002,26 @@ mod tests {
             &paths,
             "k",
             "n1",
-            Some("x".repeat(MAX_IDEMPOTENCY_KEY_BYTES + 1)),
+            Some("x".repeat(MAX_IDEMPOTENCY_KEY_CHARS + 1)),
             serde_json::json!({})
         )
         .is_err());
-        assert_eq!(manager.list().unwrap().len(), 0);
+        // Section 3.5 says 64 *characters*: a 64-CJK key is 192 UTF-8 bytes
+        // and must still be accepted. Counting bytes here would halve the
+        // limit for a Chinese caller.
+        let cjk_64 = "中".repeat(MAX_IDEMPOTENCY_KEY_CHARS);
+        assert!(cjk_64.chars().count() == MAX_IDEMPOTENCY_KEY_CHARS);
+        assert!(node_task(&manager, &paths, "k", "n1", Some(cjk_64), serde_json::json!({})).is_ok());
+        assert!(node_task(
+            &manager,
+            &paths,
+            "k",
+            "n1",
+            Some("中".repeat(MAX_IDEMPOTENCY_KEY_CHARS + 1)),
+            serde_json::json!({})
+        )
+        .is_err());
+        assert_eq!(manager.list().unwrap().len(), 1, "only the valid CJK key wrote a record");
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 

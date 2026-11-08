@@ -102,8 +102,9 @@ export type PluginGraph = {
  *  form (`rolling_back`) -- which is what a `TaskRecord.status` actually holds,
  *  since records are written by `transition_to` -- while serde's enum form is
  *  the lowercase one (`rollingback`), pinned by `wire_format_tests`. The second
- *  spelling is kept for records imported from an older build or another writer;
- *  a name this union omits is a status the UI silently falls back on. */
+ *  spelling is kept so a record written by another writer using the enum's
+ *  serde form is not silently dropped; a name this union omits is a status the
+ *  UI silently falls back on. */
 export type TaskStatus =
   | 'queued'
   | 'running'
