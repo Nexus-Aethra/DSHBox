@@ -25,7 +25,6 @@ members = [
   "crates/box-client",
   "crates/box-data-scheduler",
   "crates/box-store",
-  "crates/box-logger",
   "crates/box-template-core",
   "crates/box-updates",
   "crates/dshboxd",
@@ -84,7 +83,6 @@ box-state = { path = "crates/box-state" }
 box-server-core = { path = "crates/box-server-core" }
 box-client = { path = "crates/box-client" }
 box-data-scheduler = { path = "crates/box-data-scheduler" }
-box-logger = { path = "crates/box-logger" }
 box-template-core = { path = "crates/box-template-core" }
 box-store = { path = "crates/box-store" }
 tracing = { workspace = true }

@@ -26,7 +26,6 @@ box-store = { path = "../box-store" }
 box-template-core = { path = "../box-template-core" }
 box-toolchains = { path = "../box-toolchains" }
 box-updates = { path = "../box-updates" }
-box-logger = { path = "../box-logger" }
 tracing = { workspace = true }
 flate2 = "1.1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

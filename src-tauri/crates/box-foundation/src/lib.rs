@@ -2,6 +2,7 @@
 
 pub mod collection;
 pub mod copy_tree;
+pub mod logging;
 
 use serde::{Deserialize, Serialize};
 use std::{

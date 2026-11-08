@@ -248,6 +248,9 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
  "windows-sys 0.45.0",
 ]
 
@@ -267,17 +270,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
-]
-
-[[package]]
-name = "box-logger"
-version = "0.1.0"
-dependencies = [
- "box-foundation",
- "dirs",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -989,7 +981,6 @@ dependencies = [
  "box-extensions",
  "box-foundation",
  "box-image",
- "box-logger",
  "box-plugin-graph",
  "box-resources",
  "box-runtime",
@@ -1029,7 +1020,6 @@ dependencies = [
  "box-extensions",
  "box-foundation",
  "box-image",
- "box-logger",
  "box-plugin-graph",
  "box-resources",
  "box-runtime",

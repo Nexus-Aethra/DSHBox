@@ -1,4 +1,7 @@
 //! Unified tracing logger for every DSH Box crate.
+//! (合并自 `box-logger` crate：它只有 125 行、唯一消费者是 dshboxd，按 2026-11-08
+//! 设计文档 section 15 并入 box-foundation。tracing 初始化属于 foundation 的职责：
+//! 每个二进制启动时调用一次 `logging::init`，日志目录由 `logging::log_dir` 解析。)
 //!
 //! Each binary (daemon / desktop / CLI) calls [`init`] once at startup with
 //! a [`LogComponent`] tag. `init` configures a global `tracing_subscriber`

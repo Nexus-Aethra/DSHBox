@@ -12,6 +12,11 @@ test-kit = []
 dirs = "6.0.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Logging lives here now (merged from box-logger): one tracing facade for every
+# binary, with the workspace pinning the versions so they cannot drift.
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.45", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

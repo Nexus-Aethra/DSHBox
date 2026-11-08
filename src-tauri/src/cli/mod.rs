@@ -30,14 +30,14 @@ pub fn run() -> Option<i32> {
     // standard `~/.dsh-box/logs/cli/` directory when no runtime is configured;
     // the daemon path uses `<runtime>/logs/daemon/`.
     {
-        let log_dir = box_logger::log_dir(
-            box_logger::LogComponent::Cli,
+        let log_dir = box_foundation::logging::log_dir(
+            box_foundation::logging::LogComponent::Cli,
             box_foundation::read_config()
                 .ok()
                 .and_then(|c| c.runtime_directory)
                 .as_deref(),
         );
-        let _ = box_logger::init(box_logger::LogComponent::Cli, &log_dir);
+        let _ = box_foundation::logging::init(box_foundation::logging::LogComponent::Cli, &log_dir);
     }
 
     let arguments = env::args().skip(1).collect::<Vec<_>>();

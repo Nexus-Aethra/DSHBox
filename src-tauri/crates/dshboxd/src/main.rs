@@ -54,14 +54,14 @@ pub fn run() {
     // Initialise the unified logger before any output. The log directory
     // is `<runtime>/logs/daemon/`; the file appender is daily-rolling.
     {
-        let log_dir = box_logger::log_dir(
-            box_logger::LogComponent::Daemon,
+        let log_dir = box_foundation::logging::log_dir(
+            box_foundation::logging::LogComponent::Daemon,
             box_foundation::read_config()
                 .ok()
                 .and_then(|c| c.runtime_directory)
                 .as_deref(),
         );
-        let _ = box_logger::init(box_logger::LogComponent::Daemon, &log_dir);
+        let _ = box_foundation::logging::init(box_foundation::logging::LogComponent::Daemon, &log_dir);
     }
 
     if let Err(error) = initialize_bundled_runtime() {
