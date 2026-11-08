@@ -1943,6 +1943,55 @@ mod tests {
         (state, id, home, runtime)
     }
 
+
+    /// The generic enqueue route enforces the same 4 KiB cap. Deleting the
+    /// check in `enqueue_task` must turn this red (review of PR #37).
+    #[test]
+    fn enqueue_task_refuses_params_over_4kib() {
+        let events = Arc::new(crate::events::DaemonEvents::new());
+        let empty = BoxPaths {
+            config: PathBuf::from("/nonexistent"),
+            runtime: None,
+        };
+        // enqueue writes a log file under runtime, so the normal-path half of
+        // this test needs a real scratch root; the over-cap half is refused
+        // before any path is touched.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let runtime = env::temp_dir().join(format!("dshboxd-enqueue-cap-{stamp}"));
+        let _ = fs::create_dir_all(&runtime);
+        let state = DaemonState {
+            manager: box_scheduler::TaskManager::memory(),
+            paths: RwLock::new(BoxPaths {
+                config: PathBuf::from("/nonexistent"),
+                runtime: Some(runtime.clone()),
+            }),
+            containers: Arc::new(ContainerManager::default()),
+            resources: box_state::ResourceStateManager::default(),
+            nodes: Arc::new(crate::nodes::NodeManager::load(
+                &empty,
+                String::new(),
+                events.clone(),
+            )),
+            events,
+            browser: std::sync::Mutex::new(crate::debug::Sessions::new()),
+            artifacts: crate::node_artifacts::ArtifactIndex::memory(),
+        };
+        let over = serde_json::json!({
+            "kind": "test",
+            "params": { "blob": "x".repeat(box_scheduler::MAX_PARAMS_BYTES) },
+        });
+        let error = enqueue_task(&state, &over).unwrap_err();
+        assert!(error.contains("exceed"), "{error}");
+        assert!(state.manager.list().unwrap().is_empty(), "nothing was queued");
+        // A request with no params still works (the default is an empty object).
+        let ok = serde_json::json!({ "kind": "test" });
+        assert!(enqueue_task(&state, &ok).is_ok());
+        let _ = fs::remove_dir_all(runtime);
+    }
+
     fn cleanup(home: &PathBuf, runtime: &PathBuf) {
         let _ = fs::remove_dir_all(home);
         let _ = fs::remove_dir_all(runtime);

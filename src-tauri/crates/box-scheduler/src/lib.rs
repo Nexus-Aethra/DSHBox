@@ -980,8 +980,11 @@ impl TaskManager {
         if kind.trim().is_empty() {
             return Err("task kind is required".to_owned());
         }
-        if node_id.trim().is_empty() {
-            return Err("nodeId is required".to_owned());
+        // A node id is used to build the `node:<id>` resource key and, from
+        // stage C on, a directory name. Reuse the registry's alphabet rather
+        // than accepting `a|b` or `../../etc` here and refusing them there.
+        if !box_foundation::is_safe_identifier(&node_id) {
+            return Err("nodeId is not a safe identifier".to_owned());
         }
         if let Some(key) = &idempotency_key {
             let chars = key.chars().count();
@@ -2988,6 +2991,13 @@ mod tests {
         let manager = TaskManager::json(&paths).unwrap();
         assert!(node_task(&manager, &paths, "", "n1", None, serde_json::json!({})).is_err());
         assert!(node_task(&manager, &paths, "k", "", None, serde_json::json!({})).is_err());
+        // The alphabet is the same one the node registry uses (PR #36).
+        for bad_node in ["a|b", "../../etc", "node with space", "node/child"] {
+            assert!(
+                node_task(&manager, &paths, "k", bad_node, None, serde_json::json!({})).is_err(),
+                "{bad_node:?} was accepted"
+            );
+        }
         assert!(node_task(
             &manager,
             &paths,
@@ -3011,7 +3021,15 @@ mod tests {
         // limit for a Chinese caller.
         let cjk_64 = "中".repeat(MAX_IDEMPOTENCY_KEY_CHARS);
         assert!(cjk_64.chars().count() == MAX_IDEMPOTENCY_KEY_CHARS);
-        assert!(node_task(&manager, &paths, "k", "n1", Some(cjk_64), serde_json::json!({})).is_ok());
+        assert!(node_task(
+            &manager,
+            &paths,
+            "k",
+            "n1",
+            Some(cjk_64),
+            serde_json::json!({})
+        )
+        .is_ok());
         assert!(node_task(
             &manager,
             &paths,
@@ -3021,7 +3039,11 @@ mod tests {
             serde_json::json!({})
         )
         .is_err());
-        assert_eq!(manager.list().unwrap().len(), 1, "only the valid CJK key wrote a record");
+        assert_eq!(
+            manager.list().unwrap().len(),
+            1,
+            "only the valid CJK key wrote a record"
+        );
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 
@@ -3136,6 +3158,62 @@ mod tests {
             "a miss must not permanently block the key"
         );
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
+    /// The whole terminal half of section 3.5, not just `miss`: adding any
+    /// finished state to the dedup set would make a retry silently return the
+    /// old taskId and never run the work again. A mutation that adds Succeeded
+    /// to `is_duplicate` must turn this red (review of PR #37).
+    #[test]
+    fn no_terminal_state_dedups_a_retry() {
+        for status in [
+            "succeeded",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "rolled_back",
+            "rolledback",
+            "miss",
+        ] {
+            let label = format!("terminal-{status}");
+            let paths = paths(&label);
+            let manager = TaskManager::json(&paths).unwrap();
+            let first = node_task(
+                &manager,
+                &paths,
+                "k",
+                "n1",
+                Some("key".to_owned()),
+                serde_json::json!({}),
+            )
+            .unwrap();
+            // Drive the record to the terminal state through the state
+            // machine rather than writing a status string by hand.
+            let target = TaskState::from_known(status).unwrap();
+            {
+                let mut state = manager.state.lock().unwrap();
+                let task = state.tasks.get_mut(&first.id).unwrap();
+                task.status = target.to_string();
+                task.finished_at = Some(now_seconds());
+            }
+            manager.persist().unwrap();
+            let retry = node_task(
+                &manager,
+                &paths,
+                "k",
+                "n1",
+                Some("key".to_owned()),
+                serde_json::json!({}),
+            )
+            .unwrap();
+            assert_ne!(retry.id, first.id, "{status} must not block a retry");
+            assert_eq!(
+                manager.list().unwrap().len(),
+                2,
+                "{status} retry was enqueued"
+            );
+            let _ = fs::remove_dir_all(paths.runtime.unwrap());
+        }
     }
 }
 

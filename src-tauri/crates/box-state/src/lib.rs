@@ -485,6 +485,26 @@ mod tests {
         );
     }
 
+
+    /// `miss` is a lost claim, not a failed build, but the resource must not
+    /// read as Ready: the UI would otherwise offer a container whose
+    /// preparation never completed (design 2.5). Removing "miss" from the
+    /// match arm must turn this red.
+    #[test]
+    fn a_missed_task_is_reported_as_failed_on_its_resource() {
+        let manager = ResourceStateManager::bootstrap(
+            &BoxConfig::default(),
+            vec![toolchain()],
+            vec![],
+            vec![],
+            vec![task("miss")],
+        );
+        assert_eq!(
+            manager.resource("toolchain:node").unwrap().unwrap().health,
+            ResourceHealth::Failed
+        );
+    }
+
     #[test]
     fn bootstrap_uses_fresh_facts() {
         let manager = ResourceStateManager::bootstrap(
