@@ -68,34 +68,27 @@ gotchas for the exact invocation and the bundle checks that go with it.
 
 ### Rust workspace (`src-tauri/crates/`)
 
-| Crate                       | Role |
-|----------------------------|------|
-| `box-foundation`           | Config, paths, JSON persistence, validation |
-| `box-runtime`              | Absolute-path process exec + libgit2 checkout primitives |
-| `box-scheduler`            | Persisted background task queue, locks, cancellation |
-| `box-store`                | SQLite document-store backend, legacy JSON import |
-| `box-logger`               | tracing init, daily-rolled log files |
-| `box-state`                | `ResourceStateManager` — primary read model |
-| `box-toolchains`           | Bundled Node/npm/pnpm resolver |
-| `box-dsh-versions`         | DSH GitHub catalogue + install/remove |
-| `box-containers`           | Container metadata + active Host registry |
-| `box-extensions`           | Repository plugin/skill scan, copy, export |
-| `box-image`                | `.dsh` parser, manifest v6, gzip tar I/O |
-| `box-resources`            | Container resource kinds, extraction, injection |
-| `box-plugin-graph`         | cordis service graph, read from source + lockfiles |
-| `box-template-core`        | Template ops shared by CLI, desktop and daemon |
-| `box-data-scheduler`       | Resource map and the durable removal queue |
-| `box-server-core`          | `dshboxd` helpers, service install |
-| `box-browser`              | Headless Chromium + DevTools sessions (page-debugging RPCs) |
-| `box-api`, `box-client`    | IPC + client adapter layer |
-| `dshboxd`                  | Sidecar binary (own crate) |
+Four layers, one direction: `apps → edge → domain → core`. The directories are the
+rule, not the filing: `scripts/check-layering.mjs` (`pnpm layers:check`, run by every
+`bundle:*` script) fails when a crate reaches across a boundary.
 
-Dependency direction: `foundation/runtime/scheduler/state` → functional crates →
-Tauri desktop adapters. **Feature crates must not depend on Tauri or one
-another's mutable state.** Only the top-level `dshbox` package depends on Tauri.
+| Layer | Crates | Role |
+|-------|--------|------|
+| `core/` | `box-foundation`, `box-runtime`, `box-store`, `box-scheduler`, `box-api` | No business knowledge: config/paths/JSON/collection/logging, process + libgit2 primitives, the SQLite document store, the task queue, and the wire types every layer shares |
+| `domain/` | `box-containers`, `box-image`, `box-resources`, `box-extensions`, `box-plugin-graph`, `box-toolchains`, `box-dsh-versions`, `box-updates`, `box-template-core`, `box-browser`, `box-state` | Business capabilities, a DAG among themselves. `box-state` is the aggregate read model on top (it owns the resource map and the deletion queue too) |
+| `edge/` | `box-client`, `box-server-core` | The process boundary: RPC client adapter, daemon helpers, service install |
+| `apps/` | `dshboxd`, `box-helper` | The two binaries — control plane, and the node agent that will run operations remotely |
 
-Long operations go through `box-scheduler`; Tauri IPC handlers submit tasks,
-they don't run them inline.
+`tools/runtime-packager` sits outside the layers (a build tool, not a box crate), and
+`dshbox` (the Tauri package at `src-tauri/`) is the only package allowed to depend on
+Tauri. **Feature crates must not depend on Tauri or one another's mutable state.**
+Two rules that are not layer-shaped but are checked the same way: `box-state` must
+never depend on `box-template-core` (that pair is what keeps the data-scheduler merge
+acyclic), and no crate may depend on `dshbox`.
+
+Long operations go through `box-scheduler`; Tauri IPC handlers submit tasks, they do
+not run them inline. Why the layers and the merges that produced them:
+`docs/design/2026-11-08-node-link-session-and-crate-layering.md` section 12-19.
 
 ### Frontend (React)
 

@@ -8,28 +8,14 @@ default-run = "dshbox"
 
 [workspace]
 members = [
-  "crates/box-foundation",
-  "crates/box-api",
-  "crates/box-browser",
-  "crates/box-scheduler",
-  "crates/box-runtime",
-  "crates/box-toolchains",
-  "crates/box-dsh-versions",
-  "crates/box-containers",
-  "crates/box-extensions",
-  "crates/box-plugin-graph",
-  "crates/box-resources",
-  "crates/box-image",
-  "crates/box-state",
-  "crates/box-server-core",
-  "crates/box-client",
-  "crates/box-data-scheduler",
-  "crates/box-store",
-  "crates/box-logger",
-  "crates/box-template-core",
-  "crates/box-updates",
-  "crates/dshboxd",
-  "crates/box-helper",
+  # Four layers, one direction: apps -> edge -> domain -> core. The layout is
+  # documentation as much as structure: a crate in core/ cannot reach business
+  # code, and scripts/check-layering.mjs fails the check if one tries.
+  # See docs/design/2026-11-08-node-link-session-and-crate-layering.md section 14.
+  "crates/core/*",
+  "crates/domain/*",
+  "crates/edge/*",
+  "crates/apps/*",
   "tools/runtime-packager",
 ]
 resolver = "2"
@@ -42,9 +28,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "regist
 tracing-appender = "0.2"
 # Crates published under this workspace; `path = ...` keeps Cargo from
 # treating the dep declaration as a registry lookup.
-box-foundation = { path = "crates/box-foundation" }
-box-data-scheduler = { path = "crates/box-data-scheduler" }
-box-dsh-versions = { path = "crates/box-dsh-versions" }
+box-foundation = { path = "./crates/core/box-foundation" }
+box-dsh-versions = { path = "./crates/domain/box-dsh-versions" }
+box-state = { path = "./crates/domain/box-state" }
 
 [build-dependencies]
 tauri-build = { version = "2.4.1", features = [] }
@@ -69,24 +55,22 @@ tauri = { version = "2.10.2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2.4.0"
 webbrowser = "1.0"
 xz2 = "0.1"
-box-foundation = { path = "crates/box-foundation" }
-box-api = { path = "crates/box-api" }
-box-scheduler = { path = "crates/box-scheduler" }
-box-runtime = { path = "crates/box-runtime" }
-box-toolchains = { path = "crates/box-toolchains" }
-box-dsh-versions = { path = "crates/box-dsh-versions" }
-box-containers = { path = "crates/box-containers" }
-box-extensions = { path = "crates/box-extensions" }
-box-image = { path = "crates/box-image" }
-box-plugin-graph = { path = "crates/box-plugin-graph" }
-box-resources = { path = "crates/box-resources" }
-box-state = { path = "crates/box-state" }
-box-server-core = { path = "crates/box-server-core" }
-box-client = { path = "crates/box-client" }
-box-data-scheduler = { path = "crates/box-data-scheduler" }
-box-logger = { path = "crates/box-logger" }
-box-template-core = { path = "crates/box-template-core" }
-box-store = { path = "crates/box-store" }
+box-foundation = { path = "./crates/core/box-foundation" }
+box-api = { path = "./crates/core/box-api" }
+box-scheduler = { path = "./crates/core/box-scheduler" }
+box-runtime = { path = "./crates/core/box-runtime" }
+box-toolchains = { path = "./crates/domain/box-toolchains" }
+box-dsh-versions = { path = "./crates/domain/box-dsh-versions" }
+box-containers = { path = "./crates/domain/box-containers" }
+box-extensions = { path = "./crates/domain/box-extensions" }
+box-image = { path = "./crates/domain/box-image" }
+box-plugin-graph = { path = "./crates/domain/box-plugin-graph" }
+box-resources = { path = "./crates/domain/box-resources" }
+box-state = { path = "./crates/domain/box-state" }
+box-server-core = { path = "./crates/edge/box-server-core" }
+box-client = { path = "./crates/edge/box-client" }
+box-template-core = { path = "./crates/domain/box-template-core" }
+box-store = { path = "./crates/core/box-store" }
 tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
