@@ -951,12 +951,11 @@ impl TaskManager {
             format!("[{}] queued {}\n", task.created_at, task.kind),
         )
         .map_err(|error| error.to_string())?;
-        self.state
-            .lock()
-            .map_err(|_| "task manager lock failed")?
-            .tasks
-            .insert(id, task.clone());
-        self.persist()?;
+        let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
+        state.tasks.insert(id, task.clone());
+        // B7: this row, written under the same lock that admitted it.
+        self.persist_row(&task)?;
+        drop(state);
         Ok(task)
     }
 
@@ -1072,8 +1071,8 @@ impl TaskManager {
             }
         }
         state.tasks.insert(id, task.clone());
+        self.persist_row(&task)?;
         drop(state);
-        self.persist()?;
         Ok(task)
     }
 
@@ -1084,8 +1083,11 @@ impl TaskManager {
         if current.is_active() {
             task.cancel_requested = true;
         }
+        let updated = task.clone();
+        // B7: write only this row, while the lock is still held.
+        self.persist_row(&updated)?;
         drop(state);
-        self.persist()
+        Ok(())
     }
 
     /// Remove a finished task record and its log file. Active tasks
@@ -1125,8 +1127,10 @@ impl TaskManager {
             task.stage = "Cancelled before execution".to_owned();
             task.finished_at = Some(now_seconds());
             let updated = task.clone();
+            // Write this row before releasing the lock: no stale whole-scope
+            // snapshot can overwrite it (design section 3.3, review B7).
+            self.persist_row(&updated)?;
             drop(state);
-            self.persist()?;
             return Ok(Some(updated));
         }
         // Only a queued task may be admitted. Anything else -- a record closed
@@ -1154,8 +1158,10 @@ impl TaskManager {
         task.stage = "Running".to_owned();
         task.started_at = Some(now_seconds());
         let updated = task.clone();
+        // Write this row before releasing the lock: no stale whole-scope
+        // snapshot can overwrite it (design section 3.3, review B7).
+        self.persist_row(&updated)?;
         drop(state);
-        self.persist()?;
         Ok(Some(updated))
     }
 
@@ -1164,8 +1170,11 @@ impl TaskManager {
         let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
         let task = state.tasks.get_mut(id).ok_or("task not found")?;
         task.stages = stages;
+        let updated = task.clone();
+        // B7: write only this row, while the lock is still held.
+        self.persist_row(&updated)?;
         drop(state);
-        self.persist()
+        Ok(())
     }
 
     /// Start a stage, or bump its attempt count when it is already running or
@@ -1183,8 +1192,11 @@ impl TaskManager {
         stage.started_at = Some(now_seconds());
         stage.finished_at = None;
         stage.failure_detail = None;
+        let updated = task.clone();
+        // B7: write only this row, while the lock is still held.
+        self.persist_row(&updated)?;
         drop(state);
-        self.persist()
+        Ok(())
     }
 
     /// Record observed progress inside one stage (0-100).
@@ -1208,8 +1220,11 @@ impl TaskManager {
         // `stage`/`progress` (the command_surface gate, older clients).
         task.stage = stage.label.clone();
         task.progress = overall_progress(&task.stages);
+        let updated = task.clone();
+        // B7: write only this row, while the lock is still held.
+        self.persist_row(&updated)?;
         drop(state);
-        self.persist()
+        Ok(())
     }
 
     /// Advance a running stage from elapsed time against its budget.
@@ -1232,8 +1247,11 @@ impl TaskManager {
         stage.progress = stage.progress.max(estimate);
         task.stage = stage.label.clone();
         task.progress = overall_progress(&task.stages);
+        let updated = task.clone();
+        // B7: write only this row, while the lock is still held.
+        self.persist_row(&updated)?;
         drop(state);
-        self.persist()
+        Ok(())
     }
 
     /// Close a stage as done, or as failed with the detail of where it stopped.
@@ -1266,8 +1284,11 @@ impl TaskManager {
         }
         task.stage = task.stages[index].label.clone();
         task.progress = overall_progress(&task.stages);
+        let updated = task.clone();
+        // B7: write only this row, while the lock is still held.
+        self.persist_row(&updated)?;
         drop(state);
-        self.persist()
+        Ok(())
     }
 
     pub fn skip_stage(&self, _paths: &BoxPaths, id: &str, stage_id: &str) -> BoxResult<()> {
@@ -1279,8 +1300,11 @@ impl TaskManager {
         stage.state = StageState::Skipped;
         stage.finished_at = Some(now_seconds());
         task.progress = overall_progress(&task.stages);
+        let updated = task.clone();
+        // B7: write only this row, while the lock is still held.
+        self.persist_row(&updated)?;
         drop(state);
-        self.persist()
+        Ok(())
     }
     pub fn update(
         &self,
@@ -1294,8 +1318,10 @@ impl TaskManager {
         task.stage = stage.into();
         task.progress = progress.min(100);
         let updated = task.clone();
+        // Write this row before releasing the lock: no stale whole-scope
+        // snapshot can overwrite it (design section 3.3, review B7).
+        self.persist_row(&updated)?;
         drop(state);
-        self.persist()?;
         Ok(updated)
     }
 
@@ -1332,8 +1358,10 @@ impl TaskManager {
             );
         }
         let updated = task.clone();
+        // Write this row before releasing the lock: no stale whole-scope
+        // snapshot can overwrite it (design section 3.3, review B7).
+        self.persist_row(&updated)?;
         drop(state);
-        self.persist()?;
         Ok(updated)
     }
 
@@ -1409,8 +1437,10 @@ impl TaskManager {
             );
         }
         let updated = task.clone();
+        // Write this row before releasing the lock: no stale whole-scope
+        // snapshot can overwrite it (design section 3.3, review B7).
+        self.persist_row(&updated)?;
         drop(state);
-        self.persist()?;
         Ok(updated)
     }
 
@@ -1454,6 +1484,9 @@ impl TaskManager {
         state.running = 0;
         state.active_resources.clear();
         let mut closed = Vec::new();
+        // Collect the rows this sweep changed, so the durable write covers
+        // exactly them instead of a whole-scope snapshot (B7).
+        let mut rows = Vec::new();
         for id in open {
             let task = state.tasks.get_mut(&id).ok_or("task not found")?;
             // A rollback that was in flight is worth saying out loud: the
@@ -1479,10 +1512,11 @@ impl TaskManager {
             };
             task.finished_at = Some(now_seconds());
             task.error = Some(reason.to_owned());
+            rows.push(task.clone());
             closed.push(id);
         }
+        self.persist_rows(&rows)?;
         drop(state);
-        self.persist()?;
         Ok(closed)
     }
     /// Transition a failed task into the `RollingBack` state. The resource
@@ -1497,8 +1531,10 @@ impl TaskManager {
         task.stage = "Rolling back".to_owned();
         task.progress = 0;
         let updated = task.clone();
+        // Write this row before releasing the lock: no stale whole-scope
+        // snapshot can overwrite it (design section 3.3, review B7).
+        self.persist_row(&updated)?;
         drop(state);
-        self.persist()?;
         Ok(updated)
     }
 
@@ -1543,8 +1579,10 @@ impl TaskManager {
         }
         task.finished_at = Some(now_seconds());
         let updated = task.clone();
+        // Write this row before releasing the lock: no stale whole-scope
+        // snapshot can overwrite it (design section 3.3, review B7).
+        self.persist_row(&updated)?;
         drop(state);
-        self.persist()?;
         Ok(updated)
     }
 
@@ -1558,9 +1596,33 @@ impl TaskManager {
             }))
     }
 
+    /// Durably write exactly the rows this mutation produced, while the
+    /// caller still holds the state lock. A whole-scope `persist()` takes a
+    /// snapshot *after* the lock is released, so a concurrent writer's row
+    /// can be overwritten by a stale snapshot -- design section 3.3 (review
+    /// B7): a claim written in another thread would be lost, and after a
+    /// restart the task would look like a running task with no claim.
+    ///
+    /// `upsert` never deletes ids absent from the batch, so writing one row
+    /// cannot erase another process's records. Callers must pass the row as
+    /// it stands after their own mutation, cloned while the lock is held.
+    fn persist_row(&self, task: &TaskRecord) -> BoxResult<()> {
+        self.store.upsert(std::slice::from_ref(task))
+    }
+
+    /// The batch form for a mutation that closes several tasks at once
+    /// (`interrupt_running`). Same single-writer rule as `persist_row`.
+    fn persist_rows(&self, tasks: &[TaskRecord]) -> BoxResult<()> {
+        self.store.upsert(tasks)
+    }
+
     /// Durably project the in-memory set through the collection: every
     /// record is insert-or-replaced by id, and no id is ever deleted here
     /// (cross-process rows are removed only via `remove`).
+    ///
+    /// Startup/restore and shutdown flushes legitimately want the whole set.
+    /// A single-record mutation must use `persist_row` instead: taking the
+    /// snapshot here, after the state lock is released, is the B7 race.
     pub fn persist(&self) -> BoxResult<()> {
         let records = self.list()?;
         self.store.upsert(&records)
@@ -3215,6 +3277,87 @@ mod tests {
             );
             let _ = fs::remove_dir_all(paths.runtime.unwrap());
         }
+    }
+
+    // ---- B7: single-row writes (design section 3.3, review of PR #37) ----
+
+    /// A mutation of one task must not rewrite another task row from a stale
+    /// in-memory snapshot. The store is shared with the desktop and, from the
+    /// claim writer on, with other daemon threads: a whole-scope `persist()`
+    /// after the lock is released can overwrite a claim that was just written.
+    /// Here another writer advances task B in the store while this manager
+    /// still holds B older copy; `update` on task A must leave B alone.
+    #[test]
+    fn a_single_row_write_does_not_roll_back_another_writer() {
+        let paths = paths("b7-row-isolation");
+        let manager = TaskManager::json(&paths).unwrap();
+        let a = manager
+            .enqueue(&paths, "a", vec![], serde_json::json!({}))
+            .unwrap();
+        let b = manager
+            .enqueue(&paths, "b", vec![], serde_json::json!({}))
+            .unwrap();
+        // Another writer (a second manager over the same store) advances B
+        // to a stage this manager has never seen.
+        let other = TaskManager::json(&paths).unwrap();
+        other.merge_from_disk(&paths).unwrap();
+        other.update(&paths, &b.id, "claimed by node", 30).unwrap();
+        let advanced = manager.store.load_all().unwrap();
+        let advanced_b = advanced.iter().find(|t| t.id == b.id).unwrap();
+        assert_eq!(advanced_b.stage, "claimed by node");
+
+        // This manager in-memory copy of B is still the old one. Mutating A
+        // and writing ONLY A row must not put that old copy back.
+        manager.update(&paths, &a.id, "running", 50).unwrap();
+        let rows = manager.store.load_all().unwrap();
+        let stored_b = rows.iter().find(|t| t.id == b.id).unwrap();
+        assert_eq!(
+            stored_b.stage, "claimed by node",
+            "B7: a whole-scope persist would have restored the stale copy"
+        );
+        let stored_a = rows.iter().find(|t| t.id == a.id).unwrap();
+        assert_eq!(stored_a.stage, "running");
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
+    /// The claim writer's close sites (`finish`, `mark_missed`) must also write
+    /// only the row they closed. The task they do *not* touch is what proves it:
+    /// another writer claims C, this manager still holds C older copy, and a
+    /// whole-scope write from closing A or B would put that stale copy back --
+    /// which after a restart reads as a running task no node admits to holding.
+    #[test]
+    fn closing_one_task_does_not_restore_another_tasks_stale_row() {
+        let paths = paths("b7-close-isolation");
+        let manager = TaskManager::json(&paths).unwrap();
+        let a = manager
+            .enqueue(&paths, "a", vec![], serde_json::json!({}))
+            .unwrap();
+        let b = manager
+            .enqueue(&paths, "b", vec![], serde_json::json!({}))
+            .unwrap();
+        let c = manager
+            .enqueue(&paths, "c", vec![], serde_json::json!({}))
+            .unwrap();
+        // Another writer claims C; nothing below touches C.
+        let other = TaskManager::json(&paths).unwrap();
+        other.merge_from_disk(&paths).unwrap();
+        other.update(&paths, &c.id, "claimed by node", 30).unwrap();
+
+        manager.try_start(&paths, &a.id).unwrap();
+        manager.finish(&paths, &a.id, &Ok(())).unwrap();
+        manager.mark_missed(&b.id, "node went away").unwrap();
+
+        let rows = manager.store.load_all().unwrap();
+        let row = |id: &str| rows.iter().find(|t| t.id == id).unwrap().clone();
+        assert_eq!(row(&a.id).status, "succeeded");
+        assert_eq!(row(&b.id).status, "miss");
+        assert_eq!(row(&b.id).stage, "Lost by its node");
+        assert_eq!(
+            row(&c.id).stage,
+            "claimed by node",
+            "B7: closing A or B restored a stale copy of C"
+        );
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 }
 

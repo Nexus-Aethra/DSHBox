@@ -494,6 +494,20 @@ command as done only once the installed app has run it.
   invisible. And do not invent sub-steps for work the daemon cannot observe —
   `pnpm run build` is one child process, so splitting it into native/host/web
   would be a guess, and a guessed bar is exactly what this replaced.
+  **A single-record mutation writes its own row, and writes it inside the lock.**
+  `TaskManager::persist_row` upserts one record; a sweep that closes several
+  (`interrupt_running`) writes exactly the batch it changed (`persist_rows`);
+  the whole-scope `persist()` is left to `restore()` and the startup/shutdown
+  flush. A whole-scope snapshot is taken *after* the state lock is released, so
+  it rewrites every row from this process's in-memory copy — and a claim another
+  thread (from stage B on, another node's claim) has just written is silently
+  undone, leaving a task that reads after a restart as running with no owner
+  (design §3.3, review B7 of PR #37). Do not fix that by calling `persist()`
+  before dropping the lock: `persist()` goes through `list()`, which takes the
+  same lock, so it deadlocks — which is why the row writer exists. Two tests pin
+  the rule by advancing a task through a second `TaskManager` over the same
+  store and then mutating a different one; either call site reverted to a
+  whole-scope write turns them red.
 - **Task logs are the UI's only window into a long task.** A daemon task's log
   file is written by `TaskContext::append_log` and by nothing else — a notifier
   that writes it too doubles every line. Stage changes (`task.update`) only move

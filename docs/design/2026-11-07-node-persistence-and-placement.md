@@ -236,6 +236,13 @@ daemon 用它覆盖 grant 里的值并与白名单比对；否则白名单校验
 然后返回任务；返回后 helper 才开干。控制层的任务持久化必须由调度器的单一写者完成，
 不能在内存改完再整表 `persist()` 覆盖（评审 B7：认领写入会被覆盖）。
 
+落地方式（已实现）：单条改动只写自己那一行——`TaskManager::persist_row`，在持锁期间完成；
+一次关闭多条的扫描（`interrupt_running`）写它改过的那一批 `persist_rows`；整表 `persist()`
+只留给启动/恢复与关机 flush。注意 `persist()` 内部会 `list()`（再取同一把锁），所以
+“在锁里直接调 persist()” 会死锁——这正是要单独有 `persist_row` 的原因。两条测试钉住这条：
+经由同一个 store 上的第二个 `TaskManager` 推进某个任务，再改动另一个任务，磁盘上那一行必须
+还是别人写的。
+
 断线重连、daemon 重启、事件丢帧都自愈：helper 重连后继续 claim。SSE 只用于“有新活”的提示，不承担可靠性。
 
 **取消必须有到 node 的通道**（评审 B5）：认领响应同时带 `{ tasks: [...], cancels: [taskId…] }`，
