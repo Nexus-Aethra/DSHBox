@@ -311,7 +311,12 @@ fn run_inner() -> Result<(), String> {
                 // going (review of PR #38).
                 let _ = app
                     .state::<TaskManager>()
-                    .restore(&paths, box_scheduler::Sweep::only(OWN_TASK_KINDS));
+                    .restore(
+                        &paths,
+                        box_scheduler::Sweep::only(
+                            LocalTaskKind::ALL.map(|kind| kind.as_str()),
+                        ),
+                    );
             }
             let handle = app.handle().clone();
             thread::spawn(move || refresh_global_state(&handle));

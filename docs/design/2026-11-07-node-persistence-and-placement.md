@@ -235,7 +235,7 @@ daemon 用它覆盖 grant 里的值并与白名单比对；否则白名单校验
 **认领是 node → 控制层的同步调用**（node 问“有我的活吗”），不吃 §3.5 的异步规则：
 `node_claim_task` 在一个调度器锁内把 `queued → running` 并写 `claimedBy/claimSession/startedAt`，
 然后返回任务；返回后 helper 才开干。控制层的任务持久化必须由调度器的单一写者完成，
-不能在内存改完再整表 `persist()` 覆盖（评审 B7：认领写入会被覆盖）。
+不能在内存改完再整表 `persist()` 覆盖（评审 B7：认领写入会被覆盖；这个整表写方法现在**已经删除**，见下）。
 
 落地方式（已实现）：单条改动只写自己那一行——`TaskManager::persist_row`，在持锁期间完成；
 一次关闭多条的扫描（`interrupt_running`）写它改过的那一批 `persist_rows`；**整表写的方法已经

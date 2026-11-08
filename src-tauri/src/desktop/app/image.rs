@@ -9,6 +9,7 @@
 //! Builds run on the daemon now; this module keeps the script preview (pure
 //! parsing) and the commit/load stubs local.
 
+use super::tasks::LocalTaskKind;
 use std::path::Path;
 
 use box_api::{
@@ -282,7 +283,7 @@ pub(crate) fn enqueue_image_commit_stub(
     let task = queue_task(
         &manager,
         &app,
-        "image-commit",
+        LocalTaskKind::ImageCommit,
         vec!["repository:extensions".to_owned()],
         serde_json::json!({"reason": "not yet implemented"}),
     )?;
@@ -298,7 +299,7 @@ pub(crate) fn enqueue_image_load_stub(
     let task = queue_task(
         &manager,
         &app,
-        "image-load",
+        LocalTaskKind::ImageLoad,
         vec!["repository:extensions".to_owned()],
         serde_json::json!({"reason": "not yet implemented"}),
     )?;

@@ -516,7 +516,8 @@ command as done only once the installed app has run it.
   and the claim writer's close path, where the task the mutation does *not* touch
   is what proves the point. **A restart sweep writes only the rows it closed, and
   only for the kinds it owns** (`Sweep`): the daemon sweeps everything, the
-  desktop only the kinds it enqueues (`OWN_TASK_KINDS`), because a blanket sweep
+  desktop only the kinds it enqueues (`LocalTaskKind`, a type so a new call site
+  cannot forget to add one), because a blanket sweep
   from a client shares one store with the daemon and writes its running tasks off
   as `interrupted` on disk. The desktop's SIGTERM flush is gone for the same
   reason — it had no durability value, only the ability to put back stale rows.

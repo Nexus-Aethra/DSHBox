@@ -74,23 +74,53 @@ pub(crate) fn build_task_manager() -> TaskManager {
 /// The desktop shares the task store with the daemon, so its restart sweep must
 /// close only rows whose workers this process started: a blanket sweep writes
 /// off a daemon task that is still running (review of PR #38, the cross-process
-/// half of B7). Every `queue_task` call site uses a kind from this list, and one
-/// that does not is logged rather than silently left for nobody to close.
-pub(crate) const OWN_TASK_KINDS: [&str; 3] = ["toolchain-install", "image-commit", "image-load"];
+/// half of B7).
+///
+/// `queue_task` takes this enum instead of a string on purpose: a kind outside it
+/// would be closed by nobody (the daemon is the only other sweeper), and a new
+/// call site that forgot to add one must fail to compile rather than leave a row
+/// that reads `running` forever.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalTaskKind {
+    ToolchainInstall,
+    ImageCommit,
+    ImageLoad,
+}
+
+impl LocalTaskKind {
+    pub(crate) const ALL: [LocalTaskKind; 3] = [
+        LocalTaskKind::ToolchainInstall,
+        LocalTaskKind::ImageCommit,
+        LocalTaskKind::ImageLoad,
+    ];
+
+    /// The spelling a task record carries and the UI matches on. Written out
+    /// rather than derived from the variant name, because these strings are the
+    /// contract.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            LocalTaskKind::ToolchainInstall => "toolchain-install",
+            LocalTaskKind::ImageCommit => "image-commit",
+            LocalTaskKind::ImageLoad => "image-load",
+        }
+    }
+
+    /// Whether a stored record's kind is one this process runs, and can
+    /// therefore cancel or have swept. Routing one of these to the daemon
+    /// reports success for a cancel that never reaches the worker.
+    pub(crate) fn owns(kind: &str) -> bool {
+        Self::ALL.iter().any(|owned| owned.as_str() == kind)
+    }
+}
 
 pub(crate) fn queue_task(
     manager: &TaskManager,
     app: &tauri::AppHandle,
-    kind: &str,
+    kind: LocalTaskKind,
     resource_keys: Vec<String>,
     params: serde_json::Value,
 ) -> Result<TaskRecord, String> {
-    if !OWN_TASK_KINDS.contains(&kind) {
-        write_startup_log(&format!(
-            "task kind {kind} is not in OWN_TASK_KINDS; a restart will not close it"
-        ));
-    }
-    let task = manager.enqueue(&task_paths()?, kind, resource_keys, params)?;
+    let task = manager.enqueue(&task_paths()?, kind.as_str(), resource_keys, params)?;
     let state = app.state::<ResourceStateManager>();
     state.apply_task_update(task.clone());
     if let Ok(config) = read_config() {
@@ -231,11 +261,14 @@ pub(crate) fn cancel_task(
     manager: tauri::State<'_, TaskManager>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    // Local tasks (toolchain installs) cancel locally; daemon tasks cancel
-    // on the daemon, which owns their workers.
+    // A local task cancels locally; a daemon task cancels on the daemon, which
+    // owns its workers. Which one this is comes from the kind, and from all of
+    // them -- this used to compare against `toolchain-install` alone, so
+    // cancelling an `image-commit` was forwarded to a daemon that does not own
+    // it and the local worker kept running (review of PR #38, N1).
     if manager
         .task(&id)
-        .map(|task| task.kind == "toolchain-install")
+        .map(|task| LocalTaskKind::owns(task.kind.as_str()))
         .unwrap_or(false)
     {
         manager.request_cancel(&task_paths()?, &id)?;

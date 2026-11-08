@@ -797,6 +797,12 @@ fn stage_estimate(elapsed_secs: u64, budget_secs: u64) -> u8 {
 /// then reads as `interrupted` to every later reader, including the node that
 /// holds its claim (review of PR #38, the cross-process half of B7). The daemon
 /// owns every worker it starts; a client owns only the kinds it enqueues itself.
+///
+/// That is also where the current asymmetry sits: the daemon sweeps with
+/// `Everything`, so a daemon start while a client is running one of *its* kinds
+/// does close that client's row. It self-heals — the client's next mutation
+/// writes the row back — and getting it exactly right needs an owner field on the
+/// record rather than a kind list on both sides; see the design's open items.
 #[derive(Clone, Debug)]
 pub enum Sweep {
     /// Every stored task (the daemon, which owns the queue).
