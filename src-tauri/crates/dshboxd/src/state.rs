@@ -4,10 +4,7 @@
 //! construct their own copies.
 
 use box_foundation::{read_config, BoxConfig, BoxPaths, BoxResult};
-use box_runtime::{
-    bundled::ResolvedBundledRuntime,
-    process,
-};
+use box_runtime::{bundled::ResolvedBundledRuntime, process};
 use box_scheduler::{TaskManager, TaskNotifier};
 use box_state::ResourceStateManager;
 use std::{
@@ -273,8 +270,15 @@ impl DaemonState {
     }
 }
 
-/// Task notifier for daemon-run tasks: persists progress, refreshes the
-/// resource snapshot, and broadcasts events to all `/events` subscribers.
+/// Task notifier for daemon-run tasks: refreshes the resource snapshot and
+/// broadcasts events to all `/events` subscribers.
+///
+/// It deliberately does **not** persist: the scheduler mutation behind every
+/// notification already wrote that task's row under the state lock, so a
+/// whole-scope `persist()` here would rewrite every other task from this
+/// process's in-memory copy and undo a claim another writer just made (design
+/// section 3.3, review finding B7). `stage` runs on every stage event, which
+/// made it the most frequent way to lose one.
 pub(crate) struct DaemonNotifier {
     manager: TaskManager,
     resources: ResourceStateManager,
@@ -299,7 +303,7 @@ impl TaskNotifier for DaemonNotifier {
         if let Ok(task) = self.manager.task(task_id) {
             self.resources.apply_task_update(task);
         }
-        let _ = self.manager.persist();
+        // No `persist()` here: see the note on this type.
         self.events
             .broadcast(crate::events::DaemonEvent::TaskStage {
                 task_id: task_id.to_owned(),
@@ -333,12 +337,84 @@ impl TaskNotifier for DaemonNotifier {
         if let Ok(task) = self.manager.task(task_id) {
             self.resources.apply_task_update(task);
         }
-        let _ = self.manager.persist();
+        // No `persist()` here: see the note on this type.
         self.events
             .broadcast(crate::events::DaemonEvent::TaskFinished {
                 task_id: task_id.to_owned(),
                 status: status.to_owned(),
                 error: error.map(str::to_owned),
             });
+    }
+}
+
+#[cfg(test)]
+mod notifier_tests {
+    use super::{DaemonNotifier, TaskNotifier};
+    use box_foundation::BoxPaths;
+    use box_scheduler::TaskManager;
+    use std::{env, fs, sync::Arc};
+
+    fn scratch(name: &str) -> BoxPaths {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|delta| delta.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("dshboxd-notifier-{name}-{stamp}"));
+        let _ = fs::create_dir_all(&root);
+        BoxPaths {
+            config: root.join("config.json"),
+            runtime: Some(root),
+        }
+    }
+
+    /// A notification must not write the task table.
+    ///
+    /// This notifier fires on every stage tick, and its process shares the task
+    /// store with whoever else writes tasks -- the desktop, and from stage B a
+    /// node claim. A whole-scope `persist()` here snapshots this process's
+    /// memory, so a row another writer just changed is rewritten from the stale
+    /// copy and the task reads after a restart as running with no owner (design
+    /// section 3.3, review finding B7).
+    #[test]
+    fn a_notification_does_not_rewrite_another_writers_row() {
+        let paths = scratch("stage");
+        let manager = TaskManager::json(&paths).unwrap();
+        let a = manager
+            .enqueue(&paths, "a", vec![], serde_json::json!({}))
+            .unwrap();
+        let b = manager
+            .enqueue(&paths, "b", vec![], serde_json::json!({}))
+            .unwrap();
+
+        // Another writer claims B. This manager's copy of B is still `queued`,
+        // and nothing below touches B.
+        let other = TaskManager::json(&paths).unwrap();
+        other.merge_from_disk(&paths).unwrap();
+        other.update(&paths, &b.id, "claimed by node", 30).unwrap();
+
+        let notifier = DaemonNotifier::from_paths(
+            manager.clone(),
+            Arc::new(crate::events::DaemonEvents::new()),
+        );
+        notifier.stage(&a.id, "running", 50);
+        notifier.finished(&a.id, "succeeded", None);
+
+        // Read the store back through a fresh manager: this manager's memory
+        // would agree with itself whatever the notifier did.
+        let reader = TaskManager::json(&paths).unwrap();
+        reader.merge_from_disk(&paths).unwrap();
+        let rows = reader.list().unwrap();
+        let row = |id: &str| rows.iter().find(|task| task.id == id).unwrap().clone();
+        assert_eq!(
+            row(&b.id).stage,
+            "claimed by node",
+            "B7: the notification restored a stale copy of another writer's row"
+        );
+        assert_eq!(
+            row(&a.id).status,
+            "queued",
+            "a notification persists nothing"
+        );
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 }

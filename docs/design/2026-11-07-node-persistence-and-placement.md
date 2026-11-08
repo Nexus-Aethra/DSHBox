@@ -241,7 +241,8 @@ daemon 用它覆盖 grant 里的值并与白名单比对；否则白名单校验
 只留给启动/恢复与关机 flush。注意 `persist()` 内部会 `list()`（再取同一把锁），所以
 “在锁里直接调 persist()” 会死锁——这正是要单独有 `persist_row` 的原因。两条测试钉住这条：
 经由同一个 store 上的第二个 `TaskManager` 推进某个任务，再改动另一个任务，磁盘上那一行必须
-还是别人写的。
+还是别人写的。事件通知器（daemon 的 `DaemonNotifier`、桌面端的 `emit_task_update`）同样不写库：
+它们每个 stage tick 都会跑，且在事件里整表快照就等于把最高频的那条竞态路径重新装回去。
 
 断线重连、daemon 重启、事件丢帧都自愈：helper 重连后继续 claim。SSE 只用于“有新活”的提示，不承担可靠性。
 

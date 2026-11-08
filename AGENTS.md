@@ -507,7 +507,14 @@ command as done only once the installed app has run it.
   same lock, so it deadlocks — which is why the row writer exists. Two tests pin
   the rule by advancing a task through a second `TaskManager` over the same
   store and then mutating a different one; either call site reverted to a
-  whole-scope write turns them red.
+  whole-scope write turns them red. **Notifiers do not persist either**, and that
+  is the same rule one layer up: `DaemonNotifier::stage`/`finished` and the
+  desktop's `emit_task_update` fire on every stage tick, and each used to take a
+  whole-scope snapshot of its own — the highest-frequency way to lose a row,
+  since the desktop and the daemon share one store. They now only refresh the
+  resource snapshot and emit the event; the mutation behind them already wrote
+  the row. `dshboxd`'s `a_notification_does_not_rewrite_another_writers_row`
+  pins it.
 - **Task logs are the UI's only window into a long task.** A daemon task's log
   file is written by `TaskContext::append_log` and by nothing else — a notifier
   that writes it too doubles every line. Stage changes (`task.update`) only move
