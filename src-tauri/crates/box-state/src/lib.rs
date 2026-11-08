@@ -2,6 +2,20 @@
 //!
 //! Filesystem scanners remain the source of truth. This manager only provides a
 //! consistent, read-only view while the desktop application is running.
+//!
+//! Resource bookkeeping that used to live in the `box-data-scheduler` crate also
+//! lives here: the on-disk resource map (`resource_map`) and the two-tier
+//! deletion queue with its worker (`deletion_queue`, `deletion_worker`). They are
+//! the file-backed half of the same read model, and the crate they came from had
+//! exactly one consumer — see the layering design, section 15.
+
+pub mod deletion_queue;
+pub mod deletion_worker;
+pub mod resource_map;
+
+pub use deletion_queue::*;
+pub use deletion_worker::DeletionWorker;
+pub use resource_map::*;
 
 use box_containers::DshContainer;
 use box_dsh_versions::DshVersion;

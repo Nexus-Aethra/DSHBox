@@ -7,7 +7,7 @@ description = "Unified template install/uninstall core shared by dshboxd daemon 
 [dependencies]
 box-foundation = { workspace = true }
 box-dsh-versions = { workspace = true }
-box-data-scheduler = { workspace = true }
+box-state = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = { workspace = true }

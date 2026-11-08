@@ -15,7 +15,7 @@
 //! through the same code paths, and the IPC DTOs in `box-api` are the only
 //! thing the UI sees.
 
-use box_data_scheduler::{
+use box_state::{
     enqueue_for_hard_delete, read_resource_map, remove_resource, write_resource_map,
     ResourceEntry, ResourceStatus, ResourceType,
 };
@@ -114,7 +114,7 @@ pub fn install_template<F: Fn() -> bool + Send + 'static>(
     let mut entry_meta = std::collections::BTreeMap::new();
     entry_meta.insert("harness_ref".to_owned(), entry.harness_ref.clone().unwrap_or_default());
     entry_meta.insert("from_ref".to_owned(), entry.from_ref.clone().unwrap_or_default());
-    let resource_id = box_data_scheduler::build_resource_id(
+    let resource_id = box_state::build_resource_id(
         ResourceType::Template,
         &entry.name,
         entry.harness_ref.as_deref(),

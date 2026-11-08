@@ -203,16 +203,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "box-data-scheduler"
-version = "0.1.0"
-dependencies = [
- "box-foundation",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
 name = "box-dsh-versions"
 version = "0.1.0"
 dependencies = [
@@ -339,6 +329,7 @@ dependencies = [
  "box-toolchains",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -356,9 +347,9 @@ dependencies = [
 name = "box-template-core"
 version = "0.1.0"
 dependencies = [
- "box-data-scheduler",
  "box-dsh-versions",
  "box-foundation",
+ "box-state",
  "serde",
  "serde_json",
  "tracing",
@@ -976,7 +967,6 @@ dependencies = [
  "box-api",
  "box-client",
  "box-containers",
- "box-data-scheduler",
  "box-dsh-versions",
  "box-extensions",
  "box-foundation",
