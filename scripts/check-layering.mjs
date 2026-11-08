@@ -2,20 +2,26 @@
 // Fails when a crate reaches across a layer boundary.
 //
 // The four directories are only documentation until something checks them: a
-// misplaced `path` dependency compiles fine and quietly turns the layout into
-// the flat list it replaced. Rules:
+// misplaced dependency compiles fine and quietly turns the layout into the flat
+// list it replaced. Rules:
 //
 //   core   -> core only            (no business knowledge, ever)
 //   domain -> core + domain        (business capabilities, a DAG among themselves)
 //   edge   -> core + domain + edge (wire types, transport, client adapter)
-//   apps   -> anything, but not another app, and never the Tauri package
+//   apps   -> anything, but not another app and never the Tauri package
+//   root   -> core + domain + edge, but not a binary under apps/
 //
-// Two extra rules that are not layer-shaped: `box-state` may not depend on
-// `box-template-core` (that pair is what makes the data-scheduler merge acyclic),
-// and no crate may depend on `dshbox` (only src-tauri itself may).
+// Two rules that are not layer-shaped, checked the same way: `box-state` may not
+// depend on `box-template-core` (that pair is what keeps the data-scheduler merge
+// acyclic), and no crate may depend on the `dshbox` package (only src-tauri may).
+//
+// Both dependency spellings are resolved: `path = "..."` and `workspace = true`
+// (which points at the root's [workspace.dependencies] table). Missing the second
+// one made this guard report green on a core -> domain violation.
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 
+const ROOT_MANIFEST = join('src-tauri', 'Cargo.toml')
 const CRATES = join('src-tauri', 'crates')
 const LAYERS = ['core', 'domain', 'edge', 'apps']
 const ALLOWED = {
@@ -23,6 +29,7 @@ const ALLOWED = {
   domain: ['core', 'domain'],
   edge: ['core', 'domain', 'edge'],
   apps: ['core', 'domain', 'edge', 'apps'],
+  root: ['core', 'domain', 'edge'],
 }
 
 function cratesIn(layer) {
@@ -33,40 +40,79 @@ function cratesIn(layer) {
     .map((entry) => ({ name: entry.name, layer, dir: join(dir, entry.name) }))
 }
 
+// Dependencies declared once in the root and pulled in with `workspace = true`.
+function workspaceDependencies() {
+  const table = new Map()
+  if (!existsSync(ROOT_MANIFEST)) return table
+  const text = readFileSync(ROOT_MANIFEST, 'utf8')
+  const section = text.split(/^\[workspace\.dependencies\]$/m)[1]?.split(/^\[/m)[0]
+  if (!section) return table
+  const re = /^\s*([\w-]+)\s*=\s*\{[^}]*path\s*=\s*"([^"]+)"/gm
+  let match
+  while ((match = re.exec(section)) !== null) {
+    table.set(match[1], resolve('src-tauri', match[2]))
+  }
+  return table
+}
+
+function declaredDependencies(manifest, workspace) {
+  const text = readFileSync(manifest, 'utf8')
+  const dir = dirname(manifest)
+  const deps = []
+  const pathRe = /path\s*=\s*"([^"]+)"/g
+  let match
+  while ((match = pathRe.exec(text)) !== null) {
+    deps.push(resolve(dir, match[1]))
+  }
+  // name = { workspace = true }
+  const inlineRe = /^\s*([\w-]+)\s*=\s*\{[^}]*workspace\s*=\s*true/gm
+  while ((match = inlineRe.exec(text)) !== null) {
+    const target = workspace.get(match[1])
+    if (target) deps.push(target)
+  }
+  // name.workspace = true
+  const dottedRe = /^\s*([\w-]+)\.workspace\s*=\s*true/gm
+  while ((match = dottedRe.exec(text)) !== null) {
+    const target = workspace.get(match[1])
+    if (target) deps.push(target)
+  }
+  return deps
+}
+
+const workspace = workspaceDependencies()
 const crates = LAYERS.flatMap(cratesIn)
-const byDir = new Map(crates.map((crate) => [resolve(crate.dir), crate]))
+const root = { name: 'dshbox', layer: 'root', dir: 'src-tauri' }
+const byDir = new Map([...crates, root].map((node) => [resolve(node.dir), node]))
 const violations = []
 
 for (const crate of crates) {
-  const manifest = join(crate.dir, 'Cargo.toml')
-  const text = readFileSync(manifest, 'utf8')
-  const re = /path\s*=\s*"([^"]+)"/g
-  let match
-  while ((match = re.exec(text)) !== null) {
-    const target = byDir.get(resolve(dirname(manifest), match[1]))
-    if (!target) continue
-    if (!ALLOWED[crate.layer].includes(target.layer)) {
-      violations.push(`${crate.layer}/${crate.name} depends on ${target.layer}/${target.name}`)
+  for (const target of declaredDependencies(join(crate.dir, 'Cargo.toml'), workspace)) {
+    const node = byDir.get(target)
+    if (!node) continue
+    if (node.layer === 'root') {
+      violations.push(`${crate.layer}/${crate.name} depends on the Tauri package (${node.name})`)
       continue
     }
-    if (crate.layer === 'apps' && target.layer === 'apps' && crate.name !== target.name) {
-      violations.push(`apps/${crate.name} depends on another app (apps/${target.name})`)
+    if (!ALLOWED[crate.layer].includes(node.layer)) {
+      violations.push(`${crate.layer}/${crate.name} depends on ${node.layer}/${node.name}`)
+      continue
     }
-    if (crate.name === 'box-state' && target.name === 'box-template-core') {
+    if (crate.layer === 'apps' && node.layer === 'apps' && crate.name !== node.name) {
+      violations.push(`apps/${crate.name} depends on another app (apps/${node.name})`)
+    }
+    if (crate.name === 'box-state' && node.name === 'box-template-core') {
       violations.push('domain/box-state depends on domain/box-template-core (closes the merge cycle)')
     }
   }
-  if (/\bdshbox\s*=/.test(text) && crate.name !== 'dshbox') {
-    violations.push(`${crate.layer}/${crate.name} depends on the Tauri package dshbox`)
-  }
 }
 
-// The Tauri package itself may use any layer, but never another app.
-const rootManifest = join('src-tauri', 'Cargo.toml')
-if (existsSync(rootManifest)) {
-  const text = readFileSync(rootManifest, 'utf8')
-  if (/path\s*=\s*"\.\/crates\/apps\//.test(text)) {
-    violations.push('the Tauri package depends on a binary crate under crates/apps')
+// The Tauri package may use any layer, but never a binary under apps/.
+if (existsSync(ROOT_MANIFEST)) {
+  for (const target of declaredDependencies(ROOT_MANIFEST, workspace)) {
+    const node = byDir.get(target)
+    if (node && node.layer === 'apps') {
+      violations.push(`the Tauri package depends on the binary ${node.layer}/${node.name}`)
+    }
   }
 }
 
