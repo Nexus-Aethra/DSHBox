@@ -69,6 +69,15 @@ pub(crate) fn build_task_manager() -> TaskManager {
     }
 }
 
+/// The task kinds this process enqueues, and therefore the only ones it owns.
+///
+/// The desktop shares the task store with the daemon, so its restart sweep must
+/// close only rows whose workers this process started: a blanket sweep writes
+/// off a daemon task that is still running (review of PR #38, the cross-process
+/// half of B7). Every `queue_task` call site uses a kind from this list, and one
+/// that does not is logged rather than silently left for nobody to close.
+pub(crate) const OWN_TASK_KINDS: [&str; 3] = ["toolchain-install", "image-commit", "image-load"];
+
 pub(crate) fn queue_task(
     manager: &TaskManager,
     app: &tauri::AppHandle,
@@ -76,6 +85,11 @@ pub(crate) fn queue_task(
     resource_keys: Vec<String>,
     params: serde_json::Value,
 ) -> Result<TaskRecord, String> {
+    if !OWN_TASK_KINDS.contains(&kind) {
+        write_startup_log(&format!(
+            "task kind {kind} is not in OWN_TASK_KINDS; a restart will not close it"
+        ));
+    }
     let task = manager.enqueue(&task_paths()?, kind, resource_keys, params)?;
     let state = app.state::<ResourceStateManager>();
     state.apply_task_update(task.clone());

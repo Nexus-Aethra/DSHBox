@@ -789,6 +789,39 @@ fn stage_estimate(elapsed_secs: u64, budget_secs: u64) -> u8 {
     ((elapsed_secs.saturating_mul(90) / budget).min(90)) as u8
 }
 
+/// Which stored tasks a starting process may close as `interrupted`.
+///
+/// The sweep is an *ownership* question, not a convenience: the desktop and the
+/// daemon share one task store, so a client that swept everything would close
+/// the daemon's running tasks in that store — and a task that is still going
+/// then reads as `interrupted` to every later reader, including the node that
+/// holds its claim (review of PR #38, the cross-process half of B7). The daemon
+/// owns every worker it starts; a client owns only the kinds it enqueues itself.
+#[derive(Clone, Debug)]
+pub enum Sweep {
+    /// Every stored task (the daemon, which owns the queue).
+    Everything,
+    /// Only these task kinds (a client that enqueues its own tasks).
+    Only(Vec<String>),
+}
+
+impl Sweep {
+    pub fn only<I, S>(kinds: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::Only(kinds.into_iter().map(Into::into).collect())
+    }
+
+    fn admits(&self, kind: &str) -> bool {
+        match self {
+            Self::Everything => true,
+            Self::Only(kinds) => kinds.iter().any(|owned| owned == kind),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TaskManager {
     state: Arc<Mutex<State>>,
@@ -834,6 +867,10 @@ impl TaskManager {
     /// tasks that are still queued or running. This lets the CLI and UI
     /// share the same task queue: the CLI enqueues and runs tasks, the UI
     /// picks up the new records without breaking its own in-flight work.
+    /// Adds any stored row this manager does not already hold, and writes
+    /// nothing: it is a read of the store into memory, so the row rule does not
+    /// apply (writing back what was just read is the whole-scope write). It is
+    /// also how the tests model a second writer.
     pub fn merge_from_disk(&self, _paths: &BoxPaths) -> BoxResult<()> {
         let tasks = self.store.load_all()?;
         let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
@@ -845,12 +882,25 @@ impl TaskManager {
         Ok(())
     }
 
-    /// Load every stored task, mark active ones `interrupted` (daemon
-    /// restart recovery), and adopt the result as the in-memory set.
-    pub fn restore(&self, _paths: &BoxPaths) -> BoxResult<()> {
+    /// Load every stored task, close the ones this process owns as
+    /// `interrupted` (restart recovery), and adopt the result as the in-memory
+    /// set.
+    ///
+    /// `sweep` is the ownership boundary — see `Sweep` — because the desktop
+    /// and the daemon share the store: a client that swept everything would
+    /// close the daemon's running tasks on disk.
+    ///
+    /// Only the rows this sweep actually changed are written. The rest were just
+    /// read from the store, so rewriting them would be a whole-scope write that
+    /// undoes whatever another writer put there in the meantime (B7); the sweep's
+    /// own rows are written through the same row writer every mutation uses.
+    ///
+    /// Returns how many records it closed.
+    pub fn restore(&self, _paths: &BoxPaths, sweep: Sweep) -> BoxResult<usize> {
         let mut tasks = self.store.load_all()?;
+        let mut closed = Vec::new();
         for task in &mut tasks {
-            if !needs_shutdown_close(task) {
+            if !sweep.admits(&task.kind) || !needs_shutdown_close(task) {
                 continue;
             }
             // Only rewrite when the record's own state allows the move. A status
@@ -861,6 +911,7 @@ impl TaskManager {
             if task.transition_to(TaskState::Interrupted).is_ok() {
                 task.stage = "Interrupted by application restart".to_owned();
                 task.finished_at = Some(now_seconds());
+                closed.push(task.id.clone());
             } else {
                 warn!(
                     task = %task.id,
@@ -869,14 +920,22 @@ impl TaskManager {
                 );
             }
         }
-        self.state
-            .lock()
-            .map_err(|_| "task manager lock failed")?
-            .tasks = tasks
+        let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
+        state.tasks = tasks
             .into_iter()
             .map(|task| (task.id.clone(), task))
             .collect();
-        self.persist()
+        // Read the rows back from the adopted set rather than from the sweep's
+        // own clones: what is written is then exactly what this process sees.
+        let rows: Vec<TaskRecord> = closed
+            .iter()
+            .filter_map(|id| state.tasks.get(id).cloned())
+            .collect();
+        if !rows.is_empty() {
+            self.persist_rows(&rows)?;
+        }
+        drop(state);
+        Ok(rows.len())
     }
 
     /// Read one record by id.
@@ -1093,6 +1152,9 @@ impl TaskManager {
     /// Remove a finished task record and its log file. Active tasks
     /// (queued, running, rolling_back) stay protected so resource locks
     /// and the concurrency counter never go stale.
+    /// Remove one record. This is the only mutation that is not a row *write*:
+    /// it deletes the id it was handed (`store.remove`) and touches no other
+    /// row, so the B7 rule does not apply -- there is no snapshot to go stale.
     pub fn remove(&self, _paths: &BoxPaths, id: &str) -> BoxResult<Option<TaskRecord>> {
         let mut state = self.state.lock().map_err(|_| "task manager lock failed")?;
         let task = match state.tasks.get(id) {
@@ -1597,11 +1659,14 @@ impl TaskManager {
     }
 
     /// Durably write exactly the rows this mutation produced, while the
-    /// caller still holds the state lock. A whole-scope `persist()` takes a
-    /// snapshot *after* the lock is released, so a concurrent writer's row
-    /// can be overwritten by a stale snapshot -- design section 3.3 (review
-    /// B7): a claim written in another thread would be lost, and after a
-    /// restart the task would look like a running task with no claim.
+    /// caller still holds the state lock.
+    ///
+    /// A whole-scope write takes its snapshot *after* the lock is released, so
+    /// a concurrent writer's row is overwritten by a stale copy -- design
+    /// section 3.3 (review B7): a claim written in another thread would be
+    /// lost, and after a restart the task would look like a running task with
+    /// no claim. This crate therefore has no whole-scope writer at all; the
+    /// shape is not available to reach for.
     ///
     /// `upsert` never deletes ids absent from the batch, so writing one row
     /// cannot erase another process's records. Callers must pass the row as
@@ -1616,17 +1681,11 @@ impl TaskManager {
         self.store.upsert(tasks)
     }
 
-    /// Durably project the in-memory set through the collection: every
-    /// record is insert-or-replaced by id, and no id is ever deleted here
-    /// (cross-process rows are removed only via `remove`).
-    ///
-    /// Startup/restore and shutdown flushes legitimately want the whole set.
-    /// A single-record mutation must use `persist_row` instead: taking the
-    /// snapshot here, after the state lock is released, is the B7 race.
-    pub fn persist(&self) -> BoxResult<()> {
-        let records = self.list()?;
-        self.store.upsert(&records)
-    }
+    // There is deliberately no whole-scope writer. Every durable write goes
+    // through `persist_row` (a mutation) or `persist_rows` (a sweep that closed
+    // several rows); a method that snapshotted the whole in-memory set would
+    // be the B7 race with a name, and a caller that did not know the history
+    // would reach for it. `restore()` needs the whole set only to *read* it.
 }
 
 /// Returns a JSON-serializable description of the task state machine,
@@ -1950,6 +2009,46 @@ mod tests {
         );
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
+
+    /// The sweep's rows must reach the store, and the test above cannot prove
+    /// that: it reads `manager.list()`, which is the same manager's memory, so
+    /// memory agreeing with itself is no evidence at all.
+    ///
+    /// This is the one multi-row write path, it is what a daemon shutdown uses,
+    /// and it was unpinned: making `persist_rows` a no-op left the whole crate
+    /// green while the disk kept `queued` records for work that had been written
+    /// off -- which `restore()` then never closes, because a `queued` record is
+    /// not something a restart sweep looks at (review of PR #38, B1).
+    #[test]
+    fn interrupt_running_writes_the_rows_it_closed() {
+        let paths = paths("interrupt-durable");
+        let manager = TaskManager::json(&paths).unwrap();
+        let first = manager
+            .enqueue(&paths, "one", vec![], serde_json::json!({}))
+            .unwrap();
+        let second = manager
+            .enqueue(&paths, "two", vec![], serde_json::json!({}))
+            .unwrap();
+
+        assert_eq!(
+            manager.interrupt_running("daemon stopped").unwrap().len(),
+            2
+        );
+
+        // Read the store back through a manager that never saw the sweep. Only
+        // the batch write can put these two rows there.
+        let reader = TaskManager::json(&paths).unwrap();
+        reader.merge_from_disk(&paths).unwrap();
+        let rows = reader.list().unwrap();
+        let row = |id: &str| rows.iter().find(|task| task.id == id).unwrap().clone();
+        for id in [&first.id, &second.id] {
+            let stored = row(id);
+            assert_eq!(stored.status, "interrupted", "{id} was not written");
+            assert_eq!(stored.error.as_deref(), Some("daemon stopped"), "{id}");
+            assert!(stored.finished_at.is_some(), "{id} has no finish time");
+        }
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
     #[test]
     fn queued_task_reserves_its_resource_for_short_transactions() {
         let paths = paths("resource");
@@ -1980,8 +2079,46 @@ mod tests {
             )
             .unwrap();
         let restored = TaskManager::json(&paths).unwrap();
-        restored.restore(&paths).unwrap();
+        assert_eq!(restored.restore(&paths, Sweep::Everything).unwrap(), 1);
         assert_eq!(restored.list().unwrap()[0].status, "interrupted");
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
+    /// A restart sweep closes only the rows whose workers this process started.
+    ///
+    /// The desktop shares one store with the daemon, so sweeping everything from
+    /// there would write a daemon task that is still running off as
+    /// `interrupted` on disk -- and the record would then disagree with the node
+    /// that still holds it (review of PR #38, the cross-process half of B7).
+    #[test]
+    fn restore_sweeps_only_the_kinds_it_owns() {
+        let paths = paths("restore-scope");
+        let first = TaskManager::json(&paths).unwrap();
+        let local = first
+            .enqueue(&paths, "toolchain-install", vec![], serde_json::json!({}))
+            .unwrap();
+        let daemon_task = first
+            .enqueue(&paths, "container-start", vec![], serde_json::json!({}))
+            .unwrap();
+        first.try_start(&paths, &daemon_task.id).unwrap();
+
+        let client = TaskManager::json(&paths).unwrap();
+        let closed = client
+            .restore(&paths, Sweep::only(["toolchain-install"]))
+            .unwrap();
+        assert_eq!(closed, 1, "only the owned kind is closed");
+        let rows = client.list().unwrap();
+        let row = |id: &str| rows.iter().find(|task| task.id == id).unwrap().clone();
+        assert_eq!(row(&local.id).status, "interrupted");
+        assert_eq!(
+            row(&daemon_task.id).status,
+            "running",
+            "a client must not write off a task the daemon is still running"
+        );
+
+        // The daemon's own start still closes everything it owns.
+        let daemon = TaskManager::json(&paths).unwrap();
+        assert_eq!(daemon.restore(&paths, Sweep::Everything).unwrap(), 1);
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 
@@ -3259,7 +3396,6 @@ mod tests {
                 task.status = target.to_string();
                 task.finished_at = Some(now_seconds());
             }
-            manager.persist().unwrap();
             let retry = node_task(
                 &manager,
                 &paths,
@@ -3358,6 +3494,157 @@ mod tests {
             "B7: closing A or B restored a stale copy of C"
         );
         let _ = fs::remove_dir_all(paths.runtime.unwrap());
+    }
+
+    fn one_stage() -> Vec<TaskStage> {
+        vec![TaskStage {
+            id: "compile".to_owned(),
+            label: "Compile".to_owned(),
+            state: StageState::Pending,
+            progress: 0,
+            started_at: None,
+            finished_at: None,
+            duration_hint_secs: 60,
+            attempts: 0,
+            failure_detail: None,
+        }]
+    }
+
+    type B7Step = fn(&TaskManager, &BoxPaths, &str);
+
+    fn prepare_nothing(_manager: &TaskManager, _paths: &BoxPaths, _id: &str) {}
+
+    fn prepare_stages(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        manager.set_stages(paths, id, one_stage()).unwrap();
+    }
+
+    fn prepare_started(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        prepare_stages(manager, paths, id);
+        manager.begin_stage(paths, id, "compile").unwrap();
+    }
+
+    fn prepare_running(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        manager.try_start(paths, id).unwrap();
+    }
+
+    fn prepare_failed(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        prepare_running(manager, paths, id);
+        manager.finish(paths, id, &Err("boom".to_owned())).unwrap();
+    }
+
+    fn prepare_rolling_back(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        prepare_failed(manager, paths, id);
+        manager.start_rollback(paths, id).unwrap();
+    }
+
+    fn act_set_stages(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        manager.set_stages(paths, id, one_stage()).unwrap();
+    }
+
+    fn act_begin_stage(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        manager.begin_stage(paths, id, "compile").unwrap();
+    }
+
+    fn act_set_stage_progress(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        manager
+            .set_stage_progress(paths, id, "compile", 40)
+            .unwrap();
+    }
+
+    fn act_tick_stage(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        manager.tick_stage(paths, id, "compile").unwrap();
+    }
+
+    fn act_finish_stage(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        manager.finish_stage(paths, id, "compile", None).unwrap();
+    }
+
+    fn act_skip_stage(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        manager.skip_stage(paths, id, "compile").unwrap();
+    }
+
+    fn act_update(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        manager.update(paths, id, "working", 50).unwrap();
+    }
+
+    fn act_try_start(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        manager.try_start(paths, id).unwrap();
+    }
+
+    fn act_request_cancel(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        manager.request_cancel(paths, id).unwrap();
+    }
+
+    fn act_finish(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        manager.finish(paths, id, &Ok(())).unwrap();
+    }
+
+    fn act_start_rollback(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        manager.start_rollback(paths, id).unwrap();
+    }
+
+    fn act_finish_rollback(manager: &TaskManager, paths: &BoxPaths, id: &str) {
+        manager.finish_rollback(paths, id, &Ok(())).unwrap();
+    }
+
+    fn act_mark_missed(manager: &TaskManager, _paths: &BoxPaths, id: &str) {
+        manager.mark_missed(id, "node went away").unwrap();
+    }
+
+    /// Every single-row mutation, not just the four the tests above drive.
+    ///
+    /// Each case prepares task A, has a second manager claim B, then runs one
+    /// mutation on A and reads B back from the store. With the pre-fix
+    /// `drop(state); self.persist()` left at that one site, B comes back
+    /// `queued` -- which is why every converted site needs a case: a converted
+    /// but unpinned site can be reverted silently (review of PR #38, N3).
+    #[test]
+    fn every_single_row_mutation_leaves_another_writers_row_alone() {
+        let cases: Vec<(&str, B7Step, B7Step)> = vec![
+            ("set_stages", prepare_nothing, act_set_stages),
+            ("begin_stage", prepare_stages, act_begin_stage),
+            (
+                "set_stage_progress",
+                prepare_started,
+                act_set_stage_progress,
+            ),
+            ("tick_stage", prepare_started, act_tick_stage),
+            ("finish_stage", prepare_started, act_finish_stage),
+            ("skip_stage", prepare_stages, act_skip_stage),
+            ("update", prepare_nothing, act_update),
+            ("try_start", prepare_nothing, act_try_start),
+            ("request_cancel", prepare_nothing, act_request_cancel),
+            ("finish", prepare_running, act_finish),
+            ("start_rollback", prepare_failed, act_start_rollback),
+            ("finish_rollback", prepare_rolling_back, act_finish_rollback),
+            ("mark_missed", prepare_running, act_mark_missed),
+        ];
+        for (name, prepare, act) in cases {
+            let paths = paths(&format!("b7-all-{name}"));
+            let manager = TaskManager::json(&paths).unwrap();
+            let a = manager
+                .enqueue(&paths, "a", vec![], serde_json::json!({}))
+                .unwrap();
+            let b = manager
+                .enqueue(&paths, "b", vec![], serde_json::json!({}))
+                .unwrap();
+            prepare(&manager, &paths, &a.id);
+            // Another writer's row lands after the preparation, so it is the
+            // newest row in the store when the mutation runs.
+            let other = TaskManager::json(&paths).unwrap();
+            other.merge_from_disk(&paths).unwrap();
+            other.update(&paths, &b.id, "claimed by node", 30).unwrap();
+            act(&manager, &paths, &a.id);
+            let reader = TaskManager::json(&paths).unwrap();
+            reader.merge_from_disk(&paths).unwrap();
+            let rows = reader.list().unwrap();
+            let stored_b = rows.iter().find(|task| task.id == b.id).unwrap();
+            assert_eq!(
+                stored_b.stage, "claimed by node",
+                "{name} rewrote another writer's row from a stale snapshot"
+            );
+            let _ = fs::remove_dir_all(paths.runtime.unwrap());
+        }
     }
 }
 

@@ -236,7 +236,10 @@ impl DaemonState {
                 }
             },
         };
-        let _ = manager.restore(&paths);
+        // The daemon owns every worker it starts, so it sweeps everything. A
+        // client (the desktop) shares this store and must sweep only its own
+        // kinds -- see Sweep.
+        let _ = manager.restore(&paths, box_scheduler::Sweep::Everything);
         let events = std::sync::Arc::new(crate::events::DaemonEvents::new());
         // Replaced by main.rs once the ephemeral listener is bound.
         let control_url = String::new();
