@@ -1293,6 +1293,18 @@ fn enqueue_task(state: &DaemonState, request: &Value) -> Result<HandlerResult, S
         })
         .unwrap_or_default();
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+    // Design section 3.5: the generic enqueue route used to accept params of
+    // any size. A task record is not a payload channel, and a whole-scope
+    // upsert of a multi-MB row is exactly what section 6 rules out.
+    let params_size = serde_json::to_vec(&params)
+        .map(|bytes| bytes.len())
+        .map_err(|error| format!("params must be JSON: {error}"))?;
+    if params_size > box_scheduler::MAX_PARAMS_BYTES {
+        return Err(format!(
+            "params exceed {} bytes: {params_size}",
+            box_scheduler::MAX_PARAMS_BYTES
+        ));
+    }
     let paths = state
         .paths
         .read()

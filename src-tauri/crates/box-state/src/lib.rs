@@ -349,7 +349,10 @@ fn rebuild_resources(state: &mut ResourceSnapshot) {
     for task in &state.tasks {
         let health = match task.status.as_str() {
             "queued" | "running" | "waiting_input" => ResourceHealth::Busy,
-            "failed" | "interrupted" => ResourceHealth::Failed,
+            // `miss` is a lost claim, not a failed build, but the resource is
+            // still not ready: treating it as Ready would let the UI offer a
+            // container whose preparation never completed (design 2.5).
+            "failed" | "interrupted" | "miss" => ResourceHealth::Failed,
             _ => ResourceHealth::Ready,
         };
         for key in &task.resource_keys {
@@ -437,6 +440,10 @@ mod tests {
             params: serde_json::json!({}),
             cancel_requested: false,
             rollback_error: None,
+            node_id: None,
+            claimed_by: None,
+            claim_session: None,
+            idempotency_key: None,
         }
     }
     fn toolchain() -> ToolchainStatus {

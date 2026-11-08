@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { boxApi } from '../../shared/api/box-api'
+import { boxApi, taskFailed } from '../../shared/api/box-api'
 import type { EditYamlText } from './EditYamlDialog'
 import { EditYamlDialog } from './EditYamlDialog'
 import { ContainerTree, PluginChips, useInstalledPlugins } from './pickers'
@@ -134,7 +134,7 @@ export function ContainerResourcesPanel({ id, name, text, onClose }: Props) {
       const task = await work()
       setQueued(task.id ?? '')
       const finished = await boxApi.waitForTask(task.id)
-      if (finished !== null && finished.status === 'failed') setError(finished.error ?? finished.stage)
+      if (finished !== null && taskFailed(finished.status)) setError(finished.error ?? finished.stage)
       await reload()
     } catch (runError) {
       setError(String(runError))

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { boxApi } from '../../shared/api/box-api'
+import { boxApi, taskFailed } from '../../shared/api/box-api'
 import type { DshContainer, ResourceTypeSummary, ResourceView } from '../../shared/types/domain'
 import { Badge } from '../../ui/Badge'
 import { Button } from '../../ui/Button'
@@ -87,7 +87,7 @@ export function ResourceTypeView({ view, containers, text, removable = true, onR
       if (typeof id === 'string') {
         setQueued(id)
         const task = await boxApi.waitForTask(id)
-        if (task !== null && task.status === 'failed') setError(task.error ?? task.stage)
+        if (task !== null && taskFailed(task.status)) setError(task.error ?? task.stage)
       }
       await reload()
     } catch (runError) {

@@ -441,8 +441,26 @@ command as done only once the installed app has run it.
   reason `Miss` (a lost claim) is a state rather than a string: see
   `docs/design/2026-11-07-node-persistence-and-placement.md`. The UI's
   `TaskStatus` union in `src/shared/types/domain.ts` therefore has to list both
-  spellings and `miss`, or a status the server really sends is one the frontend
-  silently falls back on.
+  spellings and `miss`, or a status a record can hold is one the frontend
+  silently falls back on. `TaskRecord.status` is a `String` written by
+  `transition_to`, so in this build the Display spelling is the one a record
+  actually carries; the serde/lowercase spelling is kept for imported records,
+  not because the daemon emits it into a task.
+  **Every non-success terminal status is a failure, and the check is one predicate.**
+  `box-api.ts::taskFailed` owns the set (`failed`, `cancelled`, `interrupted`,
+  `miss`, both rollback ends). `waitForTask` returns the record for *any* terminal
+  status, so a caller that only compares against `'failed'` used to treat a
+  `miss` or a rolled-back task as a success and reload as if the work had
+  completed; all four wait sites now call `taskFailed`. `miss` is deliberately
+  not offered a retry from the task panel: a lost claim may have left a
+  half-written artifact, so a blind re-enqueue would put two workers on the same
+  tar (design section 2.5). `box-state` maps `miss` to `ResourceHealth::Failed`,
+  not `Ready`, for the same reason.
+  **Node tasks are a small contract, not a payload channel.** `TaskRecord`'s four
+  node fields (`nodeId/claimedBy/claimSession/idempotencyKey`) all `#[serde(default)]`,
+  so an old record loads as a plain host-side task. `enqueue_for_node` enforces
+  params <= 4 KiB and a <= 64-byte key at the boundary, and dedups only on the
+  active tuple (kind, nodeId, key) -- a `miss` must not permanently block a retry.
   **Only a record whose own status is a result may be announced as finished, and
   the status announced is the record's own.** `TaskNotifier::finished` is what
   closes the task on the far end, and `run_queued` returns without executing

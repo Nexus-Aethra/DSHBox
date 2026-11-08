@@ -5,7 +5,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { ask, open, save } from '@tauri-apps/plugin-dialog'
 import type { BoxConfig, ContainerExtensions, ContainerPathListing, ContainerResources, DataEntry, DshContainer, DshVersion, ExtensionBundle, GraphSourceKind, Language, PluginGraph, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, InstalledPlugin, UpdatePolicy, UpdateReleaseSummary, UpdateState,
-  ResourceState, ResourceTree, ResourceTypeSummary, ResourceView, ServerServiceStatus, StoredResource, TaskRecord, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
+  ResourceState, ResourceTree, ResourceTypeSummary, ResourceView, ServerServiceStatus, StoredResource, TaskRecord, TaskStatus, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
 
 type ToolchainPayload = { id: string; name: string; managedVersion: string | null }
 
@@ -77,6 +77,15 @@ async function openContainerFront(command: string, id: string): Promise<void> {
  * Polls the task list, and gives up quietly on timeout so a hung task cannot
  * spin the UI forever.
  */
+/** A terminal status that is NOT a success. `waitForTask` returns the record
+ *  for any terminal state, so every caller has to ask this before treating the
+ *  wait as a success: a `miss` (the node lost the claim) or a rollback end used
+ *  to fall through to a silent reload, which reported a failed operation as a
+ *  completed one. See design 2026-11-07 section 2.5. */
+export function taskFailed(status: TaskStatus): boolean {
+  return ['failed', 'cancelled', 'interrupted', 'miss', 'rolled_back', 'rolledback'].includes(status)
+}
+
 async function waitForTask(id: string, timeoutMs: number): Promise<TaskRecord | null> {
   // `miss` and the rollback ends are terminal too: a task whose node stopped
   // holding it will never advance, so polling it out to the timeout reports a
