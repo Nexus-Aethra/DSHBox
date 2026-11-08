@@ -701,6 +701,7 @@ command as done only once the installed app has run it.
 |------|------|
 | Architecture, runtime model, crate map | `docs/development.md`, `handoff.md` (repo root) |
 | Prepared base / sealed template design | `docs/specs/prepared-template-runtime.md` |
+| Node link (duplex session, keys), crate layering | `docs/design/2026-11-08-node-link-session-and-crate-layering.md` |
 | Document store and storage layers | `docs/specs/storage-abstraction.md` |
 | Template system behavior, container skills | `docs/template-system.md` |
 | Plugin pnpm install flow | `docs/design/pnpm-managed-plugin-install.md` |
