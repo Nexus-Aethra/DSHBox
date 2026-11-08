@@ -468,7 +468,10 @@ containers ≤ 数百、tasks **会持续增长**。前三个是毫秒级；**ta
 
 ### 12.4 安全与可达性
 
-- **node 只出站**：注册、心跳、认领、上报都由 node 发起；P 阶段的反向隧道也由 node 发起。
+- **node 出站为主，反向连为可选**（2026-11-08 变更）：注册、心跳、认领、上报仍由 node 发起；
+  但 `docs/design/2026-11-08-node-link-session-and-crate-layering.md` 新增了「控制面 dial node」的
+  备路径（默认关闭、需显式绑定地址、同样走握手认证）。原文「控制面从不 dial node」的绝对化表述
+  以那份文档为准。P 阶段的 relay 隧道仍由 node 发起。
 - **控制面的监听面今天是纯回环**：`TcpListener::bind("127.0.0.1:0")`（`main.rs:117`），HTTP 面只有
   `POST /rpc` 与 `GET /events`（`main.rs:229,313`）；`/mirror.bundle` 是本设计新增的路由，同样默认回环。
   因此**路径 2 的跨机器 join 需要显式开启绑定地址**（新增一个 config 项，默认关闭、需要用户确认），
