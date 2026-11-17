@@ -383,8 +383,16 @@ src-tauri/crates/
 
 守卫读不到依赖图时（没有 cargo、cargo 失败）**必须失败**，绝不打印成功行；
 根目录锚定在脚本自身位置而不是 `process.cwd()`（从 `src-tauri` 运行时曾扫描到 0 个 crate
-仍 exit 0）。它也不看注册表依赖，所以「feature crate 不得依赖 Tauri」这条目前只是约定、
-未被强制：今天只有 `dshbox` 依赖 `tauri`，但新增一个 `domain/` crate 引用 `tauri` 不会变红。
+仍 exit 0）。
+
+**「feature crate 不得依赖 Tauri」现在由守卫强制。**它一度只是本节写下的一句约定：守卫的
+层循环按构造成就必须跳过注册表依赖（`dep.path === undefined` 的依赖不可能指向本 workspace，
+所以不可能越层），而 `tauri` 恰恰是注册表依赖——于是新增一个 `domain/` crate 引用 `tauri`
+会照样打印 `layering ok`。代价很具体：Tauri 会把整个 webview 栈拖进链接它的 crate，而
+`dshboxd` 与 `box-helper` 必须是 headless 二进制。现在这条独立于层循环、单独遍历注册表依赖，
+按包名白名单放行（只有 `dshbox` 可用 `tauri` / `tauri-plugin-*` / `tauri-build`），
+变异测试覆盖 normal / dev / build 三种依赖位与 core / domain / edge / apps / tools 五层。
+按包名而不是 `^tauri` 通配：将来的 `tauri-plugin-foo` 是一次显式决定，不是通配符早已默许的东西。
 
 这条比目录更重要：目录只让方向可见，守卫才让它不可退化。
 

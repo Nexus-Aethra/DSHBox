@@ -45,6 +45,19 @@ const ALLOWED = {
   root: ['core', 'domain', 'edge'],
 }
 
+// The one rule that is not about direction but about the framework: a box
+// crate must never link Tauri. Only the root package (the desktop shell) may,
+// and only its own build script may link `tauri-build`. A domain/ crate that
+// reaches for Tauri drags the whole webview stack into the daemon and the node
+// helper -- both of which must stay headless binaries -- so it is checked here
+// rather than left to a reader of AGENTS.md. The rule is spelled per package
+// rather than as a `^tauri` glob so a future plugin is a deliberate decision,
+// not something the glob already permitted.
+const TAURI_ALLOWED = {
+  dshbox: new Set(['tauri', 'tauri-plugin-dialog', 'tauri-build']),
+}
+const TAURI_FAMILY = /^tauri(-|$)/
+
 function metadata() {
   if (!existsSync(WORKSPACE_MANIFEST)) {
     console.error(`layering: no workspace manifest at ${WORKSPACE_MANIFEST}`)
@@ -137,6 +150,25 @@ for (const pkg of workspace.packages) {
     if (self.layer === 'root' && target.layer === 'apps') {
       violations.push(`the Tauri package depends on the binary ${target.layer}/${target.name}`)
     }
+  }
+}
+
+// The framework rule. This loop reads registry dependencies (dep.path is
+// undefined), which the layer loop above deliberately skips: a registry dep
+// cannot point inside this workspace, so it cannot cross a layer -- but it can
+// still be the wrong dependency for that crate to have. That was a documented
+// gap: AGENTS.md said "feature crates must not depend on Tauri" and nothing
+// checked it, so a new domain/ crate could have linked Tauri and gone green.
+for (const pkg of workspace.packages) {
+  const self = nodes.get(pkg.manifest_path.replace(`${sep}Cargo.toml`, '').split(sep).join('/'))
+  if (!self) continue
+  const permitted = TAURI_ALLOWED[self.name]
+  for (const dep of pkg.dependencies) {
+    if (!TAURI_FAMILY.test(dep.name)) continue
+    if (permitted?.has(dep.name)) continue
+    const where = dep.kind ?? 'normal'
+    const holder = self.layer === 'root' ? 'the Tauri package' : `${self.layer}/${self.name}`
+    violations.push(`${holder} depends on ${dep.name} (${where}); only the dshbox package may link Tauri`)
   }
 }
 

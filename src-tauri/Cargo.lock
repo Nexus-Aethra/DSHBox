@@ -175,7 +175,6 @@ dependencies = [
 name = "box-browser"
 version = "0.1.0"
 dependencies = [
- "box-foundation",
  "serde",
  "serde_json",
  "tungstenite",
@@ -197,7 +196,6 @@ version = "0.1.0"
 dependencies = [
  "box-foundation",
  "box-runtime",
- "box-scheduler",
  "serde",
  "serde_json",
 ]
@@ -209,7 +207,6 @@ dependencies = [
  "box-api",
  "box-foundation",
  "box-runtime",
- "box-toolchains",
  "serde",
  "serde_json",
  "tracing",
@@ -219,7 +216,6 @@ dependencies = [
 name = "box-extensions"
 version = "0.1.0"
 dependencies = [
- "box-api",
  "box-containers",
  "box-dsh-versions",
  "box-foundation",
@@ -360,7 +356,6 @@ name = "box-toolchains"
 version = "0.1.0"
 dependencies = [
  "box-foundation",
- "box-runtime",
  "rusqlite",
  "serde",
 ]
