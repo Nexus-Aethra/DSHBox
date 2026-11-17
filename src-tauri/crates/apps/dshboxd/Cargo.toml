@@ -19,6 +19,7 @@ box-image = { path = "../../domain/box-image" }
 box-plugin-graph = { path = "../../domain/box-plugin-graph" }
 box-runtime = { path = "../../core/box-runtime" }
 box-scheduler = { path = "../../core/box-scheduler" }
+box-node-link = { path = "../../domain/box-node-link" }
 box-server-core = { path = "../../edge/box-server-core" }
 
 box-state = { path = "../../domain/box-state" }

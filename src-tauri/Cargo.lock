@@ -260,6 +260,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "box-node-link"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "box-plugin-graph"
 version = "0.1.0"
 dependencies = [
@@ -1006,6 +1014,7 @@ dependencies = [
  "box-extensions",
  "box-foundation",
  "box-image",
+ "box-node-link",
  "box-plugin-graph",
  "box-resources",
  "box-runtime",

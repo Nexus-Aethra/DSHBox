@@ -5,6 +5,11 @@
 //!
 //! Transport: TCP on `127.0.0.1:0` (OS-assigned ephemeral port), HTTP/1.1
 //! over `std::net`. Zero external dependencies. Single POST route: `/rpc`.
+//!
+//! A second, long-lived transport shares the same port: `GET /link` speaks
+//! length-prefixed JSON frames (`box-node-link`) so a node keeps one
+//! connection instead of opening one per operation. Stage L1: plaintext,
+//! same session gate as `/rpc`. See `node_link.rs`.
 
 mod apply;
 mod bundles;
@@ -17,6 +22,7 @@ mod extensions;
 mod host;
 mod lifecycle;
 mod node_artifacts;
+mod node_link;
 mod nodes;
 mod nodes_rpc;
 mod plugins;
@@ -331,6 +337,13 @@ fn handle_http(mut stream: TcpStream, state: Arc<DaemonState>, token: &str) {
         return;
     }
 
+    // Node link: one long-lived connection of length-prefixed JSON frames.
+    // Shares the session gate with /rpc (see node_link::Gate) so the two
+    // transports cannot drift apart in what they allow.
+    if method == "GET" && path.starts_with("/link") {
+        node_link::handle_link(stream, state, token);
+        return;
+    }
     // POST /rpc — JSON-RPC
     if method != "POST" || path != "/rpc" {
         let _ = write!(
@@ -823,4 +836,243 @@ mod gateway_tests {
             "the forged value is gone"
         );
     }
+    /// One frame that came back from the gateway, with its type kept: a
+    /// refused request is answered with a `close` frame, not a `response`
+    /// one, and a test that only looked at the payload could not tell the
+    /// difference.
+    struct LinkReply {
+        frame_type: box_node_link::frame::FrameType,
+        value: Value,
+    }
+
+    /// Drive one request through the real frame gateway, not a handler.
+    /// Returns `None` when the connection produced no frame at all.
+    fn link_rpc(state: Arc<DaemonState>, main: &str, body: Value) -> Option<LinkReply> {
+        use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = main.to_owned();
+        let server_state = state.clone();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            node_link::handle_link(stream, server_state, &token);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let frame = Frame::json(FrameType::Request, &body).unwrap();
+        write_frame(&mut client, &frame).unwrap();
+        let mut reader = BufReader::new(client);
+        let response = read_frame(&mut reader).unwrap();
+        // Drop the client first: the server loop only ends when it sees EOF
+        // on the connection, so joining before the drop would block until the
+        // test timeout.
+        drop(reader);
+        handle.join().unwrap();
+        response.map(|frame| LinkReply {
+            frame_type: frame.frame_type,
+            value: frame.value().unwrap(),
+        })
+    }
+
+    /// The frame path answers the same methods the HTTP path answers, with
+    /// the same JSON. This is the whole point of L1: the transport changed,
+    /// nothing else did.
+    #[test]
+    fn the_frame_path_answers_the_same_methods_as_http() {
+        let state = state();
+        let body = json!({ "method": "ping", "token": "main-token" });
+        let http = rpc(state.clone(), "main-token", body.clone());
+        let frame = link_rpc(state.clone(), "main-token", body).expect("a response frame");
+        assert_eq!(
+            frame.frame_type,
+            box_node_link::frame::FrameType::Response,
+            "an accepted request is answered with a response frame"
+        );
+        assert_eq!(http.1["ok"], frame.value["ok"]);
+        assert_eq!(http.1["status"], frame.value["status"]);
+    }
+
+    /// `__nodeId` is server-owned on the frame path too. A caller that
+    /// names a node in the body must not be believed -- this is the same
+    /// regression the HTTP path pins, and a new transport that forgot to
+    /// strip it would open exactly the hole the original bug was.
+    #[test]
+    fn a_frame_caller_cannot_forge_a_node_identity_in_the_body() {
+        let state = state();
+        let (grant, id, token, epoch) = enroll_a_node(&state);
+        let mut forged = json!({
+            "method": "node_artifact_report",
+            "token": token,
+            "epoch": epoch,
+            "__nodeId": "node-victim",
+            "baseId": "base-9c1f00d4a1b2c3d4",
+            "sourceCommit": "0d1f500",
+            "platform": "linux-x86_64",
+            "archive": "/var/dshbox/artifacts/base.tar",
+            "sha256": format!("9f2c{}", "a".repeat(60)),
+            "sizeBytes": 1024,
+        });
+        let response = link_rpc(state.clone(), "main-token", forged.clone())
+            .expect("a response frame");
+        assert_eq!(
+            response.frame_type,
+            box_node_link::frame::FrameType::Response,
+            "a valid session is answered, not closed"
+        );
+        // The report was attributed to the session's own node, not the
+        // forged one.
+        let rows = state.artifacts.list(Some(&id), None).unwrap();
+        assert_eq!(rows.len(), 1, "the row landed on the session node");
+        assert!(state.artifacts.list(Some("node-victim"), None).unwrap().is_empty());
+        assert_eq!(response.value["ok"], true);
+        let _ = grant;
+    }
+
+    /// A method outside `NODE_METHODS` is refused on the frame path with a
+    /// close frame, not answered. A valid session asking for a
+    /// control-plane method must not get one just because the transport is
+    /// new.
+    #[test]
+    fn a_frame_session_cannot_call_a_control_plane_method() {
+        let state = state();
+        let (grant, id, token, epoch) = enroll_a_node(&state);
+        let body = json!({
+            "method": "list_containers",
+            "token": token,
+            "epoch": epoch,
+        });
+        let response = link_rpc(state.clone(), "main-token", body)
+            .expect("the link answered before closing");
+        assert_eq!(
+            response.frame_type,
+            box_node_link::frame::FrameType::Close,
+            "a method outside NODE_METHODS closes the link, it does not answer it"
+        );
+        assert_eq!(response.value["reason"], "forbidden-method");
+        let _ = (grant, id);
+    }
+
+    /// A frame with no credential closes the link. Same rule as HTTP 401:
+    /// resolve the session first, and refuse when there is none.
+    #[test]
+    fn a_frame_without_a_credential_is_closed() {
+        let state = state();
+        let body = json!({ "method": "node_heartbeat" });
+        let reply = link_rpc(state.clone(), "main-token", body)
+            .expect("the link answered before closing");
+        assert_eq!(
+            reply.frame_type,
+            box_node_link::frame::FrameType::Close,
+            "no credential closes the link rather than answering it"
+        );
+        assert_eq!(reply.value["reason"], "no-session");
+    }
+
+    /// A malformed frame closes the link without a response. There is no
+    /// request to answer, and half a session is worse than none.
+    #[test]
+    fn a_malformed_frame_closes_the_link_without_a_response() {
+        use box_node_link::frame::{read_frame, FrameType};
+        let state = state();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "main-token".to_owned();
+        let server_state = state.clone();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            node_link::handle_link(stream, server_state, &token);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        // A frame that claims 100 bytes and delivers 3: torn, not closed.
+        let mut torn = 100u32.to_be_bytes().to_vec();
+        torn.extend_from_slice(&[FrameType::Request.as_u8(), b'{', b'}']);
+        client.write_all(&torn).unwrap();
+        client.flush().unwrap();
+        drop(client);
+        handle.join().unwrap();
+    }
+
+    /// Enroll a node and return its grant plus the session it produces, so
+    /// a test can act as that node.
+    fn enroll_a_node(state: &Arc<DaemonState>) -> (String, String, String, u64) {
+        let enroll = json!({
+            "method": "node_enroll",
+            "token": "main-token",
+            "kind": "wsl2",
+            "platform": "linux-x86_64",
+        });
+        let enrolled = rpc(state.clone(), "main-token", enroll);
+        let grant = enrolled.1["result"]["enrollToken"].as_str().unwrap().to_owned();
+        let register = json!({
+            "method": "node_register",
+            "token": "main-token",
+            "enrollToken": grant,
+            "nodeId": "node-session-owner",
+            "kind": "wsl2",
+            "platform": "linux-x86_64",
+            "capabilities": ["exec", "heartbeat"],
+            "helperVersion": "test",
+        });
+        let registered = rpc(state.clone(), "main-token", register);
+        let token = registered.1["result"]["sessionToken"].as_str().unwrap().to_owned();
+        let epoch = registered.1["result"]["epoch"].as_u64().unwrap();
+        let id = registered.1["result"]["nodeId"].as_str().unwrap_or("node-session-owner").to_owned();
+        (grant, id, token, epoch)
+    }
+
+    /// A frame that is not a request closes the link. L1 has no handshake,
+    /// so a peer that opens with `hello` is speaking a protocol this build
+    /// does not implement; answering it would imply that it does.
+    #[test]
+    fn a_non_request_frame_closes_the_link() {
+        use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+        let state = state();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "main-token".to_owned();
+        let server_state = state.clone();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            node_link::handle_link(stream, server_state, &token);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        // `hello` is the L2 handshake frame. It is declared in the codec but
+        // nothing in L1 emits or answers it.
+        let frame = Frame::json(FrameType::Hello, &serde_json::json!({ "ver": 1 })).unwrap();
+        write_frame(&mut client, &frame).unwrap();
+        client.flush().unwrap();
+        let mut reader = BufReader::new(client);
+        let reply = read_frame(&mut reader).unwrap();
+        drop(reader);
+        handle.join().unwrap();
+        let reply = reply.expect("the link answered before closing");
+        assert_eq!(reply.frame_type, FrameType::Close, "a hello is not answered");
+        assert_eq!(reply.value().unwrap()["reason"], "unexpected-frame-type");
+    }
+
+    /// A request whose payload is not JSON closes the link. There is no
+    /// method to dispatch, and guessing one would mean acting on bytes we
+    /// could not read.
+    #[test]
+    fn a_request_with_a_non_json_payload_closes_the_link() {
+        use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+        let state = state();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "main-token".to_owned();
+        let server_state = state.clone();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            node_link::handle_link(stream, server_state, &token);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let frame = Frame { frame_type: FrameType::Request, payload: b"not json".to_vec() };
+        write_frame(&mut client, &frame).unwrap();
+        client.flush().unwrap();
+        let mut reader = BufReader::new(client);
+        let reply = read_frame(&mut reader).unwrap();
+        drop(reader);
+        handle.join().unwrap();
+        assert!(reply.is_none(), "a malformed payload gets no reply at all");
+    }
+
 }
