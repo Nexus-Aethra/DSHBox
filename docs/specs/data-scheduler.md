@@ -54,12 +54,13 @@ all — no caller writes them into the map. `meta` is likewise empty on every
 entry in practice: the one place that assembles keys for it
 (`harness_ref`, `from_ref`, in `box-template-core/src/lib.rs` on template
 install) never attaches them to the entry, so today the map holds only
-id/type/path/status/refs/created_at. The digest and size figures the UI shows
-live on the published tree instead: `manifest.json` beside the resource
+id/type/path/status/refs/created_at. The digest and size figures live on the
+published tree instead: `manifest.json` beside the resource
 (`TemplateManifest`, written by `write_template_manifest` in
 `box-foundation/src/lib.rs`, carries `harnessDigest`, `profileDigest` and
-`sizeBytes`), and the per-domain indexes carry `sizeBytes` for the UI
-(`PreparedBaseRecord`, `SealedTemplateRecord`).
+`sizeBytes`), and the per-domain index records carry `sizeBytes`
+(`PreparedBaseRecord`, `SealedTemplateRecord`) — `sealed.rs` reports the
+latter over RPC as `sizeBytes`.
 
 Resource publication is ordered: validate staged tree, write manifest, atomically
 rename staging to its digest-addressed final path, then commit map/references.
