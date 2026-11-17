@@ -91,11 +91,29 @@ fn every_store_file_is_owner_only_while_the_connection_is_open() {
     // A first version did that, and passed against a mutant that tightened
     // only the .db.
     //
-    // PLATFORM: the body is cfg(unix) and is therefore a no-op on Windows,
-    // where there are no Unix mode bits and the files inherit the directory
-    // ACL instead. That matches how box-resources tightens its secret
-    // payloads (transfer/tree.rs, the same cfg pair). It is not a test on
-    // Windows and must not be read as one.
+    // PLATFORM -- read this before trusting a green run anywhere else.
+    //
+    // The body is cfg(unix), so on Windows this is a no-op: there are no Unix
+    // mode bits, and the store files inherit the runtime directory ACL. A
+    // review read that ACL back on a fresh Windows install:
+    //
+    //   NT AUTHORITY\Authenticated Users : Modify, Synchronize
+    //   BUILTIN\Users                     : ReadAndExecute, Synchronize
+    //
+    // both inherited from the parent directory. So on the platform this ships
+    // on, every local user can read the file holding the control-plane
+    // Ed25519 private key and every node PSK. The 0600 discipline design
+    // section 8.2 asks for is NOT IN FORCE on Windows -- not untested, absent.
+    //
+    // The same cfg(unix) pair in box-resources/transfer/tree.rs is a
+    // consistency point, not a sufficiency argument: that guards credential
+    // payloads an operator moves deliberately, and this guards the daemon own
+    // long-term identity written on every enrol.
+    //
+    // The fix is tracked as a follow-up, not as this comment:
+    // SetNamedSecurityInfo on .db, -wal and -shm, written by a daemon that
+    // must not be able to lock itself out. Until it lands, a green run here
+    // says the Unix path works.
     let (paths, _dir) = paths();
     let collection = open_node_keys(&paths).unwrap();
     collection
@@ -135,8 +153,9 @@ fn every_store_file_is_owner_only_while_the_connection_is_open() {
 }
 #[test]
 fn a_loose_store_is_repaired_rather_than_inherited() {
-    // Same platform note as the test above: unix-only. This one closes and
-    // reopens, which checkpoints the -wal away, so it covers the main file.
+    // Same platform note as the test above: unix-only, and the discipline is
+    // absent on Windows. This one closes and reopens, which checkpoints the
+    // -wal away, so it covers the main file only.
     // A store left world-readable by an earlier build must be fixed on the
     // next open, not inherited.
     let (paths, _dir) = paths();
