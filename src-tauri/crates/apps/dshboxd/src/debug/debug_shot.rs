@@ -1,7 +1,8 @@
 //! Screenshots: capture the page as a PNG, size it, prune the old ones.
 //!
-//! Self-contained -- the only CDP call it makes is Page.captureScreenshot, and
-//! the pruning and dimension logic is pure. Nothing here knows about the
+//! Self-contained -- the only CDP calls it makes are Page.captureScreenshot and
+//! Page.getLayoutMetrics (for the CSS pixel size), and the pruning and dimension
+//! logic is pure. Nothing here knows about the
 //! session table or about clicks and queries.
 
 use super::*;
