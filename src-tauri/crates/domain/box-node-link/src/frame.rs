@@ -73,6 +73,18 @@ impl FrameType {
     pub fn is_rpc(self) -> bool {
         matches!(self, Self::Request | Self::Response)
     }
+
+    /// True for the types that travel inside an established session, so
+    /// their payloads are sealed with the session keys.
+    ///
+    /// Hello and HelloAck are excluded on purpose: the design is explicit
+    /// that they are not encrypted, because the encryption is what they
+    /// establish. Close is excluded too -- a close carries a reason, not a
+    /// secret, and a peer whose keys are already wrong must still be able
+    /// to read why it is being dropped.
+    pub fn carries_session_payload(self) -> bool {
+        matches!(self, Self::Request | Self::Response | Self::Event | Self::Rekey)
+    }
 }
 
 impl fmt::Display for FrameType {

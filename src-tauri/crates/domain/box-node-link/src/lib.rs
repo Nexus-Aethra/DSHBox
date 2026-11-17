@@ -19,8 +19,15 @@ pub mod chain;
 pub mod frame;
 pub mod handshake;
 pub mod kdf;
+pub mod node_keys;
 pub mod session;
+pub mod session_io;
+pub mod wire;
 
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "wire_tests.rs"]
+mod wire_tests;

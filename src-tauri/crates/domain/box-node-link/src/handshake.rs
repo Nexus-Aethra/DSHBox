@@ -63,7 +63,10 @@ impl AuthMode {
 
 /// The node side of a hello: who it is, what it speaks, and the ephemeral
 /// public key plus the authentication for this exchange.
-#[derive(Clone, Debug)]
+///
+/// PartialEq is derived so a round-trip through the wire form can be asserted
+/// on directly, rather than field by field.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hello {
     pub node_id: String,
     pub mode: AuthMode,
@@ -246,6 +249,18 @@ impl NodeHand {
 /// The order matters. The control signature is checked *before* the
 /// certificate is unsealed, so a wrong control plane is refused before any
 /// of its sealed material is trusted.
+/// What the node side produces: the session keys, and the ECDH output they
+/// came from.
+///
+/// The ECDH is returned because unsealing the certificate needs it: the wrap
+/// key derives from the ECDH mixed with the bootstrap secret. Dropping it
+/// inside node_finish would force the caller to redo the agreement, which it
+/// cannot -- the ephemeral private key was consumed.
+pub struct NodeOutcome {
+    pub keys: SessionKeys,
+    pub ecdh: [u8; 32],
+}
+
 pub fn node_finish(
     hand: NodeHand,
     hello: &Hello,
@@ -253,7 +268,7 @@ pub fn node_finish(
     // Not needed to derive the session keys: they come from the ECDH alone.
     // It is a parameter so the shape mirrors node_unseal.
     _bootstrap: &[u8],
-) -> Result<SessionKeys, HandshakeError> {
+) -> Result<NodeOutcome, HandshakeError> {
     if ack.control_sig.is_empty() {
         return Err(HandshakeError::ControlSignature);
     }
@@ -268,10 +283,13 @@ pub fn node_finish(
 
     let ecdh = hand.agree_with(&ack.eph_b)?;
 
-    Ok(SessionKeys {
-        c2s: kdf::derive(ecdh.as_ref(), kdf::C2S_LABEL, &t2),
-        s2c: kdf::derive(ecdh.as_ref(), kdf::S2C_LABEL, &t2),
-        transcript: t2,
+    Ok(NodeOutcome {
+        keys: SessionKeys {
+            c2s: kdf::derive(&ecdh, kdf::C2S_LABEL, &t2),
+            s2c: kdf::derive(&ecdh, kdf::S2C_LABEL, &t2),
+            transcript: t2,
+        },
+        ecdh,
     })
 }
 
