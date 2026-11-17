@@ -45,6 +45,34 @@ const ALLOWED = {
   root: ['core', 'domain', 'edge'],
 }
 
+// The one rule that is not about direction but about the framework: a box
+// crate must never link Tauri. Only the root package (the desktop shell) may,
+// and `tauri-build` only on the root, where its build script is. A domain/ crate
+// that reaches for Tauri drags the whole webview stack into the daemon and the
+// node helper -- both of which must stay headless binaries -- so it is checked
+// here rather than left to a reader of AGENTS.md.
+//
+// The family is matched by NAME, not by provenance: cargo metadata carries no
+// information about who published a crate, so the real Tauri and an unrelated
+// crate called `tauri-utils` are indistinguishable here. Rather than guess, the
+// rule covers exactly the names a feature would plausibly reach for -- `tauri`
+// itself, any `tauri-plugin-*`, and `tauri-build` -- and leaves everything else
+// to the layer loop. That is a deliberate narrowing: a registry dep named
+// `tauri-runtime`, `tauri-codegen` or `wry` is NOT caught, even though it can pull
+// the webview in transitively. The three covered names are where the webview
+// actually enters a build, and a wider match was tried first and removed because
+// it refused crates that had nothing to do with Tauri (review of this PR).
+//
+// `tauri-build` is spelled out separately because it is the one tauri-family
+// name that is not a plugin, and it must be allowed on the root (its build
+// script) while staying forbidden elsewhere. The root may use exactly the three
+// names in ROOT_TAURI_OK; adding a fourth there is a deliberate edit to that
+// set, which is what makes the AGENTS.md sentence enforceable rather than
+// aspirational -- before this, the root could add any tauri-plugin-* unopposed.
+const TAURI_FAMILY = /^tauri(-plugin-|$)/
+const TAURI_BUILD = 'tauri-build'
+const ROOT_TAURI_OK = new Set(['tauri', 'tauri-plugin-dialog', 'tauri-build'])
+
 function metadata() {
   if (!existsSync(WORKSPACE_MANIFEST)) {
     console.error(`layering: no workspace manifest at ${WORKSPACE_MANIFEST}`)
@@ -137,6 +165,34 @@ for (const pkg of workspace.packages) {
     if (self.layer === 'root' && target.layer === 'apps') {
       violations.push(`the Tauri package depends on the binary ${target.layer}/${target.name}`)
     }
+  }
+}
+
+// The framework rule. This loop reads registry dependencies (dep.path is
+// undefined), which the layer loop above deliberately skips: a registry dep
+// cannot point inside this workspace, so it cannot cross a layer -- but it can
+// still be the wrong dependency for that crate to have. That was a documented
+// gap: AGENTS.md said "feature crates must not depend on Tauri" and nothing
+// checked it, so a new domain/ crate could have linked Tauri and gone green.
+for (const pkg of workspace.packages) {
+  const self = nodes.get(pkg.manifest_path.replace(`${sep}Cargo.toml`, '').split(sep).join('/'))
+  if (!self) continue
+  const isRoot = self.layer === 'root'
+  for (const dep of pkg.dependencies) {
+    // A path dependency named tauri-* is a vendored fork, not the framework:
+    // every path edge already belongs to the layer loop, so this rule stays out
+    // of it. Without this skip a crate could name a local directory `tauri` and
+    // be refused for something that is not Tauri at all.
+    if (dep.path !== undefined) continue
+    if (!TAURI_FAMILY.test(dep.name) && dep.name !== TAURI_BUILD) continue
+    if (isRoot && ROOT_TAURI_OK.has(dep.name)) continue
+    const where = dep.kind ?? 'normal'
+    const holder = isRoot ? 'the Tauri package' : `${self.layer}/${self.name}`
+    violations.push(
+      isRoot
+        ? `the Tauri package depends on ${dep.name} (${where}); the root may only use ${[...ROOT_TAURI_OK].join(', ')}`
+        : `${holder} depends on ${dep.name} (${where}); only the dshbox package may link Tauri`,
+    )
   }
 }
 

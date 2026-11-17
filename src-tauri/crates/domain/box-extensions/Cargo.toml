@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-box-api = { path = "../../core/box-api" }
 box-containers = { path = "../box-containers" }
 box-dsh-versions = { path = "../box-dsh-versions" }
 box-foundation = { path = "../../core/box-foundation" }

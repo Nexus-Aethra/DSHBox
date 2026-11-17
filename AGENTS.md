@@ -89,7 +89,9 @@ release workflow invokes directly.
 
 `tools/runtime-packager` sits outside the layers (a build tool, not a box crate), and
 `dshbox` (the Tauri package at `src-tauri/`) is the only package allowed to depend on
-Tauri. **Feature crates must not depend on Tauri or one another's mutable state.**
+Tauri, and the guard checks it: `tauri`, `tauri-plugin-*` and `tauri-build` on any other
+package is a `layers:check` failure, not a convention to remember. **Feature crates must
+not depend on Tauri or one another's mutable state.**
 Two rules that are not layer-shaped but are checked the same way: `box-state` must
 never depend on `box-template-core` (that pair is what keeps the data-scheduler merge
 acyclic), and no crate may depend on `dshbox`.
