@@ -78,6 +78,58 @@ impl SqliteDocumentStore {
             connection: Mutex::new(connection),
         })
     }
+
+    /// Open the secrets store: same schema, no WAL, tightened on create.
+    ///
+    /// The difference from `open` is the journal mode, and it is the whole
+    /// point. WAL keeps the real bytes in a `-wal` sidecar and leaves the main
+    /// file a near-empty header, so "this file is 0600" stops describing where
+    /// the data is -- a review of PR #51 proved it by reading the bytes back
+    /// and found the PSK and the control-plane private key entirely in the
+    /// sidecar, which SQLite had created with the default umask. With the
+    /// rollback journal instead, the data is in the one file we chmod, and
+    /// there is nothing to miss.
+    ///
+    /// The trade is concurrency: the rollback journal allows one writer at a
+    /// time, where WAL allows a writer beside readers. That is fine here and
+    /// it is the wrong trade for the main store, which the daemon and the
+    /// desktop share -- hence two stores rather than one with a flag.
+    pub fn open_secrets(path: &Path) -> BoxResult<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    format!("cannot create secrets directory {}: {error}", parent.display())
+                })?;
+            }
+        }
+        let connection = Connection::open(path)
+            .map_err(|error| format!("cannot open secrets store {}: {error}", path.display()))?;
+        connection
+            .busy_timeout(Duration::from_millis(5000))
+            .map_err(|error| format!("cannot set secrets store busy timeout: {error}"))?;
+        // The rollback journal, not WAL. See the doc comment: this is what
+        // keeps the bytes in the file we tighten.
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .map_err(|error| format!("cannot set secrets store journal mode: {error}"))?;
+        if !journal_mode.eq_ignore_ascii_case("delete") {
+            return Err(format!("secrets store journal mode unavailable (got {journal_mode})"));
+        }
+        // FULL rather than NORMAL: NORMAL is the WAL-appropriate durability
+        // level, and with the rollback journal it would skip the fsync that
+        // makes a committed secret survive a crash.
+        connection
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(|error| format!("cannot set secrets store synchronous mode: {error}"))?;
+        run_migrations(&connection)?;
+        // No ordering subtlety here: the rollback journal leaves no sidecars
+        // behind, so tightening after the migrations and tightening before
+        // them are the same call.
+        tighten_store_permissions(path);
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
+    }
 }
 
 fn run_migrations(connection: &Connection) -> BoxResult<()> {

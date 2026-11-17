@@ -10,17 +10,17 @@
 //! 1. The secret never reaches a log line. There is no tracing call in this
 //!    file at all, and the record Debug is hand-written in box-node-link to
 //!    redact it.
-//! 2. The database is 0600. Enforced in box-store on every open, not only on
+//! 2. The database is 0600. It is its own file (secrets.db), not the main
 //!    create, so a store left loose by an earlier build is repaired.
 //! 3. The token seed is never stored. A token row holds the chain end and the
 //!    last accepted link, so a stolen row cannot regenerate the chain.
 //! 4. Issuing reveals the secret once. issue returns the plaintext for that
 //!    one delivery and stores only what verification needs.
 
-use box_foundation::collection::Collection;
+use box_foundation::collection::{Collection, DocumentStore};
 use box_foundation::{now_seconds, BoxPaths, BoxResult};
 use box_node_link::node_keys::{KeyMode, NodeKeyRecord, NodeKeySummary};
-use box_store::open_document_store_for_paths;
+use box_store::SqliteDocumentStore;
 use serde::{Deserialize, Serialize};
 
 /// New scope, same store. Adding a scope is a new row, not a migration: the
@@ -84,8 +84,18 @@ impl std::fmt::Debug for ControlIdentity {
 /// same way node-artifacts does: a host with no runtime directory has nowhere
 /// to put rows, and the alternative is failing a read that has nothing to
 /// read.
+/// Open the secrets store, falling back to memory when no runtime is set.
+///
+/// The fallback is the same one node-artifacts uses: a host with no runtime
+/// directory has nowhere to put rows, and the alternative is failing a read
+/// that has nothing to read.
+fn secrets_store(paths: &BoxPaths) -> BoxResult<std::sync::Arc<dyn DocumentStore>> {
+    let path = paths.secrets_db()?;
+    Ok(std::sync::Arc::new(SqliteDocumentStore::open_secrets(&path)?))
+}
+
 pub fn open_node_keys(paths: &BoxPaths) -> BoxResult<Collection<NodeKeyRecord>> {
-    match open_document_store_for_paths(paths) {
+    match secrets_store(paths) {
         Ok(store) => Ok(Collection::new(store, NODE_KEY_SCOPE, node_key)),
         Err(_) => Ok(Collection::memory(NODE_KEY_SCOPE, node_key)),
     }
@@ -93,7 +103,7 @@ pub fn open_node_keys(paths: &BoxPaths) -> BoxResult<Collection<NodeKeyRecord>> 
 
 /// The control-identity collection.
 pub fn open_control_identity(paths: &BoxPaths) -> BoxResult<Collection<ControlIdentity>> {
-    match open_document_store_for_paths(paths) {
+    match secrets_store(paths) {
         Ok(store) => Ok(Collection::new(store, CONTROL_IDENTITY_SCOPE, identity_key)),
         Err(_) => Ok(Collection::memory(CONTROL_IDENTITY_SCOPE, identity_key)),
     }

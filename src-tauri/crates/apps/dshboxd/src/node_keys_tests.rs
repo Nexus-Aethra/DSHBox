@@ -79,41 +79,33 @@ fn the_summary_never_carries_the_secret() {
 // ---------- discipline 2: the file on disk ----------
 
 #[test]
-fn every_store_file_is_owner_only_while_the_connection_is_open() {
-    // The main .db is a near-empty header under WAL -- the bytes are in the
-    // -wal sidecar, which is where a review found the PSK and the
-    // control-plane private key. So this checks all three files, while the
-    // connection is still open.
+fn the_secrets_file_is_owner_only_and_has_no_sidecars() {
+    // The secrets live in their own database, deliberately: it does not use
+    // WAL, so there is one file and chmod is the whole story. The main store
+    // keeps its bytes in a -wal sidecar while the .db stays a near-empty
+    // header, which is how a review of PR #51 found the first 0600 attempt
+    // pointing at the wrong inode.
     //
-    // Checking after dropping the collection does not work: SQLite
-    // checkpoints and *deletes* the -wal on the last connection close, so the
-    // file holding the secret is gone by the time the assertion would run.
-    // A first version did that, and passed against a mutant that tightened
-    // only the .db.
+    // So this asserts two things: the secrets file is 0600, and no sidecar
+    // exists for it at all. The second is the one that would catch a
+    // regression back to WAL -- a sidecar appearing is the signal.
     //
-    // PLATFORM -- read this before trusting a green run anywhere else.
-    //
-    // The body is cfg(unix), so on Windows this is a no-op: there are no Unix
-    // mode bits, and the store files inherit the runtime directory ACL. A
-    // review read that ACL back on a fresh Windows install:
+    // PLATFORM -- read this before trusting a green run anywhere else. The
+    // body is cfg(unix), so on Windows this is a no-op: there are no Unix
+    // mode bits, and the file inherits the runtime directory ACL. A review
+    // read that ACL back on a fresh Windows install:
     //
     //   NT AUTHORITY\Authenticated Users : Modify, Synchronize
     //   BUILTIN\Users                     : ReadAndExecute, Synchronize
     //
     // both inherited from the parent directory. So on the platform this ships
     // on, every local user can read the file holding the control-plane
-    // Ed25519 private key and every node PSK. The 0600 discipline design
-    // section 8.2 asks for is NOT IN FORCE on Windows -- not untested, absent.
-    //
-    // The same cfg(unix) pair in box-resources/transfer/tree.rs is a
-    // consistency point, not a sufficiency argument: that guards credential
-    // payloads an operator moves deliberately, and this guards the daemon own
-    // long-term identity written on every enrol.
-    //
-    // The fix is tracked as a follow-up, not as this comment:
-    // SetNamedSecurityInfo on .db, -wal and -shm, written by a daemon that
-    // must not be able to lock itself out. Until it lands, a green run here
-    // says the Unix path works.
+    // Ed25519 private key and every node PSK. The 0600 discipline is NOT IN
+    // FORCE on Windows -- not untested, absent. Splitting the secrets into
+    // their own file does not change that: a file created on Windows inherits
+    // the directory ACL whatever database it is in. It shrinks what a local
+    // user can read from every record to only the keys, and it gives the
+    // Windows fix one seam instead of three sidecars, but it is not the fix.
     let (paths, _dir) = paths();
     let collection = open_node_keys(&paths).unwrap();
     collection
@@ -122,33 +114,25 @@ fn every_store_file_is_owner_only_while_the_connection_is_open() {
         )])
         .unwrap();
 
+    let secrets = paths.secrets_db().unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let db = paths.store_db().unwrap();
-        let mut checked = 0;
-        for suffix in ["", "-wal", "-shm"] {
-            let candidate = if suffix.is_empty() {
-                db.clone()
-            } else {
-                std::path::PathBuf::from(format!("{}{suffix}", db.display()))
-            };
-            if !candidate.exists() {
-                continue;
-            }
-            let mode = std::fs::metadata(&candidate).unwrap().permissions().mode();
-            assert_eq!(
-                mode & 0o777,
-                0o600,
-                "{} must be owner-only, got {mode:o}",
-                candidate.display()
-            );
-            checked += 1;
-        }
-        assert!(
-            checked >= 2,
-            "expected the db and its wal sidecar while open, found {checked}"
+        let mode = std::fs::metadata(&secrets).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the secrets file must be owner-only, got {mode:o}"
         );
+
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = std::path::PathBuf::from(format!("{}{suffix}", secrets.display()));
+            assert!(
+                !sidecar.exists(),
+                "{} must not exist: the secrets store does not use WAL",
+                sidecar.display()
+            );
+        }
     }
 }
 #[test]
