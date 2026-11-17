@@ -54,7 +54,6 @@ impl SqliteDocumentStore {
         // in a world-readable file in the runtime directory. Tighten it on
         // every open, not only on create, because an earlier build may have
         // left it loose.
-        tighten_store_permissions(path);
         connection
             .busy_timeout(Duration::from_millis(5000))
             .map_err(|error| format!("cannot set document store busy timeout: {error}"))?;
@@ -71,6 +70,10 @@ impl SqliteDocumentStore {
             .pragma_update(None, "synchronous", "NORMAL")
             .map_err(|error| format!("cannot set document store synchronous mode: {error}"))?;
         run_migrations(&connection)?;
+        // Tighten after the migrations, not before: the migrations are the
+        // first write, and the first write is what creates the -wal and -shm
+        // sidecars. Tightening before it would find only the main file.
+        tighten_store_permissions(path);
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -252,7 +255,20 @@ mod tests {
     }
 }
 
-/// Tighten the database file to owner-only.
+/// Tighten the database and its WAL sidecars to owner-only.
+///
+/// The sidecars are the point, and getting this wrong is silent: the store
+/// opens with `journal_mode=WAL`, so **every write lands in `-wal` first**
+/// and the main file stays a near-empty header. A review proved it by reading
+/// the bytes back -- the main `.db` held nothing, the `-wal` held the PSK and
+/// the control-plane private key. Tightening only the `.db` is tightening a
+/// file with no secrets in it.
+///
+/// All three files are touched, not just the ones that exist right now:
+/// SQLite creates `-wal` and `-shm` lazily, so a read-only open may not have
+/// produced them yet and the first write would create them at the default
+/// umask. The store is opened before any write here, so the set is what
+/// exists at open time; a file created later is caught by the next open.
 ///
 /// Called on every open rather than only on create: a store written by an
 /// earlier build may have been left world-readable, and the first time this
@@ -264,11 +280,13 @@ fn tighten_store_permissions(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mut permissions = metadata.permissions();
-            if permissions.mode() & 0o077 != 0 {
-                permissions.set_mode(0o600);
-                let _ = std::fs::set_permissions(path, permissions);
+        for candidate in store_files(path) {
+            if let Ok(metadata) = std::fs::metadata(&candidate) {
+                let mut permissions = metadata.permissions();
+                if permissions.mode() & 0o077 != 0 {
+                    permissions.set_mode(0o600);
+                    let _ = std::fs::set_permissions(&candidate, permissions);
+                }
             }
         }
     }
@@ -276,4 +294,20 @@ fn tighten_store_permissions(path: &Path) {
     {
         let _ = path;
     }
+}
+
+/// The database and the sidecars SQLite may have created beside it.
+///
+/// `-wal` is the write-ahead log, which is where the bytes actually are under
+/// WAL; `-shm` is the shared-memory index for it. Both are created by SQLite
+/// with the process umask, so both need the same tightening.
+#[cfg(unix)]
+fn store_files(path: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = vec![path.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        out.push(std::path::PathBuf::from(name));
+    }
+    out
 }

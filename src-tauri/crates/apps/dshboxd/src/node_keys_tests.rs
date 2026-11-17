@@ -79,9 +79,23 @@ fn the_summary_never_carries_the_secret() {
 // ---------- discipline 2: the file on disk ----------
 
 #[test]
-fn the_store_file_is_owner_only_after_open() {
-    // The database holds the secrets, so a file the whole machine can read
-    // makes never-log-a-secret a half-measure.
+fn every_store_file_is_owner_only_while_the_connection_is_open() {
+    // The main .db is a near-empty header under WAL -- the bytes are in the
+    // -wal sidecar, which is where a review found the PSK and the
+    // control-plane private key. So this checks all three files, while the
+    // connection is still open.
+    //
+    // Checking after dropping the collection does not work: SQLite
+    // checkpoints and *deletes* the -wal on the last connection close, so the
+    // file holding the secret is gone by the time the assertion would run.
+    // A first version did that, and passed against a mutant that tightened
+    // only the .db.
+    //
+    // PLATFORM: the body is cfg(unix) and is therefore a no-op on Windows,
+    // where there are no Unix mode bits and the files inherit the directory
+    // ACL instead. That matches how box-resources tightens its secret
+    // payloads (transfer/tree.rs, the same cfg pair). It is not a test on
+    // Windows and must not be read as one.
     let (paths, _dir) = paths();
     let collection = open_node_keys(&paths).unwrap();
     collection
@@ -89,17 +103,40 @@ fn the_store_file_is_owner_only_after_open() {
             "node-1", "a-secret", 1,
         )])
         .unwrap();
-    let db = paths.store_db().unwrap();
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&db).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "the store must be owner-only");
+        let db = paths.store_db().unwrap();
+        let mut checked = 0;
+        for suffix in ["", "-wal", "-shm"] {
+            let candidate = if suffix.is_empty() {
+                db.clone()
+            } else {
+                std::path::PathBuf::from(format!("{}{suffix}", db.display()))
+            };
+            if !candidate.exists() {
+                continue;
+            }
+            let mode = std::fs::metadata(&candidate).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "{} must be owner-only, got {mode:o}",
+                candidate.display()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "expected the db and its wal sidecar while open, found {checked}"
+        );
     }
 }
-
 #[test]
 fn a_loose_store_is_repaired_rather_than_inherited() {
+    // Same platform note as the test above: unix-only. This one closes and
+    // reopens, which checkpoints the -wal away, so it covers the main file.
     // A store left world-readable by an earlier build must be fixed on the
     // next open, not inherited.
     let (paths, _dir) = paths();
@@ -110,14 +147,34 @@ fn a_loose_store_is_repaired_rather_than_inherited() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(std::fs::metadata(&db).unwrap().permissions().mode() & 0o777, 0o644);
+        for suffix in ["", "-wal", "-shm"] {
+            let candidate = if suffix.is_empty() {
+                db.clone()
+            } else {
+                std::path::PathBuf::from(format!("{}{suffix}", db.display()))
+            };
+            if !candidate.exists() {
+                continue;
+            }
+            std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
         let _ = open_node_keys(&paths).unwrap();
-        assert_eq!(
-            std::fs::metadata(&db).unwrap().permissions().mode() & 0o777,
-            0o600,
-            "a loose store must be repaired on open"
-        );
+        for suffix in ["", "-wal", "-shm"] {
+            let candidate = if suffix.is_empty() {
+                db.clone()
+            } else {
+                std::path::PathBuf::from(format!("{}{suffix}", db.display()))
+            };
+            if !candidate.exists() {
+                continue;
+            }
+            assert_eq!(
+                std::fs::metadata(&candidate).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "a loose {} must be repaired on open",
+                candidate.display()
+            );
+        }
     }
 }
 
