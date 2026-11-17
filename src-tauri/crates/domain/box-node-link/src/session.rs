@@ -40,16 +40,25 @@ pub enum SealError {
     CounterExhausted,
     #[error("the frame failed to open; it was tampered with, misordered, or from another key")]
     OpenFailed,
+    #[error("frame seq {got} is not the expected {expected}; treated as an attack")]
+    SeqMismatch { expected: u64, got: u64 },
 }
 
 /// One direction of a session.
 ///
 /// The counter is part of the key state, not a parameter, so a caller
-/// cannot accidentally reuse a seq by constructing frames itself.
-#[derive(Clone)]
+/// cannot accidentally reuse a seq by constructing frames itself. It is
+/// deliberately not Clone: two clones would share a key and a counter,
+/// and the second one would produce the same nonce under the same key as
+/// the first -- a nonce reuse, which is fatal for an AEAD.
 pub struct RecordKey {
     key: LessSafeKey,
-    seq: u64,
+    /// How many frames this side has sealed. Drives the nonce, and never
+    /// repeats.
+    send_seq: u64,
+    /// How many frames this side has opened. The next frame must claim
+    /// exactly this, which is what makes a replay detectable.
+    recv_seq: u64,
 }
 
 impl RecordKey {
@@ -57,43 +66,74 @@ impl RecordKey {
         let unbound = UnboundKey::new(ALGORITHM, key_bytes).expect("a 32-byte key is valid");
         Self {
             key: LessSafeKey::new(unbound),
-            seq: 0,
+            send_seq: 0,
+            recv_seq: 0,
         }
     }
 
-    /// The next seq this key will use.
-    pub fn seq(&self) -> u64 {
-        self.seq
+    /// How many frames this side has sealed so far.
+    pub fn send_seq(&self) -> u64 {
+        self.send_seq
+    }
+
+    /// How many frames this side has opened so far.
+    pub fn recv_seq(&self) -> u64 {
+        self.recv_seq
     }
 
     /// Seal `plaintext` and return the ciphertext with its tag appended.
-    pub fn seal(&mut self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SealError> {
-        if self.seq >= MAX_FRAMES_PER_KEY {
+    ///
+    /// The seq this frame was sealed with is returned alongside it, because
+    /// the counter advances as part of sealing: a caller that wants to open
+    /// the frame again (or to log which frame it was) needs to know the seq
+    /// rather than infer it.
+    pub fn seal(&mut self, aad: &[u8], plaintext: &[u8]) -> Result<(u64, Vec<u8>), SealError> {
+        if self.send_seq >= MAX_FRAMES_PER_KEY {
             return Err(SealError::CounterExhausted);
         }
-        let nonce = nonce_for(self.seq);
-        self.seq += 1;
+        let seq = self.send_seq;
+        let nonce = nonce_for(seq);
+        self.send_seq += 1;
         let mut in_out = plaintext.to_vec();
         self.key
             .seal_in_place_append_tag(nonce, aead::Aad::from(aad), &mut in_out)
             .map_err(|_| SealError::OpenFailed)?;
-        Ok(in_out)
+        Ok((seq, in_out))
     }
 
-    /// Open one sealed record.
+    /// Open one sealed record, at the seq the frame claims.
     ///
-    /// The expected seq is a parameter so the caller can enforce ordering
-    /// across a reconnect: a frame that opens but carries the wrong seq is
-    /// still a refusal.
-    pub fn open(&mut self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, SealError> {
-        let nonce = nonce_for(self.seq);
+    /// Design section 4: a duplicate or backwards seq is an attack and the
+    /// connection is closed, not buffered. So the seq is a parameter and
+    /// anything other than exactly the next one is refused *before* the
+    /// AEAD runs -- a frame that would open under the right nonce but
+    /// claims the wrong seq is still a refusal.
+    pub fn open_at(&mut self, seq: u64, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, SealError> {
+        // The only frame that may be opened is the next one in sequence:
+        // exactly recv_seq. Anything else -- a duplicate of one already
+        // opened, or one ahead of the counter -- is refused before the
+        // AEAD runs, which is what makes a replay detectable even when the
+        // bytes would otherwise open.
+        if seq != self.recv_seq {
+            return Err(SealError::SeqMismatch {
+                expected: self.recv_seq,
+                got: seq,
+            });
+        }
+        let nonce = nonce_for(seq);
         let mut in_out = ciphertext.to_vec();
         let plain = self
             .key
             .open_in_place(nonce, aead::Aad::from(aad), &mut in_out)
             .map_err(|_| SealError::OpenFailed)?;
-        self.seq += 1;
+        self.recv_seq = seq + 1;
         Ok(plain.to_vec())
+    }
+
+    /// Open the record this key expects next, when the caller has no seq of
+    /// its own to check against.
+    pub fn open(&mut self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, SealError> {
+        self.open_at(self.recv_seq, aad, ciphertext)
     }
 }
 
@@ -144,4 +184,13 @@ pub struct SessionCert {
     pub control_fingerprint: String,
     pub issued_at: u64,
     pub expires_at: u64,
+}
+
+/// Lowercase hex, for logs and test assertions.
+pub fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }

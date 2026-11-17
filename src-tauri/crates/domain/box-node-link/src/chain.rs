@@ -42,10 +42,13 @@ impl ChainState {
     /// Start a chain from a seed. The control plane keeps the state; the
     /// seed goes to the node and is not stored here.
     pub fn from_seed(seed: &[u8; 32], length: u32) -> Self {
+        // Same floor as ChainNode::new: a one-link chain has no spendable
+        // link that is not the seed.
+        let length = length.max(2);
         Self {
             last_accepted: None,
             chain_end: hex(&hash_n(seed, length)),
-            remaining: length,
+            remaining: length - 1,
         }
     }
 
@@ -73,16 +76,32 @@ impl ChainNode {
     /// when H(value) equals what it holds, so the first value sent must be
     /// c_(n-1). Starting at k = n would send c_n itself, whose hash is
     /// c_(n+1) -- a value nothing will ever accept.
+    /// `length` must be at least 2.
+    ///
+    /// A one-link chain would start the node at k = 0, which is the seed
+    /// itself -- exactly what the node must never send. Two links is the
+    /// smallest usable chain, and it is what DEFAULT_CHAIN_LENGTH is far
+    /// above anyway; the floor is here so a caller passing a bad length gets
+    /// a working chain rather than a silently broken one.
     pub fn new(seed: [u8; 32], length: u32) -> Self {
+        let length = length.max(2);
         Self {
             seed,
-            next_k: length.saturating_sub(1),
+            next_k: length - 1,
         }
     }
 
     /// How many more handshakes this node can do before re-enrolment.
     pub fn remaining(&self) -> u32 {
         self.next_k
+    }
+
+    /// True once the node has spent every link it safely can.
+    ///
+    /// At that point it must be re-enrolled rather than pushed further,
+    /// because the only link left is the seed.
+    pub fn is_exhausted(&self) -> bool {
+        self.next_k <= 1
     }
 
     /// The value to send on the next handshake, and the k it corresponds to.
@@ -92,8 +111,12 @@ impl ChainNode {
     /// use a smaller k: resending the same c_k is a permanent refusal,
     /// because H(c_k) is c_k+1 and the control plane now expects c_k.
     pub fn next_value(&mut self) -> (String, u32) {
-        let k = self.next_k;
-        self.next_k = self.next_k.saturating_sub(1);
+        // Never k = 0. H^0(seed) is the seed itself, and sending it would put
+        // the seed in the control plane's last_accepted -- which design
+        // section 8 forbids, because a stolen node-keys row would then
+        // regenerate the whole chain and every future value.
+        let k = self.next_k.max(1);
+        self.next_k = k.saturating_sub(1).max(1);
         (hex(&hash_n(&self.seed, k)), k)
     }
 

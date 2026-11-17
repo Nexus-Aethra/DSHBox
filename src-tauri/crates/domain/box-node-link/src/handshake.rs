@@ -160,6 +160,14 @@ pub fn transcript_client(hello: &Hello) -> [u8; 32] {
     input.extend_from_slice(hello.mode.as_str().as_bytes());
     input.extend_from_slice(&hello.client_nonce);
     input.extend_from_slice(&hello.eph_a);
+    // The node long-term key is bound in, so a signature over t1 is a
+    // signature over *this key* and not one that can be re-attached to
+    // another key. Without this, node-key mode verifies a signature
+    // without authenticating anyone.
+    if let Some(pubkey) = &hello.node_pubkey {
+        input.extend_from_slice(&(pubkey.len() as u32).to_be_bytes());
+        input.extend_from_slice(pubkey);
+    }
     ring::digest::digest(&ring::digest::SHA256, &input)
         .as_ref()
         .try_into()
@@ -209,6 +217,26 @@ impl NodeHand {
             .try_into()
             .map_err(|_| ring::error::Unspecified)
     }
+
+    /// Agree with the peer public key, consuming this hand.
+    ///
+    /// The ECDH output is what the session keys and the wrap key both
+    /// derive from, so a caller that needs the wrap key (to unseal the
+    /// certificate) needs this too. The hand is consumed, exactly as in
+    /// node_finish: the ephemeral private key is destroyed by the act of
+    /// using it, which is the forward secrecy the design asks for.
+    pub fn agree_with(
+        self,
+        peer_public_key: &[u8; 32],
+    ) -> Result<[u8; 32], HandshakeError> {
+        let peer = agreement::UnparsedPublicKey::new(&agreement::X25519, peer_public_key);
+        agreement::agree_ephemeral(self.eph_private, &peer, |material| {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&material[..32]);
+            out
+        })
+        .map_err(|_| HandshakeError::SealMismatch)
+    }
 }
 
 /// The node side: verify the control plane and derive the session keys.
@@ -236,16 +264,7 @@ pub fn node_finish(
     peer.verify(&t2, &ack.control_sig)
         .map_err(|_| HandshakeError::ControlSignature)?;
 
-    // agree_ephemeral consumes the private key, so the ephemeral secret is
-    // destroyed by the act of using it. That is the forward secrecy the
-    // design doc asks for: it is a property of the API, not of discipline.
-    let peer_b = agreement::UnparsedPublicKey::new(&agreement::X25519, &ack.eph_b);
-    let ecdh = agreement::agree_ephemeral(hand.eph_private, &peer_b, |material| {
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&material[..32]);
-        out
-    })
-    .map_err(|_| HandshakeError::SealMismatch)?;
+    let ecdh = hand.agree_with(&ack.eph_b)?;
 
     Ok(SessionKeys {
         c2s: kdf::derive(ecdh.as_ref(), kdf::C2S_LABEL, &t2),
@@ -290,6 +309,11 @@ pub fn control_finish(
     signing_key: &signature::Ed25519KeyPair,
     session_cert: &[u8],
     secret: &[u8],
+    // The key registered for this nodeId in node-keys, if it has one.
+    // NodeKey mode requires it to match hello.node_pubkey exactly: the
+    // signature proves the node holds the private key, and this proves it
+    // is the key we registered.
+    registered_pubkey: Option<&[u8]>,
 ) -> Result<(SessionKeys, HelloAck), HandshakeError> {
     // No downgrade. A peer offering another version or suite is refused
     // before anything is derived, which is what keeps a future suite from
@@ -315,6 +339,15 @@ pub fn control_finish(
         }
         AuthMode::NodeKey => {
             let pubkey = hello.node_pubkey.as_ref().ok_or(HandshakeError::NodeSignature)?;
+            // The key must be the one registered for this nodeId. Verifying
+            // the signature alone would let any peer with any key
+            // impersonate any nodeId -- "a signature verified" is not "the
+            // right node connected", and the difference is exactly this
+            // comparison.
+            match registered_pubkey {
+                Some(registered) if registered == pubkey.as_slice() => {}
+                _ => return Err(HandshakeError::NodeSignature),
+            }
             let sig = hello.node_sig.as_ref().ok_or(HandshakeError::NodeSignature)?;
             let peer = signature::UnparsedPublicKey::new(&signature::ED25519, pubkey);
             peer.verify(&t1, sig).map_err(|_| HandshakeError::NodeSignature)?;
