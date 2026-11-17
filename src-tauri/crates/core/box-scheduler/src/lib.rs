@@ -1954,8 +1954,21 @@ mod tests {
         fn stage(&self, _task_id: &str, _stage: &str, _progress: u8) {}
         fn log(&self, _task_id: &str, _line: &str) {}
     }
+    /// A fresh runtime root per call. The suffix is a UUID, not
+    /// `now_seconds()`: a wall-clock second is coarse enough that two tests
+    /// in the same binary -- or a re-run inside the same second -- used to land
+    /// on the SAME path. `TaskManager::json` reads every row back from
+    /// `<runtime>/state/tasks.json`, so a leftover directory from the previous
+    /// run is adopted as this test's starting state: the 1,582
+    /// `dsh-box-scheduler-*` directories left in %TEMP% on this machine were
+    /// the visible symptom, and a stale `running` row is a silent one. The
+    /// UUID makes the directory unique per call, so no run can read or delete
+    /// another's rows; each test still removes its own at the end.
     fn paths(name: &str) -> BoxPaths {
-        let root = env::temp_dir().join(format!("dsh-box-scheduler-{name}-{}", now_seconds()));
+        let root = env::temp_dir().join(format!(
+            "dsh-box-scheduler-{name}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         BoxPaths {
             config: root.join("config.json"),
             runtime: Some(root),
@@ -2479,6 +2492,7 @@ mod tests {
         let build = stages.iter().find(|s| s.id == "build").unwrap();
         assert_eq!(build.progress, 100);
         assert_eq!(build.state, StageState::Done);
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 
     /// A failed stage records where it stopped, and the stages after it stay
@@ -2515,6 +2529,7 @@ mod tests {
             "later stages must not look done"
         );
         assert_eq!(publish.progress, 0);
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 
     /// Retrying a stage is visible as a count, not as a silent restart.
@@ -2538,6 +2553,7 @@ mod tests {
             install.failure_detail.is_none(),
             "a retry clears the previous detail"
         );
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 
     /// The overall figure is weighted by budget, so the old single bar keeps
@@ -2711,6 +2727,7 @@ mod tests {
         // Idempotent: a second call must not free the other task's slot.
         manager.mark_missed(&first.id, "again").unwrap();
         assert_eq!(running(&manager), 1, "a repeated miss releases nothing");
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 
     /// A late report from a node that lost its claim changes nothing: the record
@@ -2739,6 +2756,7 @@ mod tests {
         assert_eq!(record.progress, 0, "and it does not fake progress");
         assert_eq!(record.error.as_deref(), Some("lost"));
         assert_eq!(running(&manager), 0, "and it releases nothing twice");
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 
     /// A rollback that was in flight when the daemon stopped has no worker to
@@ -2773,6 +2791,7 @@ mod tests {
             .unwrap();
         assert_eq!(record.status, "interrupted");
         assert_eq!(record.stage, "Interrupted during rollback");
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 
     /// Final states are history: a `miss` and a rolled-back task are left alone.
@@ -2821,6 +2840,7 @@ mod tests {
             statuses.iter().all(|status| status != "interrupted"),
             "{statuses:?}"
         );
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 
     /// Only a `Running` record holds a slot: `try_start` takes it in the same
@@ -2878,6 +2898,7 @@ mod tests {
             manager.try_start(&paths, &third.id).unwrap().is_none(),
             "the gate did not widen"
         );
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 
     /// A record that was closed must not be admitted. `try_start` moves the
@@ -2917,6 +2938,7 @@ mod tests {
             .unwrap();
         assert_eq!(record.status, "miss", "and the record is untouched");
         assert_eq!(record.stage, "Lost by its node");
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 
     /// A worker must give up on a record that can never be queued again. Before
@@ -2991,6 +3013,7 @@ mod tests {
             manager.resource_idle("node:n1").unwrap(),
             "and nothing is held"
         );
+        let _ = fs::remove_dir_all(paths.runtime.unwrap());
     }
 
     /// The predicate every emitter of a task's result depends on.

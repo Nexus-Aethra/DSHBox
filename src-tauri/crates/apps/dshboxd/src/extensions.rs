@@ -1101,7 +1101,14 @@ mod tests {
     }
 
     fn sandbox(name: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("dshboxd-ext-{name}-{}", now_seconds()));
+        // A UUID, not now_seconds(): a wall-clock second is coarse enough
+        // that a re-run inside the same second reuses the previous
+        // directory, and this root is a document store another test may
+        // still be reading.
+        let dir = env::temp_dir().join(format!(
+            "dshboxd-ext-{name}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -1233,6 +1240,10 @@ mod tests {
         let _ = fs::remove_dir_all(&source_a);
         let _ = fs::remove_dir_all(&source_b);
         let _ = fs::remove_dir_all(&source_c);
+        // The two sandbox roots themselves: they hold a document store and a
+        // HOME, so leaving them behind means the next run adopts this one's rows.
+        let _ = fs::remove_dir_all(&runtime);
+        let _ = fs::remove_dir_all(&home);
     }
 
     struct EnvGuard {

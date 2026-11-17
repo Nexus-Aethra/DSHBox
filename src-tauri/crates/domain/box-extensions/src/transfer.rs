@@ -207,9 +207,18 @@ pub fn resolve_conflict_name(
 mod tests {
     use super::*;
 
+    /// A fresh sandbox root per call. The suffix is a UUID, not
+    /// `now_seconds()`: a wall-clock second is coarse enough that two tests in
+    /// the same binary -- or a re-run inside the same second -- used to land on
+    /// the SAME path, so a directory left behind by an earlier run was adopted
+    /// as this test's starting state. The UUID makes the directory unique per
+    /// call, so no run can read or delete another's rows; each test still
+    /// removes its own at the end.
     fn sandbox(name: &str) -> PathBuf {
-        let root = std::env::temp_dir()
-            .join(format!("dshbox-transfer-{name}-{}", box_foundation::now_seconds()));
+        let root = std::env::temp_dir().join(format!(
+            "dshbox-transfer-{name}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         fs::create_dir_all(&root).unwrap();
         root
     }

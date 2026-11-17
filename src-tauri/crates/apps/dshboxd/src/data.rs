@@ -455,7 +455,14 @@ mod tests {
     }
 
     fn test_root(name: &str) -> PathBuf {
-        let root = env::temp_dir().join(format!("dshboxd-data-{name}-{}", now_seconds()));
+        // A UUID, not now_seconds(): a wall-clock second is coarse enough
+        // that a re-run inside the same second reuses the previous
+        // directory, and this root is a document store another test may
+        // still be reading.
+        let root = env::temp_dir().join(format!(
+            "dshboxd-data-{name}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
