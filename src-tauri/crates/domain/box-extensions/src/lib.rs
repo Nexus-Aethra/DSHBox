@@ -1116,7 +1116,10 @@ mod tests {
 
     #[test]
     fn scans_profiles_scoped_plugins_and_container_skills() {
-        let root = std::env::temp_dir().join(format!("dshbox-extension-test-{}", now_seconds()));
+        let root = std::env::temp_dir().join(format!(
+            "dshbox-extension-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         fs::create_dir_all(root.join("profile/profiles/web/node_modules/@scope/plugin")).unwrap();
         fs::create_dir_all(root.join("profile/skills/demo")).unwrap();
         fs::write(
@@ -1146,7 +1149,10 @@ mod tests {
 
     #[test]
     fn reference_owners_are_added_removed_and_idempotent() {
-        let root = std::env::temp_dir().join(format!("dshbox-references-test-{}", now_seconds()));
+        let root = std::env::temp_dir().join(format!(
+            "dshbox-references-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         fs::create_dir_all(repository_root(&root)).unwrap();
 
         // Absent entries count as zero.
@@ -1194,7 +1200,10 @@ mod tests {
 
     #[test]
     fn legacy_numeric_references_are_dropped_on_read() {
-        let root = std::env::temp_dir().join(format!("dshbox-references-legacy-{}", now_seconds()));
+        let root = std::env::temp_dir().join(format!(
+            "dshbox-references-legacy-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         fs::create_dir_all(repository_root(&root)).unwrap();
         // Oldest format: bare numeric value. Reads as empty; a subsequent
         // write drops the entry from the file entirely.
@@ -1215,8 +1224,14 @@ mod tests {
 
     #[test]
     fn reconcile_rebuilds_owner_map_from_canonical_sources() {
-        let root = std::env::temp_dir().join(format!("dshbox-reconcile-test-{}", now_seconds()));
-        let home = std::env::temp_dir().join(format!("dshbox-reconcile-home-{}", now_seconds()));
+        let root = std::env::temp_dir().join(format!(
+            "dshbox-reconcile-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let home = std::env::temp_dir().join(format!(
+            "dshbox-reconcile-home-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         fs::create_dir_all(repository_root(&root)).unwrap();
         fs::create_dir_all(home.join(".dsh-box")).unwrap();
         fs::write(
@@ -1305,7 +1320,10 @@ mod tests {
 
     #[test]
     fn detects_skill_and_dsh_plugin_roots() {
-        let root = std::env::temp_dir().join(format!("dshbox-detect-test-{}", now_seconds()));
+        let root = std::env::temp_dir().join(format!(
+            "dshbox-detect-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         let skill = root.join("skill");
         let plugin = root.join("plugin");
         fs::create_dir_all(&skill).unwrap();
@@ -1326,7 +1344,10 @@ mod tests {
 
     #[test]
     fn derived_entries_mirror_the_install_and_spare_owned_rows() {
-        let root = std::env::temp_dir().join(format!("dshbox-derived-test-{}", now_seconds()));
+        let root = std::env::temp_dir().join(format!(
+            "dshbox-derived-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         fs::create_dir_all(repository_root(&root)).unwrap();
         upsert_reference_entry(
             &root,

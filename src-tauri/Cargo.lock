@@ -227,6 +227,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "uuid",
  "xz2",
 ]
 

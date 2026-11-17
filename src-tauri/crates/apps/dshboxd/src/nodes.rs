@@ -717,23 +717,37 @@ mod tests {
         // at once rather than after a sweep interval.
         // A real runtime dir, so both managers open the same document store
         // and the second one genuinely reads what the first wrote.
-        let root = std::env::temp_dir().join(format!("dshboxd-nodes-restart-{}", now_seconds()));
+        // A UUID, not now_seconds(): a wall-clock second is coarse enough
+        // that a re-run inside the same second reuses the previous
+        // directory, and this root is a document store another test may
+        // still be reading.
+        let root = std::env::temp_dir().join(format!(
+            "dshboxd-nodes-restart-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let paths = BoxPaths { config: root.join("config.json"), runtime: Some(root.clone()) };
-        let first = NodeManager::load(&paths, "http://127.0.0.1:1".to_owned(), Arc::new(DaemonEvents::new()));
-        let (grant, id, _, _) = first.enroll("wsl2", "linux-x86_64", vec![], Some("survivor".to_owned())).unwrap();
-        first.register(&grant, None, None).unwrap();
-        assert_eq!(first.get(&id).unwrap().unwrap().status, NodeStatus::Online);
+        // A block, so both managers -- and with them the SQLite connection
+        // they hold on `state/dshbox.db` -- are dropped before the root is
+        // removed. Removing first would fail on Windows while the handle is
+        // open, and the `let _ =` would hide it.
+        {
+            let first = NodeManager::load(&paths, "http://127.0.0.1:1".to_owned(), Arc::new(DaemonEvents::new()));
+            let (grant, id, _, _) = first.enroll("wsl2", "linux-x86_64", vec![], Some("survivor".to_owned())).unwrap();
+            first.register(&grant, None, None).unwrap();
+            assert_eq!(first.get(&id).unwrap().unwrap().status, NodeStatus::Online);
 
-        let reloaded = NodeManager::load(&paths, "http://127.0.0.1:2".to_owned(), Arc::new(DaemonEvents::new()));
-        let record = reloaded.get(&id).unwrap().expect("record survives the restart");
-        assert_eq!(record.status, NodeStatus::Offline);
-        assert!(record.enrolled_at.is_some(), "the record is kept, not deleted");
-        // The host node is ours, not a survivor, and stays online.
-        assert_eq!(reloaded.get(HOST_NODE_ID).unwrap().unwrap().status, NodeStatus::Online);
-        // Demoting is idempotent.
-        assert_eq!(reloaded.demote_orphans_after_restart(), 0);
+            let reloaded = NodeManager::load(&paths, "http://127.0.0.1:2".to_owned(), Arc::new(DaemonEvents::new()));
+            let record = reloaded.get(&id).unwrap().expect("record survives the restart");
+            assert_eq!(record.status, NodeStatus::Offline);
+            assert!(record.enrolled_at.is_some(), "the record is kept, not deleted");
+            // The host node is ours, not a survivor, and stays online.
+            assert_eq!(reloaded.get(HOST_NODE_ID).unwrap().unwrap().status, NodeStatus::Online);
+            // Demoting is idempotent.
+            assert_eq!(reloaded.demote_orphans_after_restart(), 0);
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
