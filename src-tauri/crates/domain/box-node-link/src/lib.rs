@@ -1,14 +1,26 @@
-//! Frame codec for the node link: one length-prefixed, type-tagged JSON
-//! frame at a time.
+//! The node link: frame codec, handshake, record layer, and token chain.
 //!
-//! This crate is the *transport* half of the node link and nothing else. It
-//! knows how a frame is laid out on the wire and how to refuse a malformed
-//! one; it does not know about sessions, tokens, crypto or tasks. Those
-//! belong to the layers above (L2 handshake, L4 task streaming) and arrive
-//! later without changing this file.
+//! This crate is the *protocol* half of the node link and nothing else. It
+//! knows how a frame is laid out on the wire, how a bootstrap secret becomes
+//! two session keys, and how a token chain is verified; it does not know
+//! about the daemon, the store, the scheduler, or Tauri.
 //!
-//! Both sides of the link use it -- `dshboxd` reads requests and writes
-//! responses, `box-helper` writes requests and reads responses -- which is
-//! why it is a crate and not a module inside either binary.
+//! Both sides of the link use it -- dshboxd is the control plane,
+//! box-helper is the node -- which is why it is a crate and not a module
+//! inside either binary.
+//!
+//! The layering: frame.rs is the transport, handshake.rs is the key
+//! agreement, session.rs is the record layer the handshake produces keys
+//! for, and chain.rs is the token-chain bootstrap. Each is a separate file
+//! because each changes for a different reason: a wire-format fix does not
+//! touch the crypto, and a crypto fix does not touch the chain.
 
+pub mod chain;
 pub mod frame;
+pub mod handshake;
+pub mod kdf;
+pub mod session;
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
