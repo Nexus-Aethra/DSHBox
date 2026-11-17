@@ -7,3 +7,9 @@ description = "Frame codec for the node link session shared by dshboxd and box-h
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# The crypto primitives the handshake is built from. Pinned by the offline
+# mirror; the design doc (section 9) requires ring and no hand-rolled
+# primitives, so this is the whole list.
+ring = "0.17.14"
+thiserror = "2.0"
