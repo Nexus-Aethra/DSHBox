@@ -27,7 +27,7 @@
 
 use ring::agreement;
 use ring::rand::SecureRandom;
-use ring::signature;
+use ring::signature::{self, KeyPair};
 use serde::{Deserialize, Serialize};
 
 use crate::kdf;
@@ -481,4 +481,76 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
         diff |= a[i] ^ b[i];
     }
     std::hint::black_box(diff) == 0
+}
+
+// ---------- the control plane long-term key ----------
+
+/// A control-plane Ed25519 key pair, as the parts a caller needs.
+///
+/// The public key and its fingerprint are what a node pins offline; the
+/// PKCS#8 document is what gets stored. Neither is the private key in a form
+/// anyone should log, which is why the function returns them separately and
+/// the caller decides what to persist.
+pub struct ControlKeypair {
+    /// Ed25519 public key, hex.
+    pub pubkey_hex: String,
+    /// PKCS#8 DER document, hex. This is the secret.
+    pub seckey_hex: String,
+    /// Short fingerprint of the public key.
+    pub fingerprint: String,
+}
+
+impl std::fmt::Debug for ControlKeypair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlKeypair")
+            .field("pubkey_hex", &self.pubkey_hex)
+            .field("seckey_hex", &"<redacted>")
+            .field("fingerprint", &self.fingerprint)
+            .finish()
+    }
+}
+
+/// Generate a control-plane key pair.
+///
+/// Lives here rather than in the daemon because the primitive, the encoding
+/// and the fingerprint scheme belong with the rest of the crypto: a daemon
+/// that generated keys itself would need its own ring dependency and its own
+/// idea of how a fingerprint is computed, and the two would drift.
+pub fn generate_control_keypair() -> Result<ControlKeypair, HandshakeError> {
+    let rng = ring::rand::SystemRandom::new();
+    let document = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
+        .map_err(|_| HandshakeError::ControlSignature)?;
+    let key = ring::signature::Ed25519KeyPair::from_pkcs8(document.as_ref())
+        .map_err(|_| HandshakeError::ControlSignature)?;
+    let pubkey_hex = hex(key.public_key().as_ref());
+    let fingerprint = crate::node_keys::fingerprint_of(&pubkey_hex);
+    Ok(ControlKeypair {
+        pubkey_hex,
+        seckey_hex: hex(document.as_ref()),
+        fingerprint,
+    })
+}
+
+/// Rebuild a signing key from a stored PKCS#8 document.
+pub fn control_signing_key(
+    seckey_hex: &str,
+) -> Result<ring::signature::Ed25519KeyPair, HandshakeError> {
+    let bytes = hex_decode(seckey_hex).ok_or(HandshakeError::ControlSignature)?;
+    ring::signature::Ed25519KeyPair::from_pkcs8(&bytes)
+        .map_err(|_| HandshakeError::ControlSignature)
+}
+
+
+/// Decode hex, or None on a malformed or odd-length input.
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
 }

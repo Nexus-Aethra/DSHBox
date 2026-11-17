@@ -22,6 +22,7 @@ mod extensions;
 mod host;
 mod lifecycle;
 mod node_artifacts;
+mod node_keys;
 mod node_link;
 mod nodes;
 mod nodes_rpc;
