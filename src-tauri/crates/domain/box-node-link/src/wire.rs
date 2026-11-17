@@ -16,7 +16,7 @@ use crate::handshake::{AuthMode, Hello, HelloAck, SUITE, VERSION};
 
 /// The node's first frame, as it travels.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HelloWire {
     pub version: u16,
     pub suite: u16,
@@ -39,7 +39,7 @@ pub struct HelloWire {
 
 /// The control plane's reply, as it travels.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HelloAckWire {
     /// 16 random bytes, hex.
     pub server_nonce: String,

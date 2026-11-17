@@ -102,7 +102,7 @@ impl fmt::Debug for NodeKeyRecord {
             .field("mode", &self.mode.as_str())
             .field("secret", &"<redacted>")
             .field("last_accepted", &self.last_accepted)
-            .field("chain_end", &self.chain_end)
+            .field("chain_end", &self.chain_end.as_deref().map(|v| short_digest("node-chain-end-v1", v)))
             .field("node_pubkey", &self.node_pubkey)
             .field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
@@ -215,9 +215,18 @@ impl NodeKeyRecord {
 /// Lets an operator match a key read off one machine against the one the
 /// control plane holds, without either side printing the key.
 pub fn fingerprint_of(pubkey_hex: &str) -> String {
+    short_digest("node-key-fingerprint-v1", pubkey_hex)
+}
+
+/// A short, stable digest of any chain value.
+///
+/// Separate from fingerprint_of, and with its own domain prefix, so a chain
+/// digest and a key fingerprint can never be mistaken for each other in a
+/// log line.
+pub fn short_digest(domain: &str, value: &str) -> String {
     let digest = ring::digest::digest(
         &ring::digest::SHA256,
-        format!("node-key-fingerprint-v1:{pubkey_hex}").as_bytes(),
+        format!("{domain}:{value}").as_bytes(),
     );
     let hex = digest
         .as_ref()

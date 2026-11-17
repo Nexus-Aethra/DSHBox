@@ -234,3 +234,32 @@ fn the_debug_form_never_prints_key_material() {
     assert!(!text.contains("transcript"));
     assert!(!text.contains("0a0a"));
 }
+
+#[test]
+fn a_sealed_close_round_trips_to_the_peer() {
+    // Design section 4 says every frame after the handshake is sealed, and a
+    // close is a frame. An unsealed close would be injectable by anyone on
+    // the path, including close{already-connected} -- a forced disconnect
+    // from a peer with no key material. So a close inside a session is
+    // sealed, and only the peer can read it.
+    let (mut ours, mut theirs) = pair();
+    let frame = ours
+        .seal_frame(FrameType::Close, br#"{"reason":"revoked"}"#)
+        .unwrap();
+    assert_eq!(
+        theirs.open_frame(&frame).unwrap(),
+        br#"{"reason":"revoked"}"#
+    );
+}
+
+#[test]
+fn a_plaintext_close_is_refused_inside_a_session() {
+    // The mirror image: a close that is not sealed cannot be read by a
+    // session, so the record layer refuses it rather than guessing.
+    let (_, mut theirs) = pair();
+    let frame = Frame {
+        frame_type: FrameType::Close,
+        payload: br#"{"reason":"revoked"}"#.to_vec(),
+    };
+    assert!(theirs.open_frame(&frame).is_err());
+}

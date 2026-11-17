@@ -66,6 +66,10 @@ pub enum SessionError {
     Handshake(#[from] HandshakeError),
     #[error("seal: {0}")]
     Seal(#[from] SealError),
+    #[error("these keys have lived past {MAX_KEY_AGE:?} and must be rekeyed")]
+    KeyTooOld,
+    #[error("this key has sealed {MAX_FRAMES_PER_KEY} frames and must be rekeyed")]
+    KeyTooUsed,
     #[error("the peer closed the connection before answering the hello")]
     PeerHungUp,
     #[error("the frame type is not valid here: {0:?}")]
@@ -108,6 +112,11 @@ impl Session {
         if !frame.frame_type.carries_session_payload() {
             return Err(SessionError::WrongFrameType(frame.frame_type));
         }
+        // The receive direction ages too. A session that only reads still
+        // has to rekey, or a long-lived subscriber would never rotate.
+        if self.key_installed_at.elapsed() >= MAX_KEY_AGE {
+            return Err(SessionError::KeyTooOld);
+        }
         // The seq travels as a big-endian u64 in the first 8 bytes of the
         // sealed payload, ahead of the AEAD ciphertext.
         if frame.payload.len() < 8 {
@@ -117,23 +126,27 @@ impl Session {
         seq_bytes.copy_from_slice(&frame.payload[..8]);
         let seq = u64::from_be_bytes(seq_bytes);
         let ciphertext = &frame.payload[8..];
-        // No aad: the seq is already the nonce, so a frame claiming the wrong
-        // seq is refused twice over -- once by open_at's ordering check and
-        // again by the AEAD, because the nonce it derives from that seq does
-        // not match the one it was sealed with.
+        // No aad, and the seq is not authenticated: the clear prefix is a
+        // public counter, and a nonce is public by construction. The only
+        // thing that stops a reordered frame is open_at's ordering check,
+        // which runs before the AEAD and refuses anything that is not
+        // exactly the next seq. That single check is the whole defence, so
+        // it is the one the tests pin.
         Ok(self.s2c.open_at(seq, b"", ciphertext)?)
     }
 
-    /// Force a rekey if the current keys are too old or too used.
+    /// Force a rekey if these keys are too old or too used.
     ///
-    /// Checked before every send rather than on a timer, because a session
-    /// that is idle should not rekey and a busy one should not wait.
+    /// The two limits have separate errors because they mean different
+    /// things to a caller deciding whether to rekey or to drop: age is a
+    /// wall-clock deadline the peer also enforces, count is a property of
+    /// this direction alone.
     fn check_key_age(&self) -> Result<(), SessionError> {
         if self.key_installed_at.elapsed() >= MAX_KEY_AGE {
-            return Err(SessionError::Seal(SealError::CounterExhausted));
+            return Err(SessionError::KeyTooOld);
         }
         if self.c2s.send_seq() >= MAX_FRAMES_PER_KEY {
-            return Err(SessionError::Seal(SealError::CounterExhausted));
+            return Err(SessionError::KeyTooUsed);
         }
         Ok(())
     }

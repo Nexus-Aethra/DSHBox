@@ -79,11 +79,24 @@ impl FrameType {
     ///
     /// Hello and HelloAck are excluded on purpose: the design is explicit
     /// that they are not encrypted, because the encryption is what they
-    /// establish. Close is excluded too -- a close carries a reason, not a
-    /// secret, and a peer whose keys are already wrong must still be able
-    /// to read why it is being dropped.
+    /// establish.
+    ///
+    /// Close is the interesting case, and the honest answer is that it
+    /// depends on which side of the handshake it is sent from. Before a
+    /// handshake there are no keys, so a close is necessarily plaintext --
+    /// that is how the L1 path refuses a connection. After one, design
+    /// section 4 says every frame is sealed, and an unsealed close would be
+    /// injectable: an on-path attacker with no key material could send
+    /// close{already-connected} and force a disconnect.
+    ///
+    /// So this predicate answers only "is this type ever sealed", and the
+    /// session layer decides per-frame. Anything that wants "is this frame
+    /// sealed" must ask the session, not the type.
     pub fn carries_session_payload(self) -> bool {
-        matches!(self, Self::Request | Self::Response | Self::Event | Self::Rekey)
+        matches!(
+            self,
+            Self::Request | Self::Response | Self::Event | Self::Rekey | Self::Close
+        )
     }
 }
 
