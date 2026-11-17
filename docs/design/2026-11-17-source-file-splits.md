@@ -82,11 +82,11 @@
 | `transfer/tree.rs` | `safe_join`、`tree_stats`、`tree_digest`、`collect_files`、`copy_tree`、`restrict_permissions`、`pack_tar`、`unpack_tar` | 判据 2：被上层调用，从不调用上层 |
 | `transfer/parts.rs` | `PayloadPart`、`PARTS_FILE`、`payload_parts`、`read/write_parts_manifest`、`part_dir`、`extract_parts`、`inject_parts`、`inject_one` | 判据 1：载荷布局的版本演进 |
 | `transfer/section.rs` | `SECTION_FILE`、`section_value`、`nest`、`descend_mut`、`remove_section`、`entries_at`、`walk_entries`、`write_section`、`merge_yaml`、`merge_value` | 判据 1：YAML section 语义 |
+| `transfer.rs`（保留） | `Extracted`、`Injected`、`extract`、`inject`、`extract_path`、`extract_section`、`inject_section` | 判据 2：编排者 |
 
 `read_entries`（列举目录并排序）归 `tree.rs`：它是文件系统原语，最初被写在
 `parts.rs` 里，于是 `tree.rs` 与 `section.rs` 都要反向 import 它，构成一个环。
 评审 PR #47 时发现并指出——判据 2 是靠这次搬迁满足的，不是最初的摆放。
-| `transfer.rs`（保留） | `Extracted`、`Injected`、`extract`、`inject`、`extract_path`、`extract_section`、`inject_section` | 判据 2：编排者 |
 
 目录改模块只需把 `src/transfer.rs` 换成 `src/transfer/mod.rs` + 三个子文件，
 对外 `pub use` 路径不变——**这是唯一不需要改任何调用方的拆法**，所以它
@@ -120,6 +120,10 @@
 | # | 内容 | 风险 | 为什么这个顺序 |
 |---|---|---|---|
 | 1 | `box-resources/transfer.rs` → `transfer/` 目录 | 低 | 对外路径不变，零调用方改动；用来跑通「拆完立刻全量测试」的流程 |
+
+`read_entries`（列举目录并排序）归 `tree.rs`：它是文件系统原语，最初被写在
+`parts.rs` 里，于是 `tree.rs` 与 `section.rs` 都要反向 import 它，构成一个环。
+评审 PR #47 时发现并指出——判据 2 是靠这次搬迁满足的，不是最初的摆放。
 | 2 | `versions.rs` 三拆 | 低 | 依赖方向清晰（索引/目录被编排者调用），无循环 |
 | 3 | `sealed.rs` 四拆 | 中 | `pnpm_approval` 是 supply-chain 敏感区，独立成模块后它的测试边界更清楚 |
 | 4 | `dispatch.rs` 五拆 | 高 | 调用方最多（`main.rs` 路由 + 各 RPC 名），最后做 |
