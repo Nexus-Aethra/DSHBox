@@ -48,6 +48,13 @@ impl SqliteDocumentStore {
         }
         let connection = Connection::open(path)
             .map_err(|error| format!("cannot open document store {}: {error}", path.display()))?;
+        // The database is where secrets land: node bootstrap keys, resource
+        // credentials, task params. A file the whole machine can read makes
+        // "never log a secret" a half-measure -- the secret is still sitting
+        // in a world-readable file in the runtime directory. Tighten it on
+        // every open, not only on create, because an earlier build may have
+        // left it loose.
+        tighten_store_permissions(path);
         connection
             .busy_timeout(Duration::from_millis(5000))
             .map_err(|error| format!("cannot set document store busy timeout: {error}"))?;
@@ -242,5 +249,31 @@ mod tests {
         drop(first);
         let second = SqliteDocumentStore::open(&path).unwrap();
         assert_eq!(second.load_scope("tasks").unwrap().len(), 1);
+    }
+}
+
+/// Tighten the database file to owner-only.
+///
+/// Called on every open rather than only on create: a store written by an
+/// earlier build may have been left world-readable, and the first time this
+/// code runs it should repair that rather than inherit it. Best-effort by
+/// design -- a filesystem without Unix permissions (or a Windows volume) has
+/// nothing to tighten, and failing the open there would make the store
+/// unusable on platforms where the file ACL is the only control.
+fn tighten_store_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            if permissions.mode() & 0o077 != 0 {
+                permissions.set_mode(0o600);
+                let _ = std::fs::set_permissions(path, permissions);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
     }
 }
