@@ -134,6 +134,8 @@ pub enum HandshakeError {
     NodeSignature,
     #[error("the session certificate could not be unsealed")]
     SealMismatch,
+    #[error("the control plane fingerprint is not the one pinned offline")]
+    FingerprintMismatch,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -408,6 +410,10 @@ pub fn node_unseal(
     // recomputes it from its own copy rather than receiving it.
     bootstrap: &[u8],
     eph_private_agreement: &[u8],
+    // The fingerprint the node pinned from the bootstrap material. The
+    // certificate must name this one, or the control plane it is talking to
+    // is not the one it enrolled with.
+    pinned_fingerprint: &str,
 ) -> Result<Vec<u8>, HandshakeError> {
     let t1 = transcript_client(hello);
     let t2 = keys.transcript;
@@ -422,17 +428,39 @@ pub fn node_unseal(
             kdf::derive(&mix, kdf::WRAP_LABEL, &t2)
         }
     };
-    crate::session::open(&wrap_key, 0, &t2, &ack.sealed_cert)
+    let plaintext = crate::session::open(&wrap_key, 0, &t2, &ack.sealed_cert)?;
+    // Change detection: the certificate names a fingerprint, and it has to be
+    // the one pinned offline. A rotated control-plane key fails earlier at
+    // ControlSignature, so reaching here means the signature verified --
+    // which is exactly when a stale fingerprint has to be caught.
+    let cert: crate::session::SessionCert =
+        serde_json::from_slice(&plaintext).map_err(|_| HandshakeError::SealMismatch)?;
+    if cert.control_fingerprint != pinned_fingerprint {
+        return Err(HandshakeError::FingerprintMismatch);
+    }
+    Ok(plaintext)
 }
 
-/// Compare two secrets without an early exit.
+/// Compare two macs without an early exit.
 ///
-/// A `==` on a mac leaks how many leading bytes matched, which is enough
-/// to forge one byte at a time.
+/// A `==` on a mac leaks how many leading bytes matched, which is enough to
+/// forge one byte at a time.
+///
+/// This is hand-written because ring 0.17 offers no public alternative:
+/// `ring::constant_time::verify_slices_are_equal` is the whole of that module
+/// and it is itself deprecated, with ring's own note saying it carries "no
+/// promises regarding side channels". The implementation ring uses
+/// internally (`bb::verify_slices_are_equal`) is pub(crate) and unreachable
+/// from here. So the choice is this loop or nothing.
+///
+/// The loop is the fixed-size, no-branch shape on purpose: both inputs are
+/// 32 bytes by type, so there is no length to check and nothing for an editor
+/// to add a branch to. `ring::hint::black_box` on the accumulator keeps the
+/// compiler from short-circuiting it.
 fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     let mut diff = 0u8;
     for i in 0..32 {
         diff |= a[i] ^ b[i];
     }
-    diff == 0
+    std::hint::black_box(diff) == 0
 }

@@ -136,6 +136,121 @@ fn a_retry_after_a_lost_ack_uses_a_smaller_k() {
 // ---------- negative cases (design section 9) ----------
 
 #[test]
+fn n7e_a_registered_node_key_is_accepted_and_a_foreign_one_is_refused() {
+    // The case that pins blocker 2: the registered key is accepted, and a
+    // peer presenting its own key is refused. Without the second half, a
+    // future edit could delete the registered_pubkey comparison and only a
+    // test that passes a *matching* key would notice -- and only if the
+    // signature check broke too.
+    let rng = rng();
+    let signing = control_keypair();
+    let node_signing = control_keypair();
+    let node_pubkey = node_signing.public_key().as_ref().to_vec();
+
+    let control = handshake::ControlHand::new(&rng).unwrap();
+    let eph_a = control.public_key().unwrap();
+    let mut nonce = [0u8; 16];
+    rng.fill(&mut nonce).unwrap();
+    let hello = Hello {
+        node_id: "node-key".to_owned(),
+        mode: AuthMode::NodeKey,
+        version: handshake::VERSION,
+        suite: handshake::SUITE,
+        client_nonce: [3u8; 16],
+        eph_a,
+        mac: None,
+        node_pubkey: Some(node_pubkey.clone()),
+        node_sig: None,
+    };
+    let t1 = handshake::transcript_client(&hello);
+    let node_sig = node_signing.sign(&t1).as_ref().to_vec();
+    let hello = Hello {
+        node_sig: Some(node_sig),
+        ..hello
+    };
+
+    // The registered key is accepted.
+    let accepted = handshake::control_finish(
+        handshake::ControlHand::new(&rng).unwrap(),
+        &hello,
+        nonce,
+        &signing,
+        b"cert",
+        b"",
+        Some(&node_pubkey),
+    );
+    assert!(accepted.is_ok(), "the registered node key must be accepted");
+
+    // A peer with its own key is refused, even though its signature is valid.
+    let impostor = control_keypair();
+    let impostor_pubkey = impostor.public_key().as_ref().to_vec();
+    let mut foreign = hello.clone();
+    foreign.node_pubkey = Some(impostor_pubkey.clone());
+    let foreign_t1 = handshake::transcript_client(&foreign);
+    foreign.node_sig = Some(impostor.sign(&foreign_t1).as_ref().to_vec());
+    let refused = handshake::control_finish(
+        handshake::ControlHand::new(&rng).unwrap(),
+        &foreign,
+        nonce,
+        &signing,
+        b"cert",
+        b"",
+        Some(&node_pubkey),
+    );
+    assert_eq!(
+        refused.err(),
+        Some(handshake::HandshakeError::NodeSignature),
+        "a foreign node key must be refused"
+    );
+}
+
+#[test]
+fn n7f_a_missing_control_signature_is_refused_in_node_key_mode() {
+    // Section 9 case 7, node-key leg: the NODE refuses an ack whose
+    // controlSig is missing, in node-key mode as in the other two.
+    let rng = rng();
+    let signing = control_keypair();
+    let node_signing = control_keypair();
+    let node_pubkey = node_signing.public_key().as_ref().to_vec();
+    let control = handshake::ControlHand::new(&rng).unwrap();
+    let eph_a = control.public_key().unwrap();
+    let mut nonce = [0u8; 16];
+    rng.fill(&mut nonce).unwrap();
+    let hello = Hello {
+        node_id: "node-key".to_owned(),
+        mode: AuthMode::NodeKey,
+        version: handshake::VERSION,
+        suite: handshake::SUITE,
+        client_nonce: [4u8; 16],
+        eph_a,
+        mac: None,
+        node_pubkey: Some(node_pubkey.clone()),
+        node_sig: None,
+    };
+    let t1 = handshake::transcript_client(&hello);
+    let hello = Hello {
+        node_sig: Some(node_signing.sign(&t1).as_ref().to_vec()),
+        ..hello
+    };
+    let (_, ack) = handshake::control_finish(
+        control,
+        &hello,
+        nonce,
+        &signing,
+        b"cert",
+        b"",
+        Some(&node_pubkey),
+    )
+    .unwrap();
+    let mut stripped = ack.clone();
+    stripped.control_sig = Vec::new();
+    let node_hand =
+        handshake::NodeHand::new(&rng, signing.public_key().as_ref().to_vec()).unwrap();
+    let outcome = handshake::node_finish(node_hand, &hello, &stripped, b"");
+    assert_eq!(outcome.err(), Some(handshake::HandshakeError::ControlSignature));
+}
+
+#[test]
 fn n1_a_tampered_hello_field_makes_the_control_plane_refuse_it() {
     // Flip one bit of the client nonce. The mac was computed over the
     // honest transcript, so the control plane must refuse the hello rather
@@ -226,7 +341,7 @@ fn n5_an_oversized_frame_is_refused_before_it_is_allocated() {
 }
 
 #[test]
-fn n6_an_expired_chain_is_refused() {
+fn n6_a_spent_chain_is_refused_rather_than_reused() {
     let seed = [0u8; 32];
     let mut state = ChainState::from_seed(&seed, 1);
     let mut node = ChainNode::new(seed, 1);
@@ -313,32 +428,36 @@ fn the_session_certificate_only_unseals_with_the_right_wrap_key() {
 
 #[test]
 fn n4_a_control_fingerprint_that_changed_is_refused_on_reconnect() {
-    // The node pins the control fingerprint it got offline with the bootstrap
-    // material. On a later connection the certificate names a fingerprint;
-    // if it is not the pinned one, the connection is refused -- that is the
-    // change detection design section 5 asks for.
+    // The certificate names the control fingerprint. The node pinned one from
+    // the bootstrap material, so unsealing with that pinned value succeeds and
+    // unsealing with any other is a refusal -- with a reason distinct from
+    // SealMismatch, because a caller that collapses the two cannot log which
+    // happened.
     let exchange = psk_exchange(b"a perfectly good psk");
-    // Unseal the certificate the way the node does, then check the
-    // fingerprint inside it against the one pinned offline.
-    let cert_bytes = handshake::node_unseal(
+    let honest = handshake::node_unseal(
         &exchange.keys,
         &exchange.hello,
         &exchange.ack,
         b"a perfectly good psk",
         &exchange.ecdh,
-    )
-    .expect("the certificate must unseal for the honest peer");
-    let cert: SessionCert = serde_json::from_slice(&cert_bytes).unwrap();
-    assert_eq!(cert.control_fingerprint, "fp-1");
-    // The pinned fingerprint came from the bootstrap material, not from the
-    // wire. A certificate naming anything else is a control plane the node
-    // has never seen, and the connection must be refused.
-    assert_ne!(
-        cert.control_fingerprint, "fp-pinned",
-        "a changed fingerprint must be detectable from the certificate"
+        "fp-1",
+    );
+    assert!(honest.is_ok(), "the pinned fingerprint must unseal");
+
+    let rotated = handshake::node_unseal(
+        &exchange.keys,
+        &exchange.hello,
+        &exchange.ack,
+        b"a perfectly good psk",
+        &exchange.ecdh,
+        "fp-rotated",
+    );
+    assert_eq!(
+        rotated.err(),
+        Some(handshake::HandshakeError::FingerprintMismatch),
+        "a certificate naming another fingerprint must be refused"
     );
 }
-
 #[test]
 fn n7_a_missing_control_signature_is_refused_in_every_mode() {
     // controlSig is required in all three modes: it is the only thing that
@@ -410,7 +529,7 @@ fn n7c_a_wrong_signature_is_refused_in_token_mode() {
 }
 
 #[test]
-fn n7d_a_missing_control_signature_is_refused_in_node_key_mode() {
+fn n7d_a_node_key_hello_with_no_node_signature_is_refused() {
     let rng = rng();
     let signing = control_keypair();
     let node_signing = control_keypair();
