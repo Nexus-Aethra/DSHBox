@@ -45,4 +45,8 @@
 # never tracked.
 /D:\\*
 src-tauri/box-data/
+# The crate's own scratch dir: HOME / git / pnpm config written by the clean-room
+# tests. It moved with the crate into core/; the old path is kept because a
+# checkout that predates the move still has it.
 src-tauri/crates/box-runtime/box-data/
+src-tauri/crates/core/box-runtime/box-data/

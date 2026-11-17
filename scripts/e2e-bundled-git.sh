@@ -9,7 +9,7 @@
 # This script only exercises the file-system + executable side of the
 # bundling. The clean-room policy itself (PATH prepend + GIT_* injection)
 # is covered by `bundled_package_manager_policy_injects_git_path_and_clean_room_vars`
-# in `src-tauri/crates/box-runtime/src/process/env.rs`.
+# in `src-tauri/crates/core/box-runtime/src/process/env.rs`.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"

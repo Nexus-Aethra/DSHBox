@@ -101,7 +101,17 @@ const inputs = [
 const stampFile = join('src-tauri', '.build-stamp')
 // An empty stamp counts as absent: build.rs treats it the same way, because a
 // zero-byte file would otherwise let a release build embed an empty batch id.
-const stamped = existsSync(stampFile) && readFileSync(stampFile, 'utf8').trim() !== ''
+// An unreadable one is treated as absent too -- a lock or a permission problem
+// should send us down the rebuild path (which will fail loudly if the file really
+// cannot be written) rather than out of this script with a raw exception.
+function readStamp(file) {
+  try {
+    return readFileSync(file, 'utf8').trim()
+  } catch {
+    return ''
+  }
+}
+const stamped = readStamp(stampFile) !== ''
 if (!stamped && !force) {
   console.log('no build stamp: the staged artifacts do not name a build batch, so they are rebuilt')
 }
