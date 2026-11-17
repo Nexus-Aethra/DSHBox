@@ -8,9 +8,14 @@ because it had exactly one consumer.
 
 ## Single source of truth
 
-`state/resource-map.json` is the authoritative index of published resources.
-Task state is persisted in the document store (`state/dshbox.db`; the
-legacy file was `state/tasks.json`); task-private
+`state/resource-map.json` is the authoritative index of published resources,
+and it is still a plain JSON file written atomically through
+`resource_map_path` / `write_resource_map` (`box-state/src/resource_map.rs`).
+It has not migrated to the document store: `LEGACY_SCOPES` in `box-store`
+(`box-store/src/import.rs`) lists only `tasks`, so AGENTS.md's document-store
+rule describes the direction of travel, not today's layout — this spec
+describes today's. Task state is persisted in the document store
+(`state/dshbox.db`; the legacy file was `state/tasks.json`); task-private
 files live only in `staging/<task-id>/`. Filesystem scans may diagnose drift but
 must not silently recreate state records.
 
@@ -32,15 +37,29 @@ from removal and allow provenance; they are not runtime filesystem links.
 ```text
 ResourceEntry {
   id: String,                 // "plugin:<digest>", "base:<digest>", ...
-  kind: ResourceKind,
-  path: RelativePath,
+  type: ResourceType,         // Plugin | Template | Container | Unknown;
+                             // spelled r#type in Rust, `type` in JSON
+  path: String,               // absolute path of the published tree on disk
   status: Active | Deleted,
-  refs: Vec<ResourceId>,      // resources that directly depend on this record
-  manifestDigest: String,
-  sizeBytes: u64,
-  createdAt: u64
+  refs: Vec<String>,          // resource ids that directly depend on this record
+  meta: BTreeMap<String, String>,   // free-form per-entry extras
+  created_at: u64             // written as createdAt in JSON (rename_all = "camelCase")
 }
 ```
+
+Only `id`, `type` and `path` are supplied by callers:
+`ResourceEntry::new` (`resource_map.rs`) fills in `status`, `refs`, `meta` and
+`created_at` itself. `manifestDigest` and `sizeBytes` are not recorded here at
+all — no caller writes them into the map. `meta` is likewise empty on every
+entry in practice: the one place that assembles keys for it
+(`harness_ref`, `from_ref`, in `box-template-core/src/lib.rs` on template
+install) never attaches them to the entry, so today the map holds only
+id/type/path/status/refs/created_at. The digest and size figures the UI shows
+live on the published tree instead: `manifest.json` beside the resource
+(`TemplateManifest`, written by `write_template_manifest` in
+`box-foundation/src/lib.rs`, carries `harnessDigest`, `profileDigest` and
+`sizeBytes`), and the per-domain indexes carry `sizeBytes` for the UI
+(`PreparedBaseRecord`, `SealedTemplateRecord`).
 
 Resource publication is ordered: validate staged tree, write manifest, atomically
 rename staging to its digest-addressed final path, then commit map/references.
