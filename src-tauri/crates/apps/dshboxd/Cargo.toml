@@ -1,0 +1,45 @@
+[package]
+name = "dshboxd"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dshboxd"
+path = "src/main.rs"
+
+[dependencies]
+box-resources = { path = "../../domain/box-resources" }
+box-api = { path = "../../core/box-api" }
+box-browser = { path = "../../domain/box-browser" }
+box-containers = { path = "../../domain/box-containers" }
+box-dsh-versions = { path = "../../domain/box-dsh-versions" }
+box-extensions = { path = "../../domain/box-extensions" }
+box-foundation = { path = "../../core/box-foundation" }
+box-image = { path = "../../domain/box-image" }
+box-plugin-graph = { path = "../../domain/box-plugin-graph" }
+box-runtime = { path = "../../core/box-runtime" }
+box-scheduler = { path = "../../core/box-scheduler" }
+box-server-core = { path = "../../edge/box-server-core" }
+
+box-state = { path = "../../domain/box-state" }
+box-store = { path = "../../core/box-store" }
+box-template-core = { path = "../../domain/box-template-core" }
+box-toolchains = { path = "../../domain/box-toolchains" }
+box-updates = { path = "../../domain/box-updates" }
+tracing = { workspace = true }
+flate2 = "1.1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+base64 = "0.22"
+tar = "0.4"
+uuid = { version = "1.18", features = ["v4"] }
+# Guest artifacts are verified before use, like every other runtime archive.
+sha2 = "0.10"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = "0.8"
+
+[dev-dependencies]
+tempfile = "3.13"

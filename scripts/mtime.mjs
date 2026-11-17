@@ -10,7 +10,14 @@ import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from '
 import { join } from 'node:path'
 
 // Directories that never influence build output freshness.
-const SKIP_DIRS = new Set(['node_modules', 'dist', 'target', '.git', '.pnpm', '.vite'])
+//
+// `box-data` is the clean-room tests' scratch tree (HOME, git and pnpm config that
+// `box-runtime`'s policy tests write into the crate directory). It is gitignored,
+// but the mtime gate below walks the whole crate, and a test run leaves a file far
+// newer than any staged artifact -- so without this entry `server:prepare` rebuilt
+// the entire sidecar after every `cargo test`, which reads as slowness rather than
+// as the stale-input bug it is.
+const SKIP_DIRS = new Set(['node_modules', 'dist', 'target', '.git', '.pnpm', '.vite', 'box-data'])
 
 export function latestMtime(path) {
   const stat = statSync(path)

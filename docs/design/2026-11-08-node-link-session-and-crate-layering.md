@@ -1,6 +1,8 @@
 # 2026-11-08 — node 会话协议（双向流 + 加密）与 crate 分层
 
-> 状态：**设计，未实现**（决策已定，待按 §10 分步落地）。
+> 状态：**分段落地中**。§0-§11（会话协议、密钥、L1-L4 分步）仍是**设计，未实现**；
+> §12-§19（crate 分层、两处合并、四层目录与守卫）**已落地**——目录就是
+> `src-tauri/crates/{core,domain,edge,apps}`，守卫是 `scripts/check-layering.mjs`。
 > 前序：`docs/design/2026-11-07-node-persistence-and-placement.md`（数据与调度，B1 施工基准）、
 > `docs/design/2026-11-04-node-core.md`（stage A 注册表）、`docs/design/2026-11-04-node-artifact.md`（产物）。
 >
@@ -306,7 +308,7 @@ src-tauri/crates/
     box-runtime        # 进程/exec/git 原语
     box-store          # SQLite DocumentStore + 旧 JSON 导入
     box-scheduler      # 任务队列/锁/状态机
-    box-api            # 线路类型（零依赖；domain 与 edge 都要用它，所以必须在 core）
+    box-api            # 线路类型（零 box 依赖，只有 serde；domain 与 edge 都要用它，所以必须在 core）
     box-node-link      # 新：帧 + 握手 + 密钥派生（只依赖 ring/serde）
   domain/              # 业务能力，互相成 DAG
     box-containers  box-image  box-resources  box-extensions
@@ -330,14 +332,16 @@ src-tauri/crates/
 |---|---|
 | `box-logger` → `box-foundation` | 125 行、1 消费者；tracing 初始化 + 日志滚动本就属于 foundation 的职责 |
 | `box-data-scheduler` → `box-state` | 947 行、1 消费者；资源映射与「待删除队列」是同一个读模型的两半。合并后 `box-template-core → box-state`，不成环（`box-state` 不依赖 `box-template-core`） |
-| `box-api` **归位到 `core/`**（不合并） | 零依赖的线路类型，被 `box-dsh-versions`、`box-extensions`、`dshboxd` 使用——**domain 必须能依赖它**，所以它属于 core 而不是 edge |
+| `box-api` **归位到 `core/`**（不合并） | 零 box 依赖的线路类型（只有 serde），被 `box-dsh-versions`、`dshboxd` 使用——**domain 必须能依赖它**，所以它属于 core 而不是 edge。（`box-extensions` 的清单里也声明了它，但源码中没有 `box_api::` 引用；这条依赖该删，见 §19。） |
 
 **为什么不做「`box-api` + `box-client` → `box-ipc`」**：草案最初是这么写的，但 `box-api` 被 domain 层的包依赖，
 并进 `edge/` 就会产生 `domain → edge`，直接违反 §18 的守卫。写成目录之后这个坑一眼可见——
 这也是要那条守卫的理由之一。`box-client`（377 行、fan-in 0）先留在 `edge/`；如果它长期只被 `dshbox`
 （Tauri 包）使用，可以再降级成那个包里的模块，那时再删一个 crate。
 
-22 → 20（两处合并）；加 `box-node-link`、`box-node-ops` = **22**，但每一层都能说出它为什么在这一层。
+按 **box crate** 计：22 → 20（两处合并）；加 `box-node-link`、`box-node-ops` = **22**，但每一层都能说出它为什么在这一层。
+（守卫报的是 workspace 成员数：今天是 **22 = 20 个 box crate + 根包 `dshbox` + `tools/runtime-packager`**，
+将来两个 node crate 落地后是 24。两个数字口径不同，别直接对比。）
 
 ## 16. 两条禁令
 
@@ -349,20 +353,38 @@ src-tauri/crates/
 
 1. **先合并**（小、可审）：新建目标文件、改 `use`、删旧包、更新 root `Cargo.toml` 与依赖方；
    验收就是全 workspace 测试 + `command_surface` 仍绿。
-2. **再搬层**（纯路径）：`members` 改成 `crates/core/*` 一类通配、21 个 crate 的 `path =` 依赖、
-   `scripts/prepare-server.mjs` 里三处硬编码的 `crates/box-helper` 路径、`scripts/e2e-bundled-git.sh`、
-   `crates/box-image/tests`、`AGENTS.md` 的 crate 表；文档里的旧路径保留（历史记录），只在新文档注新位置。
+2. **再搬层**（纯路径）——**已落地**：`members` 改成 `crates/{core,domain,edge,apps}/*` 四个通配、
+   各 crate 的 `path =` 依赖重写、`scripts/prepare-server.mjs` 不再硬编码 `crates/box-helper` 而是把每个
+   `path = ...` 解析成真正含 `Cargo.toml` 的目录、`scripts/e2e-bundled-git.sh` 与 `crates/box-image/tests`
+   改成向上找标记而不是数父级跳数、`AGENTS.md` 的 crate 表换成四层表。
+   文档里指向旧路径的**历史叙述**保留（合并台账、迁移记录），当前语义的指引则改成新路径。
 
 ## 18. 守卫：`scripts/check-layering.mjs`
 
-读每个 `Cargo.toml` 的 `box-*` 依赖，断言：
-- `core/` 不依赖 `domain/`、`edge/`、`apps/`；
-- `domain/` 只依赖 `core/`（含 `box-api` 的线路类型）与本层其它包，不依赖 `edge/`、`apps/`；
-  `box-state` 是聚合层，允许依赖 `domain/` 内的其它包；
-- `edge/` 不依赖 `apps/`；
+**依赖图来自 `cargo metadata --no-deps --offline`，不是对 Cargo.toml 做文本扫描。**
+这一点是被评审逼出来的：文本扫描分不清依赖与注释，看不见
+`[dependencies.foo]` 表，看不见 `workspace = true` 的继承，而且只认识它被喂进去的那些目录
+——三者各自都让守卫在一条真实越界上报过绿（core → domain 的
+`[dependencies.box-state]` + `workspace = true` 曾输出 "layering ok" 并 exit 0）。
+改用 cargo 之后，每种清单写法都按构造成立；`--no-deps` 保证离线（只读本 workspace 的清单）。
+成员列表也来自同一个来源，所以层外的 crate 不会再「因为扫描没看见而存在」。
+
+断言（按 manifest 自身路径判定层）：
+- `core/` 只依赖 `core/`；
+- `domain/` 只依赖 `core/` 与 `domain/`（`box-api` 的线路类型在 `core/`）；
+- `edge/` 只依赖 `core/`、`domain/`、`edge/`；
 - `apps/` 之间不互相依赖；
+- `tools/`（`runtime-packager` 这类构建工具）可以用 `core/`、`domain/`、`edge/`，但不链接 `apps/`；
+- 根包（Tauri 包）可以用下面三层，但不能依赖 `apps/` 下的二进制；
 - **`box-state` 不依赖 `box-template-core`**（合并 `box-data-scheduler` 之后的成环风险，见 §13）；
-- 任何 crate 都不依赖 `dshbox`（Tauri 包只能被 `src-tauri` 自己用）。
+- 任何 crate 都不依赖 `dshbox`（Tauri 包只能被 `src-tauri` 自己用）；
+- **既不属于四层、也不在 `tools/` 下的 workspace 成员本身就是违规**，无论它是否恰好依赖了
+  什么东西——层外成员正是分层规则失去意义的地方。
+
+守卫读不到依赖图时（没有 cargo、cargo 失败）**必须失败**，绝不打印成功行；
+根目录锚定在脚本自身位置而不是 `process.cwd()`（从 `src-tauri` 运行时曾扫描到 0 个 crate
+仍 exit 0）。它也不看注册表依赖，所以「feature crate 不得依赖 Tauri」这条目前只是约定、
+未被强制：今天只有 `dshbox` 依赖 `tauri`，但新增一个 `domain/` crate 引用 `tauri` 不会变红。
 
 这条比目录更重要：目录只让方向可见，守卫才让它不可退化。
 

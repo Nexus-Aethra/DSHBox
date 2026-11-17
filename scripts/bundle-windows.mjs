@@ -7,10 +7,14 @@
 //      Windows), fall back to x86_64-pc-windows-gnu if that's the only
 //      target whose linker we can find, and let the user force either
 //      via --msvc / --gnu / --linker.
-//   2. plugin:build       (script: plugin:build)
-//   3. runtime:prepare    (script: runtime:prepare)
-//   4. server:prepare     (script: server:prepare; also stops dshboxd.exe)
-//   5. tauri build (NSIS) under the chosen Rust target
+//   2. layers:check       (script: layers:check) — the crate layering guard.
+//      It lives here rather than only in the `pnpm bundle:windows` wrapper
+//      because the release workflow invokes this script directly, so the
+//      one entry point CI uses was the one place the guard never ran.
+//   3. plugin:build       (script: plugin:build)
+//   4. runtime:prepare    (script: runtime:prepare)
+//   5. server:prepare     (script: server:prepare; also stops dshboxd.exe)
+//   6. tauri build (NSIS) under the chosen Rust target
 //
 // Notes:
 //   - Non-Windows hosts are rejected up front.
@@ -449,16 +453,21 @@ if (tools.toolchain.kind === 'gnu' && flags.toolchain === 'auto') {
   console.warn('  "Desktop development with C++" workload, or pass --msvc.')
 }
 
-// 1. plugin:build
+// 1. layers:check — fail before spending twenty minutes compiling a tree that
+// violates the layout. Runs through pnpm like the other steps, so the target
+// script is the single definition of "the guard".
+runStep('layers:check', tools.pnpm, [...tools.pnpmPrefixArgs, 'layers:check'])
+
+// 2. plugin:build
 runStep('plugin:build', tools.pnpm, [...tools.pnpmPrefixArgs, 'plugin:build'])
 
-// 2. runtime:prepare
+// 3. runtime:prepare
 runStep('runtime:prepare', tools.pnpm, [...tools.pnpmPrefixArgs, 'runtime:prepare'])
 
-// 3. server:prepare
+// 4. server:prepare
 runStep('server:prepare', tools.pnpm, [...tools.pnpmPrefixArgs, 'server:prepare'])
 
-// 4. tauri build (NSIS)
+// 5. tauri build (NSIS)
 if (flags.skipBundle) {
   console.log('')
   console.log('▶ skipping tauri build (--no-bundle)')

@@ -51,24 +51,28 @@ For comparison, `boxfile.dsh` (in the same directory) is a minimal
 
 ## Where to look in the source
 
-- **Parser**: `crates/box-image/src/script.rs::parse_source_token`
+- **Parser**: `src-tauri/crates/domain/box-image/src/script.rs::parse_source_token`
   is the single source of truth for what `ADD plugin <src>` accepts.
   Adding a new prefix there is the only code change needed to
   support a new spec shape.
 
-- **Builder**: `crates/dshboxd/src/image.rs` routes each
-  `ParsedSource` variant to the right fetcher — local dir import,
-  `npm pack`, git clone, tarball unpack, etc.
+- **Fetcher**: `src-tauri/crates/apps/dshboxd/src/extensions.rs` resolves the
+  `ParsedSource` variants an `ADD plugin` inside a boxfile can name — the
+  `npm pack` invocation at `:85`, the bare name/scope/version arm at `:327`, and the
+  GitHub/tarball prefixes through `pnpm_plugin_spec` in `sealed.rs:563`.
+  `sealed.rs` is the sealed-template build path; `data.rs` is a different verb
+  (`ADD data`), not the plugin fetcher.
 
-- **Workspace promotion**: `crates/dshboxd/src/bundles.rs::install_container_plugin`
+- **Workspace promotion**: `src-tauri/crates/apps/dshboxd/src/bundles.rs::install_container_plugin`
   rewrites `link:` → `workspace:*` and injects `dangerouslyAllowAllBuilds: true`
   into the profile's `pnpm-workspace.yaml` so transitive deps hoist
   and native modules (`node-pty`, `ssh2`, `cpu-features`) build without
   manual `pnpm approve-builds`.
 
-- **Daemon reconcile**: `crates/dshboxd/src/host.rs` describes the
-  durable record (`host.json`) and CAS generation logic that keeps
-  the watcher thread from clobbering fresh state.
+- **Daemon reconcile**: `src-tauri/crates/apps/dshboxd/src/host.rs` describes the
+  durable record (`host.json`) and the compare-and-swap on its `generation`
+  field, which keeps a stale writer (one that loaded an older generation) from
+  clobbering a fresh entry.
 
 ## What you'll see in the task log
 

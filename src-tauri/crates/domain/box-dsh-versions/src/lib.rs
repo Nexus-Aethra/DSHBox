@@ -1,0 +1,887 @@
+//! DSH runtime DTOs, source repository constants, and the harness clone +
+//! template-index pipeline. Templates are the single source of truth — the
+//! Harness tab in the UI is a derived view over the template index, no
+//! separate harness resource type is written any more.
+
+use box_foundation::{is_safe_identifier, mirror_url, now_seconds, read_config, BoxResult};
+use box_runtime::{remove_checkout, shallow_clone_with_cancel};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    path::PathBuf,
+};
+use tracing::info;
+
+pub const DSH_REPOSITORY: &str = "https://github.com/deepseek-ai/deepseek-harness.git";
+pub const DSH_TAGS_API: &str =
+    "https://api.github.com/repos/deepseek-ai/deepseek-harness/tags?per_page=100";
+
+/// Canonical FROM reference used by every harness template this crate
+/// generates. Harness clones live at `<root>/runtimes/<tag>/source/` and
+/// their matching template entries sit in `<root>/state/template-index.json`
+/// — there is no separate harness resource type any more, the Harness tab
+/// in the UI is a derived view over the template index.
+pub const HARNESS_STANDARD_REF: &str = "github.com/deepseek-ai/deepseek-harness:latest";
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshVersion {
+    pub name: String,
+    pub installed: bool,
+}
+
+/// Order a catalogue the way a reader looks for a release: `latest` first, then
+/// newest to oldest.
+///
+/// The list used to come out in the byte order of its names, because it was
+/// collected into a `BTreeMap<String, _>`. That put the oldest release at the top
+/// and the newest at the bottom, and it would have put `dsh-v0.1.10` *above*
+/// `dsh-v0.1.2` the first time DSH shipped a two-digit number — a string compare
+/// reads the `1` of `10` against the `2` and stops there.
+pub fn sort_catalog(versions: &mut [DshVersion]) {
+    versions.sort_by(|left, right| {
+        order_of(&left.name)
+            .cmp(&order_of(&right.name))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+}
+
+/// A sort key that puts `latest` first, then descends by release value, and
+/// leaves anything unrecognisable at the end in name order.
+fn order_of(name: &str) -> (u8, std::cmp::Reverse<Release>, String) {
+    if name == "latest" {
+        return (0, std::cmp::Reverse(Release::default()), String::new());
+    }
+    match parse_release(name) {
+        Some(release) => (1, std::cmp::Reverse(release), String::new()),
+        None => (2, std::cmp::Reverse(Release::default()), name.to_owned()),
+    }
+}
+
+/// The value of a release name: its numeric components and its pre-release
+/// identifiers, in the shape semver orders them.
+#[derive(Default, PartialEq, Eq, Debug)]
+struct Release {
+    numbers: Vec<u64>,
+    /// Empty for a final release.
+    pre: Vec<Identifier>,
+}
+
+impl Ord for Release {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.numbers.cmp(&other.numbers).then_with(|| {
+            // Deriving this would get it backwards: an empty `Vec` compares less
+            // than a non-empty one, which would make `0.1.6` older than
+            // `0.1.6-alpha.2`. The release with no pre-release is the newer one.
+            match (self.pre.is_empty(), other.pre.is_empty()) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                (false, false) => self.pre.cmp(&other.pre),
+            }
+        })
+    }
+}
+
+impl PartialOrd for Release {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Identifier {
+    /// A numeric identifier outranks a textual one, per semver.
+    Numeric(u64),
+    Text(String),
+}
+
+/// Read `dsh-v0.1.6-alpha.2`, `v0.1.6`, `0.1.6` — the shapes DSH tags use.
+fn parse_release(name: &str) -> Option<Release> {
+    let rest = name.trim_start_matches(|byte: char| !byte.is_ascii_digit());
+    if rest.is_empty() {
+        return None;
+    }
+    let (numbers, pre) = match rest.split_once('-') {
+        Some((numbers, pre)) => (numbers, pre),
+        None => (rest, ""),
+    };
+    let numbers: Option<Vec<u64>> = numbers
+        .split('.')
+        .map(|part| part.parse::<u64>().ok())
+        .collect();
+    let mut numbers = numbers?;
+    if numbers.is_empty() {
+        return None;
+    }
+    // `0.1` and `0.1.0` are the same release; padding makes them compare equal
+    // rather than one running out of components first.
+    while numbers.len() < 3 {
+        numbers.push(0);
+    }
+    let pre = pre
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<u64>()
+                .map_or_else(|_| Identifier::Text(part.to_owned()), Identifier::Numeric)
+        })
+        .collect();
+    Some(Release { numbers, pre })
+}
+
+/// A `pull template <ref>` request broken into its constituent pieces. The
+/// `version` is what gets used as the install directory name and the local
+/// template file name (`<root>/templates/<version>.dsh`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateRef {
+    /// Full `https://...` URL of the Git repository.
+    pub url: String,
+    /// Optional tag/branch/commit to check out; `None` means `latest`.
+    pub tag: Option<String>,
+    /// The version slug persisted as the install directory name. Defaults
+    /// to `latest` when the caller omits a tag.
+    pub version: String,
+}
+
+/// Parse a `github.com/<owner>/<repo>[:tag|@ref]` style reference into the
+/// pieces needed to clone the repository and name the local install. The
+/// `:tag` / `@ref` suffix is optional; when absent, `latest` is used. The
+/// returned `url` is always `https://github.com/<owner>/<repo>` (the host
+/// has to be one of the well-known git hosts, since `shallow_clone_with_cancel`
+/// only handles `https://` remotes).
+pub fn parse_template_ref(ref_value: &str) -> BoxResult<TemplateRef> {
+    let value = ref_value.trim();
+    if value.is_empty() {
+        return Err("template reference cannot be empty".to_owned());
+    }
+    let last_at = value.rfind('@');
+    let last_colon = value.rfind(':');
+    let (head, tag) = match (last_at, last_colon) {
+        (Some(at), Some(colon)) if at > colon => {
+            let tag = &value[at + 1..];
+            if tag.is_empty() {
+                return Err("template reference has empty `@ref` suffix".to_owned());
+            }
+            (&value[..at], Some(tag.to_owned()))
+        }
+        (Some(at), None) => {
+            let tag = &value[at + 1..];
+            if tag.is_empty() {
+                return Err("template reference has empty `@ref` suffix".to_owned());
+            }
+            (&value[..at], Some(tag.to_owned()))
+        }
+        (Some(_), Some(colon)) => {
+            let tag = &value[colon + 1..];
+            if tag.is_empty() {
+                return Err("template reference has empty `:tag` suffix".to_owned());
+            }
+            (&value[..colon], Some(tag.to_owned()))
+        }
+        (None, Some(colon)) => {
+            let tag = &value[colon + 1..];
+            if tag.is_empty() {
+                return Err("template reference has empty `:tag` suffix".to_owned());
+            }
+            (&value[..colon], Some(tag.to_owned()))
+        }
+        (None, None) => (value, None),
+    };
+    let parts: Vec<&str> = head.split('/').collect();
+    if parts.len() != 3 || !matches!(parts[0], "github.com" | "gitlab.com" | "bitbucket.org") {
+        return Err(format!(
+            "template reference must be `github.com/<owner>/<repo>[:tag|@ref]`, got `{ref_value}`"
+        ));
+    }
+    let url = format!("https://{head}");
+    let version = tag.clone().unwrap_or_else(|| "latest".to_owned());
+    if !is_safe_identifier(&version) {
+        return Err(format!(
+            "template reference resolves to an unsafe version `{version}`"
+        ));
+    }
+    Ok(TemplateRef { url, tag, version })
+}
+
+pub fn version_directory(root: &str, version: &str) -> PathBuf {
+    PathBuf::from(root)
+        .join("runtimes")
+        .join(version)
+        .join("source")
+}
+
+/// `<root>/templates` — base `.dsh` scripts, one per installed DSH version.
+pub fn templates_directory(root: &str) -> PathBuf {
+    PathBuf::from(root).join("templates")
+}
+
+/// `<root>/templates/<version>.dsh` — base build script for a version. Older
+/// `pull_template` runs dropped a flat alias here so `build_image` could
+/// resolve templates by their DSH version. Newer versions write the script
+/// body to the content-addressable hash directory and keep this alias only
+/// as a read-side fallback for users that already have one on disk.
+pub fn harness_template_path(root: &str, version: &str) -> PathBuf {
+    templates_directory(root).join(format!("{version}.dsh"))
+}
+
+/// Collapse a template reference (`github.com/<owner>/<repo>[:tag|@ref]`)
+/// into a filesystem-safe filename stem. The actual template body is
+/// stored in a content-addressable hash directory; this legacy alias is
+/// only kept around so `build_image` can still resolve templates by their
+/// old version (`latest`, `v0.1.0`) without re-plumbing the build path.
+pub fn sanitize_template_ref(ref_value: &str) -> String {
+    // Older builds split the URL on `/` and `:` to make a flat filename
+    // like `github.com_deepseek-ai_deepseek-harness_latest.dsh`. The new
+    // layout stores the body under a hash directory, so this is only used
+    // as a friendly alias stem; the user-facing name in the index keeps
+    // the original `/` and `:` characters verbatim.
+    ref_value.trim().replace('\\', "_")
+}
+
+/// `<root>/templates/<ref-sanitized>.dsh` — pull_template writes its base
+/// script here so two different refs (e.g. `.../harness:latest` and
+/// `.../harness:v0.1.0`) live side by side instead of overwriting each other.
+pub fn template_path(root: &str, ref_value: &str) -> PathBuf {
+    templates_directory(root).join(format!("{}.dsh", sanitize_template_ref(ref_value)))
+}
+
+/// Per-runtime template storage: every distinct script lives at
+/// `<root>/templates/<fnv1a64-hash>/script.dsh` and the index at
+/// `<root>/state/template-index.json` maps the user-facing `name` (an alias
+/// like `deepseek-harness:latest`) to the content-addressable id. Pull and
+/// import flows land here, mirroring the plugin resource's two-level
+/// (index + content-addressable directory) layout.
+pub fn template_storage_root(root: &str) -> PathBuf {
+    templates_directory(root)
+}
+
+pub fn template_index_path(root: &str) -> PathBuf {
+    PathBuf::from(root).join("state").join("template-index.json")
+}
+
+pub fn template_content_path(root: &str, id: &str) -> PathBuf {
+    template_storage_root(root).join(id).join("script.dsh")
+}
+
+pub fn template_manifest_path(root: &str, id: &str) -> PathBuf {
+    // `manifest.json` is the v8 built-template resource list. Keep the
+    // index-facing metadata separate so writing one cannot overwrite the
+    // other (source templates use this file too).
+    template_storage_root(root).join(id).join("entry.json")
+}
+
+/// FNV-1a 64-bit hash of a single template script. The content is the
+/// script body verbatim (no `fnv1a64:` prefix here; the prefix is added by
+/// `extension_digest` and we deliberately keep template ids bare so they
+/// read naturally in `template ls` and on disk).
+pub fn template_content_hash(content: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in content.bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Index entry for one local template. `id` is the content-addressable
+/// hash; `name` is the user-facing alias used by `template rm/show/export`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateEntry {
+    pub name: String,
+    pub id: String,
+    #[serde(default)]
+    pub harness_ref: Option<String>,
+    #[serde(default)]
+    pub profile: String,
+    #[serde(default)]
+    pub imported_at: u64,
+    #[serde(default)]
+    pub from_ref: Option<String>,
+    /// True when the hash directory holds a built resource list
+    /// (`list.json`) instead of a source script (`script.dsh`).
+    #[serde(default)]
+    pub built: bool,
+    /// `Root` for the official `github.com/deepseek-ai/deepseek-harness*`
+    /// template family (gets the optimised install path with `.dsh-prepared`
+    /// + `prepared-source` symlink so DSH host boot skips `pnpm install`),
+    /// `Common` for everything else (user-authored, imported, built). New
+    /// field — older index files default to `Common` so legacy installs
+    /// keep working without a migration.
+    #[serde(default)]
+    pub kind: TemplateKind,
+}
+
+/// Whether a template is part of the official harness family (`Root`) or a
+/// user-authored / imported / built template (`Common`). The split exists so
+/// `Root` templates can take a faster install path; the storage layout,
+/// `box_state` bookkeeping, and IPC DTOs are identical between the two.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TemplateKind {
+    #[default]
+    Common,
+    Root,
+}
+
+impl TemplateKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Common => "common",
+            Self::Root => "root",
+        }
+    }
+}
+
+/// True when `ref_value` is part of the official harness family. The check
+/// is purely a prefix match on the user-facing ref so a hypothetical fork
+/// (`github.com/<fork>/deepseek-harness`) stays `Common` and only the
+/// upstream repo triggers the optimised path.
+pub fn classify_kind(ref_value: &str) -> TemplateKind {
+    if ref_value.starts_with("github.com/deepseek-ai/deepseek-harness") {
+        TemplateKind::Root
+    } else {
+        TemplateKind::Common
+    }
+}
+
+pub type TemplateIndex = std::collections::BTreeMap<String, TemplateEntry>;
+
+pub fn read_template_index(root: &str) -> TemplateIndex {
+    fs::read_to_string(template_index_path(root))
+        .ok()
+        .and_then(|source| serde_json::from_str(&source).ok())
+        .unwrap_or_default()
+}
+
+pub fn write_template_index(root: &str, index: &TemplateIndex) -> Result<(), String> {
+    let path = template_index_path(root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(index).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Persist a script body to the hash-addressed template store, write its
+/// manifest, and register it under `name` in the index. Returns the new
+/// entry. If the same name was previously registered under a different
+/// hash, that orphan directory is garbage-collected.
+pub fn write_template_with_entry(
+    root: &str,
+    name: &str,
+    text: &str,
+    harness_ref: Option<String>,
+    profile: &str,
+    from_ref: Option<String>,
+    imported_at: u64,
+    kind: TemplateKind,
+) -> Result<TemplateEntry, String> {
+    let id = template_content_hash(text);
+    let dir = template_storage_root(root).join(&id);
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    fs::write(dir.join("script.dsh"), text).map_err(|error| error.to_string())?;
+    let entry = TemplateEntry {
+        name: name.to_owned(),
+        id: id.clone(),
+        harness_ref,
+        profile: profile.to_owned(),
+        imported_at,
+        from_ref,
+        built: false,
+        kind,
+    };
+    let manifest = serde_json::json!({
+        "name": entry.name,
+        "id": entry.id,
+        "harnessRef": entry.harness_ref,
+        "profile": entry.profile,
+        "importedAt": entry.imported_at,
+        "fromRef": entry.from_ref,
+        "kind": entry.kind.as_str(),
+    });
+    fs::write(
+        template_manifest_path(root, &id),
+        serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut index = read_template_index(root);
+    if let Some(previous) = index.insert(name.to_owned(), entry.clone()) {
+        if previous.id != entry.id {
+            collect_unreferenced_template_hash(root, &previous.id, &index);
+        }
+    }
+    write_template_index(root, &index)?;
+    Ok(entry)
+}
+
+/// Delete the hash-addressed directory and its manifest when no index entry
+/// still points at it. Used both by `write_template_with_entry` (to retire
+/// the old hash when the same name is re-imported with different bytes) and
+/// by `remove_template` (when the user drops a template).
+pub fn collect_unreferenced_template_hash(root: &str, id: &str, index: &TemplateIndex) {
+    if index.values().any(|entry| entry.id == id) {
+        return;
+    }
+    let dir = template_storage_root(root).join(id);
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_file(template_manifest_path(root, id));
+}
+
+pub fn built_template_list_path(root: &str, id: &str) -> PathBuf {
+    template_storage_root(root).join(id).join("manifest.json")
+}
+
+/// The on-disk directory for one built template — every resource row in
+/// `manifest.json` references files under this path (relative), so the
+/// materialiser can copy them into the container profile without going
+/// through the runtime plugin repository.
+pub fn built_template_artifact_dir(root: &str, id: &str) -> PathBuf {
+    template_storage_root(root).join(id)
+}
+
+pub fn built_template_repository_dir(root: &str, id: &str) -> PathBuf {
+    template_storage_root(root).join(id).join("repository")
+}
+
+pub fn built_template_data_dir(root: &str, id: &str) -> PathBuf {
+    template_storage_root(root).join(id).join("data")
+}
+
+/// Persist a built template (the metadata-only product of `dshbox build`)
+/// into the SAME content-addressable store as source script templates —
+/// there is no separate image registry, only built templates. The id is
+/// the fnv1a64 hash of the serialised resource list; re-building under
+/// the same name retires the previous hash.
+///
+/// Every resource referenced by the list is expected to already live
+/// under `<root>/templates/<id>/repository/...` or
+/// `<root>/templates/<id>/data/<digest>/` — this function only writes
+/// `manifest.json` (the resource list) and the per-hash `manifest.json`
+/// index entry. The resource materialisation itself happens in the
+/// caller so we can fail loudly for one row without abandoning an
+/// otherwise-good build.
+pub fn write_built_template(
+    root: &str,
+    list: &box_api::TemplateResourceList,
+) -> Result<TemplateEntry, String> {
+    let body = serde_json::to_string(list).map_err(|error| error.to_string())?;
+    let id = template_content_hash(&body);
+    let dir = template_storage_root(root).join(&id);
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    fs::write(dir.join("manifest.json"), &body).map_err(|error| error.to_string())?;
+    // Built templates inherit their kind from the base ref. The `base` field
+    // is the user-facing reference (`github.com/.../deepseek-harness:latest`
+    // for harness builds, anything else for user-authored builds), so the
+    // same classify function drives both pull and build classification.
+    let kind = classify_kind(&list.base);
+    let entry = TemplateEntry {
+        name: list.name.clone(),
+        id: id.clone(),
+        harness_ref: list.harness_ref.clone(),
+        profile: list.profile.clone(),
+        imported_at: list.created_at,
+        from_ref: Some(list.base.clone()),
+        built: true,
+        kind,
+    };
+    let manifest = serde_json::json!({
+        "name": entry.name,
+        "id": entry.id,
+        "harnessRef": entry.harness_ref,
+        "profile": entry.profile,
+        "importedAt": entry.imported_at,
+        "fromRef": entry.from_ref,
+        "built": true,
+        "kind": entry.kind.as_str(),
+    });
+    fs::write(
+        template_manifest_path(root, &id),
+        serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut index = read_template_index(root);
+    if let Some(previous) = index.insert(list.name.clone(), entry.clone()) {
+        if previous.id != entry.id {
+            collect_unreferenced_template_hash(root, &previous.id, &index);
+        }
+    }
+    write_template_index(root, &index)?;
+    Ok(entry)
+}
+
+/// Read the resource list of a built template by index name. Returns
+/// `Ok(None)` when the name is unknown or refers to a source script
+/// template (callers then fall back to the script path).
+pub fn read_built_template(
+    root: &str,
+    name: &str,
+) -> Result<Option<box_api::TemplateResourceList>, String> {
+    let index = read_template_index(root);
+    let Some(entry) = index.get(name) else {
+        return Ok(None);
+    };
+    if !entry.built {
+        return Ok(None);
+    }
+    let dir = template_storage_root(root).join(&entry.id);
+    let path = dir.join("manifest.json");
+    if !path.is_file() {
+        return Err(format!(
+            "built template `{name}` is corrupt: manifest.json missing in {}",
+            dir.display()
+        ));
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|error| format!("cannot parse {}: {error}", path.display()))
+}
+
+/// Every data-store digest referenced by any built template — the GC input
+/// for `dshbox template prune`.
+pub fn referenced_snapshot_digests(root: &str) -> Result<Vec<String>, String> {
+    let mut digests = Vec::new();
+    for entry in read_template_index(root).values() {
+        if !entry.built {
+            continue;
+        }
+        let path = built_template_list_path(root, &entry.id);
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(list) = serde_json::from_str::<box_api::TemplateResourceList>(&text) else {
+            continue;
+        };
+        for resource in &list.resources {
+            if resource.source_kind != "plugin" {
+                if let Some(digest) = resource.source.strip_prefix("data/") {
+                    digests.push(digest.to_owned());
+                }
+            }
+        }
+    }
+    digests.sort();
+    digests.dedup();
+    Ok(digests)
+}
+
+pub fn installed_versions(root: &str) -> BoxResult<Vec<String>> {
+    let directory = PathBuf::from(root).join("runtimes");
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut versions = fs::read_dir(&directory)
+        .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| {
+            // The completion marker (`.dshbox-runtime.json`, written only
+            // after a successful clone in `pull_template`) is the installed
+            // criterion — NOT the `.git` directory, which libgit2 creates
+            // the instant a clone starts. Harness clones are large and take
+            // minutes; keying on `.git` made the UI report "installed" while
+            // the download was still running.
+            is_safe_identifier(name)
+                && version_directory(root, name)
+                    .join(".dshbox-runtime.json")
+                    .is_file()
+        })
+        .collect::<Vec<_>>();
+    versions.sort();
+    Ok(versions)
+}
+
+/// Pull a template by reference: clone the upstream repository into the
+/// runtime directory, record the commit, and materialise the base template
+/// that other containers can extend. Returns the resolved `version` slug.
+///
+/// This is the canonical entry point for `dshbox pull template <ref>`; it
+/// replaces the older `install_dsh_version(version)` workflow. A missing
+/// `:tag` / `@ref` suffix defaults to `latest`.
+pub fn pull_template(
+    root: &str,
+    ref_value: &str,
+    cancelled: impl Fn() -> bool + Send + 'static,
+) -> BoxResult<String> {
+    let parsed = parse_template_ref(ref_value)?;
+    let destination = version_directory(root, &parsed.version);
+    info!(ref = %ref_value, version = %parsed.version, dest = %destination.display(), "pulling template");
+    if destination.exists() {
+        let index = read_template_index(root);
+        let indexed = index.values().any(|entry| {
+            entry.harness_ref.as_deref() == Some(parsed.version.as_str())
+        });
+        let complete = destination.join(".dshbox-runtime.json").is_file();
+        if indexed {
+            // Fully installed harness the index still knows about — the
+            // user is re-pulling a version that never went away. Refuse
+            // rather than silently re-clone over their work.
+            return Err(format!(
+                "template version already exists: {}",
+                destination.display()
+            ));
+        }
+        if complete {
+            // Orphaned but complete runtime clone: the template index entry
+            // was removed (e.g. `template rm`, `remove_template`) but the
+            // clone was left behind. Reuse it and re-materialise the index
+            // entry — faster than re-cloning hundreds of megabytes, and
+            // this is exactly the "delete template then reinstall" flow.
+            let marker: serde_json::Value = fs::read_to_string(
+                destination.join(".dshbox-runtime.json"),
+            )
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+            let commit = marker
+                .get("commit")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            write_pulled_base_template(root, &parsed, ref_value, &commit, destination.to_str())?;
+            return Ok(parsed.version);
+        }
+        // Incomplete clone (half-removed, or killed mid-download): discard
+        // the partial directory and re-clone from scratch. A dangling
+        // `.dshbox-runtime.json` and/or partial checkout is not usable.
+        remove_checkout(&destination);
+    }
+    fs::create_dir_all(
+        destination
+            .parent()
+            .ok_or("invalid template destination")?,
+    )
+    .map_err(|error| format!("cannot create template destination: {error}"))?;
+    // Route the clone through the configured GitHub mirror (if any): the
+    // mirror covers git transfers too, otherwise clones hit github.com
+    // directly and fail with SSL errors on networks that block it.
+    let mirror = read_config().ok().and_then(|config| config.github_mirror);
+    let target = mirror_url(&parsed.url, mirror.as_deref());
+    // `latest` is the "default branch" convention; clones resolve HEAD
+    // instead of failing with `revspec 'latest' not found`. Display paths
+    // (template list, version picker) keep the literal `latest` tag.
+    let revision = parsed.tag.as_deref().filter(|tag| *tag != "latest");
+    let commit = match shallow_clone_with_cancel(
+        &target,
+        &destination,
+        revision,
+        cancelled,
+    ) {
+        Ok(commit) => commit,
+        Err(error) => {
+            remove_checkout(&destination);
+            return Err(error);
+        }
+    };
+    fs::write(
+        destination.join(".dshbox-runtime.json"),
+        serde_json::json!({
+            "version": parsed.version,
+            "from": ref_value,
+            "commit": commit,
+        })
+        .to_string(),
+    )
+    .map_err(|error| format!("cannot write runtime metadata: {error}"))?;
+    // Materialise the base `<root>/templates/<ref-sanitized>.dsh` script so
+    // the harness tag (e.g. `latest` or `v0.1.0`) is part of the filename
+    // and two distinct refs do not overwrite each other.
+    write_pulled_base_template(root, &parsed, &ref_value, &commit, destination.to_str())?;
+    info!(version = %parsed.version, commit = %commit, "template pull complete");
+    Ok(parsed.version)
+}
+
+/// Write the base `.dsh` script a `pull_template` produces. The script
+/// body lives in the content-addressable hash directory; the index keeps
+/// the user-facing ref (e.g. `github.com/deepseek-ai/deepseek-harness:latest`)
+/// as the template name. A legacy alias is also written so `build_image`
+/// can resolve templates by their DSH version (`latest`, `v0.1.0`) without
+/// re-plumbing the build path.
+fn write_pulled_base_template(
+    root: &str,
+    parsed: &TemplateRef,
+    ref_value: &str,
+    _commit: &str,
+    _runtime_subdir: Option<&str>,
+) -> Result<(), String> {
+    let body = format!("FROM {ref_value}\nPROFILE web\nNAME {ref_value}\nVERSION latest\n");
+    // Always store the template under `<ref>:<version>` so the name shown
+    // by `template ls` / the UI Resources page carries the version tag
+    // explicitly. A bare `github.com/<owner>/<repo>` pull still gets the
+    // `:latest` suffix, matching how the harness tag is documented.
+    let name = match &parsed.tag {
+        Some(_tag) => ref_value.to_owned(),
+        None => format!("{ref_value}:latest"),
+    };
+    // Always surface a non-empty `version` so the UI / CLI can render the
+    // template's harness tag column. A bare pull resolves to `:latest`.
+    let harness_ref = Some(parsed.tag.clone().unwrap_or_else(|| "latest".to_owned()));
+    let kind = classify_kind(ref_value);
+    let _ = write_template_with_entry(
+        root,
+        &name,
+        &body,
+        harness_ref,
+        "web",
+        Some(ref_value.to_owned()),
+        now_seconds(),
+        kind,
+    )?;
+    // Legacy flat alias — keep writing it so older `build_image` callers
+    // (and CLI users resolving templates by `latest`/`v0.1.0`) continue
+    // to find the script body at the path they expect.
+    let legacy = harness_template_path(root, &parsed.version);
+    let _ = std::fs::write(&legacy, &body);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use box_foundation::now_seconds;
+
+    fn fixture(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dshbox-versions-{}-{}-{name}",
+            std::process::id(),
+            now_seconds()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        // A finished install carries the completion marker written by
+        // `pull_template`; `.git` alone means a clone still in flight.
+        let source = dir.join("runtimes/v0.1.0/source");
+        fs::create_dir_all(source.join(".git")).unwrap();
+        fs::write(
+            source.join(".dshbox-runtime.json"),
+            "{\"version\":\"v0.1.0\",\"commit\":\"deadbeef\"}",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn catalog(names: &[&str]) -> Vec<String> {
+        let mut versions: Vec<DshVersion> = names
+            .iter()
+            .map(|name| DshVersion { name: (*name).to_owned(), installed: false })
+            .collect();
+        sort_catalog(&mut versions);
+        versions.into_iter().map(|version| version.name).collect()
+    }
+
+    #[test]
+    fn the_catalog_reads_newest_first_with_latest_on_top() {
+        // The Harness tab listed `dsh-v0.1.0-rc.7` first and `latest` last, because
+        // the entries were collected into a `BTreeMap` and handed out in the byte
+        // order of their names — the oldest release at the top, the moving
+        // reference the others are cut from at the bottom.
+        assert_eq!(
+            catalog(&["dsh-v0.1.0-rc.7", "latest", "dsh-v0.1.6-alpha.2", "dsh-v0.1.5-rc.2"]),
+            vec!["latest", "dsh-v0.1.6-alpha.2", "dsh-v0.1.5-rc.2", "dsh-v0.1.0-rc.7"]
+        );
+    }
+
+    #[test]
+    fn a_two_digit_number_is_not_read_as_a_string() {
+        // Byte order compares the `1` of `10` against the `2` of `2` and stops, so
+        // 0.1.10 was going to sort above 0.1.2 the first time DSH shipped one.
+        assert_eq!(
+            catalog(&["dsh-v0.1.2-rc.1", "dsh-v0.1.10-alpha.1", "dsh-v0.1.9"]),
+            vec!["dsh-v0.1.10-alpha.1", "dsh-v0.1.9", "dsh-v0.1.2-rc.1"]
+        );
+    }
+
+    #[test]
+    fn a_release_outranks_its_own_pre_releases() {
+        // `0.1.6` is the release `0.1.6-alpha.2` was cut from. Deriving the order
+        // would have said the opposite: an empty identifier list compares less than
+        // a non-empty one.
+        assert_eq!(
+            catalog(&["dsh-v0.1.6-alpha.2", "dsh-v0.1.6", "dsh-v0.1.6-rc.1"]),
+            vec!["dsh-v0.1.6", "dsh-v0.1.6-rc.1", "dsh-v0.1.6-alpha.2"]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_name_is_still_listed() {
+        // A tag that is neither `latest` nor a version keeps a place, at the end
+        // and in name order, rather than being dropped from the list.
+        assert_eq!(
+            catalog(&["zzz-custom", "dsh-v0.1.0", "aaa-custom", "latest"]),
+            vec!["latest", "dsh-v0.1.0", "aaa-custom", "zzz-custom"]
+        );
+    }
+
+    #[test]
+    fn in_flight_clone_is_not_reported_installed() {
+        let dir = fixture("in-flight");
+        // Simulate a harness clone that started (`.git` created) but has
+        // not finished (no marker yet): it must not count as installed,
+        // otherwise the UI shows "installed" mid-download.
+        let source = dir.join("runtimes/latest/source");
+        fs::create_dir_all(source.join(".git")).unwrap();
+        let versions = installed_versions(dir.to_str().unwrap()).unwrap();
+        assert_eq!(versions, vec!["v0.1.0"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_template_ref_defaults_to_latest() {
+        let parsed = parse_template_ref("github.com/deepseek-ai/deepseek-harness").unwrap();
+        assert_eq!(parsed.url, "https://github.com/deepseek-ai/deepseek-harness");
+        assert_eq!(parsed.tag, None);
+        assert_eq!(parsed.version, "latest");
+    }
+
+    #[test]
+    fn sanitize_template_ref_keeps_url_separators() {
+        // With the hash-addressed layout the template body lives under
+        // `<hash>/script.dsh`; `_sanitize_template_ref` is only kept for
+        // the legacy flat-file alias so it must keep URL separators around
+        // (only `\` is folded) to read more naturally.
+        assert_eq!(
+            sanitize_template_ref("github.com/deepseek-ai/deepseek-harness:latest"),
+            "github.com/deepseek-ai/deepseek-harness:latest"
+        );
+        assert_eq!(
+            sanitize_template_ref("  github.com/foo/bar  "),
+            "github.com/foo/bar"
+        );
+    }
+
+    #[test]
+    fn parse_template_ref_latest_is_preserved_for_display() {
+        // The parse layer keeps `latest` as the version tag so the templates
+        // list and version picker show it; `pull_template` separately maps
+        // `latest` to the repository HEAD before cloning.
+        let parsed = parse_template_ref("github.com/deepseek-ai/deepseek-harness:latest").unwrap();
+        assert_eq!(parsed.url, "https://github.com/deepseek-ai/deepseek-harness");
+        assert_eq!(parsed.tag.as_deref(), Some("latest"));
+        assert_eq!(parsed.version, "latest");
+    }
+
+    #[test]
+    fn parse_template_ref_accepts_colon_tag() {
+        let parsed =
+            parse_template_ref("github.com/deepseek-ai/deepseek-harness:v0.1.0").unwrap();
+        assert_eq!(parsed.tag.as_deref(), Some("v0.1.0"));
+        assert_eq!(parsed.version, "v0.1.0");
+    }
+
+    #[test]
+    fn parse_template_ref_accepts_at_ref() {
+        let parsed =
+            parse_template_ref("github.com/deepseek-ai/deepseek-harness@v0.1.0").unwrap();
+        assert_eq!(parsed.tag.as_deref(), Some("v0.1.0"));
+        assert_eq!(parsed.version, "v0.1.0");
+    }
+
+    #[test]
+    fn parse_template_ref_rejects_unknown_hosts() {
+        assert!(parse_template_ref("example.com/foo/bar").is_err());
+    }
+}

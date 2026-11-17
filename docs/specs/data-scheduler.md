@@ -1,6 +1,10 @@
 # Data scheduler specification
 
-Status: schema-10 design, 2026-08-20.
+Status: schema-10 design, 2026-08-20. The implementation that carries this
+contract now lives in the `box-state` crate
+(`crates/domain/box-state/src/{resource_map,deletion_queue,deletion_worker}.rs`);
+the crate that used to be named `box-data-scheduler` was merged into it
+because it had exactly one consumer.
 
 ## Single source of truth
 

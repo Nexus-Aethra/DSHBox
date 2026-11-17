@@ -2,20 +2,31 @@ import { copyFile, mkdir, utimes, writeFile } from 'node:fs/promises'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { arch, env, platform } from 'node:process'
 import { spawnSync } from 'node:child_process'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { hashInputs, isFresh } from './mtime.mjs'
 
 // Extract every `path = "../<crate>"` reference from dshboxd's Cargo.toml
 // so we can scope the mtime gate to crates that actually feed the daemon.
 // Hash-mismatches in unrelated crates fall through to the hash cache below.
+// Resolve every path dependency of a manifest to a directory that really holds a
+// Cargo.toml. Path-based on purpose: the crates live in layer directories
+// (core/, domain/, edge/, apps/), so a name-shaped guess like crates/<name>
+// would stop matching after a move -- and then the mtime gate below would watch
+// nothing at all while still reporting success.
 function readLocalDeps(manifestPath) {
   const text = readFileSync(manifestPath, 'utf8')
+  const manifestDir = dirname(manifestPath)
   const deps = new Set()
-  const re = /path\s*=\s*"\.\.\/([\w-]+)"/g
+  const re = /path\s*=\s*"([^"]+)"/g
   let match
-  while ((match = re.exec(text)) !== null) deps.add(match[1])
-  // Always include dshboxd's own crate directory.
-  deps.add('dshboxd')
+  while ((match = re.exec(text)) !== null) {
+    const resolved = resolve(manifestDir, match[1])
+    // Skips a [[bin]] path such as src/main.rs: that is a file, not a crate root.
+    if (!existsSync(join(resolved, 'Cargo.toml'))) continue
+    deps.add(resolved)
+  }
+  // Always include the crate's own directory.
+  deps.add(manifestDir)
   return [...deps].sort()
 }
 
@@ -33,17 +44,18 @@ const force = process.argv.includes('--force')
 // mtime gate: rebuild whenever a source that actually feeds the daemon
 // is newer than the existing sidecar. We only watch crates that dshboxd
 // depends on (per its Cargo.toml), so an unrelated crate edit (e.g.
-// box-data-scheduler, which dshboxd doesn't use) won't force a needless
-// rebuild. Cross-crate edits in transitive dependencies still trip this
+// box-browser, which dshboxd reaches only through box-containers) won't force a
+// needless rebuild. Cross-crate edits in transitive dependencies still trip this
 // because Cargo.lock + the affected crate are included.
-const localDeps = readLocalDeps(join('src-tauri', 'crates', 'dshboxd', 'Cargo.toml'))
+const dshboxdManifest = join('src-tauri', 'crates', 'apps', 'dshboxd', 'Cargo.toml')
+const localDeps = readLocalDeps(dshboxdManifest)
 const sources = [
-  ...localDeps.map((name) => join('src-tauri', 'crates', name)),
+  ...localDeps,
   // The helper is staged by this script too, so its sources must count as
   // staleness for both artifacts. Without this, editing only the helper left the
   // previously staged copy in every installer -- the exact drift that building
   // the two together exists to prevent.
-  join('src-tauri', 'crates', 'box-helper'),
+  join('src-tauri', 'crates', 'apps', 'box-helper'),
   // Profiles, features and workspace dependencies live here; a change to any of
   // them changes both artifacts, and neither gate used to look at this file.
   join('src-tauri', 'Cargo.toml'),
@@ -55,7 +67,7 @@ const sources = [
 // hold is one-directional: **every hash input must also be watched by mtime**.
 // Then any real change trips the gate first, so the digest is never the only
 // thing standing between a user and a stale artifact. The reverse is deliberate
-// -- the twenty dependency crates are watched for mtime but not hashed, because
+// -- the dependency crates are watched for mtime but not hashed, because
 // hashing them would cost more than the rebuild it might save. Hashing a file
 // nobody watches is what would be silent: a change there would not even be
 // looked at.
@@ -65,12 +77,44 @@ const cacheFile = join(cacheRoot, `${target}.sha256`)
 const inputs = [
   join('src-tauri', 'Cargo.toml'),
   join('src-tauri', 'Cargo.lock'),
-  join('src-tauri', 'crates', 'dshboxd', 'Cargo.toml'),
-  join('src-tauri', 'crates', 'dshboxd', 'build.rs'),
-  ...walkRustFiles(join('src-tauri', 'crates', 'dshboxd', 'src')),
-  join('src-tauri', 'crates', 'box-helper', 'Cargo.toml'),
-  ...walkRustFiles(join('src-tauri', 'crates', 'box-helper', 'src')),
+  dshboxdManifest,
+  join('src-tauri', 'crates', 'apps', 'dshboxd', 'build.rs'),
+  ...walkRustFiles(join('src-tauri', 'crates', 'apps', 'dshboxd', 'src')),
+  join('src-tauri', 'crates', 'apps', 'box-helper', 'Cargo.toml'),
+  ...walkRustFiles(join('src-tauri', 'crates', 'apps', 'box-helper', 'src')),
 ]
+
+// The stamp records *which build batch* produced the staged artifacts, so it
+// cannot be invented: a cache hit knows the artifacts are current with the
+// sources, but not the id they were compiled under. Writing "now" there produced
+// a stamp naming a batch that never existed -- the staged daemon would report one
+// id while a desktop rebuilt afterwards embedded the other, and the pair would
+// disagree about being stale forever.
+//
+// Absence of the stamp is therefore a miss, not a hit: it means the artifacts
+// were produced by something other than a staged batch (an earlier build whose
+// stamp was cleaned, a partially restored tree), and the only honest way to get
+// a batch id for them is to build them. That is cheap when nothing changed --
+// cargo relinks or reuses -- and it is the one path that closes the loop where
+// the release-mode panic tells the reader to run this script and the script then
+// did nothing.
+const stampFile = join('src-tauri', '.build-stamp')
+// An empty stamp counts as absent: build.rs treats it the same way, because a
+// zero-byte file would otherwise let a release build embed an empty batch id.
+// An unreadable one is treated as absent too -- a lock or a permission problem
+// should send us down the rebuild path (which will fail loudly if the file really
+// cannot be written) rather than out of this script with a raw exception.
+function readStamp(file) {
+  try {
+    return readFileSync(file, 'utf8').trim()
+  } catch {
+    return ''
+  }
+}
+const stamped = readStamp(stampFile) !== ''
+if (!stamped && !force) {
+  console.log('no build stamp: the staged artifacts do not name a build batch, so they are rebuilt')
+}
 
 if (!isFresh(destination, sources, force) || !isFresh(helperDestination, sources, force)) {
   // Stale → rebuild. Record the digest *before* compiling, so it describes the
@@ -81,7 +125,7 @@ if (!isFresh(destination, sources, force) || !isFresh(helperDestination, sources
   await rebuild(destination, target, force)
   process.exit(0)
 }
-if (hashInputs(cacheFile, inputs, force) && existsSync(destination) && existsSync(helperDestination)) {
+if (stamped && hashInputs(cacheFile, inputs, force) && existsSync(destination) && existsSync(helperDestination)) {
   console.log(`server sidecar inputs unchanged (hash cache hit at ${cacheFile}); skipping cargo build`)
   process.exit(0)
 }

@@ -12,10 +12,10 @@ shelling out to the `dshbox` CLI and scraping stdout.
 
 ## Wire contract
 
-Verified against `src-tauri/crates/dshboxd/src/main.rs`. The details below
+Verified against `src-tauri/crates/apps/dshboxd/src/main.rs`. The details below
 are the ones that are easy to get wrong:
 
-- **`POST /rpc` is matched exactly.** `path != "//rpc"` is a 404, so the
+- **`POST /rpc` is matched exactly.** `path != "/rpc"` is a 404, so the
   path must carry no query string.
 - **The token travels in the JSON body**, not in an `Authorization`
   header. `box-client` also sends `Bearer`, but the daemon never reads it.

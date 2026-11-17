@@ -100,10 +100,10 @@ DSH Box separates a Tauri **desktop shell**, a framework-free Rust workspace, a 
 |---|---|---|
 | Frontend (React 18 + Vite, `src/`) | Pages, components, `useTaskQueue`/`useContainers`/`useResources`/`useSettings` hooks. **No business logic** — pages fire RPC requests and react to daemon SSE events. | Keeps the Box UI thin and lets any client (UI/CLI/agent) share the same code path. |
 | Desktop shell (Tauri 2, `src-tauri/src/`) | Browser window, tray, Tauri IPC adapters. Listens on `127.0.0.1` to the daemon's loopback HTTP server. All real work is delegated to `dshboxd` over HTTP RPC. | One source of truth for state changes — UI and CLI cannot drift. |
-| Daemon (`src-tauri/crates/dshboxd`) | Long-lived background service. Owns the queue, the data store, the template index, container registry, and the SSE event bus. Single HTTP entry point (`POST /rpc`) plus `GET /events?token=…`. | Background work (installs, rebuilds, uninstalls) survives the desktop window closing. |
-| Crate workspace (`src-tauri/crates/`) | Framework-free Rust crates: `box-foundation`, `box-runtime`, `box-scheduler`, `box-state`, `box-toolchains`, `box-dsh-versions`, `box-containers`, `box-extensions`, `box-image`, `box-template-core`, `box-data-scheduler`, `box-logger`, `box-server-core`, `box-browser`, `box-api`, `box-client`. | Pure functions + unit tests; only the top-level `dshbox` binary and `dshboxd` link Tauri/HTTP. |
+| Daemon (`src-tauri/crates/apps/dshboxd`) | Long-lived background service. Owns the queue, the data store, the template index, container registry, and the SSE event bus. Single HTTP entry point (`POST /rpc`) plus `GET /events?token=…`. | Background work (installs, rebuilds, uninstalls) survives the desktop window closing. |
+| Crate workspace (`src-tauri/crates/`) | Framework-free Rust crates in four layers — `core/` (`box-foundation`, `box-runtime`, `box-store`, `box-scheduler`, `box-api`), `domain/` (`box-state`, `box-containers`, `box-image`, `box-resources`, `box-extensions`, `box-plugin-graph`, `box-toolchains`, `box-dsh-versions`, `box-updates`, `box-template-core`, `box-browser`), `edge/` (`box-client`, `box-server-core`), `apps/` (`dshboxd`, `box-helper`). | Pure functions + unit tests; only the top-level `dshbox` package links Tauri. `pnpm layers:check` fails a crate that reaches across a boundary. |
 
-The dependency direction is one-way: `foundation / runtime / scheduler / state` → functional crates → Tauri/desktop adapters. Feature crates do not depend on Tauri or one another's mutable state.
+The dependency direction is one-way and enforced: `apps → edge → domain → core`. A crate in `core/` cannot reach business code, `domain/` sees only `core` and itself, and the Tauri package uses the three lower layers but never a binary under `apps/`. Feature crates do not depend on Tauri or one another's mutable state. `scripts/check-layering.mjs` (`pnpm layers:check`, run by every packaging path including the release workflow) reads the graph from `cargo metadata` and fails the build on a crossing.
 
 ### Daemon — dual-mode RPC + SSE event stream
 
@@ -389,26 +389,31 @@ The SDK also exposes it without the UI: `dshbox update status|check|download|ins
 ```
 src/                       React/TypeScript management UI
 src-tauri/                 Rust workspace + Tauri shell
-  crates/                  focused, framework-free crates
-    box-foundation         config, paths, document collections
-    box-store              SQLite document store + legacy import
-    box-runtime            absolute-path process exec
-    box-scheduler          persisted task queue + locks
-    box-state              ResourceStateManager (read model)
-    box-toolchains         bundled Node/pnpm resolver
-    box-dsh-versions       DSH GitHub catalogue (harness tag + installs)
-    box-containers         Container metadata + active Host registry
-    box-extensions         repository plugin/skill scan + transfer
-    box-image              .dsh parser, manifest v6, gzip tar I/O
-    box-plugin-graph       plugin dependency scan + graph assembly
-    box-resources          resource kinds, extraction and injection
-    box-template-core      root/common template install/uninstall core
-    box-data-scheduler     soft-delete + dual-queue async hard-delete
-    box-logger             tracing init + daily-rolled log files
-    box-containers         container metadata + active host registry
-    box-server-core        dshboxd helpers + service install
-    box-browser            headless Chromium + DevTools sessions
-    box-api, box-client    RPC surface + client adapter
+  crates/                  focused, framework-free crates, in four layers:
+    core/                  no business knowledge, never reaches upward
+      box-foundation       config, paths, document collections, logging
+      box-store            SQLite document store + legacy import
+      box-runtime          absolute-path process exec
+      box-scheduler        persisted task queue + locks
+      box-api              wire types every layer shares
+    domain/                business capabilities, a DAG among themselves
+      box-state            ResourceStateManager, resource map, deletion queue
+      box-toolchains       bundled Node/pnpm resolver
+      box-dsh-versions     DSH GitHub catalogue (harness tag + installs)
+      box-containers       container metadata + active Host registry
+      box-extensions       repository plugin/skill scan + transfer
+      box-image            .dsh parser, manifest v6, gzip tar I/O
+      box-plugin-graph     plugin dependency scan + graph assembly
+      box-resources        resource kinds, extraction and injection
+      box-template-core    root/common template install/uninstall core
+      box-browser          headless Chromium + DevTools sessions
+      box-updates          release discovery + verified installer metadata
+    edge/                  the process boundary
+      box-server-core      dshboxd helpers + service install
+      box-client           RPC client adapter
+    apps/                  the two binaries
+      dshboxd              control plane (POST /rpc + GET /events)
+      box-helper           node agent
   src/desktop/app/         domain modules (containers, extensions, tasks, …)
   tools/runtime-packager   bundled Node/pnpm/Git runtime packager
 plugins/                   dsh-box-sandbox — the agent tool plugin
