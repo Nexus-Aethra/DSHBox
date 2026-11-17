@@ -8,7 +8,7 @@
 //   core   -> core only            (no business knowledge, ever)
 //   domain -> core + domain        (business capabilities, a DAG among themselves)
 //   edge   -> core + domain + edge (wire types, transport, client adapter)
-//   apps   -> anything, but not another app
+//   apps   -> core + domain + edge + apps, but not another app (and not tools/)
 //   tools  -> core + domain + edge (a build tool never links a binary)
 //   root   -> core + domain + edge (the Tauri package never links a binary)
 //

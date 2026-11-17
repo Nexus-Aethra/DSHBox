@@ -56,10 +56,12 @@ For comparison, `boxfile.dsh` (in the same directory) is a minimal
   Adding a new prefix there is the only code change needed to
   support a new spec shape.
 
-- **Fetcher**: `src-tauri/crates/apps/dshboxd/src/data.rs` routes each
-  `ParsedSource` variant to the right fetcher — local dir import,
-  `npm pack`, git clone, tarball unpack, etc. (`sealed.rs` and
-  `extensions.rs` route the variants they own.)
+- **Fetcher**: `src-tauri/crates/apps/dshboxd/src/extensions.rs` resolves the
+  `ParsedSource` variants an `ADD plugin` inside a boxfile can name — the
+  `npm pack` invocation at `:85`, the bare name/scope/version arm at `:327`, and the
+  GitHub/tarball prefixes through `pnpm_plugin_spec` in `sealed.rs:563`.
+  `sealed.rs` is the sealed-template build path; `data.rs` is a different verb
+  (`ADD data`), not the plugin fetcher.
 
 - **Workspace promotion**: `src-tauri/crates/apps/dshboxd/src/bundles.rs::install_container_plugin`
   rewrites `link:` → `workspace:*` and injects `dangerouslyAllowAllBuilds: true`
