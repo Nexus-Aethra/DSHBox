@@ -44,8 +44,8 @@ const force = process.argv.includes('--force')
 // mtime gate: rebuild whenever a source that actually feeds the daemon
 // is newer than the existing sidecar. We only watch crates that dshboxd
 // depends on (per its Cargo.toml), so an unrelated crate edit (e.g.
-// box-data-scheduler, which dshboxd doesn't use) won't force a needless
-// rebuild. Cross-crate edits in transitive dependencies still trip this
+// box-browser, which dshboxd reaches only through box-containers) won't force a
+// needless rebuild. Cross-crate edits in transitive dependencies still trip this
 // because Cargo.lock + the affected crate are included.
 const dshboxdManifest = join('src-tauri', 'crates', 'apps', 'dshboxd', 'Cargo.toml')
 const localDeps = readLocalDeps(dshboxdManifest)
@@ -84,6 +84,17 @@ const inputs = [
   ...walkRustFiles(join('src-tauri', 'crates', 'apps', 'box-helper', 'src')),
 ]
 
+// The stamp is part of "is the staged artifact a real batch": without one, a
+// release build of the desktop or the daemon refuses to run (build.rs panics),
+// and this script is the command that error tells the reader to run. So a
+// populated hash cache with the artifacts present but *no* stamp must not take
+// the skip path -- it did, and the recommended remedy then left the reader in a
+// loop: release build fails, run this, "inputs unchanged", release build fails
+// identically. A stamp is cheap to write and cannot be wrong: the artifacts it
+// describes are already on disk and unchanged.
+const stampFile = join('src-tauri', '.build-stamp')
+const stamped = existsSync(stampFile)
+
 if (!isFresh(destination, sources, force) || !isFresh(helperDestination, sources, force)) {
   // Stale → rebuild. Record the digest *before* compiling, so it describes the
   // inputs that are about to be built: written afterwards (as it was on the miss
@@ -95,6 +106,14 @@ if (!isFresh(destination, sources, force) || !isFresh(helperDestination, sources
 }
 if (hashInputs(cacheFile, inputs, force) && existsSync(destination) && existsSync(helperDestination)) {
   console.log(`server sidecar inputs unchanged (hash cache hit at ${cacheFile}); skipping cargo build`)
+  if (!stamped) {
+    // Nothing is rebuilt, but the artifacts on disk are declared to belong to a
+    // build batch so the release builds this script is the documented fix for
+    // can actually start.
+    const stamp = String(Math.floor(Date.now() / 1000))
+    await writeFile(stampFile, `${stamp}\n`)
+    console.log(`restored missing build stamp: ${stamp} (${stampFile})`)
+  }
   process.exit(0)
 }
 await rebuild(destination, target, force)

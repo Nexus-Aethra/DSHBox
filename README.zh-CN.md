@@ -96,7 +96,7 @@ DSH Box 拆成 Tauri **桌面外壳**、一个不依赖框架的 Rust workspace�
 | 前端（React 18 + Vite，`src/`） | 页面、组件、`useTaskQueue`/`useContainers`/`useResources`/`useSettings` 等 hook。**没有业务逻辑**——页面只发 RPC 并对 daemon 的 SSE 事件做出反应。 | 让 Box 界面保持轻薄，并让任何客户端（界面/CLI/agent）共用同一条代码路径。 |
 | 桌面外壳（Tauri 2，`src-tauri/src/`） | 浏览器窗口、托盘、Tauri IPC 适配层。通过 loopback HTTP 与 daemon 通信。所有实际工作都交给 `dshboxd`。 | 状态变更只有一个源头，界面与 CLI 不会各自漂移。 |
 | Daemon（`src-tauri/crates/dshboxd`） | 常驻后台服务。拥有任务队列、文档存储、模板索引、容器注册表和 SSE 事件总线。单一 HTTP 入口（`POST /rpc`）加 `GET /events?token=…`。 | 安装、重建、卸载等后台工作不会随窗口关闭而中断。 |
-| Crate workspace（`src-tauri/crates/`） | 不依赖框架的 Rust crate：`box-foundation`、`box-runtime`、`box-scheduler`、`box-state`、`box-toolchains`、`box-dsh-versions`、`box-containers`、`box-extensions`、`box-image`、`box-template-core`、`box-data-scheduler`、`box-logger`、`box-server-core`、`box-browser`、`box-api`、`box-client`。 | 纯函数 + 单元测试；只有顶层 `dshbox` 与 `dshboxd` 链接 Tauri/HTTP。 |
+| Crate workspace（`src-tauri/crates/`） | 不依赖框架的 Rust crate，分四层 `core/`（`box-foundation`、`box-runtime`、`box-store`、`box-scheduler`、`box-api`）、`domain/`（`box-state`、`box-containers`、`box-image`、`box-resources`、`box-extensions`、`box-plugin-graph`、`box-toolchains`、`box-dsh-versions`、`box-updates`、`box-template-core`、`box-browser`）、`edge/`（`box-client`、`box-server-core`）、`apps/`（`dshboxd`、`box-helper`）。 | 纯函数 + 单元测试；只有顶层 `dshbox` 与 `dshboxd` 链接 Tauri/HTTP。越过层边界的 crate 会被 `pnpm layers:check` 判红。 |
 
 依赖方向是单向的：`foundation / runtime / scheduler / state` → 功能 crate → Tauri/桌面适配层。功能 crate 不依赖 Tauri，也不依赖彼此的易变状态。
 
@@ -365,26 +365,31 @@ Windows 与 macOS 支持原地安装：应用关闭后，一个已脱离的辅�
 ```
 src/                       React/TypeScript 管理界面
 src-tauri/                 Rust workspace + Tauri 外壳
-  crates/                  不依赖框架的细分 crate
-    box-foundation         配置、路径、文档集合
-    box-store              SQLite 文档存储 + 旧格式导入
-    box-runtime            绝对路径进程执行
-    box-scheduler          持久化任务队列 + 锁
-    box-state              ResourceStateManager（读模型）
-    box-toolchains         捆绑 Node/pnpm 解析
-    box-dsh-versions       DSH GitHub 目录（harness tag + 安装）
-    box-containers         容器元数据 + 活动宿主注册表
-    box-extensions         资源库插件/技能扫描与传输
-    box-image              .dsh 解析、manifest v6、gzip tar I/O
-    box-plugin-graph       插件依赖扫描与图组装
-    box-resources          资源 kind、提取与注入
-    box-template-core      根/通用模板安装卸载核心
-    box-data-scheduler     软删除 + 双队列异步硬删除
-    box-logger             tracing 初始化与按天滚动日志
-    box-containers         容器元数据 + 运行中的 host 注册表
-    box-server-core        dshboxd 辅助 + 服务安装
-    box-browser            无头 Chromium + DevTools 会话
-    box-api, box-client    RPC 面 + 客户端适配
+  crates/                  不依赖框架的细分 crate，分四层：
+    core/                  无业务知识，绝不向上引用
+      box-foundation       配置、路径、文档集合、日志
+      box-store            SQLite 文档存储 + 旧格式导入
+      box-runtime          绝对路径进程执行
+      box-scheduler        持久化任务队列 + 锁
+      box-api              各层共享的线路类型
+    domain/                业务能力，彼此构成 DAG
+      box-state            ResourceStateManager、资源表、删除队列
+      box-toolchains       捆绑 Node/pnpm 解析
+      box-dsh-versions     DSH GitHub 目录（harness tag + 安装）
+      box-containers       容器元数据 + 活动宿主注册表
+      box-extensions       资源库插件/技能扫描与传输
+      box-image            .dsh 解析、manifest v6、gzip tar I/O
+      box-plugin-graph     插件依赖扫描与图组装
+      box-resources        资源 kind、提取与注入
+      box-template-core    根/通用模板安装卸载核心
+      box-browser          无头 Chromium + DevTools 会话
+      box-updates          版本发现 + 校验过的安装包元数据
+    edge/                  进程边界
+      box-server-core      dshboxd 辅助 + 服务安装
+      box-client           RPC 客户端适配
+    apps/                  两个二进制
+      dshboxd              控制面（POST /rpc + GET /events）
+      box-helper           节点代理
   src/desktop/app/         领域模块（containers、extensions、tasks……）
   tools/runtime-packager   捆绑 Node/pnpm/Git 运行时打包器
 plugins/                   dsh-box-sandbox —— agent 工具插件

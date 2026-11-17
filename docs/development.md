@@ -100,31 +100,40 @@ package depends on Tauri. It owns windows and IPC adapters; business behavior
 lives in framework-free crates.
 
 ```text
-box-foundation     paths, config, document-store contract, JSON persistence, validation
-box-api            IPC DTOs shared by the daemon, the desktop and the CLI
-box-store          SQLite document-store backend + legacy JSON import
-box-scheduler      task records, locks, cancellation, recovery
-box-runtime        absolute-path process execution and libgit2 checkout
-box-logger         tracing init and daily-rolled log files
-box-toolchains     bundled Node/npm/pnpm resolution
-box-dsh-versions   Harness release catalogue, install/remove
-box-containers     container metadata and host registry
-box-extensions     repository plugin/skill scan, import, export
-box-image          .dsh parser and template manifest handling
-box-resources      container resource kinds, extraction, injection
-box-plugin-graph   cordis service graph, read from source and lockfiles
-box-template-core  template resources on top of the data scheduler
-box-data-scheduler resource map + durable task queue
-box-containers     container metadata + active host registry
-box-state          ResourceStateManager read model
-box-server-core    dshboxd helpers and user-service install
-box-client         RPC client used by the desktop and the CLI
-dshboxd            sidecar binary: scheduler-backed lifecycle + HTTP RPC
-dshbox             Tauri shell and CLI adapters (the only Tauri-dependent package)
+core/
+  box-foundation       paths, config, document-store contract, JSON, validation, logging
+  box-api              wire types shared by the daemon, the desktop and the CLI
+  box-store            SQLite document-store backend + legacy JSON import
+  box-scheduler        task records, locks, cancellation, recovery
+  box-runtime          absolute-path process execution and libgit2 checkout
+domain/
+  box-toolchains       bundled Node/npm/pnpm resolution
+  box-dsh-versions     Harness release catalogue, install/remove
+  box-containers       container metadata and host registry
+  box-extensions       repository plugin/skill scan, import, export
+  box-image            .dsh parser and template manifest handling
+  box-resources        container resource kinds, extraction, injection
+  box-plugin-graph     cordis service graph, read from source and lockfiles
+  box-template-core    template resources on top of the state read model
+  box-state            ResourceStateManager, resource map, deletion queue
+  box-updates          release discovery, manifest verification
+  box-browser          headless Chromium and DevTools sessions
+edge/
+  box-server-core      dshboxd helpers and user-service install
+  box-client           RPC client used by the desktop and the CLI
+apps/
+  dshboxd              sidecar binary: scheduler-backed lifecycle + HTTP RPC
+  box-helper           node agent: runs operations on a worker machine
+dshbox                 Tauri shell and CLI adapters (the only Tauri-dependent package)
 ```
 
-Dependency direction is `foundation/runtime/scheduler/state` → functional
-crates → desktop adapters. Feature crates must not depend on Tauri or on one
+Dependency direction is one-way and enforced by `scripts/check-layering.mjs`
+(`pnpm layers:check`, run before every `bundle:*`): `apps → edge → domain →
+core`. `core` never reaches business code, `domain` sees only `core` and
+itself, and the Tauri package uses the three lower layers but never a binary
+under `apps/`. Because the guard reads the graph from `cargo metadata`, every
+manifest spelling is covered and a crate filed outside the four directories is
+reported rather than skipped. Feature crates must not depend on Tauri or on one
 another's mutable state. Long work is submitted to `box-scheduler`; Tauri
 handlers and CLI handlers do not execute it inline.
 

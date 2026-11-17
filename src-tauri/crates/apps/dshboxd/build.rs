@@ -9,14 +9,19 @@ fn main() {
     let release = std::env::var("PROFILE")
         .map(|profile| profile == "release")
         .unwrap_or(false);
-    let stamp_path = walk_up(&crate_dir, ".build-stamp");
+    // The stamp is only valid next to the *application* manifest, which is where
+    // prepare-server writes it. Looking for the bare filename anywhere above the
+    // crate would accept a stray stamp from an unrelated directory (a packed
+    // checkout, an enclosing scratch tree) and embed a build id that names another
+    // batch -- the exact symptom this stamp exists to catch, wearing a green light.
+    let stamp_path = app_manifest_dir(&crate_dir).map(|dir| dir.join(".build-stamp"));
 
-    let stamp = match &stamp_path {
-        Some(path) => {
+    let stamp = match stamp_path.as_deref().map(|path| (path, path.exists())) {
+        Some((path, true)) => {
             println!("cargo:rerun-if-changed={}", path.display());
             std::fs::read_to_string(path).unwrap_or_default()
         }
-        None => {
+        _ => {
             // `.build-stamp` is generated and gitignored, so a fresh clone has none.
             // A *release* build must not embed an empty stamp silently: the only
             // symptom is a client that reports a stale server, which reads like a
@@ -25,12 +30,12 @@ fn main() {
             let hint = "run `pnpm server:prepare` (scripts/prepare-server.mjs) to write src-tauri/.build-stamp";
             if release {
                 panic!(
-                    "cannot find .build-stamp above {}; {hint}",
+                    "cannot find .build-stamp beside the dshbox manifest above {}; {hint}",
                     crate_dir.display()
                 );
             }
             println!(
-                "cargo:warning=no .build-stamp above {}; {hint}",
+                "cargo:warning=no .build-stamp beside the dshbox manifest above {}; {hint}",
                 crate_dir.display()
             );
             String::new()
@@ -44,18 +49,19 @@ fn main() {
     );
 }
 
-/// Walk up from the crate directory until `marker` exists.
-///
-/// Counting parent hops broke once, when `dshboxd` moved into `crates/apps/`: the
-/// build embedded an **empty** stamp and the only symptom was a client that kept
-/// reporting a stale server. Returns `None` when nothing above the crate has the
-/// marker, so the caller decides what a missing marker means.
-fn walk_up(start: &Path, marker: &str) -> Option<PathBuf> {
+// The directory holding the *application* manifest: the Cargo.toml whose package
+// is `dshbox`. Counting parent hops broke once, when `dshboxd` moved into
+// `crates/apps/`; naming the package instead survives any further move, and it is
+// the same anchor `app_version` reads, so the stamp and the version it is embedded
+// beside can never come from two different checkouts.
+fn app_manifest_dir(start: &Path) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
-        let candidate = dir.join(marker);
-        if candidate.exists() {
-            return Some(candidate);
+        let manifest = dir.join("Cargo.toml");
+        if let Ok(text) = std::fs::read_to_string(&manifest) {
+            if text.lines().any(|line| line.trim() == "name = \"dshbox\"") {
+                return Some(dir);
+            }
         }
         if !dir.pop() {
             return None;
@@ -71,22 +77,18 @@ fn walk_up(start: &Path, marker: &str) -> Option<PathBuf> {
 // install report itself as 0.1.0 and therefore claim every published release was an
 // update.
 fn app_version(crate_dir: &Path) -> String {
-    let mut dir = crate_dir.to_path_buf();
-    loop {
-        let manifest = dir.join("Cargo.toml");
-        if let Ok(text) = std::fs::read_to_string(&manifest) {
-            if text.lines().any(|line| line.trim() == "name = \"dshbox\"") {
-                println!("cargo:rerun-if-changed={}", manifest.display());
-                for line in text.lines() {
-                    if let Some(rest) = line.trim().strip_prefix("version = ") {
-                        return rest.trim().trim_matches('"').to_owned();
-                    }
-                }
-                return String::new();
-            }
-        }
-        if !dir.pop() {
-            return String::new();
+    let Some(dir) = app_manifest_dir(crate_dir) else {
+        return String::new();
+    };
+    let manifest = dir.join("Cargo.toml");
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        return String::new();
+    };
+    println!("cargo:rerun-if-changed={}", manifest.display());
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("version = ") {
+            return rest.trim().trim_matches('"').to_owned();
         }
     }
+    String::new()
 }

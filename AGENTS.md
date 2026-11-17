@@ -23,9 +23,12 @@ src/                       React/TypeScript management UI (the "Box" UI)
 src-tauri/                 Rust workspace + Tauri shell
   src/desktop/app/         Tauri modules: containers, extensions, lifecycle, ...
   src/cli/                 CLI subcommands (build, run, container, template, plugin, bundle, ...)
-  crates/                  Framework-free crates (see Architecture below)
-  crates/dshboxd/          Background server sidecar
-  tools/runtime-packager   Bundled Node/pnpm runtime packager
+  crates/                  Framework-free crates, four layers (see Architecture below)
+    core/                  foundation, runtime, store, scheduler, api
+    domain/                business capabilities, a DAG among themselves
+    edge/                  box-client, box-server-core
+    apps/                  dshboxd (sidecar), box-helper (node agent)
+  tools/runtime-packager   Bundled Node/pnpm runtime packager (outside the layers)
 docs/                      development.md, template-system.md, specs/, design/,
                            notes/, releases/
 examples/                  Sample boxfile.dsh and plugin-chains demo
@@ -50,6 +53,9 @@ pnpm tauri build          # desktop binary (passes `--features tauri/custom-prot
 pnpm bundle:windows       # MSI (runs scripts/bundle-windows.mjs)
 pnpm bundle:linux         # .deb/.rpm
 pnpm bundle:macos         # .dmg
+
+# Architecture guard: fails when a crate reaches across a layer boundary
+pnpm layers:check
 
 # Tests
 cd src-tauri && cargo test --workspace            # full Rust suite (160+ passing)
