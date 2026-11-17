@@ -76,9 +76,29 @@ e2e 回归发现上游 DSH `latest`（0.1.2-alpha.1）新增 browser-trust fence
 
 ## 数据库位置
 
-`<runtime>/state/dshbox.db`（`BoxPaths::store_db()`）。WAL 模式，
-`synchronous=NORMAL`。任务日志本体仍是 `logs/tasks/<uuid>.log` 文件（append），
-不进库。
+两个库，不是一个：
+
+| 路径 | 打开方式 | 日志模式 | 装什么 |
+|---|---|---|---|
+| `<runtime>/state/dshbox.db` | `open_document_store_for_paths` | WAL，`synchronous=NORMAL` | 任务、资源记录、产物索引等一切非秘密域 |
+| `<runtime>/state/secrets.db` | `SqliteDocumentStore::open_secrets` | 回滚日志，`synchronous=FULL` | 仅 node 引导密钥与控制面身份 |
+
+任务日志本体仍是 `logs/tasks/<uuid>.log` 文件（append），不进库。
+
+**为什么密钥单独一个库，而且不用 WAL。** WAL 把真实字节放在 `-wal` sidecar
+里，主库只是个近空壳——所以「这个文件是 0600」不再描述数据在哪。PR #51 的
+审核读回字节证实了这点：PSK 与控制面私钥全在 sidecar 里，而 sidecar 由 SQLite
+按默认 umask 创建。不用 WAL，字节就在被 chmod 的那一个文件里。代价是并发：
+回滚日志只允许一个写者，WAL 允许写者与读者并存——这对密钥库合适，对 daemon 与
+桌面共享的主库不合适。
+
+**文件权限，分平台说清。** Unix 上每次 open 都收紧到 0600（不只创建时，早先
+构建留下的宽松文件是被修复而非继承）。Windows 上没有 mode mask，继承才是授予
+访问的东西，所以 secrets.db 用 `SetNamedSecurityInfoW` +
+`PROTECTED_DACL_SECURITY_INFORMATION` 替换整个 DACL，只授予 SYSTEM、创建用户
+与 Administrators；`PROTECTED` 标志是承重的那个，少了它写入的只是额外授予，
+运行时目录该给的照旧。收紧失败是致命的而非降级：主库可以 best-effort，密钥库
+保护失败还继续写正是 PR #51 那件事。
 
 ## 后续域迁移顺序（建议）
 

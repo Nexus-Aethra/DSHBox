@@ -154,6 +154,22 @@ worked). `command_surface` in `desktop/app.rs` diffs the command literals in
 command as done only once the installed app has run it.
 
 ## Known gotchas
+- **A Unix-only test in WSL is a false green unless you check the host.**
+  `wsl -e sh -lc "cargo test ..."` resolves the *Windows* `cargo.exe`, whose host is
+  `x86_64-pc-windows-msvc` — so `#[cfg(unix)]` bodies are compiled out and the test
+  never runs. Two rounds of mutation testing on PR #52 passed 11/11 against a broken
+  secrets store for exactly this reason. The meaningful invocation is the native Linux
+  toolchain, and it must be verified rather than assumed:
+
+      wsl -e sh -lc 'export PATH=$HOME/.cargo/bin:$HOME/.rustup/bin:$PATH; \
+                   cd /mnt/d/dsh/DSHBox/src-tauri && \
+                   rustc -vV | grep host && cargo test -p box-store --offline'
+
+  Expect `host: x86_64-unknown-linux-gnu`. If it says `pc-windows-msvc`, the run
+  proves nothing about the Unix path. The offline cargo cache is shared by symlinking
+  the Windows cache into WSL (`~/.cargo/registry/cache/<mirror>/`), which saves a
+  download — but note the two caches are separate, so a crate present on one side is
+  not necessarily on the other.
 - **The node helper is built with the sidecar, never separately.**
   `scripts/prepare-server.mjs` compiles `dshboxd` and `box-helper` in one cargo
   invocation (so one build stamp covers both) and stages them at
