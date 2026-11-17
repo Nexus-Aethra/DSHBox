@@ -50,13 +50,23 @@ const ALLOWED = {
 // and only its own build script may link `tauri-build`. A domain/ crate that
 // reaches for Tauri drags the whole webview stack into the daemon and the node
 // helper -- both of which must stay headless binaries -- so it is checked here
-// rather than left to a reader of AGENTS.md. The rule is spelled per package
-// rather than as a `^tauri` glob so a future plugin is a deliberate decision,
-// not something the glob already permitted.
-const TAURI_ALLOWED = {
-  dshbox: new Set(['tauri', 'tauri-plugin-dialog', 'tauri-build']),
-}
-const TAURI_FAMILY = /^tauri(-|$)/
+// rather than left to a reader of AGENTS.md.
+//
+// The family is matched by name, not by provenance: cargo metadata cannot tell
+// the real Tauri from an unrelated crate that happens to be called `tauri-utils`,
+// so the rule errs toward refusing both. That is the safe direction -- a false
+// positive fails loudly with a readable message, a false negative ships the
+// webview into the daemon -- and the allow-list below is the escape hatch.
+//
+// `tauri-plugin-*` covers every plugin; `tauri-build` is spelled out separately
+// because it is the one tauri-family name that is not a plugin, and it must be
+// allowed on the root (its build script) while staying forbidden elsewhere.
+// The root may use exactly these three; adding a plugin there is a deliberate
+// edit to this set, which is what makes the AGENTS.md sentence enforceable
+// rather than aspirational.
+const TAURI_FAMILY = /^tauri(-plugin-|$)/
+const TAURI_BUILD = 'tauri-build'
+const ROOT_TAURI_OK = new Set(['tauri', 'tauri-plugin-dialog', 'tauri-build'])
 
 function metadata() {
   if (!existsSync(WORKSPACE_MANIFEST)) {
@@ -162,13 +172,22 @@ for (const pkg of workspace.packages) {
 for (const pkg of workspace.packages) {
   const self = nodes.get(pkg.manifest_path.replace(`${sep}Cargo.toml`, '').split(sep).join('/'))
   if (!self) continue
-  const permitted = TAURI_ALLOWED[self.name]
+  const isRoot = self.layer === 'root'
   for (const dep of pkg.dependencies) {
-    if (!TAURI_FAMILY.test(dep.name)) continue
-    if (permitted?.has(dep.name)) continue
+    // A path dependency named tauri-* is a vendored fork, not the framework:
+    // every path edge already belongs to the layer loop, so this rule stays out
+    // of it. Without this skip a crate could name a local directory `tauri` and
+    // be refused for something that is not Tauri at all.
+    if (dep.path !== undefined) continue
+    if (!TAURI_FAMILY.test(dep.name) && dep.name !== TAURI_BUILD) continue
+    if (isRoot && ROOT_TAURI_OK.has(dep.name)) continue
     const where = dep.kind ?? 'normal'
-    const holder = self.layer === 'root' ? 'the Tauri package' : `${self.layer}/${self.name}`
-    violations.push(`${holder} depends on ${dep.name} (${where}); only the dshbox package may link Tauri`)
+    const holder = isRoot ? 'the Tauri package' : `${self.layer}/${self.name}`
+    violations.push(
+      isRoot
+        ? `the Tauri package depends on ${dep.name} (${where}); the root may only use ${[...ROOT_TAURI_OK].join(', ')}`
+        : `${holder} depends on ${dep.name} (${where}); only the dshbox package may link Tauri`,
+    )
   }
 }
 
