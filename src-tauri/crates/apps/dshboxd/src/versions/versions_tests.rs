@@ -76,7 +76,7 @@ use super::*;
         let temporary = tempfile::tempdir().unwrap();
         let layout = RuntimeLayout::new(temporary.path());
         layout.initialize_schema_10().unwrap();
-        let mut index = PreparedBaseIndex::new();
+        let mut index = super::prepared_base_index::PreparedBaseIndex::new();
         index.insert(
             "latest".to_owned(),
             PreparedBaseRecord {

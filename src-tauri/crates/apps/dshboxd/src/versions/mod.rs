@@ -39,143 +39,28 @@ use crate::{
     },
 };
 
-pub(crate) fn is_safe_version_name(version: &str) -> bool {
-    box_foundation::is_safe_identifier(version)
-}
+mod prepared_base_index;
+mod dsh_catalog;
 
-#[derive(Deserialize)]
-struct GitHubTag {
-    name: String,
-}
+// prepared_base_index is the storage, dsh_catalog is the remote catalogue, and
+// this file is the orchestration that turns one into the other. `pub use` keeps
+// every existing `crate::versions::x` path working.
+pub use prepared_base_index::*;
+use prepared_base_index::{read_prepared_base_index, write_prepared_base_index};
+pub use dsh_catalog::*;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct PreparedBaseRecord {
-    pub(crate) id: String,
-    pub(crate) version: String,
-    pub(crate) source_ref: String,
-    pub(crate) source_commit: String,
-    pub(crate) directory: String,
-    pub(crate) created_at: u64,
-    pub(crate) size_bytes: u64,
-}
 
-type PreparedBaseIndex = BTreeMap<String, PreparedBaseRecord>;
 
-fn prepared_base_index_path(layout: &RuntimeLayout) -> PathBuf {
-    layout.state_dir().join("prepared-bases.json")
-}
 
-fn read_prepared_base_index(layout: &RuntimeLayout) -> Result<PreparedBaseIndex, String> {
-    match fs::read_to_string(prepared_base_index_path(layout)) {
-        Ok(body) => serde_json::from_str(&body)
-            .map_err(|error| format!("cannot parse prepared-base index: {error}")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Err(error) => Err(format!("cannot read prepared-base index: {error}")),
-    }
-}
 
-fn write_prepared_base_index(
-    layout: &RuntimeLayout,
-    index: &PreparedBaseIndex,
-) -> Result<(), String> {
-    atomic_write_json(&prepared_base_index_path(layout), index)
-}
 
-pub(crate) fn prepared_base_for_version(
-    root: &str,
-    version: &str,
-) -> Result<PreparedBaseRecord, String> {
-    let layout = RuntimeLayout::new(root);
-    layout.initialize_schema_10()?;
-    read_prepared_base_index(&layout)?
-        .remove(version)
-        .ok_or_else(|| format!("prepared Harness base `{version}` is not installed"))
-}
 
-/// Return every prepared Harness base that can be used as a direct container
-/// template. This is deliberately shared with the template listing so the
-/// CLI and desktop never disagree about which roots are runnable.
-pub(crate) fn list_prepared_bases(root: &str) -> Result<Vec<PreparedBaseRecord>, String> {
-    let layout = RuntimeLayout::new(root);
-    layout.initialize_schema_10()?;
-    Ok(read_prepared_base_index(&layout)?.into_values().collect())
-}
 
-/// Resolve the canonical FROM reference into its mirror-aware clone URL.
-/// Centralised here so the CLI and the desktop don't reach into
-/// `box_dsh_versions` themselves.
-fn mirror_url_for(ref_value: &str) -> Result<String, String> {
-    let parsed = parse_template_ref(ref_value)
-        .map_err(|error| format!("invalid harness reference: {error}"))?;
-    let mirror = read_config().ok().and_then(|config| config.github_mirror);
-    Ok(mirror_url(&parsed.url, mirror.as_deref()))
-}
 
-/// Fetch the harness version catalog. Primary path is the git protocol via
-/// libgit2 (`ls-remote` equivalent, no system git executable, no GitHub API
-/// rate limits): the harness repo's tags ARE the version list. The GitHub
-/// REST API stays as a fallback for networks where the git transport is
-/// blocked but plain HTTPS works.
-///
-/// The returned list is **never** persisted — it is shown only when the
-/// user explicitly asks to "Load versions", so a one-off network outage
-/// does not produce a stale catalog on disk.
-pub(crate) fn fetch_remote_dsh_tags() -> Result<Vec<String>, String> {
-    let config = read_config()?;
-    let target = mirror_url_for(HARNESS_STANDARD_REF)?;
-    match box_runtime::list_remote_tags(&target) {
-        Ok(tags) => {
-            let filtered: Vec<String> = tags
-                .into_iter()
-                .filter(|name| is_safe_version_name(name))
-                .collect();
-            if !filtered.is_empty() {
-                return Ok(filtered);
-            }
-            // Repo reachable but tagless: fall through to the API so a
-            // legitimately empty ls-remote does not blank the catalog.
-        }
-        Err(error) => {
-            eprintln!("dshboxd: git tag listing failed ({error}); falling back to the GitHub API");
-        }
-    }
-    fetch_remote_dsh_tags_api(config.github_mirror.as_deref())
-}
 
-fn fetch_remote_dsh_tags_api(github_mirror: Option<&str>) -> Result<Vec<String>, String> {
-    use box_dsh_versions::DSH_TAGS_API;
-    let endpoint = mirror_url(DSH_TAGS_API, github_mirror);
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("DSH-Box/0.1")
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|error| format!("cannot create GitHub client: {error}"))?;
-    let response = client
-        .get(&endpoint)
-        .send()
-        .map_err(|error| format!("cannot reach GitHub: {error}"))?;
-    let tags: Vec<GitHubTag> = response
-        .error_for_status()
-        .map_err(|error| format!("GitHub tags request failed: {error}"))?
-        .json()
-        .map_err(|error| format!("cannot parse GitHub tags: {error}"))?;
-    Ok(tags
-        .into_iter()
-        .map(|tag| tag.name)
-        .filter(|name| is_safe_version_name(name))
-        .collect())
-}
 
-/// In-memory refresh kept around as a thin wrapper so the existing
-/// `dsh-catalog-refresh` task semantics do not change for the UI. It used
-/// to write `state/dsh-catalog.json`; now it just touches the network
-/// and prints the result (no persistence, no IPC return value of
-/// consequence — the UI re-queries `list_dsh_catalog` for the merged
-/// list right after the task settles).
-pub(crate) fn refresh_dsh_catalog() -> Result<(), String> {
-    fetch_remote_dsh_tags().map(|_| ())
-}
+
+
 
 /// Pull and prepare a root Harness template. The base is complete: it installs
 /// dependencies and builds the client artifacts (native addon, host/client
@@ -817,127 +702,8 @@ pub(crate) fn uninstall_dsh_version(version: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Build the `DshVersion[]` payload the Harness tab shows. Every entry is
-/// derived from the template index: name = `harness_ref`, `installed` =
-/// `<runtime>/runtimes/<tag>/source/.dshbox-runtime.json` exists.
-///
-/// Remote tags fetched by `refresh_dsh_catalog` are merged in (always
-/// marked `installed = false` unless the template index says otherwise)
-/// so users still see new releases between pulls.
-pub(crate) fn list_dsh_versions_derived(
-    remote_tags: Option<Vec<String>>,
-) -> Result<Vec<DshVersion>, String> {
-    let root = read_config()?
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
 
-    let layout = RuntimeLayout::new(&root);
-    layout.initialize_schema_10()?;
-    let index = read_prepared_base_index(&layout)?;
-    let mut by_name: std::collections::BTreeMap<String, DshVersion> =
-        std::collections::BTreeMap::new();
-    for record in index.values() {
-        if !is_safe_version_name(&record.version) {
-            continue;
-        }
-        let installed = PathBuf::from(&record.directory)
-            .join("manifest.json")
-            .is_file();
-        by_name
-            .entry(record.version.clone())
-            .and_modify(|existing| existing.installed = existing.installed || installed)
-            .or_insert(DshVersion {
-                name: record.version.clone(),
-                installed,
-            });
-    }
 
-    // Remote-only entries (always uninstalled).
-    if let Some(tags) = remote_tags {
-        for tag in tags {
-            if !is_safe_version_name(&tag) {
-                continue;
-            }
-            by_name.entry(tag.clone()).or_insert(DshVersion {
-                name: tag,
-                installed: false,
-            });
-        }
-    }
-
-    // Make sure `latest` shows up even when nothing is installed yet —
-    // it's the implicit default branch reference.
-    by_name.entry("latest".to_owned()).or_insert(DshVersion {
-        name: "latest".to_owned(),
-        installed: false,
-    });
-
-    // Collected by name for dedup, which is also byte order — oldest first, and
-    // `latest` last because `l` sorts after `d`. Ordered for reading instead.
-    let mut versions: Vec<DshVersion> = by_name.into_values().collect();
-    sort_catalog(&mut versions);
-    Ok(versions)
-}
-
-/// Just the `installed` subset — useful for the Container page badge.
-pub(crate) fn list_installed_dsh_versions() -> Result<Vec<String>, String> {
-    let root = read_config()?
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    let layout = RuntimeLayout::new(&root);
-    layout.initialize_schema_10()?;
-    Ok(read_prepared_base_index(&layout)?.into_keys().collect())
-}
-
-/// One-time migration for users that have runtime clones but no template
-/// index entries (older installs that used the legacy `install_dsh_version`
-/// path). For every `runtimes/<tag>/source/.dshbox-runtime.json` that does
-/// not yet have a template index entry, register one with the canonical
-/// `FROM github.com/deepseek-ai/deepseek-harness:<tag>` body.
-///
-/// Idempotent: a second call is a no-op once every runtime is mirrored.
-/// Returns the tags that were registered in this pass so the caller can
-/// surface a diagnostic message.
-#[allow(
-    dead_code,
-    reason = "legacy migration is intentionally not run during rapid schema iteration"
-)]
-pub(crate) fn migrate_runtime_runtimes_to_templates() -> Result<Vec<String>, String> {
-    let root = read_config()?
-        .runtime_directory
-        .ok_or("DSH Box storage is not configured")?;
-    let index = read_template_index(&root);
-    let existing: std::collections::BTreeSet<String> = index
-        .values()
-        .filter_map(|entry| entry.harness_ref.clone())
-        .collect();
-    let mut registered = Vec::new();
-    for tag in installed_versions(&root)? {
-        if existing.contains(&tag) {
-            continue;
-        }
-        let ref_value = format!("github.com/deepseek-ai/deepseek-harness:{tag}");
-        let body = format!("FROM {ref_value}\nPROFILE web\nNAME {ref_value}\nVERSION latest\n");
-        // Drop the body into the hash-addressed store, mirroring what
-        // `pull_template` does. `write_template_with_entry` also updates
-        // the manifest and index, so no extra bookkeeping is needed.
-        // The kind is always `Root` here — this migration only handles
-        // legacy harness clones, never user-authored templates.
-        box_dsh_versions::write_template_with_entry(
-            &root,
-            &ref_value,
-            &body,
-            Some(tag.clone()),
-            "web",
-            Some(ref_value.clone()),
-            now_seconds(),
-            box_dsh_versions::TemplateKind::Root,
-        )
-        .map_err(|error| format!("cannot register migrated template for `{tag}`: {error}"))?;
-        registered.push(tag);
-    }
-    Ok(registered)
-}
 
 #[cfg(test)]
 #[path = "versions_tests.rs"]

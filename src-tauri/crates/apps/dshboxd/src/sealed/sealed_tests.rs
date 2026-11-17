@@ -4,6 +4,9 @@
 //! under test and the cases that pin it. See AGENTS.md.
 
 use super::*;
+use super::pnpm_approval::{
+    add_pnpm_build_approval, build_approval_hint, pnpm_git_allow_build_key, pnpm_ignored_build_keys,
+};
     #[test]
     fn prepared_base_is_exposed_as_a_direct_runnable_template() {
         let temporary = tempfile::tempdir().unwrap();
