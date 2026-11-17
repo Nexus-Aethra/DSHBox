@@ -96,9 +96,9 @@ DSH Box 拆成 Tauri **桌面外壳**、一个不依赖框架的 Rust workspace�
 | 前端（React 18 + Vite，`src/`） | 页面、组件、`useTaskQueue`/`useContainers`/`useResources`/`useSettings` 等 hook。**没有业务逻辑**——页面只发 RPC 并对 daemon 的 SSE 事件做出反应。 | 让 Box 界面保持轻薄，并让任何客户端（界面/CLI/agent）共用同一条代码路径。 |
 | 桌面外壳（Tauri 2，`src-tauri/src/`） | 浏览器窗口、托盘、Tauri IPC 适配层。通过 loopback HTTP 与 daemon 通信。所有实际工作都交给 `dshboxd`。 | 状态变更只有一个源头，界面与 CLI 不会各自漂移。 |
 | Daemon（`src-tauri/crates/apps/dshboxd`） | 常驻后台服务。拥有任务队列、文档存储、模板索引、容器注册表和 SSE 事件总线。单一 HTTP 入口（`POST /rpc`）加 `GET /events?token=…`。 | 安装、重建、卸载等后台工作不会随窗口关闭而中断。 |
-| Crate workspace（`src-tauri/crates/`） | 不依赖框架的 Rust crate，分四层 `core/`（`box-foundation`、`box-runtime`、`box-store`、`box-scheduler`、`box-api`）、`domain/`（`box-state`、`box-containers`、`box-image`、`box-resources`、`box-extensions`、`box-plugin-graph`、`box-toolchains`、`box-dsh-versions`、`box-updates`、`box-template-core`、`box-browser`）、`edge/`（`box-client`、`box-server-core`）、`apps/`（`dshboxd`、`box-helper`）。 | 纯函数 + 单元测试；只有顶层 `dshbox` 与 `dshboxd` 链接 Tauri/HTTP。越过层边界的 crate 会被 `pnpm layers:check` 判红。 |
+| Crate workspace（`src-tauri/crates/`） | 不依赖框架的 Rust crate，分四层 `core/`（`box-foundation`、`box-runtime`、`box-store`、`box-scheduler`、`box-api`）、`domain/`（`box-state`、`box-containers`、`box-image`、`box-resources`、`box-extensions`、`box-plugin-graph`、`box-toolchains`、`box-dsh-versions`、`box-updates`、`box-template-core`、`box-browser`）、`edge/`（`box-client`、`box-server-core`）、`apps/`（`dshboxd`、`box-helper`）。 | 纯函数 + 单元测试；只有顶层 `dshbox` 包链接 Tauri。越过层边界的 crate 会被 `pnpm layers:check` 判红。 |
 
-依赖方向是单向且被强制的：`apps → edge → domain → core`。`core/` 里的 crate 够不到业务代码，`domain/` 只能看见 `core` 和自己，Tauri 包可以用下面三层、但绝不链接 `apps/` 下的二进制。功能 crate 不依赖 Tauri，也不依赖彼此的易变状态。`scripts/check-layering.mjs`（`pnpm layers:check`，每个 `bundle:*` 都会先跑）从 `cargo metadata` 读依赖图，越界就判红。
+依赖方向是单向且被强制的：`apps → edge → domain → core`。`core/` 里的 crate 够不到业务代码，`domain/` 只能看见 `core` 和自己，Tauri 包可以用下面三层、但绝不链接 `apps/` 下的二进制。功能 crate 不依赖 Tauri，也不依赖彼此的易变状态。`scripts/check-layering.mjs`（`pnpm layers:check`，每条打包路径都会先跑，包括发布工作流）从 `cargo metadata` 读依赖图，越界就判红。
 
 ### Daemon —— 双模 RPC + SSE 事件流
 

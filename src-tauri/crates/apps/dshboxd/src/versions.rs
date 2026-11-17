@@ -768,7 +768,7 @@ fn tree_size_bytes(path: &Path) -> Result<u64, String> {
 
 /// Uninstall a DSH harness: soft-delete the runtime clone, drop the
 /// template index entry, and enqueue the background hard-delete via the
-/// data-scheduler's deletion queue.
+/// `box_state` deletion queue.
 ///
 /// Delegates to `box_template_core::uninstall_template` so the daemon and
 /// the CLI share the same soft-delete logic (rename + resource-map cleanup

@@ -29,9 +29,11 @@ React UI / dshbox CLI
           +-- resource and diagnostics persistence
 ```
 
-Only the desktop package depends on Tauri. Crate dependencies flow from
-foundation/runtime/scheduler/state toward the functional crates and then the
-adapters.
+Only the desktop package depends on Tauri. Crate dependencies flow one way,
+`apps → edge → domain → core`: a crate in `core/` cannot reach business code, and
+`domain/` sees only `core` and itself. The Tauri package uses the three lower
+layers but never a binary under `apps/`. `scripts/check-layering.mjs` enforces
+this (see "Code modules" below).
 
 ## Current runtime model
 
@@ -127,9 +129,13 @@ apps/
 dshbox                 Tauri shell and CLI adapters (the only Tauri-dependent package)
 ```
 
-Dependency direction is one-way and enforced by `scripts/check-layering.mjs`
-(`pnpm layers:check`, run before every `bundle:*`): `apps → edge → domain →
-core`. `core` never reaches business code, `domain` sees only `core` and
+Dependency direction is one-way and enforced by
+[`scripts/check-layering.mjs`](../scripts/check-layering.mjs) (`pnpm
+layers:check`, run by every packaging path) : `apps → edge → domain → core`. The rationale, the measured
+fan-in that decided which crates were merged away, and the rules that are not
+layer-shaped live in
+[the layering design](design/2026-11-08-node-link-session-and-crate-layering.md)
+sections 12-19. `core` never reaches business code, `domain` sees only `core` and
 itself, and the Tauri package uses the three lower layers but never a binary
 under `apps/`. Because the guard reads the graph from `cargo metadata`, every
 manifest spelling is covered, and a workspace member that is neither one of the

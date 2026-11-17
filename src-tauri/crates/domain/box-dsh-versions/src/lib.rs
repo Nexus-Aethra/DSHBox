@@ -315,7 +315,7 @@ pub struct TemplateEntry {
 /// Whether a template is part of the official harness family (`Root`) or a
 /// user-authored / imported / built template (`Common`). The split exists so
 /// `Root` templates can take a faster install path; the storage layout,
-/// data-scheduler bookkeeping, and IPC DTOs are identical between the two.
+/// `box_state` bookkeeping, and IPC DTOs are identical between the two.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TemplateKind {

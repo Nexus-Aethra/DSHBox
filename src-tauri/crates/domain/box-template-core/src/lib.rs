@@ -56,7 +56,7 @@ pub struct InstallOutcome {
 ///    host launches read this marker and skip `pnpm install` when the
 ///    marker is fresh.
 /// 4. Register the template in `<runtime>/state/resource-map.json` as a
-///    `Template` row so the data-scheduler can soft-delete it later. The
+///    `Template` row so `box_state` can soft-delete it later. The
 ///    `path` field points at the runtime directory (root) or the
 ///    template index (common); both are stable per-entry identifiers.
 ///
@@ -98,7 +98,7 @@ pub fn install_template<F: Fn() -> bool + Send + 'static>(
         write_root_prepared_marker(&runtime_path, &version, &parsed.tag.clone().unwrap_or_else(|| "latest".to_owned()))?;
     }
 
-    // 4. Register in the data-scheduler resource map so uninstall can do
+    // 4. Register in the `box_state` resource map so uninstall can do
     //    the soft-delete + background hard-delete via the existing
     //    deletion-queue worker.
     let resource_path = if kind == TemplateKind::Root {
@@ -155,9 +155,9 @@ pub fn install_template<F: Fn() -> bool + Send + 'static>(
 ///
 /// - **Fast path** (this function): rename the runtime clone to
 ///   `<name>.deleted-<ts>`, drop the template-index entry, drop the
-///   resource-map entry, enqueue a hard-delete in the data-scheduler's
+///   resource-map entry, enqueue a hard-delete in `box_state`'s
 ///   fast queue, clear `selected_dsh_version` if it pointed here.
-/// - **Background**: the data-scheduler's `DeletionWorker` drains the
+/// - **Background**: `box_state`'s `DeletionWorker` drains the
 ///   fast queue every tick and removes the renamed directory via
 ///   `remove_dir_all`. Failures are retried by the slow queue (60s
 ///   interval, 5 attempts) before becoming `permanent_failures`.
@@ -178,8 +178,8 @@ pub fn uninstall_template(runtime: &str, name: &str) -> Result<(String, String),
 
     // Soft-delete: rename the runtime directory if it exists. The rename
     // itself is atomic on Windows when the destination lives on the same
-    // volume; the subsequent remove_dir_all is what the data-scheduler
-    // runs in the background.
+    // volume; the subsequent remove_dir_all is what `box_state`'s
+    // background worker runs.
     let runtime_path = version_directory(runtime, &version);
     if runtime_path.exists() {
         let ts = box_foundation::now_seconds();
@@ -203,8 +203,8 @@ pub fn uninstall_template(runtime: &str, name: &str) -> Result<(String, String),
                 let _ = fs::rename(parent, &renamed);
             }
         }
-        // Tell the data-scheduler where the renamed directory lives so
-        // the background worker can `remove_dir_all` it.
+        // Tell `box_state` where the renamed directory lives so the
+        // background worker can `remove_dir_all` it.
         let resource_path = archived_dir.to_string_lossy().into_owned();
         enqueue_for_hard_delete(Path::new(runtime), &format!("template:{name}"), &resource_path)?;
     }

@@ -25,8 +25,15 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
-    let stamp = match stamp_path.as_deref().map(|path| (path, path.exists())) {
-        Some((path, true)) => std::fs::read_to_string(path).unwrap_or_default(),
+    // An empty stamp is the same as no stamp. The whole point of the release panic
+    // is that a binary must not claim a build batch it does not have; a truncated
+    // or zero-byte `.build-stamp` would satisfy a bare existence test and embed
+    // `DSHBOX_BUILD_STAMP=` -- the failure wearing the shape of a success.
+    let stamp = match stamp_path
+        .as_deref()
+        .map(|path| (path, std::fs::read_to_string(path).unwrap_or_default()))
+    {
+        Some((_, contents)) if !contents.trim().is_empty() => contents,
         _ => {
             // `.build-stamp` is generated and gitignored, so a fresh clone has none.
             // A *release* build must not embed an empty stamp silently: the only

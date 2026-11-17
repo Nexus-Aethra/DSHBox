@@ -99,8 +99,8 @@ fn install(ref_value: &str) -> Result<(), String> {
 }
 
 /// `dshbox template uninstall <name>` — soft-delete by name. The actual
-/// removal of the cloned source happens in the data-scheduler's
-/// background deletion queue, so this returns within a few hundred
+/// removal of the cloned source happens in `box_state`'s background
+/// deletion queue, so this returns within a few hundred
 /// milliseconds even for multi-GB clones.
 fn uninstall(name: &str) -> Result<(), String> {
     let client = rpc::connect()?;

@@ -99,7 +99,9 @@ const inputs = [
 // the release-mode panic tells the reader to run this script and the script then
 // did nothing.
 const stampFile = join('src-tauri', '.build-stamp')
-const stamped = existsSync(stampFile)
+// An empty stamp counts as absent: build.rs treats it the same way, because a
+// zero-byte file would otherwise let a release build embed an empty batch id.
+const stamped = existsSync(stampFile) && readFileSync(stampFile, 'utf8').trim() !== ''
 if (!stamped && !force) {
   console.log('no build stamp: the staged artifacts do not name a build batch, so they are rebuilt')
 }

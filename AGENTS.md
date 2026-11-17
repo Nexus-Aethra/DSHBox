@@ -58,7 +58,7 @@ pnpm bundle:macos         # .dmg
 pnpm layers:check
 
 # Tests
-cd src-tauri && cargo test --workspace            # full Rust suite (160+ passing)
+cd src-tauri && cargo test --workspace            # full Rust suite (474 passing, 46 suites)
 scripts/e2e-*.sh                                   # sandbox-isolated end-to-end
 ```
 
@@ -75,8 +75,10 @@ gotchas for the exact invocation and the bundle checks that go with it.
 ### Rust workspace (`src-tauri/crates/`)
 
 Four layers, one direction: `apps → edge → domain → core`. The directories are the
-rule, not the filing: `scripts/check-layering.mjs` (`pnpm layers:check`, run by every
-`bundle:*` script) fails when a crate reaches across a boundary.
+rule, not the filing: `scripts/check-layering.mjs` (`pnpm layers:check`) fails when a
+crate reaches across a boundary. Every packaging path runs it — the three
+`bundle:*` scripts and `scripts/bundle-windows.mjs` itself, which is what the
+release workflow invokes directly.
 
 | Layer | Crates | Role |
 |-------|--------|------|
