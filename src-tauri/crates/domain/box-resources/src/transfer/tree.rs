@@ -6,7 +6,6 @@
 //! filesystem directly.
 
 use super::*;
-use super::parts::read_entries;
 
 /// Join `rel` onto `root`, refusing anything that could leave it: absolute
 /// paths, `..`, and root/prefix components are all rejected outright rather
@@ -73,6 +72,18 @@ pub fn tree_digest(path: &Path) -> Result<String, String> {
     Ok(format!("{hash:016x}"))
 }
 
+/// List a directory's entries, sorted. The sort is what makes the tar and the
+/// digest reproducible: an unsorted listing would let the same tree produce
+/// different bytes on different runs.
+pub(super) fn read_entries(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        entries.push(entry.path());
+    }
+    entries.sort();
+    Ok(entries)
+}
 pub(super) fn collect_files(root: &Path, prefix: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<(), String> {
     let meta = fs::symlink_metadata(root).map_err(|error| format!("{}: {error}", root.display()))?;
     let relative = prefix.to_string_lossy().to_string();
@@ -134,7 +145,7 @@ pub fn copy_tree(from: &Path, to: &Path, root: &Path) -> Result<(u64, u64), Stri
 }
 
 /// Tighten a payload that carries a secret: files `0600`, directories `0700`.
-pub fn restrict_permissions(path: &Path) {
+pub(super) fn restrict_permissions(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

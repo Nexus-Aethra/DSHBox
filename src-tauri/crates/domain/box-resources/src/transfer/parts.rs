@@ -7,7 +7,7 @@
 
 use super::*;
 use super::section::{entries_at, extract_section, inject_section, merge_yaml, SECTION_FILE};
-use super::tree::restrict_permissions;
+use super::tree::{read_entries, restrict_permissions};
 
 /// One part of a payload: where it goes back, and whether it is a whole path or
 /// one key path inside a YAML document there.
@@ -42,7 +42,7 @@ pub fn payload_parts(payload_dir: &Path, fallback_path: &str) -> Vec<PayloadPart
     })
 }
 
-pub fn read_parts_manifest(payload_dir: &Path) -> Option<Vec<PayloadPart>> {
+pub(super) fn read_parts_manifest(payload_dir: &Path) -> Option<Vec<PayloadPart>> {
     let text = fs::read_to_string(payload_dir.join(PARTS_FILE)).ok()?;
     serde_json::from_str::<Vec<PayloadPart>>(&text)
         .ok()
@@ -322,16 +322,6 @@ fn collect_entries(root: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
-}
-
-pub(super) fn read_entries(dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        entries.push(entry.path());
-    }
-    entries.sort();
-    Ok(entries)
 }
 
 fn remove_path(path: &Path) -> Result<(), String> {

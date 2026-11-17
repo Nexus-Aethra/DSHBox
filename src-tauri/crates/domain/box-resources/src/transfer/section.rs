@@ -6,7 +6,7 @@
 //! new code.
 
 use super::*;
-use super::parts::read_entries;
+use super::tree::read_entries;
 
 pub(super) fn extract_section(
     container_root: &Path,
@@ -266,7 +266,7 @@ pub fn write_section(
 
 /// Merge two YAML documents: mappings merge key by key, the incoming value wins
 /// on a scalar or sequence conflict.
-pub fn merge_yaml(target: &str, incoming: &str) -> Result<String, String> {
+pub(super) fn merge_yaml(target: &str, incoming: &str) -> Result<String, String> {
     let base: serde_yaml::Value =
         serde_yaml::from_str(target).map_err(|error| format!("invalid YAML at destination: {error}"))?;
     let overlay: serde_yaml::Value =
