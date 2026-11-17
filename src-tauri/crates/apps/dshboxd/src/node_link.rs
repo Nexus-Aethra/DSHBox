@@ -10,26 +10,29 @@
 //! to a network you would not expose plain HTTP to.
 //!
 //! The point of L1 is that the *transport* changes and nothing else does:
-// the same handlers, the same whitelist, the same identity binding. So the
+//! the same handlers, the same whitelist, the same identity binding. So the
 // gate below is written once and used by both paths.
 
 use crate::state::DaemonState;
 use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+use std::io::Read;
 use std::net::TcpStream;
 use std::sync::Arc;
 
 /// What a caller is allowed to do on this connection, decided once per
 /// request exactly as the HTTP path decides it.
 ///
-/// Kept as data rather than a bool so a future transport cannot accidentally
-/// skip a step: the HTTP path and the frame path both build one of these and
-/// both act on the same fields.
+/// One field today. The gate resolves to a node id, and everything the
+/// daemon needs to know about the caller follows from it: `Some(id)` is a
+/// session scoped to that node, `None` is either the control plane (main
+/// token) or an enroll-grant registration, and the handler layer tells those
+/// two apart itself. A field for "is main" was tried and removed -- nothing
+/// read it, and an unread field in a security struct is a claim the code
+/// does not make.
 pub(crate) struct Gate {
     /// The node this connection speaks for, or `None` for the control plane
     /// (a caller holding the main discovery token).
     pub(crate) node_id: Option<String>,
-    /// True when the bearer is the daemon's own discovery token.
-    pub(crate) is_main: bool,
 }
 
 impl Gate {
@@ -69,7 +72,7 @@ impl Gate {
         {
             return Err(GateDenied::ForbiddenMethod);
         }
-        Ok(Self { node_id: session_node, is_main })
+        Ok(Self { node_id: session_node })
     }
 }
 
@@ -106,14 +109,36 @@ impl GateDenied {
 /// The read side is sequential. A second concurrent request on the same
 /// connection would need request IDs to match responses, and L1 has no use
 /// for them -- the helper sends one request at a time.
-pub(crate) fn handle_link(mut stream: TcpStream, state: Arc<DaemonState>, main_token: &str) {
+pub(crate) fn handle_link(
+    stream: TcpStream,
+    buffered: Vec<u8>,
+    state: Arc<DaemonState>,
+    main_token: &str,
+) {
+    // Write on a clone, read through a chain: whatever the header parser had
+    // already buffered, then the socket. A BufReader reads in blocks, so the
+    // first frame is usually already in `buffered` by the time the blank line
+    // is seen -- dropping it would look exactly like a clean close, with no
+    // reply and no error.
+    let mut writer = match stream.try_clone() {
+        Ok(clone) => clone,
+        Err(_) => return,
+    };
+    // Cursor implements Read, and Read::chain takes any Read, so the
+    // leftovers are read to the end before the socket is touched.
+    let leftovers = std::io::Cursor::new(buffered);
+    let mut reader = std::io::BufReader::new(leftovers.chain(stream));
+    // The caller hands us the reader it already used to parse the HTTP
+    // request, and that is not a convenience: a BufReader reads in blocks,
+    // so the bytes of the first frame are usually already sitting in its
+    // buffer by the time the blank line is seen. Building a second reader
+    // from the raw socket would skip those bytes and the first frame would
+    // be lost -- silently, because what follows looks exactly like a clean
+    // close at a frame boundary.
+    //
     // A node link is long-lived by design, so there is no per-request
     // timeout to inherit: the read blocks until a frame arrives or the peer
     // goes away.
-    let mut reader = std::io::BufReader::new(match stream.try_clone() {
-        Ok(clone) => clone,
-        Err(_) => return,
-    });
     loop {
         let frame = match read_frame(&mut reader) {
             Ok(Some(frame)) => frame,
@@ -131,7 +156,7 @@ pub(crate) fn handle_link(mut stream: TcpStream, state: Arc<DaemonState>, main_t
         // something else is speaking a protocol this build does not
         // implement yet; say so rather than silently ignoring it.
         if frame.frame_type != FrameType::Request {
-            let _ = send_close(&mut stream, "unexpected-frame-type");
+            let _ = send_close(&mut writer, "unexpected-frame-type");
             return;
         }
         let request = match frame.value() {
@@ -157,12 +182,12 @@ pub(crate) fn handle_link(mut stream: TcpStream, state: Arc<DaemonState>, main_t
                         return;
                     }
                 };
-                if write_frame(&mut stream, &frame).is_err() {
+                if write_frame(&mut writer, &frame).is_err() {
                     return;
                 }
             }
             Err(denied) => {
-                let _ = send_close(&mut stream, denied.reason());
+                let _ = send_close(&mut writer, denied.reason());
                 return;
             }
         }
@@ -171,10 +196,10 @@ pub(crate) fn handle_link(mut stream: TcpStream, state: Arc<DaemonState>, main_t
 
 /// Write a close frame carrying a reason. Best-effort: the peer is going
 /// away regardless.
-fn send_close(stream: &mut TcpStream, reason: &str) -> std::io::Result<()> {
+fn send_close<W: std::io::Write>(writer: &mut W, reason: &str) -> std::io::Result<()> {
     let frame = Frame::json(FrameType::Close, &serde_json::json!({ "reason": reason }))
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
-    write_frame(stream, &frame).map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))
+    write_frame(writer, &frame).map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))
 }
 
 #[cfg(test)]

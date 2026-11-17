@@ -716,6 +716,15 @@ command as done only once the installed app has run it.
 
 - Rust: edition 2021, Cargo workspace with `resolver = "2"`. Prefer
   framework-free functions over Tauri-coupled types inside crates.
+- **No giant files. `main.rs` holds top-level routing and nothing else.**
+  A file that needs scrolling to be understood costs every future reader --
+  human or agent -- the same tax on every visit, and the cost compounds
+  because a big file attracts more code. The working limits:
+  **tests live in their own file** (`#[path = "foo_tests.rs"] mod foo_tests;`),
+  and **a source file stops growing at roughly 500 lines**, at which point it
+  splits by concern rather than by alphabet. `dshboxd/src/main.rs` is the
+  reference shape: routing, lifecycle wiring and discovery only -- every
+  business capability is already its own module.
 - Frontend: TypeScript strict, React 18, Vite 6, no extra UI library — build
   primitives under `src/ui/`.
 - **Persistence: document store, not scattered files.** Persisted indexes go
