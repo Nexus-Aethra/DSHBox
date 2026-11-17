@@ -417,10 +417,21 @@ fn restrict_to_owner(path: &Path) -> Result<(), u32> {
     use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION};
     use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
 
-    // Three well-known SIDs: "SY" is SYSTEM, "CO" is CREATOR OWNER, "BA" is
-    // BUILTIN\Administrators. CREATOR OWNER rather than a snapshot of the
-    // current user SID, so the grant keeps working if the daemon is later run
-    // by a service account the operator set up.
+    // Three well-known SIDs: SY is SYSTEM, CO is CREATOR OWNER, BA is
+    // BUILTIN\Administrators.
+    //
+    // CO is used as a spelling, not for the resilience an earlier comment
+    // claimed for it. On a file CREATOR OWNER resolves to the owner SID at
+    // write time -- which is the running user, i.e. exactly the snapshot that
+    // comment said it was avoiding. It only stays abstract when inherited,
+    // which is the container case and not this one. So the grant is whoever
+    // ran the daemon when the file was written.
+    //
+    // Granting the token user SID directly instead would be more honest and
+    // would let an operator switch the daemon to a service account without a
+    // manual ACL edit. That needs OpenProcessToken and GetTokenInformation,
+    // which is a bigger change than this commit and belongs with the review
+    // that asks for service-account support.
     let mut trustees: Vec<TRUSTEE_W> = Vec::new();
     let mut sids: Vec<*mut core::ffi::c_void> = Vec::new();
     for name in ["SY", "CO", "BA"] {
@@ -784,6 +795,14 @@ mod windows_acl_tests {
             .prefix("dshbox-acl-store-")
             .tempdir()
             .unwrap();
+        // A hostile parent, exactly as restricted_file builds one. Without
+        // this the test passes under the mutant: %TEMP% already grants only
+        // SYSTEM, Administrators and the running user, so there is no AU to
+        // remove and the inherited DACL satisfies the assertion on its own.
+        // A review proved that by running the mutant -- the other two tests
+        // went red and this one stayed green, because it was the only one
+        // whose environment already met the property it claimed to check.
+        grant_authenticated_users(dir.path());
         let paths = BoxPaths {
             config: PathBuf::from("C:\\nonexistent"),
             runtime: Some(dir.path().to_path_buf()),
