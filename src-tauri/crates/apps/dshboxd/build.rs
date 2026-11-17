@@ -16,11 +16,17 @@ fn main() {
     // batch -- the exact symptom this stamp exists to catch, wearing a green light.
     let stamp_path = app_manifest_dir(&crate_dir).map(|dir| dir.join(".build-stamp"));
 
+    // Watch the stamp whenever its location is known, existing or not. Emitting
+    // this only when the file was already there left a dev build (which warns and
+    // carries on) with an empty DSHBOX_BUILD_STAMP for as long as the crate itself
+    // stayed unchanged: the stamp appearing is exactly the event that has to make
+    // cargo run this script again.
+    if let Some(path) = &stamp_path {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+
     let stamp = match stamp_path.as_deref().map(|path| (path, path.exists())) {
-        Some((path, true)) => {
-            println!("cargo:rerun-if-changed={}", path.display());
-            std::fs::read_to_string(path).unwrap_or_default()
-        }
+        Some((path, true)) => std::fs::read_to_string(path).unwrap_or_default(),
         _ => {
             // `.build-stamp` is generated and gitignored, so a fresh clone has none.
             // A *release* build must not embed an empty stamp silently: the only

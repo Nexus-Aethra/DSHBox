@@ -23,8 +23,8 @@
 // real violation (review of PR #40). Cargo resolves the manifests, so every
 // spelling is covered by construction, and `--no-deps` keeps it offline (it reads
 // this workspace's manifests, nothing else). The member list comes from the same
-// place, so a crate outside the four layer directories is reported rather than
-// skipped instead of being invisible.
+// place, so a crate outside the four layer directories is a violation rather
+// than something the scan never saw.
 import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
@@ -70,6 +70,13 @@ function metadata() {
 }
 
 // Which layer a manifest belongs to, from its own path.
+//
+// `tools/` is a real directory of build tools that may use core/domain/edge but
+// never link a binary. Anything else that is not one of the four layers and not
+// the Tauri package is an error, whether or not it also has a crossing edge:
+// a member outside the layout is exactly the case where the layer rule stops
+// meaning anything, and reporting it only when it happens to have an internal
+// path dependency made the outcome depend on an unrelated detail.
 function classify(manifestPath) {
   const path = manifestPath.split(sep).join('/')
   const cratesPrefix = `${join(REPO_ROOT, 'src-tauri', 'crates').split(sep).join('/')}/`
@@ -81,7 +88,7 @@ function classify(manifestPath) {
     return 'unlayered'
   }
   if (path.startsWith(`${join(REPO_ROOT, 'src-tauri', 'tools').split(sep).join('/')}/`)) return 'tools'
-  return 'external'
+  return 'unlayered'
 }
 
 const workspace = metadata()
@@ -92,7 +99,9 @@ for (const pkg of workspace.packages) {
   const layer = classify(pkg.manifest_path)
   nodes.set(dir, { name: pkg.name, layer, dir, manifest: pkg.manifest_path })
   if (layer === 'unlayered') {
-    violations.push(`${pkg.name} is a workspace member outside core/ domain/ edge/ apps/ (${relative(REPO_ROOT, pkg.manifest_path)})`)
+    violations.push(
+      `${pkg.name} is a workspace member outside core/ domain/ edge/ apps/ (and not a build tool under tools/): ${relative(REPO_ROOT, pkg.manifest_path)}`,
+    )
   }
 }
 
@@ -137,5 +146,5 @@ if (violations.length > 0) {
   console.error('layout: docs/design/2026-11-08-node-link-session-and-crate-layering.md section 14')
   process.exit(1)
 }
-const counted = [...new Set([...nodes.values()].map((node) => node.layer))]
+const counted = [...new Set([...nodes.values()].map((node) => node.layer))].filter((layer) => layer !== 'root')
 console.log(`layering ok: ${nodes.size} workspace members across ${counted.sort().join(' / ')}`)

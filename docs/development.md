@@ -132,9 +132,10 @@ Dependency direction is one-way and enforced by `scripts/check-layering.mjs`
 core`. `core` never reaches business code, `domain` sees only `core` and
 itself, and the Tauri package uses the three lower layers but never a binary
 under `apps/`. Because the guard reads the graph from `cargo metadata`, every
-manifest spelling is covered and a crate filed outside the four directories is
-reported rather than skipped. Feature crates must not depend on Tauri or on one
-another's mutable state. Long work is submitted to `box-scheduler`; Tauri
+manifest spelling is covered, and a workspace member that is neither one of the
+four layers nor a build tool under `tools/` is a violation in its own right —
+whether or not it happens to depend on something. Feature crates must not depend
+on Tauri or on one another's mutable state. Long work is submitted to `box-scheduler`; Tauri
 handlers and CLI handlers do not execute it inline.
 
 ## Toolchains and process execution

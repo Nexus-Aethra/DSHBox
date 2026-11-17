@@ -84,16 +84,25 @@ const inputs = [
   ...walkRustFiles(join('src-tauri', 'crates', 'apps', 'box-helper', 'src')),
 ]
 
-// The stamp is part of "is the staged artifact a real batch": without one, a
-// release build of the desktop or the daemon refuses to run (build.rs panics),
-// and this script is the command that error tells the reader to run. So a
-// populated hash cache with the artifacts present but *no* stamp must not take
-// the skip path -- it did, and the recommended remedy then left the reader in a
-// loop: release build fails, run this, "inputs unchanged", release build fails
-// identically. A stamp is cheap to write and cannot be wrong: the artifacts it
-// describes are already on disk and unchanged.
+// The stamp records *which build batch* produced the staged artifacts, so it
+// cannot be invented: a cache hit knows the artifacts are current with the
+// sources, but not the id they were compiled under. Writing "now" there produced
+// a stamp naming a batch that never existed -- the staged daemon would report one
+// id while a desktop rebuilt afterwards embedded the other, and the pair would
+// disagree about being stale forever.
+//
+// Absence of the stamp is therefore a miss, not a hit: it means the artifacts
+// were produced by something other than a staged batch (an earlier build whose
+// stamp was cleaned, a partially restored tree), and the only honest way to get
+// a batch id for them is to build them. That is cheap when nothing changed --
+// cargo relinks or reuses -- and it is the one path that closes the loop where
+// the release-mode panic tells the reader to run this script and the script then
+// did nothing.
 const stampFile = join('src-tauri', '.build-stamp')
 const stamped = existsSync(stampFile)
+if (!stamped && !force) {
+  console.log('no build stamp: the staged artifacts do not name a build batch, so they are rebuilt')
+}
 
 if (!isFresh(destination, sources, force) || !isFresh(helperDestination, sources, force)) {
   // Stale → rebuild. Record the digest *before* compiling, so it describes the
@@ -104,16 +113,8 @@ if (!isFresh(destination, sources, force) || !isFresh(helperDestination, sources
   await rebuild(destination, target, force)
   process.exit(0)
 }
-if (hashInputs(cacheFile, inputs, force) && existsSync(destination) && existsSync(helperDestination)) {
+if (stamped && hashInputs(cacheFile, inputs, force) && existsSync(destination) && existsSync(helperDestination)) {
   console.log(`server sidecar inputs unchanged (hash cache hit at ${cacheFile}); skipping cargo build`)
-  if (!stamped) {
-    // Nothing is rebuilt, but the artifacts on disk are declared to belong to a
-    // build batch so the release builds this script is the documented fix for
-    // can actually start.
-    const stamp = String(Math.floor(Date.now() / 1000))
-    await writeFile(stampFile, `${stamp}\n`)
-    console.log(`restored missing build stamp: ${stamp} (${stampFile})`)
-  }
   process.exit(0)
 }
 await rebuild(destination, target, force)
