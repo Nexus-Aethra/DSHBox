@@ -518,6 +518,40 @@ impl BoxPaths {
             .ok_or("DSH Box storage is not configured")?
             .join("state/dshbox.db"))
     }
+
+    /// `<runtime>/state/secrets.db` -- a second SQLite database holding only
+    /// the bootstrap secrets: node keys and the control-plane identity.
+    ///
+    /// Separate from `store_db` for three reasons, in order of how much they
+    /// matter:
+    ///
+    /// 1. It does not use WAL. The main store does, and under WAL the bytes
+    ///    live in the `-wal` sidecar while the `.db` stays a near-empty
+    ///    header -- so tightening the database to 0600 means tightening three
+    ///    files in the right order, and a review of PR #51 found the first
+    ///    attempt pointing at the wrong inode. Without WAL there is one file
+    ///    and chmod is the whole story.
+    /// 2. The blast radius shrinks. Everything else the daemon persists --
+    ///    task params, resource records, the artifact index -- stays in the
+    ///    main store, and only the secrets are here. On a platform where the
+    ///    file ACL cannot be tightened (Windows inherits it from the runtime
+    ///    directory), the file a local user can read is one with nothing but
+    ///    keys in it, rather than one with every record.
+    /// 3. It gives the future Windows work a single seam. The fix there is
+    ///    SetNamedSecurityInfo on the files that hold secrets; with secrets
+    ///    split out, that is one file rather than three sidecars.
+    ///
+    /// What this does NOT do is make the secrets safe on Windows. A file
+    /// created there inherits the runtime directory ACL whatever database it
+    /// is in, so the gap the review named is unchanged by this split. It is
+    /// recorded here so nobody reads the split as the fix.
+    pub fn secrets_db(&self) -> BoxResult<PathBuf> {
+        Ok(self
+            .runtime
+            .as_ref()
+            .ok_or("DSH Box storage is not configured")?
+            .join("state/secrets.db"))
+    }
     pub fn task_log(&self, id: &str) -> BoxResult<PathBuf> {
         Ok(self
             .runtime
