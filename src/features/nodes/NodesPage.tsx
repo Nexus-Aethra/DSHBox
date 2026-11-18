@@ -61,6 +61,14 @@ export function NodesPage(props: Props) {
         </div>
       </div>
       <p className="section-note">{text.nodesNote}</p>
+      {/* Says the status is live, because the alternative is a page that
+         looks live and is not. The daemon broadcasts every transition, so
+         the claim is earned. */}
+      <p className="node-live">
+        <span className="node-live-dot" aria-hidden="true" />
+        {text.nodeLive}
+        <span className="node-live-note">{text.nodeLiveNote}</span>
+      </p>
 
       <div className="version-list node-list">
         {nodes.map((node) => (

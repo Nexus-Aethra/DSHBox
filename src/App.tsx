@@ -242,7 +242,7 @@ export function MainApp() {
       void settings.refreshToolchains()
     }
     if (target === 'nodes') {
-      void nodes.loadNodes()
+      nodes.enter()
     }
   }
 
@@ -253,6 +253,16 @@ export function MainApp() {
     if (onboardingDone) loadSection(section)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onboardingDone])
+
+  // Leaving the Nodes page tears down its event subscription. Central rather
+  // than at each call site, because there are three ways to change section --
+  // the nav, the update badge and the settings button -- and a fourth would
+  // forget it. A listener that outlives its page patches state nobody is
+  // looking at.
+  useEffect(() => {
+    if (section !== 'nodes') nodes.leave()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [section])
 
   if (settings.loading) {
     return (

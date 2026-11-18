@@ -1,6 +1,15 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { boxApi } from '../shared/api/box-api'
 import type { EnrollReply, NodeRecord } from '../shared/types/domain'
+
+/**
+ * The one daemon frame this hook listens for.
+ *
+ * Narrow on purpose: the daemon broadcasts a dozen event names and this page
+ * cares about exactly one. A wide union here would be a second copy of the
+ * task event list, and the two would drift.
+ */
+type NodeEvent = { event: 'node_status'; payload: { id: string; status: string } }
 
 /**
  * Node registry state, and the two actions the control plane may take on it.
@@ -23,6 +32,11 @@ export function useNodes(onError: (message: string | null) => void) {
   // copy field is the last chance to keep it.
   const [enrolled, setEnrolled] = useState<EnrollReply | null>(null)
   const [enrolling, setEnrolling] = useState(false)
+  // Set while the page is open, so the subscription below knows it is live.
+  // The daemon broadcasts node_status on every transition -- registering,
+  // online, offline, draining, failed -- so a node going dark reaches this
+  // page without the user having to ask for it.
+  const [live, setLive] = useState(false)
 
   async function loadNodes(): Promise<void> {
     setLoading(true)
@@ -36,6 +50,23 @@ export function useNodes(onError: (message: string | null) => void) {
       setLoading(false)
     }
   }
+
+  // Subscribe while the page is open. The frame names the node and its new
+  // status and nothing else, so the row is patched in place rather than the
+  // whole list being re-fetched: a re-fetch on every heartbeat would be one
+  // request per node per interval, for a list that is already correct except
+  // for one field.
+  useEffect(() => {
+    if (!live) return
+    const unlisten = boxApi.listenTask<NodeEvent>('daemon://event', (frame) => {
+      if (frame.event !== 'node_status') return
+      const { id, status } = frame.payload
+      setNodes((current) => current.map((node) => (node.id === id ? { ...node, status: status as NodeRecord['status'] } : node)))
+    })
+    return () => {
+      void unlisten.then((off) => off())
+    };
+  }, [live])
 
   async function enroll(kind: string, platform: string, nodeId: string | null): Promise<void> {
     setEnrolling(true)
@@ -80,6 +111,10 @@ export function useNodes(onError: (message: string | null) => void) {
     enrolled,
     enrolling,
     loadNodes,
+    // Enter and leave are separate from loadNodes so the subscription can be
+    // torn down when the page closes, without a second load on the way out.
+    enter: () => { setLive(true); void loadNodes() },
+    leave: () => setLive(false),
     enroll,
     removeNode,
     dismissEnrolled,

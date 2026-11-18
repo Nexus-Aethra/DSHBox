@@ -312,6 +312,7 @@ const COPY = {
     pluginGraphBlocked: (plugin: string, service: string) => `${plugin} waits for ${service}; no plugin in this graph provides it`,
     pluginGraphBlockedInactive: (plugin: string, service: string) => `${plugin} waits for ${service}, whose provider is installed but not activated`,
     // ---- nodes ----
+    nodeLive: 'Live', nodeLiveNote: 'Status updates arrive as they happen; the daemon broadcasts every transition.',
     nodes: 'Nodes', nodesTitle: 'Nodes', nodesNote: 'Machines this box can run work on. The host is always here and is not listed.',
     noNodes: 'No nodes enrolled yet.',
     nodeKind: 'Kind', nodePlatform: 'Platform', nodeStatus: 'Status', nodeLastSeen: 'Last seen', nodeCapabilities: 'Capabilities',
@@ -620,6 +621,7 @@ const COPY = {
     pluginGraphBlocked: (plugin: string, service: string) => `${plugin} 等待 ${service}，但图中没有插件提供它`,
     pluginGraphBlockedInactive: (plugin: string, service: string) => `${plugin} 等待 ${service}，其提供者已安装但未激活`,
     // ---- 节点 ----
+    nodeLive: '实时', nodeLiveNote: '状态变化即时到达；daemon 会广播每一次状态迁移。',
     nodes: '节点', nodesTitle: '节点管理', nodesNote: '本 Box 可在其上运行任务的机器。本机始终在列，不在此处显示。',
     noNodes: '尚未登记任何节点。',
     nodeKind: '类型', nodePlatform: '平台', nodeStatus: '状态', nodeLastSeen: '最近心跳', nodeCapabilities: '能力',

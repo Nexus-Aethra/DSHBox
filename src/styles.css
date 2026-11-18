@@ -769,3 +769,6 @@ dialog .resource-panel { max-height: 70vh; overflow-y: auto; }
    another row. */
 .enroll-secret-card { border-color: #2864dc; }
 .enroll-secret-actions { align-items: center; display: flex; gap: 10px; }
+.node-live { align-items: center; color: #29734d; display: flex; font-size: 12px; gap: 7px; margin: 0 0 14px; }
+.node-live-dot { background: #29734d; border-radius: 50%; display: block; height: 7px; width: 7px; }
+.node-live-note { color: #8a939c; }
