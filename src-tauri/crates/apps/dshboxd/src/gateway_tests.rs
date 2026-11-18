@@ -17,6 +17,14 @@ use serde_json::{json, Value};
 use std::io::{BufReader, Read, Write};
 use std::sync::{Mutex, RwLock};
 
+/// Decode a hex string, for reading a key back out of the store.
+fn hex_to_bytes(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+        .collect()
+}
+
 fn state() -> Arc<DaemonState> {
     let events = Arc::new(crate::events::DaemonEvents::new());
     let empty = BoxPaths {
@@ -380,11 +388,14 @@ fn enroll_a_node(state: &Arc<DaemonState>) -> (String, String, String, u64) {
     (grant, id, token, epoch)
 }
 
-/// A frame that is not a request closes the link. L1 has no handshake,
-/// so a peer that opens with `hello` is speaking a protocol this build
-/// does not implement; answering it would imply that it does.
+/// A frame that is neither a request nor a hello closes the link.
+///
+/// L4b added the handshake, so `hello` is no longer an unimplemented frame
+/// type -- it is the first frame of the encrypted path, and it is answered by
+/// that path. What still closes the link outright is anything else: a
+/// response, an event or a rekey arriving with nothing to answer.
 #[test]
-fn a_non_request_frame_closes_the_link() {
+fn a_non_request_non_hello_frame_closes_the_link() {
     use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
     let state = state();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -396,8 +407,40 @@ fn a_non_request_frame_closes_the_link() {
         node_link::handle_link(stream, Vec::new(), server_state, &token);
     });
     let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    // `hello` is the L2 handshake frame. It is declared in the codec but
-    // nothing in L1 emits or answers it.
+    // A response frame with no request behind it.
+    let frame = Frame::json(FrameType::Response, &serde_json::json!({ "ok": true })).unwrap();
+    write_frame(&mut client, &frame).unwrap();
+    client.flush().unwrap();
+    let mut reader = BufReader::new(client);
+    let reply = read_frame(&mut reader).unwrap();
+    drop(reader);
+    handle.join().unwrap();
+    let reply = reply.expect("the link answered before closing");
+    assert_eq!(reply.frame_type, FrameType::Close);
+    assert_eq!(reply.value().unwrap()["reason"], "unexpected-frame-type");
+}
+
+/// A hello now reaches the handshake rather than being refused as an
+/// unknown frame type.
+///
+/// The close reason changed from "unexpected-frame-type" to "bad-hello", and
+/// that difference is the whole point of the test: it pins that the encrypted
+/// path is the one that answers, not the plaintext gate.
+#[test]
+fn a_hello_is_answered_by_the_handshake_path() {
+    use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+    let state = state();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = "main-token".to_owned();
+    let server_state = state.clone();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        node_link::handle_link(stream, Vec::new(), server_state, &token);
+    });
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    // A hello with none of the fields the wire shape requires, so it is
+    // refused for its contents rather than for its type.
     let frame = Frame::json(FrameType::Hello, &serde_json::json!({ "ver": 1 })).unwrap();
     write_frame(&mut client, &frame).unwrap();
     client.flush().unwrap();
@@ -406,8 +449,126 @@ fn a_non_request_frame_closes_the_link() {
     drop(reader);
     handle.join().unwrap();
     let reply = reply.expect("the link answered before closing");
-    assert_eq!(reply.frame_type, FrameType::Close, "a hello is not answered");
-    assert_eq!(reply.value().unwrap()["reason"], "unexpected-frame-type");
+    assert_eq!(reply.frame_type, FrameType::Close);
+    assert_eq!(reply.value().unwrap()["reason"], "bad-hello");
+}
+
+/// A daemon state with a real runtime directory, so the handshake has a
+/// secrets store to open.
+///
+/// The default `state()` has `runtime: None`, which makes every handshake fail
+/// with `no-identity` -- correct for the tests that only exercise the gate, and
+/// useless for the ones that exercise the handshake itself.
+fn state_with_runtime(dir: &std::path::Path) -> Arc<DaemonState> {
+    let events = Arc::new(crate::events::DaemonEvents::new());
+    let empty = BoxPaths {
+        config: std::path::PathBuf::from("/nonexistent"),
+        runtime: None,
+    };
+    Arc::new(DaemonState {
+        manager: TaskManager::memory(),
+        paths: RwLock::new(BoxPaths {
+            config: std::path::PathBuf::from("/nonexistent"),
+            runtime: Some(dir.to_path_buf()),
+        }),
+        containers: Arc::new(Default::default()),
+        resources: ResourceStateManager::default(),
+        events: events.clone(),
+        browser: Mutex::new(crate::debug::Sessions::new()),
+        nodes: Arc::new(crate::nodes::NodeManager::load(&empty, String::new(), events)),
+        artifacts: crate::node_artifacts::ArtifactIndex::memory(),
+    })
+}
+
+/// A well-formed hello reaches the handshake and is refused for the node,
+/// not for the frame.
+///
+/// The difference from `a_hello_is_answered_by_the_handshake_path` is what
+/// this adds: that one sends a hello with no usable fields and gets
+/// `bad-hello` from the wire decoder, which a stub could produce. This one
+/// builds a structurally valid hello -- real version, suite, nonce and an
+/// ephemeral key -- so it gets past the decoder and is refused by the
+/// handshake itself, with a reason that names the node problem.
+///
+/// It stops at `not-enrolled` because nothing writes a `node-keys` row yet:
+/// `node_enroll` registers the node but not its key. A full session needs
+/// that, and it is the next stage, so this test pins the path it can reach
+/// rather than claiming one it cannot.
+#[test]
+fn a_hello_reaches_the_handshake_and_is_refused_for_its_node() {
+    use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+    use box_node_link::handshake::{self, AuthMode, Hello, NodeHand};
+    use box_node_link::SystemRandom;
+    use box_node_link::wire;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_runtime(dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = "main-token".to_owned();
+    let server_state = state.clone();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        node_link::handle_link(stream, Vec::new(), server_state, &token);
+    });
+
+    // Nothing enrols a node key yet: `node_enroll` writes the registry row
+    // but not a `node-keys` row, and that is the next stage. So this hello
+    // is refused with `not-enrolled` -- which is the honest state of the
+    // handshake path today, and the reason this test stops here rather than
+    // claiming a full session it cannot have.
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let rng = SystemRandom::new();
+    let control_pubkey = {
+        let collection = crate::node_keys::open_control_identity(
+            &state.paths.read().unwrap(),
+        )
+        .unwrap();
+        crate::node_keys::ensure_control_identity(&collection).unwrap();
+        crate::node_keys::find_identity(&collection)
+            .unwrap()
+            .map(|record| hex_to_bytes(&record.pubkey))
+            .unwrap()
+    };
+
+    let node_hand = NodeHand::new(&rng, control_pubkey).unwrap();
+    let eph_a = node_hand.public_key().unwrap();
+    // Psk mode, because it is the only one a node with no key can present:
+    // node-key mode is refused by the wire decoder for missing its key
+    // fields, which is a different refusal and not the one under test.
+    let hello = Hello {
+        node_id: "node-handshake".to_owned(),
+        mode: AuthMode::Psk,
+        version: handshake::VERSION,
+        suite: handshake::SUITE,
+        client_nonce: handshake::fresh_nonce().unwrap(),
+        eph_a,
+        // A mac that will not verify. It gets past the wire decoder, which
+        // is the point: the handshake then refuses the node for having no
+        // row at all, before it ever looks at the mac.
+        mac: Some([0u8; 32]),
+        node_pubkey: None,
+        node_sig: None,
+    };
+    // The node is not enrolled with a key yet, so this hello is refused --
+    // but refused by the handshake, with a reason that names it, which is
+    // what proves the path is real.
+    let payload = serde_json::to_vec(&wire::hello_wire(&hello)).unwrap();
+    // `Frame::json` takes a Value; the hello wire form is already serialised,
+    // so the frame is built directly. `payload` is public for exactly this.
+    let frame = Frame {
+        frame_type: FrameType::Hello,
+        payload,
+    };
+    write_frame(&mut client, &frame).unwrap();
+    client.flush().unwrap();
+    let mut reader = BufReader::new(client);
+    let reply = read_frame(&mut reader).unwrap().expect("the link answered");
+    drop(reader);
+    handle.join().unwrap();
+    assert_eq!(reply.frame_type, FrameType::Close);
+    assert_eq!(reply.value().unwrap()["reason"], "not-enrolled");
 }
 
 /// A request whose payload is not JSON closes the link. There is no

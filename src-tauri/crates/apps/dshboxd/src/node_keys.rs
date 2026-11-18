@@ -200,22 +200,6 @@ pub fn find_identity(
         .find(|record| record.id == "default"))
 }
 
-/// The signing key for a stored identity, for the handshake.
-///
-/// Rebuilt from the PKCS#8 document on every call rather than cached, because
-/// a cached key would be a secret held in memory for the life of the process
-/// for no gain -- the handshake signs once per connection.
-pub fn signing_key(
-    identity: &ControlIdentity,
-) -> BoxResult<box_node_link::handshake::ControlKeypair> {
-    // The stored halves are reassembled into the same shape the generator
-    // produced, so a caller cannot tell a rebuilt key from a fresh one.
-    Ok(box_node_link::handshake::ControlKeypair {
-        pubkey_hex: identity.pubkey.clone(),
-        seckey_hex: identity.seckey.clone(),
-        fingerprint: identity.fingerprint.clone(),
-    })
-}
 #[cfg(test)]
 #[path = "node_keys_tests.rs"]
 mod tests;
