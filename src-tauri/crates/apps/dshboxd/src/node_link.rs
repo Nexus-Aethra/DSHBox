@@ -344,7 +344,14 @@ fn handle_secure(
         control,
         &hello,
         nonce,
-        &signing_key(&identity_collection),
+        &match signing_key(&identity_collection) {
+            Ok(key) => key,
+            Err(reason) => {
+                tracing::warn!(target: "node_link", "the stored control plane key is unusable");
+                let _ = send_close(&mut writer, reason);
+                return;
+            }
+        },
         &cert,
         &bootstrap_secret(&hello, &record),
         registered.as_deref(),
@@ -487,19 +494,20 @@ fn ensure_identity(
 /// Rebuilt from PKCS#8 on every handshake rather than cached: a cached key
 /// would be a secret held in memory for the life of the process, and a
 /// handshake signs once per connection.
+///
+/// A key that will not load is an error, not a reason to mint a new one. An
+/// earlier version generated a fresh keypair on a load failure, which fails
+/// safe in the narrow sense -- the node rejects a fingerprint it never pinned
+/// -- but leaves the daemon signing as an identity it does not know it has
+/// lost. A control plane whose identity changed under it should say so and
+/// stop, not quietly become somebody else.
 fn signing_key(
     collection: &box_foundation::collection::Collection<crate::node_keys::ControlIdentity>,
-) -> box_node_link::handshake::ControlKey {
+) -> Result<box_node_link::handshake::ControlKey, &'static str> {
     match crate::node_keys::find_identity(collection) {
-        Ok(Some(record)) => match handshake::control_signing_key(&record.seckey) {
-            Ok(key) => key,
-            Err(_) => handshake::generate_control_keypair()
-                .and_then(|generated| handshake::control_signing_key(&generated.seckey_hex))
-                .expect("a freshly generated key must be loadable"),
-        },
-        _ => handshake::generate_control_keypair()
-            .and_then(|generated| handshake::control_signing_key(&generated.seckey_hex))
-            .expect("a freshly generated key must be loadable"),
+        Ok(Some(record)) => handshake::control_signing_key(&record.seckey)
+            .map_err(|_| "no-identity"),
+        _ => Err("no-identity"),
     }
 }
 
