@@ -26,11 +26,29 @@ use crate::handshake::{self, AuthMode, HandshakeError, Hello, SessionKeys};
 use crate::session::{RecordKey, SealError, MAX_FRAMES_PER_KEY};
 use crate::wire::{self, HelloAckWire, WireError};
 
+/// The margin must stay smaller than the key life, with room for a poll.
+///
+/// Checked here rather than left to a reader, because the failure is silent
+/// and inverted: shrink `MAX_KEY_AGE` below `REKEY_AT_REMAINING + a poll`
+/// and `should_rekey` becomes permanently true, so the loop rotates on every
+/// wake -- key churn for no reason, which is what the margin exists to
+/// prevent. A unit test cannot catch it, because the test imports the same
+/// constants and would drift with them.
+const _: () = assert!(REKEY_AT_REMAINING.as_secs() * 2 < MAX_KEY_AGE.as_secs());
+
 /// How long one set of keys may live before a rekey is forced.
 ///
 /// Design section 4: 2^32 frames or 5 minutes, whichever comes first. The
 /// frame limit is far below a nonce wrap, so this is a belt to that braces.
 pub const MAX_KEY_AGE: Duration = Duration::from_secs(300);
+
+/// Rotate when this much of the key life is left.
+///
+/// A margin inside `MAX_KEY_AGE` rather than a second limit: rotating here
+/// leaves a minute of slack before the keys would be retired anyway, which
+/// is what makes a proactive rotation possible at all. A caller that waited
+/// for the limit would be rotating too late.
+pub const REKEY_AT_REMAINING: Duration = Duration::from_secs(60);
 
 /// A session that has completed its handshake and can carry frames.
 pub struct Session {
@@ -282,6 +300,16 @@ fn install_rekey(&mut self, salt: &[u8; 16]) {
     self.key_installed_at = Instant::now();
     self.rekey_epoch = self.rekey_epoch.wrapping_add(1);
 }
+    /// True when the keys are close enough to their limit to be worth rotating.
+    ///
+    /// The caller cannot compute this: it does not know when the keys were
+    /// installed, and a second opinion about the key age is how the two drift.
+    /// A peer that is about to be refused on age is exactly the peer that
+    /// should be rotating, and this is what lets a quiet session rotate
+    /// without waiting for the refusal.
+    pub fn should_rekey(&self) -> bool {
+        self.key_installed_at.elapsed() + REKEY_AT_REMAINING >= MAX_KEY_AGE
+    }
 }
 
 

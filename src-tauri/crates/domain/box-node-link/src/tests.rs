@@ -9,6 +9,7 @@
 //! opaque error would let a tampered field and a downgraded suite be
 //! refused for the same wrong reason.
 
+use std::time::Duration;
 use ring::rand::SecureRandom;
 use ring::signature::KeyPair;
 use ring::rand::SystemRandom;
@@ -789,4 +790,52 @@ fn a_rekey_frame_is_accepted_after_the_keys_have_aged() {
     // fresh keys.
     let after = theirs.seal_frame(FrameType::Response, b"after").unwrap();
     assert_eq!(ours.open_frame(&after).unwrap(), b"after");
+}
+
+
+/// `should_rekey` is true only in the margin before the keys expire.
+#[test]
+fn should_rekey_is_true_only_in_the_margin_before_expiry() {
+    use crate::session_io::{MAX_KEY_AGE, REKEY_AT_REMAINING};
+
+    let (mut ours, _theirs) = pair();
+    // Fresh keys: no rotation.
+    assert!(!ours.should_rekey(), "fresh keys must not rotate");
+
+    // Just outside the margin: still no rotation. This is the case a naive
+    // "rotate when old" check would get wrong, and it would rotate on every
+    // poll for most of the key life.
+    ours.age_keys_for_test(MAX_KEY_AGE - REKEY_AT_REMAINING - Duration::from_secs(5));
+    assert!(!ours.should_rekey(), "outside the margin must not rotate");
+
+    // Inside the margin: rotate. The keys are about to be refused, and this
+    // is the last point at which a rotation can save the session.
+    ours.age_keys_for_test(MAX_KEY_AGE - REKEY_AT_REMAINING + Duration::from_secs(5));
+    assert!(ours.should_rekey(), "inside the margin must rotate");
+
+    // Past the limit entirely: still rotate, because the alternative is a
+    // session that cannot seal anything.
+    ours.age_keys_for_test(MAX_KEY_AGE * 2);
+    assert!(ours.should_rekey(), "an expired session must still rotate");
+}
+
+/// A rotation resets the margin, so the next poll does not rotate again.
+#[test]
+fn a_rekey_clears_the_rotation_margin() {
+    use crate::session_io::MAX_KEY_AGE;
+    use std::io::BufWriter;
+
+    let (mut ours, _theirs) = pair();
+    ours.age_keys_for_test(MAX_KEY_AGE);
+    assert!(ours.should_rekey());
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let sender = std::net::TcpStream::connect(("127.0.0.1", listener.local_addr().unwrap().port())).unwrap();
+    let _receiver = listener.accept().unwrap();
+    ours.send_rekey(&mut BufWriter::new(sender)).unwrap();
+
+    // The keys are new, so the margin is clear -- otherwise every poll would
+    // rotate again, and a session would churn its keys for no reason.
+    assert!(!ours.should_rekey(), "a rotation must clear the margin");
+    assert_eq!(ours.rekey_count(), 1);
 }

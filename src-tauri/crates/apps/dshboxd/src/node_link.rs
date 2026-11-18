@@ -32,6 +32,7 @@ use box_node_link::wire;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// What a caller is allowed to do on this connection, decided once per
 /// request exactly as the HTTP path decides it.
@@ -206,9 +207,9 @@ fn handle_plaintext(
                 return;
             }
         }
-        // A node link is long-lived by design, so there is no per-request
-        // timeout to inherit: the read blocks until a frame arrives or the peer
-        // goes away.
+        // No timeout here: this is the L1 path, and a peer that has not sent
+        // anything yet is not a peer that has gone away. The rotation timeout
+        // belongs to the encrypted loop, which has keys to age.
         frame = match read_frame(&mut reader) {
             Ok(Some(frame)) => frame,
             Ok(None) => return,
@@ -497,6 +498,15 @@ fn handle_secure(
 /// this daemon do, not to limit legitimate rotation.
 const MAX_REKEYS_PER_LINK: u32 = 256;
 
+
+/// How often the loop wakes to consider rotating the keys.
+///
+/// The read is blocking, so a session that goes quiet would otherwise never
+/// reconsider its keys -- and a quiet session is exactly the one that ages
+/// out unnoticed. Short enough that a rotation happens well before the
+/// keys expire, long enough that an idle connection does not spin.
+const REKEY_POLL: Duration = Duration::from_secs(30);
+
 fn run_secure_loop(
     reader: &mut BufReader<std::io::Chain<std::io::Cursor<Vec<u8>>, TcpStream>>,
     writer: &mut BufWriter<TcpStream>,
@@ -505,10 +515,40 @@ fn run_secure_loop(
     main_token: &str,
 ) {
     let mut rekeys_seen: u32 = 0;
+    // The read blocks, but not forever -- and only here. A quiet session
+    // still has to rotate its keys on schedule, and the only way to notice
+    // the schedule is to wake up. The timeout is deliberately NOT set on the
+    // handshake or the plaintext path: those wait for a peer that has not
+    // said anything yet, and disconnecting one for being slow is a
+    // regression the rotation does not need.
+    let _ = reader
+        .get_ref()
+        .get_ref()
+        .1
+        .set_read_timeout(Some(REKEY_POLL));
     loop {
         let frame = match read_frame(reader) {
             Ok(Some(frame)) => frame,
             Ok(None) => return,
+            // A timeout is not a failure: it is the wake-up. The frame is
+            // simply not here yet. `read_frame` maps it to its own variant,
+            // which is why this matches on the variant rather than on a
+            // formatted message.
+            Err(box_node_link::frame::FrameError::TimedOut) => {
+                // Rotate when the keys are close enough to their limit to be
+                // worth it. A quiet session ages out otherwise, and the first
+                // thing that happens then is a request being refused -- which
+                // the peer sees as an error and the operator sees as a node
+                // that stopped working for no visible reason.
+                if session.should_rekey() {
+                    tracing::debug!(target: "node_link", "keys nearing their limit; asking the peer to rotate");
+                    if session.send_rekey(writer).is_err() {
+                        let _ = send_close(writer, "rekey-failed");
+                        return;
+                    }
+                }
+                continue;
+            }
             Err(error) => {
                 tracing::debug!(target: "node_link", %error, "frame error; closing session");
                 return;
