@@ -152,6 +152,11 @@ pub enum HandshakeError {
     FingerprintMismatch,
 }
 
+/// Lowercase hex, for a key on its way into a store row.
+pub fn hex_encode(bytes: &[u8]) -> String {
+    hex(bytes)
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -352,6 +357,12 @@ pub fn control_finish(
     // signature proves the node holds the private key, and this proves it
     // is the key we registered.
     registered_pubkey: Option<&[u8]>,
+    // True when this handshake is the upgrade: a node-key hello against a
+    // row that has no registered key yet. The registered-key comparison is
+    // what proves a reconnect belongs to the node it claims, and there is
+    // nothing to compare against on the first one -- so it is skipped here
+    // and the caller registers the key after the signature verifies.
+    upgrading: bool,
 ) -> Result<(SessionKeys, HelloAck, Option<[u8; 32]>), HandshakeError> {
     // No downgrade. A peer offering another version or suite is refused
     // before anything is derived, which is what keeps a future suite from
@@ -422,8 +433,14 @@ pub fn control_finish(
             // impersonate any nodeId -- "a signature verified" is not "the
             // right node connected", and the difference is exactly this
             // comparison.
-            match registered_pubkey {
-                Some(registered) if registered == pubkey.as_slice() => {}
+            // On the upgrade there is nothing registered yet, so the
+            // comparison has nothing to compare. The signature still has to
+            // verify, and the caller registers the key afterwards -- which
+            // is what makes the *next* handshake a comparison rather than a
+            // registration.
+            match (upgrading, registered_pubkey) {
+                (true, _) => {}
+                (false, Some(registered)) if registered == pubkey.as_slice() => {}
                 _ => return Err(HandshakeError::NodeSignature),
             }
             let sig = hello.node_sig.as_ref().ok_or(HandshakeError::NodeSignature)?;
@@ -622,7 +639,7 @@ pub fn control_signing_key(seckey_hex: &str) -> Result<ControlKey, HandshakeErro
 
 
 /// Decode hex, or None on a malformed or odd-length input.
-fn hex_decode(text: &str) -> Option<Vec<u8>> {
+pub fn hex_decode(text: &str) -> Option<Vec<u8>> {
     if text.len() % 2 != 0 {
         return None;
     }
@@ -661,3 +678,17 @@ pub fn fill_random(dest: &mut [u8]) -> Result<(), HandshakeError> {
         .map_err(|_| HandshakeError::ControlSignature)
 }
 
+/// Check that a node long-term key signed a transcript.
+///
+/// Lives here rather than in the daemon for the same reason `fresh_nonce`
+/// does: `ring` is a dependency of the crate that owns the crypto, and a
+/// daemon reaching for the primitive itself is two things that drift. The
+/// caller passes the hex the store holds and the signature it received;
+/// this says yes or no.
+pub fn verify_node_key(pubkey_hex: &str, transcript: &[u8], signature: &[u8]) -> bool {
+    let Some(pubkey) = hex_decode(pubkey_hex) else {
+        return false;
+    };
+    let peer = signature::UnparsedPublicKey::new(&signature::ED25519, &pubkey);
+    peer.verify(transcript, signature).is_ok()
+}

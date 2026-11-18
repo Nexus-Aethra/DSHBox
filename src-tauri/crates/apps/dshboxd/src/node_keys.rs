@@ -295,3 +295,56 @@ fn hex(bytes: &[u8]) -> String {
     }
     out
 }
+/// Upgrade a node from its bootstrap mode to node-key mode.
+///
+/// The design has three modes and this is the transition between two of them
+/// (section 6): a node enrols with a token chain, and its first successful
+/// handshake can register the long-term key it will use from then on. After
+/// the upgrade the chain is irrelevant -- the node proves itself with a
+/// signature and the control plane checks it against the key it registered
+/// here, which is what makes "a signature verified" mean "the right node
+/// connected".
+///
+/// The signature is checked *before* the row is written. Upgrading first and
+/// verifying later would let any caller register any key as any node.
+///
+/// A row that is already in node-key mode is left alone rather than
+/// overwritten: a second registration attempt is either a bug or an attempt
+/// to take the identity over, and both should be a refusal the caller can
+/// see.
+pub fn upgrade_to_node_key(
+    collection: &Collection<NodeKeyRecord>,
+    node_id: &str,
+    pubkey_hex: &str,
+    signature: &[u8],
+    transcript: &[u8],
+) -> BoxResult<NodeKeyRecord> {
+    let rows = collection.load_all()?;
+    let record = rows
+        .iter()
+        .find(|row| row.id == node_id)
+        .ok_or_else(|| format!("no node key row for {node_id}"))?;
+
+    // Already upgraded. The existing key stands; a caller offering a
+    // different one is trying to become somebody else.
+    if record.mode == box_node_link::node_keys::KeyMode::NodeKey {
+        return Err(format!(
+            "node {node_id} is already registered with a long-term key"
+        ));
+    }
+
+    if !box_node_link::handshake::verify_node_key(pubkey_hex, transcript, signature) {
+        return Err("the offered node key did not sign the transcript".to_owned());
+    }
+
+    let mut upgraded = record.clone();
+    upgraded.mode = box_node_link::node_keys::KeyMode::NodeKey;
+    upgraded.node_pubkey = Some(pubkey_hex.to_owned());
+    // The chain is retired with the mode. Keeping it would leave a usable
+    // credential in a row whose mode says it does not need one.
+    upgraded.chain_end = None;
+    upgraded.last_accepted = None;
+    upgraded.secret = String::new();
+    collection.upsert(&[upgraded.clone()])?;
+    Ok(upgraded)
+}

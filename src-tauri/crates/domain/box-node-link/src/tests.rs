@@ -78,7 +78,7 @@ fn psk_exchange(psk: &[u8]) -> Exchange {
     })
     .unwrap();
     let (keys, ack, _spent) =
-        handshake::control_finish(control, &hello, nonce, &signing, &cert, psk, None).unwrap();
+        handshake::control_finish(control, &hello, nonce, &signing, &cert, psk, None, false).unwrap();
 
     // The node side of the agreement, taken against the eph_b the ack
     // carries. Needed to rebuild the wrap key for node_unseal.
@@ -181,6 +181,7 @@ fn n7e_a_registered_node_key_is_accepted_and_a_foreign_one_is_refused() {
         b"cert",
         b"",
         Some(&node_pubkey),
+        false,
     );
     assert!(accepted.is_ok(), "the registered node key must be accepted");
 
@@ -199,6 +200,7 @@ fn n7e_a_registered_node_key_is_accepted_and_a_foreign_one_is_refused() {
         b"cert",
         b"",
         Some(&node_pubkey),
+        false,
     );
     assert_eq!(
         refused.err(),
@@ -245,6 +247,7 @@ fn n7f_a_missing_control_signature_is_refused_in_node_key_mode() {
         b"cert",
         b"",
         Some(&node_pubkey),
+        false,
     )
     .unwrap();
     let mut stripped = ack.clone();
@@ -273,6 +276,7 @@ fn n1_a_tampered_hello_field_makes_the_control_plane_refuse_it() {
         b"cert",
         b"a perfectly good psk",
         None,
+        false,
     );
     assert_eq!(
         outcome.err(),
@@ -295,6 +299,7 @@ fn n3_a_downgraded_suite_is_refused_rather_than_negotiated() {
         b"cert",
         b"a perfectly good psk",
         None,
+        false,
     );
     assert_eq!(
         outcome.err(),
@@ -317,6 +322,7 @@ fn n3b_an_unknown_version_is_refused_too() {
         b"cert",
         b"a perfectly good psk",
         None,
+        false,
     );
     assert_eq!(
         outcome.err(),
@@ -533,7 +539,7 @@ fn n7c_a_wrong_signature_is_refused_in_token_mode() {
         // The stored value is the chain end: what the presented link hashes
         // to. Passing the link itself would be the off-by-one the chain walk
         // already warns about.
-        handshake::control_finish(control, &hello, nonce, &signing, b"cert", &crate::chain::hash_once(&link), None).unwrap();
+        handshake::control_finish(control, &hello, nonce, &signing, b"cert", &crate::chain::hash_once(&link), None, false).unwrap();
     let mut tampered = ack.clone();
     tampered.control_sig[0] ^= 0xff;
     let node_hand =
@@ -575,6 +581,7 @@ fn n7d_a_node_key_hello_with_no_node_signature_is_refused() {
         b"cert",
         b"",
         Some(&node_pubkey),
+        false,
     );
     assert_eq!(outcome.err(), Some(handshake::HandshakeError::NodeSignature));
 }
