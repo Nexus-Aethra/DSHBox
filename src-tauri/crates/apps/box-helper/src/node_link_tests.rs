@@ -104,7 +104,9 @@ impl Peer {
             let Some(frame) = read_frame(&mut reader).unwrap() else {
                 return;
             };
-            let payload = session.open_frame(&frame).unwrap();
+            let payload = session
+                .open_frame(&frame)
+                .expect("the peer opens the request under the agreed keys");
             let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
             // A node handler reads `request["epoch"]`, not
             // `request["params"]["epoch"]`.
@@ -130,13 +132,6 @@ impl Peer {
 fn a_helper_opens_a_session_and_exchanges_an_encrypted_request() {
     let seed = [9u8; 32];
     let chain_length = 64u32;
-    let (control_pubkey, control_seckey) = control_keypair();
-    let peer = Peer::spawn(seed, chain_length, control_seckey);
-
-    // The control-plane key the peer generated is not knowable in advance, so
-    // the peer is spawned with a fixed one for the test. That is the one
-    // difference from production, where the daemon identity is generated on
-    // first use and read back out of the store.
     // The control-plane key the peer signs with, and the client pins, from one
     // shared keypair -- there is no round trip to exchange one first.
     let (control_pubkey, control_seckey) = control_keypair();

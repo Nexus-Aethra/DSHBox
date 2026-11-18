@@ -11,10 +11,13 @@
 //! - **It does not replace the HTTP path.** The daemon still answers `/rpc`,
 //!   and the helper still uses it for anything that is not a node method. Two
 //!   ways to reach the same handler is a migration, not a rewrite.
-//! - **It does not persist the node key.** The long-term key is generated per
-//!   process and registered on the first handshake, so a restart re-enrols.
-//!   Persisting it is stage B, and it needs a 0600 file the helper can write
-//!   on every target it runs on.
+//! - **It does not persist a node key, and does not need one yet.** The
+//!   helper connects in token mode, where the chain is the reconnect
+//!   credential: each handshake spends one link and the row holds the last
+//!   accepted one, so a restart spends the next link down. Node-key mode
+//!   needs a key that survives a restart, which means a 0600 file the helper
+//!   can write on every target it runs on -- that is stage B, and until then
+//!   the chain is what reconnects.
 //! - **It does not drive tasks.** Stage B moves operations down; this is the
 //!   transport they will arrive on.
 //!
@@ -76,7 +79,18 @@ pub fn connect(
     let seed = box_node_link::handshake::hex_decode(&config.seed)
         .ok_or("the seed is not valid hex")?;
     let seed: [u8; 32] = seed.try_into().map_err(|_| "the seed is not 32 bytes")?;
-    let link = box_node_link::chain::hash_n(&seed, config.chain_length.saturating_sub(1).max(1));
+    // A chain shorter than two has no spendable link that is not the seed,
+    // and a one-link chain would send the seed itself. The CLI already
+    // refuses it; this is the same rule one layer down, stated rather than
+    // floored, because a silent floor is how a caller gets a link it did not
+    // ask for.
+    if config.chain_length < 2 {
+        return Err(format!(
+            "chain length must be at least 2, got {}",
+            config.chain_length
+        ));
+    }
+    let link = box_node_link::chain::hash_n(&seed, config.chain_length - 1);
 
     // Token mode, not node-key. The chain is the reconnect credential: every
     // handshake spends one link, and the row holds 64 of them, so a restart
