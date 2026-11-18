@@ -149,6 +149,7 @@ fn a_helper_opens_a_session_and_exchanges_an_encrypted_request() {
         &format!("http://127.0.0.1:{}", peer.port),
         box_node_link::chain::ChainNode::new(seed, chain_length),
         std::net::TcpStream::connect(("127.0.0.1", peer.port)).unwrap(),
+        None,
     )
     .expect("the client opens a session against the peer");
     // The call carries an epoch, which is what a node heartbeat sends. If the
@@ -292,6 +293,7 @@ fn the_client_follows_a_rekey_that_arrives_before_the_response() {
         &format!("http://127.0.0.1:{port}"),
         box_node_link::chain::ChainNode::new(seed, chain_length),
         std::net::TcpStream::connect(("127.0.0.1", port)).unwrap(),
+        None,
     )
     .expect("the client opens a session");
 
@@ -520,6 +522,7 @@ fn a_failed_reconnect_steps_the_walk_back_through_the_method() {
         &format!("http://127.0.0.1:{port}"),
         box_node_link::chain::ChainNode::new(seed, chain_length),
         std::net::TcpStream::connect(("127.0.0.1", port)).unwrap(),
+        None,
     )
     .expect("the first handshake completes");
 
@@ -535,4 +538,263 @@ fn a_failed_reconnect_steps_the_walk_back_through_the_method() {
         before_retry - 1,
         "a failed reconnect must leave the walk one step lower"
     );
+}
+
+
+
+/// A restart reconnects: the resumed link is one the control plane accepts.
+///
+/// The first version of this test asserted that resuming AT the persisted k
+/// gives that k back -- which is the BUG, not the fix. The file holds the link
+/// that was spent; resuming at it re-offers the value the control plane already
+/// holds, and it is refused forever. The reviewer proved that with the daemon
+/// own acceptance check, so this test drives the real resume path and
+/// cross-checks the result against `chain::accept`.
+///
+/// It goes through `resume_walk`, not through its own arithmetic: the decision
+/// lives between two files, and a decision in the gap is a decision nothing
+/// checks. A version that recomputed the subtraction locally passed even with
+/// the bug restored, which is how this was found the second time.
+#[test]
+fn a_restart_resumes_at_a_link_the_control_plane_accepts() {
+    let seed = [31u8; 32];
+    let chain_length = 64u32;
+    let dir = std::env::temp_dir().join(format!("dshbox-resume-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The first process: walk, spend a link, persist the position.
+    let mut walker = box_node_link::chain::ChainNode::new(seed, chain_length);
+    let (spent_hex, spent_k) = walker.next_value();
+    node_link::write_walk(&dir, spent_k).expect("the position is written");
+
+    // The daemon accepted it, so it now holds that value and expects its
+    // preimage. This is the daemon own check, not a reimplementation of it.
+    let mut state = box_node_link::chain::ChainState::from_seed(&seed, chain_length);
+    assert!(box_node_link::chain::accept(&mut state, &spent_hex).is_ok());
+
+    // The second process, through the real resume path.
+    let mut resumed = node_link::resume_walk(seed, chain_length, Some(&dir));
+    let (offered_hex, offered_k) = resumed.next_value();
+
+    assert_ne!(offered_hex, spent_hex, "a restart must not re-offer the spent link");
+    assert!(offered_k < spent_k, "the resumed walk must be below the spent link");
+
+    // And the daemon accepts it, which is the whole claim checked against the
+    // daemon own rule rather than against my opinion of it.
+    let verdict = box_node_link::chain::accept(&mut state, &offered_hex);
+    assert!(verdict.is_ok(), "the resumed link must be accepted: {verdict:?}");
+
+    // And the BUG is refused, so this test cannot be satisfied by the old
+    // behaviour. Re-offering the spent link is what the first version did.
+    assert!(box_node_link::chain::accept(&mut state, &spent_hex).is_err());
+
+    // No state directory means a fresh walk, which is stage A behaviour.
+    let fresh = node_link::resume_walk(seed, chain_length, None);
+    assert_eq!(fresh.remaining(), chain_length - 1, "no state means a fresh walk");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+#[test]
+fn a_write_leaves_no_temp_file() {
+    let dir = std::env::temp_dir().join(format!("dshbox-walk-tmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    node_link::write_walk(&dir, 40).expect("the write succeeds");
+    let mut leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    leftovers.sort();
+    assert_eq!(leftovers, vec![String::from("node-link-walk.json")], "only the state file remains");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ChainNode::at resumes at a specific k, and clamps one that is out of range.
+#[test]
+fn a_resumed_walk_clamps_an_out_of_range_k() {
+    let seed = [3u8; 32];
+    // A k beyond the chain means the chain length changed under us. Clamping
+    // keeps the walk inside the chain rather than refusing to start.
+    let high = box_node_link::chain::ChainNode::at(seed, 999, 64);
+    assert!(high.remaining() <= 63, "a k past the end is clamped into the chain");
+
+    // A k of zero would be the seed itself, which must never be offered.
+    let mut low = box_node_link::chain::ChainNode::at(seed, 0, 64);
+    let (_hex, k) = low.next_value();
+    assert!(k >= 1, "a k of zero is clamped to one, never the seed");
+}
+
+
+/// The walk is persisted before the hello reaches the peer.
+///
+/// The whole feature is this ordering, and a reorder mutation proved nothing
+/// pinned it: moving the write after the flush left the entire suite green. So
+/// the peer checks the file at the moment it sees the hello -- which is the
+/// only place the ordering is observable from outside the process.
+#[test]
+fn the_walk_is_persisted_before_the_hello_reaches_the_peer() {
+    use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+    // The peer completes no handshake: it only has to be there.
+    use std::io::{BufReader, BufWriter, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    let seed = [41u8; 32];
+    let chain_length = 64u32;
+    let (control_pubkey, _seckey) = control_keypair();
+    let dir = std::env::temp_dir().join(format!("dshbox-order-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The peer reports what it saw, and the test asserts on it.
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let dir_for_peer = dir.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let incoming = listener.accept();
+        let (stream, _) = match incoming {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = BufWriter::new(stream);
+        // The hello itself is not inspected -- only its timing. A peer that
+        // reads it has already received the bytes the client flushed.
+        let _frame = read_frame(&mut reader).unwrap();
+        // At the moment the hello arrives, the state file must already exist.
+        // A write that happens after the flush cannot satisfy this.
+        let existed = node_link::read_walk(&dir_for_peer);
+        let _ = seen_tx.send(existed);
+
+        // Then refuse, so the client does not hang waiting for an ack.
+        let close = Frame::json(
+            FrameType::Close,
+            &serde_json::json!({ "reason": "test-refusal" }),
+        )
+        .unwrap();
+        write_frame(&mut writer, &close).unwrap();
+        writer.flush().unwrap();
+        // Drop the writer, so the socket closes and the client read of the
+        // ack ends rather than waiting for bytes that are never coming.
+        drop(writer);
+        drop(reader);
+    });
+
+    let config = LinkConfig {
+        seed: hex_of(&seed),
+        pinned_fingerprint: "fp-test".to_owned(),
+        control_pubkey: hex_of(&control_pubkey),
+        chain_length,
+    };
+    let walker = box_node_link::chain::ChainNode::new(seed, chain_length);
+    let _ = node_link::connect(
+        &config,
+        "node-order",
+        &format!("http://127.0.0.1:{port}"),
+        walker,
+        std::net::TcpStream::connect(("127.0.0.1", port)).unwrap(),
+        Some(&dir),
+    );
+
+    // The peer saw the file already written when the hello arrived.
+    let seen = seen_rx.recv_timeout(std::time::Duration::from_secs(5));
+    assert!(seen.is_ok(), "the peer must have observed something");
+    assert_eq!(
+        seen.unwrap(),
+        Some(chain_length - 1),
+        "the walk must be on disk before the hello is on the wire"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+/// A write that fails stops the handshake, rather than letting the hello out.
+///
+/// The second blocker in the first review of this PR was exactly this: the
+/// error was logged and ignored, so the link was spent on the wire with nothing
+/// on disk -- the scenario the write exists to prevent. The fix returns Err, but
+/// the re-review proved the error *propagation* was unpinned: swallowing it left
+/// the committed suite green, because the ordering test fails only on the file
+/// being absent, not on an error being ignored.
+///
+/// So the test hands `connect` a state path that cannot be created -- a regular
+/// file where a directory is needed -- and asserts the error names the
+/// persistence. If the error were swallowed the hello would go out and the peer
+/// would answer it, which is the other assertion here.
+#[test]
+fn a_write_that_fails_stops_the_handshake_rather_than_letting_the_hello_out() {
+    use box_node_link::frame::{read_frame, FrameType};
+    use std::io::{BufReader, BufWriter, Write};
+    use std::net::TcpListener;
+
+    let seed = [53u8; 32];
+    let chain_length = 64u32;
+    let (control_pubkey, _seckey) = control_keypair();
+
+    // A peer that reports whether a hello arrived at all.
+    let (hello_tx, hello_rx) = std::sync::mpsc::channel();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let incoming = listener.accept();
+        let (stream, _) = match incoming {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = BufWriter::new(stream);
+        let frame = read_frame(&mut reader).unwrap();
+        let _ = hello_tx.send(frame.map(|f| f.frame_type));
+        let close = box_node_link::frame::Frame::json(
+            FrameType::Close,
+            &serde_json::json!({ "reason": "unreachable" }),
+        )
+        .unwrap();
+        box_node_link::frame::write_frame(&mut writer, &close).unwrap();
+        writer.flush().unwrap();
+    });
+
+    // A path that exists as a FILE, so create_dir_all on it must fail. That is
+    // the shape of a full or read-only filesystem without needing one.
+    let blocker = std::env::temp_dir().join(format!("dshbox-nodir-{}", std::process::id()));
+    let _ = std::fs::remove_file(&blocker);
+    std::fs::write(&blocker, "not a directory").unwrap();
+
+    let config = LinkConfig {
+        seed: hex_of(&seed),
+        pinned_fingerprint: "fp-test".to_owned(),
+        control_pubkey: hex_of(&control_pubkey),
+        chain_length,
+    };
+    let walker = box_node_link::chain::ChainNode::new(seed, chain_length);
+    let result = node_link::connect(
+        &config,
+        "node-write-fails",
+        &format!("http://127.0.0.1:{port}"),
+        walker,
+        std::net::TcpStream::connect(("127.0.0.1", port)).unwrap(),
+        Some(&blocker),
+    );
+
+    // The error names the persistence, not the handshake. A swallowed error
+    // would let the hello out and the failure would read as a refusal instead.
+    let error = match result {
+        Ok(_) => panic!("a write that fails must stop the handshake"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("cannot persist the chain walk"),
+        "the reason must be the persistence: {error}"
+    );
+
+    // And no hello reached the peer, which is the point of stopping. The peer
+    // does report something -- a clean EOF, because the socket closed without
+    // a frame -- but the frame type it saw is None rather than Hello.
+    let seen = hello_rx.recv_timeout(std::time::Duration::from_secs(5));
+    assert_eq!(seen.ok(), Some(None), "no hello frame reached the peer");
+
+    let _ = std::fs::remove_file(&blocker);
 }

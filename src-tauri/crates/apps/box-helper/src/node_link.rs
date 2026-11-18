@@ -6,20 +6,20 @@
 //! handshake, and sends its heartbeats over the encrypted frames instead of
 //! one HTTP POST each.
 //!
-//! Three things this deliberately does not do:
+//! The shape of this module, and the one limit it still has:
 //!
 //! - **It does not replace the HTTP path.** The daemon still answers `/rpc`,
 //!   and the helper still uses it for anything that is not a node method. Two
 //!   ways to reach the same handler is a migration, not a rewrite.
-//! - **It does not persist the walk, so a restart reconnects no more than a
-//!   reconnect does.** The walk lives on the `Link`, and the `Link` dies with
-//!   the process, so a restart builds a fresh walk starting at c_(n-1) -- the
-//!   value the control plane already holds, and a handshake it refuses. This
-//!   is the design red line ("persist before sending", section 3) and it is
-//!   *not* satisfied here: satisfying it needs a file the helper can write on
-//!   every target it runs on, which is stage B. Within one process the walk
-//!   does advance and a reconnect does spend the next link, which is what
-//!   this module delivers. A restart re-enrolls.
+//! - **The walk is persisted when the operator gives a state directory**,
+//!   which is what satisfies the design red line ("persist before sending",
+//!   section 3): the position is written *before* the hello goes out, so a
+//!   restart continues from where the process got to instead of offering
+//!   c_(n-1) again -- a value the control plane already holds and refuses.
+//!   Without the directory the walk lives only in memory and a restart
+//!   re-enrolls, exactly as stage A did. The two are kept apart on purpose:
+//!   the seed is a secret the operator manages, this is bookkeeping the
+//!   helper owns.
 //! - **It does not drive tasks.** Stage B moves operations down; this is the
 //!   transport they will arrive on.
 //!
@@ -66,12 +66,69 @@ pub struct Link {
     /// handshake would be refused. This is what makes a reconnect spend the
     /// *next* link rather than the first one twice.
     ///
-    /// It is not persisted across processes, which is why a restart re-enrols.
+    /// It is persisted across processes when a state directory is supplied,
+    /// which is what lets a restart reconnect rather than re-enroll.
     walker: box_node_link::chain::ChainNode,
     /// Everything needed to open the link again.
     config: LinkConfig,
     node_id: String,
     control_url: String,
+    state_dir: Option<std::path::PathBuf>,
+}
+
+
+/// The file the walk position is persisted in, next to the seed the operator
+/// supplied. Its name is deliberately not the seed name: the seed is a secret
+/// the operator manages, this is bookkeeping the helper owns.
+const WALK_FILE: &str = "node-link-walk.json";
+
+/// Read the persisted walk position, or None if there is nothing to read.
+///
+/// A file that is missing, empty or unparseable is "no state", not an error:
+/// a first run has no state, and a truncated file from a crash is exactly the
+/// case the smaller-k rule exists for. Failing here would turn a recoverable
+/// crash into a helper that refuses to start.
+pub fn read_walk(directory: &std::path::Path) -> Option<u32> {
+    let text = std::fs::read_to_string(directory.join(WALK_FILE)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get("next_k")?.as_u64().map(|k| k as u32)
+}
+
+/// Persist the walk position. The write is atomic, because a half-written
+/// state file is worse than none: it would be read as a position the helper
+/// never reached.
+pub fn write_walk(directory: &std::path::Path, next_k: u32) -> Result<(), String> {
+    std::fs::create_dir_all(directory).map_err(|e| format!("state dir: {e}"))?;
+    let text = serde_json::to_string(&serde_json::json!({ "next_k": next_k }))
+        .map_err(|e| format!("state encode: {e}"))?;
+    let path = directory.join(WALK_FILE);
+    // A k-suffixed temp name, so two helpers sharing a state directory do not
+    // race on the rename. One helper per directory is the documented shape,
+    // but a fixed name makes the second one corrupt the first silently.
+    let temp = directory.join(format!("{WALK_FILE}.{next_k}.tmp"));
+    std::fs::write(&temp, text).map_err(|e| format!("state write: {e}"))?;
+    std::fs::rename(&temp, &path).map_err(|e| format!("state rename: {e}"))?;
+    Ok(())
+}
+/// Build the walk a process starts with.
+///
+/// Resumes below the persisted position when there is one, because the file
+/// holds the link that was SPENT and the control plane already holds that
+/// value -- resuming at it re-offers it and is refused forever. That is the
+/// whole point of persisting, and it is a function of its own so the test
+/// can drive it: the decision lives between two files, and a decision in the
+/// gap is a decision nothing checks.
+pub fn resume_walk(
+    seed: [u8; 32],
+    chain_length: u32,
+    state_dir: Option<&std::path::Path>,
+) -> box_node_link::chain::ChainNode {
+    match state_dir.and_then(read_walk) {
+        Some(spent_k) => {
+            box_node_link::chain::ChainNode::at(seed, spent_k.saturating_sub(1).max(1), chain_length)
+        }
+        None => box_node_link::chain::ChainNode::new(seed, chain_length),
+    }
 }
 
 /// Open a socket to the control plane.
@@ -95,6 +152,7 @@ pub fn connect(
     control_url: &str,
     walker: box_node_link::chain::ChainNode,
     stream: TcpStream,
+    state_dir: Option<&std::path::Path>,
 ) -> Result<Link, String> {
     // The socket is dialled by the caller, not here. That is what makes the
     // handshake testable: a fake peer on the other end of a listener is enough
@@ -118,19 +176,35 @@ pub fn connect(
     // The link comes from the walk, not from `chain_length - 1`: on a
     // reconnect the control plane already holds the first link, and sending
     // it again is refused.
-    // The link comes from the walk, not from `chain_length - 1`: on a
-    // reconnect the control plane already holds the first link, and sending
-    // it again is refused.
     let mut walker = walker;
-    let (hex, _k) = walker.next_value();
+    // Persist BEFORE sending. The control plane records its spend before it
+    // writes the ack, so a hello that goes out and is answered by silence
+    // leaves it holding a value this side never saw accepted. Writing the
+    // walk position first is what makes the next attempt use a smaller k --
+    // the design red line, and the one thing the in-memory walk cannot do
+    // on its own.
+    let (hex, k) = walker.next_value();
+    if let Some(directory) = state_dir {
+        // A failure here is fatal for THIS attempt, and deliberately so. The
+        // link is about to be spent on the wire; if the position is not on
+        // disk first, the next restart re-offers it and is refused forever --
+        // the exact scenario this write exists to prevent. The daemon makes
+        // the same choice from the other side: spend_chain_link failing
+        // sends close{link-not-stored} and refuses to ack.
+        //
+        // The cost is bounded, because open_link treats a failed connect as
+        // non-fatal and falls back to HTTP: a full disk costs the encrypted
+        // path, not the node.
+        write_walk(directory, k).map_err(|e| format!("cannot persist the chain walk: {e}"))?;
+    }
     let link = box_node_link::handshake::hex_decode(&hex)
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
         .expect("a chain value is 32 bytes of hex");
 
-    // Token mode. The chain is the reconnect credential within one process:
-    // each handshake spends one link, and the walk holds where it got to. A
-    // restart is a different matter -- it re-enrols, for the reason the module
-    // doc gives.
+    // Token mode. The chain is the reconnect credential: each handshake
+    // spends one link, and the walk holds where it got to -- in memory for
+    // this process, and on disk when the operator gave a state directory,
+    // which is what makes a restart reconnect rather than re-enrol.
     // The control-plane key comes from the config, which is where the enrol
     // reply puts it. A bad hex here is a typo in the flag, and saying so is
     // better than a signature-shaped error three steps later.
@@ -226,6 +300,7 @@ pub fn connect(
         config: config.clone(),
         node_id: node_id.to_owned(),
         control_url: control_url.to_owned(),
+        state_dir: state_dir.map(std::path::Path::to_path_buf),
     })
 }
 
@@ -242,8 +317,6 @@ pub fn rewind_after_failure(walker: &mut box_node_link::chain::ChainNode, offere
 
 impl Link {
 
-    /// Open the link again after it dropped, spending the next chain link.
-    ///
     /// Open the link again after it dropped, spending the next chain link.
     ///
     /// This is the piece that was missing: a link that stopped working used to
@@ -294,6 +367,7 @@ impl Link {
             &self.control_url,
             self.walker.clone(),
             stream,
+            self.state_dir.as_deref(),
         );
         let reopened = match reopened {
             Ok(link) => link,

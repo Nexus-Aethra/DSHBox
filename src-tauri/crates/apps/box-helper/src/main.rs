@@ -34,6 +34,10 @@ struct Args {
     /// The material for the encrypted link, when the operator supplied it.
     /// Without it the helper runs exactly as it did in stage A.
     link: Option<node_link::LinkConfig>,
+    /// Where the chain walk position is persisted, when the operator wants a
+    /// restart to reconnect rather than re-enrol. Without it the walk lives
+    /// only in memory and a restart re-enrols, which is what stage A did.
+    link_state_dir: Option<std::path::PathBuf>,
 }
 
 /// Read the arguments from the process.
@@ -54,6 +58,7 @@ fn parse_from<I: Iterator<Item = String>>(mut iter: I) -> Result<Args, String> {
         kind: "wsl2".to_owned(),
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         link: None,
+        link_state_dir: None,
     };
     while let Some(flag) = iter.next() {
         let value = iter.next().ok_or_else(|| format!("missing value for {flag}"))?;
@@ -89,6 +94,14 @@ fn parse_from<I: Iterator<Item = String>>(mut iter: I) -> Result<Args, String> {
                     ));
                 }
                 args.link.get_or_insert_with(Default::default).chain_length = length
+            }
+            "--link-state-dir" => {
+                // Where the walk position lives across processes. Separate
+                // from the seed on purpose: the seed is a secret the operator
+                // manages, this is bookkeeping the helper owns, and mixing
+                // the two is how a permission bug ships on a target nobody
+                // tested.
+                args.link_state_dir = Some(std::path::PathBuf::from(value))
             }
             other => return Err(format!("unknown flag {other}")),
         }
@@ -243,6 +256,7 @@ fn open_link(
     config: &node_link::LinkConfig,
     node_id: &str,
     control_url: &str,
+    state_dir: Option<&std::path::Path>,
 ) -> Option<node_link::Link> {
     let seed = match seed_bytes(config) {
         Ok(seed) => seed,
@@ -253,11 +267,15 @@ fn open_link(
     };
 
     // The walk starts here and lives on the Link, so a reconnect spends the
-    // next link rather than the first one again. It is NOT rebuilt per
-    // process: a fresh walk starts at c_(n-1) again, and the control plane
-    // already holds that value, so a restart would be refused. Persisting
-    // the walk across processes is stage B.
-    let walker = box_node_link::chain::ChainNode::new(seed, config.chain_length);
+    // next link rather than the first one again.
+    //
+    // It is resumed from disk when the operator gave a state directory, which
+    // is what makes a restart reconnect instead of re-enrol -- the design red
+    // line in section 3, and the one thing an in-memory walk cannot do.
+    let walker = node_link::resume_walk(seed, config.chain_length, state_dir);
+    if let Some(spent) = state_dir.and_then(node_link::read_walk) {
+        println!("[helper] resuming the chain walk below c_{spent}");
+    }
     // Dial first, so a socket that cannot be opened is reported as such
     // rather than surfacing as a handshake failure.
     let stream = match node_link::dial(control_url) {
@@ -267,7 +285,7 @@ fn open_link(
             return None;
         }
     };
-    match node_link::connect(config, node_id, control_url, walker, stream) {
+    match node_link::connect(config, node_id, control_url, walker, stream, state_dir) {
         Ok(link) => {
             println!("[helper] node link established");
             Some(link)
@@ -320,7 +338,9 @@ fn main() {
     let mut link = args
         .link
         .as_ref()
-        .and_then(|config| open_link(config, &args.node_id, &args.control_url));
+        .and_then(|config| {
+            open_link(config, &args.node_id, &args.control_url, args.link_state_dir.as_deref())
+        });
 
     let mut backoff = 1u64;
     loop {
@@ -340,10 +360,6 @@ fn main() {
             }
             Err(error) => {
                 eprintln!("[helper] heartbeat failed: {error}");
-                // A link that stops working is reconnected rather than
-                // abandoned: the transport is what broke, the node is still
-                // alive, and the chain still has links. Falling back to HTTP
-                // for the rest of the process life -- which is what this did
                 // A link that stops working is reconnected rather than
                 // abandoned: the transport is what broke, the node is still
                 // alive, and the chain still has links. Falling back to HTTP
