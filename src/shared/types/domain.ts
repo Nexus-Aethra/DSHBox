@@ -1,6 +1,60 @@
 export type Language = 'en' | 'zh-CN'
 export type ToolchainStatus = { id: string; name: string; version: string | null }
 export type DshVersion = { name: string; installed: boolean }
+/**
+ * One node in the registry, as the daemon holds it.
+ *
+ * A node is a machine, not a workload: no DSH versions, images or plugins
+ * live here (those are artifacts and profile state). The desktop forwards
+ * `node_list` verbatim rather than shaping it, so these field names are the
+ * daemon's -- `camelCase`, straight off the Rust record.
+ */
+/**
+ * Wire status of a node. Lowercase on the wire, like the task states; the
+ * daemon pins the spelling in a test so a rename cannot silently drift.
+ */
+export type NodeStatus = 'registering' | 'online' | 'offline' | 'draining' | 'failed'
+
+export type NodeRecord = {
+  id: string
+  /** "host" | "wsl2" | "libkrun" | "vz" | "docker" */
+  kind: string
+  /** `{OS}-{ARCH}`, e.g. "windows-x86_64". Not a package target. */
+  platform: string
+  status: NodeStatus
+  capabilities: string[]
+  /** Address the helper calls back on; null for the in-process host node. */
+  controlUrl: string | null
+  /** Bumped every daemon start; an old epoch is refused. */
+  sessionEpoch: number
+  enrolledAt: number | null
+  lastSeen: number | null
+  helperVersion: string | null
+  /** Backend-specific reference (distro name, container id, ...). */
+  backendRef: string | null
+  /** The daemon's own host. Built-in, never heartbeats, cannot be removed. */
+  hostNode: boolean
+}
+
+/**
+ * What an enrol reply carries. The `seed` is present exactly once, in the
+ * reply to the enrol that minted it, and is never stored by the daemon -- so
+ * a UI that does not show it has lost it for good.
+ */
+export type EnrollReply = {
+  enrollToken: string
+  nodeId: string
+  controlUrl: string | null
+  epoch: number
+  expiresAt: number
+  bootstrap?: {
+    mode: string
+    seed: string
+    chainLength: number
+    chainEnd: string
+  }
+}
+
 export type DshContainer = { id: string; name: string; version: string; profile: string; template?: string; directory: string; status: string }
 // Local template surfaced by the daemon. Stored under
 // `<runtime>/templates/<content-hash>/script.dsh` and looked up through
