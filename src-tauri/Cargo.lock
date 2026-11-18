@@ -245,6 +245,7 @@ dependencies = [
 name = "box-helper"
 version = "0.1.0"
 dependencies = [
+ "box-node-link",
  "serde_json",
 ]
 
