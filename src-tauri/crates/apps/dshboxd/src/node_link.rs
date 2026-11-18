@@ -21,7 +21,7 @@
 
 use crate::state::DaemonState;
 use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
-use box_foundation::{BoxPaths, BoxResult};
+use box_foundation::BoxResult;
 use box_node_link::handshake::{self, AuthMode, ControlHand, Hello};
 use crate::node_keys::mode_of;
 use box_node_link::SystemRandom;
@@ -512,7 +512,11 @@ fn run_secure_loop(
     writer: &mut BufWriter<TcpStream>,
     session: &mut Session,
     state: &Arc<DaemonState>,
-    main_token: &str,
+    // Deliberately unused. The plaintext path gates on the main token; the
+    // encrypted path does not, because the handshake already authenticated
+    // the peer. Passing it at all keeps the two signatures comparable, and
+    // the underscore says which one consults it.
+    _main_token: &str,
 ) {
     let mut rekeys_seen: u32 = 0;
     // The read blocks, but not forever -- and only here. A quiet session
@@ -623,7 +627,7 @@ fn run_secure_loop(
         // Seal the reply, rotating the keys first if the design has retired
         // them. A loop rather than a match arm: the retry is a second attempt
         // under new keys, and a second attempt is what a loop says.
-        let mut reply = loop {
+        let reply = loop {
             match session.seal_frame(FrameType::Response, &payload) {
                 Ok(frame) => break frame,
                 // A key that has aged or been used past its limit is retired

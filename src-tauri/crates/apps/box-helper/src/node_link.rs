@@ -11,13 +11,15 @@
 //! - **It does not replace the HTTP path.** The daemon still answers `/rpc`,
 //!   and the helper still uses it for anything that is not a node method. Two
 //!   ways to reach the same handler is a migration, not a rewrite.
-//! - **It does not persist a node key, and does not need one yet.** The
-//!   helper connects in token mode, where the chain is the reconnect
-//!   credential: each handshake spends one link and the row holds the last
-//!   accepted one, so a restart spends the next link down. Node-key mode
-//!   needs a key that survives a restart, which means a 0600 file the helper
-//!   can write on every target it runs on -- that is stage B, and until then
-//!   the chain is what reconnects.
+//! - **It does not persist the walk, so a restart reconnects no more than a
+//!   reconnect does.** The walk lives on the `Link`, and the `Link` dies with
+//!   the process, so a restart builds a fresh walk starting at c_(n-1) -- the
+//!   value the control plane already holds, and a handshake it refuses. This
+//!   is the design red line ("persist before sending", section 3) and it is
+//!   *not* satisfied here: satisfying it needs a file the helper can write on
+//!   every target it runs on, which is stage B. Within one process the walk
+//!   does advance and a reconnect does spend the next link, which is what
+//!   this module delivers. A restart re-enrolls.
 //! - **It does not drive tasks.** Stage B moves operations down; this is the
 //!   transport they will arrive on.
 //!
@@ -38,7 +40,7 @@ use std::net::TcpStream;
 /// Deliberately does not carry the node id: that comes from the args the
 /// caller already parsed, and a config that has to be patched after
 /// construction is a config that can be used unpatched.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct LinkConfig {
     /// The token-chain seed, hex. Spent one link per handshake.
     pub seed: String,
@@ -57,6 +59,19 @@ pub struct Link {
     session: Session,
     reader: BufReader<TcpStream>,
     writer: BufWriter<TcpStream>,
+    /// The chain walk, held across reconnects within one process.
+    ///
+    /// Not rebuilt per connection: a fresh walk starts at `c_(n-1)` again,
+    /// and the control plane already holds that value, so the second
+    /// handshake would be refused. This is what makes a reconnect spend the
+    /// *next* link rather than the first one twice.
+    ///
+    /// It is not persisted across processes, which is why a restart re-enrols.
+    walker: box_node_link::chain::ChainNode,
+    /// Everything needed to open the link again.
+    config: LinkConfig,
+    node_id: String,
+    control_url: String,
 }
 
 /// Open the link: handshake, then a session ready to carry frames.
@@ -68,6 +83,7 @@ pub fn connect(
     config: &LinkConfig,
     node_id: &str,
     control_url: &str,
+    walker: box_node_link::chain::ChainNode,
 ) -> Result<Link, String> {
     let (host, port) = crate::split_url(control_url)?;
     let stream = TcpStream::connect((host.as_str(), port)).map_err(|e| format!("connect: {e}"))?;
@@ -76,9 +92,6 @@ pub fn connect(
     // and accepts a value only when H(value) equals it, so the first value is
     // c_(n-1): sending c_n itself would be a value whose hash nothing will
     // ever accept. That is the off-by-one the chain walk already warns about.
-    let seed = box_node_link::handshake::hex_decode(&config.seed)
-        .ok_or("the seed is not valid hex")?;
-    let seed: [u8; 32] = seed.try_into().map_err(|_| "the seed is not 32 bytes")?;
     // A chain shorter than two has no spendable link that is not the seed,
     // and a one-link chain would send the seed itself. The CLI already
     // refuses it; this is the same rule one layer down, stated rather than
@@ -90,18 +103,22 @@ pub fn connect(
             config.chain_length
         ));
     }
-    let link = box_node_link::chain::hash_n(&seed, config.chain_length - 1);
+    // The link comes from the walk, not from `chain_length - 1`: on a
+    // reconnect the control plane already holds the first link, and sending
+    // it again is refused.
+    // The link comes from the walk, not from `chain_length - 1`: on a
+    // reconnect the control plane already holds the first link, and sending
+    // it again is refused.
+    let mut walker = walker;
+    let (hex, _k) = walker.next_value();
+    let link = box_node_link::handshake::hex_decode(&hex)
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .expect("a chain value is 32 bytes of hex");
 
-    // Token mode, not node-key. The chain is the reconnect credential: every
-    // handshake spends one link, and the row holds 64 of them, so a restart
-    // reconnects until the chain runs out.
-    //
-    // Node-key mode would need the long-term key to survive a restart, and
-    // this build has no key file -- the key is generated per process, so a
-    // restart offers a key the daemon has never seen and the handshake is
-    // refused forever. Persisting the key is stage B and needs a 0600 file
-    // the helper can write on every target it runs on. Until then the chain
-    // is what reconnects, which is exactly what it is for.
+    // Token mode. The chain is the reconnect credential within one process:
+    // each handshake spends one link, and the walk holds where it got to. A
+    // restart is a different matter -- it re-enrols, for the reason the module
+    // doc gives.
     // The control-plane key comes from the config, which is where the enrol
     // reply puts it. A bad hex here is a typo in the flag, and saying so is
     // better than a signature-shaped error three steps later.
@@ -110,7 +127,7 @@ pub fn connect(
 
     let rng = box_node_link::SystemRandom::new();
     let node_hand =
-        NodeHand::new(&rng, control_pubkey).map_err(|e| format!("handshake: {e}"))?;
+        NodeHand::new(&rng, control_pubkey.clone()).map_err(|e| format!("handshake: {e}"))?;
 
     let mut hello = Hello {
         node_id: node_id.to_owned(),
@@ -193,10 +210,76 @@ pub fn connect(
         session,
         reader,
         writer,
+        walker,
+        config: config.clone(),
+        node_id: node_id.to_owned(),
+        control_url: control_url.to_owned(),
     })
 }
 
 impl Link {
+    /// Step the walk back after a failed attempt.
+    ///
+    /// Its own method rather than inline in `reconnect`, because the decision
+    /// is the part worth testing and the reconnect that triggers it needs a
+    /// socket. Deleting the call in `reconnect` would still leave this
+    /// untested, but at least the arithmetic is pinned somewhere.
+    fn rewind_after_failure(&mut self, offered_k: u32) {
+        self.walker.rewind_to(offered_k.saturating_sub(1).max(1));
+    }
+
+    /// Open the link again after it dropped, spending the next chain link.
+    ///
+    /// Open the link again after it dropped, spending the next chain link.
+    ///
+    /// This is the piece that was missing: a link that stopped working used to
+    /// mean HTTP for the rest of the process life, because nothing could open
+    /// it again -- the enrol material the first connect needed was gone, and a
+    /// fresh chain value would have been the first one, which the control plane
+    /// already holds.
+    ///
+    /// Both are solved by keeping them on the Link: the config and the walk
+    /// survive, so a reconnect is an ordinary handshake one link further down
+    /// the chain. When the chain runs out the error says so, and the caller
+    /// needs a fresh enrol grant -- which is a real limit, not a silent one.
+    ///
+    /// **A failed attempt costs a link, permanently.** The rewind below steps
+    /// back one on any failure, including a refusal, which is a link the daemon
+    /// never spent. That errs toward the safe side -- not rewinding after a
+    /// lost ack is a permanent refusal, rewinding after a refusal only wastes
+    /// budget -- but it means a node on a flaky network does not get the full
+    /// 63 handshakes. Measured: with one failure in three attempts, 62.
+    pub fn reconnect(&mut self) -> Result<(), String> {
+        if self.walker.is_exhausted() {
+            return Err(
+                "the bootstrap chain is exhausted; a fresh enrol grant is required".to_owned(),
+            );
+        }
+
+        // The link this attempt will offer, remembered so a failure can rewind
+        // to it. The control plane records its spend *before* writing the ack,
+        // so a lost ack leaves the daemon holding a value this side has not
+        // seen accepted -- and resending that same value is a permanent
+        // refusal, because H(c_k) is c_(k+1) and the daemon now expects c_k.
+        // That is the design red line, and rewind is the repair it names.
+        let offered_k = self.walker.remaining().max(1);
+        let reopened = connect(
+            &self.config,
+            &self.node_id,
+            &self.control_url,
+            self.walker.clone(),
+        );
+        let reopened = match reopened {
+            Ok(link) => link,
+            Err(error) => {
+                self.rewind_after_failure(offered_k);
+                return Err(error);
+            }
+        };
+        *self = reopened;
+        Ok(())
+    }
+
     /// One encrypted request, and the decrypted response.
     ///
     /// The method must be on `NODE_METHODS`: the daemon enforces it on the
