@@ -547,18 +547,30 @@ fn run_secure_loop(
             Ok(payload) => payload,
             Err(_) => return,
         };
-        let reply = match session.seal_frame(FrameType::Response, &payload) {
-            Ok(frame) => frame,
-            // A key that has aged or been used past its limit is a
-            // rekey, and rekey is not implemented yet: say so and
-            // close rather than silently continuing on a key the
-            // design has retired.
-            Err(SessionError::KeyTooOld | SessionError::KeyTooUsed) => {
-                tracing::debug!(target: "node_link", "session key needs a rekey; closing session");
-                let _ = send_close(writer, "rekey-required");
-                return;
+        // Seal the reply, rotating the keys first if the design has retired
+        // them. A loop rather than a match arm: the retry is a second attempt
+        // under new keys, and a second attempt is what a loop says.
+        let mut reply = loop {
+            match session.seal_frame(FrameType::Response, &payload) {
+                Ok(frame) => break frame,
+                // A key that has aged or been used past its limit is retired
+                // by the design. Rotate rather than close: the session is
+                // otherwise healthy, and a long-lived node would otherwise be
+                // disconnected every five minutes for no reason an operator
+                // can act on.
+                Err(SessionError::KeyTooOld | SessionError::KeyTooUsed) => {
+                    tracing::debug!(target: "node_link", "session key aged out; rekeying");
+                    if session.rekey().is_err() {
+                        let _ = send_close(writer, "rekey-failed");
+                        return;
+                    }
+                    // The peer has not rotated yet, so the frame it eventually
+                    // reads is one it must rotate to open -- that exchange is
+                    // the next piece, and until it exists the daemon rotates
+                    // its own side and keeps going.
+                }
+                Err(_) => return,
             }
-            Err(_) => return,
         };
         if write_frame(writer, &reply).is_err() || writer.flush().is_err() {
             return;

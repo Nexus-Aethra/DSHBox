@@ -53,6 +53,8 @@ pub enum SealError {
 /// the first -- a nonce reuse, which is fatal for an AEAD.
 pub struct RecordKey {
     key: LessSafeKey,
+    /// The bytes `key` was built from, kept for the rekey derivation.
+    raw: [u8; 32],
     /// How many frames this side has sealed. Drives the nonce, and never
     /// repeats.
     send_seq: u64,
@@ -62,10 +64,20 @@ pub struct RecordKey {
 }
 
 impl RecordKey {
+    /// The raw key bytes, for deriving the next epoch.
+    ///
+    /// Crate-private for the same reason the field is: a key that can be read
+    /// is a key that can be leaked. It exists for `Session::rekey`, which is
+    /// the one place the next keys legitimately come from the current ones.
+    pub(crate) fn material(&self) -> &[u8; 32] {
+        &self.raw
+    }
+
     pub fn new(key_bytes: &[u8; 32]) -> Self {
         let unbound = UnboundKey::new(ALGORITHM, key_bytes).expect("a 32-byte key is valid");
         Self {
             key: LessSafeKey::new(unbound),
+            raw: *key_bytes,
             send_seq: 0,
             recv_seq: 0,
         }

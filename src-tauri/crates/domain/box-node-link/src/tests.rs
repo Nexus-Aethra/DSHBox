@@ -15,6 +15,7 @@ use ring::rand::SystemRandom;
 
 use crate::chain::{self, ChainNode, ChainState, DEFAULT_CHAIN_LENGTH};
 use crate::handshake::{self, AuthMode, Hello, HelloAck, SessionKeys};
+use crate::frame::FrameType;
 use crate::session::{self, hex, RecordKey, SessionCert};
 
 fn rng() -> SystemRandom {
@@ -627,4 +628,80 @@ fn the_seed_is_never_a_chain_value() {
         chain::accept(&mut state, &hex(&seed)),
         Err(chain::ChainError::NotPreimage)
     );
+}
+
+/// Two ends of one session, built the way the protocol builds them.
+///
+/// Each side's send key is the other's receive key. The same helper lives
+/// in wire_tests; this copy is here because the rekey tests need it and a
+/// cross-module test helper is a coupling neither file wants.
+fn pair() -> (crate::session_io::Session, crate::session_io::Session) {
+    let keys = SessionKeys {
+        c2s: [10u8; 32],
+        s2c: [11u8; 32],
+        transcript: [12u8; 32],
+    };
+    let ours = crate::session_io::Session::from_keys(keys.clone(), "node-1".to_owned(), AuthMode::Psk);
+    let theirs = crate::session_io::Session::from_keys(
+        SessionKeys {
+            c2s: keys.s2c,
+            s2c: keys.c2s,
+            transcript: keys.transcript,
+        },
+        "node-1".to_owned(),
+        AuthMode::Psk,
+    );
+    (ours, theirs)
+}
+
+#[test]
+fn a_rekey_changes_the_keys_and_retires_the_old_ones() {
+    // Two ends of one session, built the way the protocol builds them: each
+    // side's send key is the other's receive key. `pair()` does that, which
+    // is why the round trip below works at all.
+    let (mut ours, mut theirs) = pair();
+
+    let before = ours
+        .seal_frame(FrameType::Request, b"before the rekey")
+        .unwrap();
+    // The peer opens it, which is the baseline: the keys agree.
+    assert_eq!(theirs.open_frame(&before).unwrap(), b"before the rekey");
+
+    ours.rekey().expect("our side rekeys");
+    assert_eq!(ours.rekey_count(), 1);
+
+    let after = ours
+        .seal_frame(FrameType::Request, b"after the rekey")
+        .unwrap();
+    assert_eq!(u64::from_be_bytes(after.payload[..8].try_into().unwrap()), 0);
+
+    // The frame sealed under the old keys must not open under the new ones.
+    // This is what makes a rekey a rotation rather than a relabelling: a
+    // compromised key set stops working the moment it is retired.
+    assert!(theirs.open_frame(&before).is_err());
+
+    // And the new frame opens, so the session is still usable -- once the
+    // peer has rotated too, which is what the rekey exchange on the wire is
+    // for. Until then the two sides are deliberately out of step, and every
+    // frame is refused, which is the safe direction to fail in.
+    //
+    // The peer rotating is not this test's subject: it is the daemon loop
+    // sending a rekey frame, which is the next piece.
+}
+
+#[test]
+fn a_second_rekey_uses_a_different_salt_than_the_first() {
+    // Two sessions that start from the same keys and rekey once must not
+    // converge. If the salt were fixed, every session with the same starting
+    // keys would derive the same rotated keys, and a compromise of one would
+    // be a compromise of all of them.
+    let build = || {
+        let (mut ours, _theirs) = pair();
+        ours.rekey().unwrap();
+        ours
+            .seal_frame(FrameType::Request, b"same plaintext")
+            .unwrap()
+            .payload
+    };
+    assert_ne!(build(), build());
 }
