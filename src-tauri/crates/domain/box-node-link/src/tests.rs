@@ -63,6 +63,7 @@ fn psk_exchange(psk: &[u8]) -> Exchange {
         mac: None,
         node_pubkey: None,
         node_sig: None,
+        link: None,
     };
     let t1 = handshake::transcript_client(&hello);
     let mac = crate::kdf::hmac_sha256(&crate::kdf::bootstrap_key(psk), &t1);
@@ -76,7 +77,7 @@ fn psk_exchange(psk: &[u8]) -> Exchange {
         expires_at: 2,
     })
     .unwrap();
-    let (keys, ack) =
+    let (keys, ack, _spent) =
         handshake::control_finish(control, &hello, nonce, &signing, &cert, psk, None).unwrap();
 
     // The node side of the agreement, taken against the eph_b the ack
@@ -161,11 +162,13 @@ fn n7e_a_registered_node_key_is_accepted_and_a_foreign_one_is_refused() {
         mac: None,
         node_pubkey: Some(node_pubkey.clone()),
         node_sig: None,
+        link: None,
     };
     let t1 = handshake::transcript_client(&hello);
     let node_sig = node_signing.sign(&t1).as_ref().to_vec();
     let hello = Hello {
         node_sig: Some(node_sig),
+        link: None,
         ..hello
     };
 
@@ -226,13 +229,15 @@ fn n7f_a_missing_control_signature_is_refused_in_node_key_mode() {
         mac: None,
         node_pubkey: Some(node_pubkey.clone()),
         node_sig: None,
+        link: None,
     };
     let t1 = handshake::transcript_client(&hello);
     let hello = Hello {
         node_sig: Some(node_signing.sign(&t1).as_ref().to_vec()),
+        link: None,
         ..hello
     };
-    let (_, ack) = handshake::control_finish(
+    let (_, ack, _spent) = handshake::control_finish(
         control,
         &hello,
         nonce,
@@ -511,20 +516,30 @@ fn n7c_a_wrong_signature_is_refused_in_token_mode() {
         mac: None,
         node_pubkey: None,
         node_sig: None,
+        link: None,
     };
-    // A real mac, so the node authenticates and the control plane signs. The
-    // thing under test is the signature, not the mac.
+    // A real link, so the chain check passes and the control plane signs.
+    // Token mode spends a link: the value presented must hash to the stored
+    // chain end, and the mac is over that same link.
+    let link = crate::chain::hash_once(b"the link preimage");
+    let hello = Hello {
+        link: Some(link),
+        ..hello
+    };
     let t1 = handshake::transcript_client(&hello);
-    let mac = crate::kdf::hmac_sha256(&crate::kdf::bootstrap_key(b"chain value"), &t1);
+    let mac = crate::kdf::hmac_sha256(&crate::kdf::bootstrap_key(&link), &t1);
     let hello = Hello { mac: Some(mac), ..hello };
-    let (_, ack) =
-        handshake::control_finish(control, &hello, nonce, &signing, b"cert", b"chain value", None).unwrap();
+    let (_, ack, _spent) =
+        // The stored value is the chain end: what the presented link hashes
+        // to. Passing the link itself would be the off-by-one the chain walk
+        // already warns about.
+        handshake::control_finish(control, &hello, nonce, &signing, b"cert", &crate::chain::hash_once(&link), None).unwrap();
     let mut tampered = ack.clone();
     tampered.control_sig[0] ^= 0xff;
     let node_hand =
         handshake::NodeHand::new(&rng, signing.public_key().as_ref().to_vec()).unwrap();
     let outcome =
-        handshake::node_finish(node_hand, &hello, &tampered, b"chain value");
+        handshake::node_finish(node_hand, &hello, &tampered, &link);
     assert_eq!(outcome.err(), Some(handshake::HandshakeError::ControlSignature));
 }
 
@@ -549,6 +564,7 @@ fn n7d_a_node_key_hello_with_no_node_signature_is_refused() {
         mac: None,
         node_pubkey: Some(node_pubkey.clone()),
         node_sig: None,
+        link: None,
     };
     // The control plane refuses a node-key hello with no signature at all.
     let outcome = handshake::control_finish(

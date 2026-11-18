@@ -83,6 +83,13 @@ pub struct Hello {
     pub node_pubkey: Option<Vec<u8>>,
     /// node-key: an Ed25519 signature over t1.
     pub node_sig: Option<Vec<u8>>,
+    /// token: the chain link being spent, c_k.
+    ///
+    /// The control plane holds the chain end and accepts a value only when
+    /// H(value) equals it, so this is what makes the link spendable at all.
+    /// It is bound into the transcript, which is what stops a link being
+    /// lifted off one hello and re-attached to another.
+    pub link: Option<[u8; 32]>,
 }
 
 /// The control plane reply, and everything the node needs to finish.
@@ -131,6 +138,10 @@ pub enum HandshakeError {
     UnsupportedSuite(u16),
     #[error("the transcript does not match the peer mac")]
     TranscriptMismatch,
+    /// token mode: the presented link is not the preimage of the stored
+    /// chain end, so it is not the next link in the chain.
+    #[error("the presented chain link is not the preimage of the stored chain end")]
+    ChainMismatch,
     #[error("the control plane signature is missing or wrong")]
     ControlSignature,
     #[error("the node signature is missing or wrong")]
@@ -172,6 +183,12 @@ pub fn transcript_client(hello: &Hello) -> [u8; 32] {
     if let Some(pubkey) = &hello.node_pubkey {
         input.extend_from_slice(&(pubkey.len() as u32).to_be_bytes());
         input.extend_from_slice(pubkey);
+    }
+    // The chain link, for the same reason: a link lifted off one hello and
+    // re-attached to another must not produce the same transcript, or the
+    // mac that proved possession of the secret still verifies.
+    if let Some(link) = &hello.link {
+        input.extend_from_slice(link);
     }
     ring::digest::digest(&ring::digest::SHA256, &input)
         .as_ref()
@@ -273,6 +290,7 @@ pub fn node_finish(
         return Err(HandshakeError::ControlSignature);
     }
     let t1 = transcript_client(hello);
+
     let t2 = transcript_full(&t1, &ack.server_nonce, &ack.eph_b);
 
     // The control plane proves itself over the whole transcript. A missing
@@ -334,7 +352,7 @@ pub fn control_finish(
     // signature proves the node holds the private key, and this proves it
     // is the key we registered.
     registered_pubkey: Option<&[u8]>,
-) -> Result<(SessionKeys, HelloAck), HandshakeError> {
+) -> Result<(SessionKeys, HelloAck, Option<[u8; 32]>), HandshakeError> {
     // No downgrade. A peer offering another version or suite is refused
     // before anything is derived, which is what keeps a future suite from
     // being tricked into an old one.
@@ -347,15 +365,55 @@ pub fn control_finish(
 
     let t1 = transcript_client(hello);
 
+    // The link this handshake spent, for the caller to persist before the
+    // reply goes out. Token mode fills it; the others leave it None.
+    let mut spent_link: Option<[u8; 32]> = None;
+
     // Node authentication. In psk and token mode this is the HMAC over t1;
     // in node-key mode it is the Ed25519 signature over t1.
     match hello.mode {
-        AuthMode::Psk | AuthMode::Token => {
+        AuthMode::Psk => {
             let mac = hello.mac.ok_or(HandshakeError::TranscriptMismatch)?;
             let expected = kdf::hmac_sha256(&kdf::bootstrap_key(secret), &t1);
             if !constant_time_eq(&mac, &expected) {
                 return Err(HandshakeError::TranscriptMismatch);
             }
+        }
+        AuthMode::Token => {
+            // The link is spent here, and spending it is the whole point.
+            //
+            // The control plane holds the chain end c_n and accepts a value
+            // only when H(value) equals it, so the link the node presents is
+            // c_(n-1) and this check is what retires it. The caller must
+            // persist the new expectation (the presented value itself) before
+            // this returns, which is why the value travels in `spent` rather
+            // than being dropped: the next handshake must present its
+            // preimage.
+            //
+            // Authenticating over the chain end instead -- which is what an
+            // earlier revision did -- leaves the link unspent, so the same
+            // mac is reusable for the life of the row: any peer that once
+            // read a hello can mint a fresh one with a new nonce and be
+            // handed a session as that node. That is the design's own
+            // continuation property defeated without breaking a hash.
+            let link = hello.link.ok_or(HandshakeError::ChainMismatch)?;
+            let hashed = crate::chain::hash_once(&link);
+            // The stored chain end is the only 32-byte value in play, and a
+            // length that is not 32 is a malformed row rather than a wrong
+            // link.
+            let expected: [u8; 32] = secret
+                .try_into()
+                .map_err(|_| HandshakeError::ChainMismatch)?;
+            if !constant_time_eq(&hashed, &expected) {
+                return Err(HandshakeError::ChainMismatch);
+            }
+            // And the mac, over the same link, proves the node holds it.
+            let mac = hello.mac.ok_or(HandshakeError::TranscriptMismatch)?;
+            let expected = kdf::hmac_sha256(&kdf::bootstrap_key(&link), &t1);
+            if !constant_time_eq(&mac, &expected) {
+                return Err(HandshakeError::TranscriptMismatch);
+            }
+            spent_link = Some(link);
         }
         AuthMode::NodeKey => {
             let pubkey = hello.node_pubkey.as_ref().ok_or(HandshakeError::NodeSignature)?;
@@ -391,9 +449,25 @@ pub fn control_finish(
     })
     .map_err(|_| HandshakeError::SealMismatch)?;
 
+    // The wrap key mixes the ECDH secret with the secret this mode proved.
+    //
+    // In psk mode that is an independent proof the control plane holds the
+    // PSK, which never travelled. In token mode the mix is over the *link
+    // the node just spent*, not over the stored chain end: the node derives
+    // the same key from the link it presented, and mixing the chain end
+    // here would give the two sides different keys and a certificate that
+    // will not unseal. It is defence in depth either way, because the
+    // chain value is on the wire.
     let wrap_key = match hello.mode {
         AuthMode::NodeKey => kdf::derive(ecdh.as_ref(), kdf::WRAP_LABEL, &t2),
-        _ => {
+        AuthMode::Token => {
+            let link = hello.link.ok_or(HandshakeError::ChainMismatch)?;
+            let mut mix = Vec::with_capacity(64);
+            mix.extend_from_slice(ecdh.as_ref());
+            mix.extend_from_slice(&kdf::bootstrap_key(&link));
+            kdf::derive(&mix, kdf::WRAP_LABEL, &t2)
+        }
+        AuthMode::Psk => {
             let mut mix = Vec::with_capacity(64);
             mix.extend_from_slice(ecdh.as_ref());
             mix.extend_from_slice(&kdf::bootstrap_key(secret));
@@ -415,6 +489,7 @@ pub fn control_finish(
             control_sig,
             sealed_cert,
         },
+        spent_link,
     ))
 }
 

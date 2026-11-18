@@ -21,7 +21,9 @@
 
 use crate::state::DaemonState;
 use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+use box_foundation::{BoxPaths, BoxResult};
 use box_node_link::handshake::{self, AuthMode, ControlHand, Hello};
+use crate::node_keys::mode_of;
 use box_node_link::SystemRandom;
 use box_node_link::node_keys::NodeKeyRecord;
 use box_node_link::session_io::Session;
@@ -300,6 +302,24 @@ fn handle_secure(
         }
     };
 
+    // The mode the row was issued in must be the mode offered. A mismatch is
+    // a refusal, not a fallback: the row records which secret this node
+    // holds, and honouring a different mode means reading a field the row
+    // does not populate. Today an empty field makes that fail closed by
+    // accident -- and an accident is one refactor away from being wrong.
+    let offered = box_node_link::node_keys::KeyMode::from(hello.mode);
+    if mode_of(&record) != offered {
+        tracing::debug!(
+            target: "node_link",
+            node_id = %hello.node_id,
+            ?offered,
+            stored = ?mode_of(&record),
+            "the offered mode does not match the stored row; closing link"
+        );
+        let _ = send_close(&mut writer, "mode-mismatch");
+        return;
+    }
+
     let nonce = match handshake::fresh_nonce() {
         Ok(nonce) => nonce,
         Err(_) => {
@@ -340,7 +360,7 @@ fn handle_secure(
         .node_pubkey
         .as_deref()
         .and_then(|hex| hex_decode(hex));
-    let (keys, ack) = match handshake::control_finish(
+    let (keys, ack, spent_link) = match handshake::control_finish(
         control,
         &hello,
         nonce,
@@ -365,6 +385,32 @@ fn handle_secure(
             return;
         }
     };
+
+    // Persist the spent link BEFORE the reply goes out.
+    //
+    // The design rule is "persist before sending": if the ack is lost and the
+    // node retries, the daemon already expects the preimage of what it just
+    // accepted, so a retry with the same link is refused rather than granted
+    // a second session. Writing after the reply would leave a window where
+    // the link is still spendable.
+    //
+    // A failure here closes the link rather than continuing: the handshake
+    // succeeded, so the node believes it is connected, and letting it talk
+    // while the daemon has lost track of the link would make the next
+    // handshake a coin flip.
+    if let Some(link) = spent_link {
+        let stored = hex(&link);
+        if let Err(error) = spend_chain_link(&paths, &hello.node_id, &stored) {
+            tracing::warn!(
+                target: "node_link",
+                %error,
+                node_id = %hello.node_id,
+                "cannot persist the spent chain link; closing link"
+            );
+            let _ = send_close(&mut writer, "link-not-stored");
+            return;
+        }
+    }
 
     let payload = match serde_json::to_vec(&wire::ack_wire(&ack)) {
         Ok(payload) => payload,
@@ -569,16 +615,23 @@ fn node_record(
 fn bootstrap_secret(hello: &Hello, record: &NodeKeyRecord) -> Vec<u8> {
     match hello.mode {
         AuthMode::Psk => record.secret.clone().into_bytes(),
-        // The chain end is stored as hex because the store is JSON and the
-        // value is bytes. Decoding it here is what makes the two sides
-        // derive the same bootstrap key: the node hashes the seed it was
-        // given, while the daemon holds only the hex of the result. Handing
-        // the ASCII of that hex to the KDF instead would make every mac
-        // mismatch, and the mismatch would look like an authentication
-        // failure rather than the encoding bug it is.
+        // The value the next link must be the preimage of.
+        //
+        // Before the first connection that is the chain end; afterwards it
+        // is the last link accepted, which is what spends a link. Reading
+        // the chain end unconditionally -- which is what this did at first
+        // -- leaves it unchanged for the life of the row, so the same link
+        // keeps verifying and the authentication material is reusable
+        // forever.
+        //
+        // It is stored as hex because the store is JSON and the value is
+        // bytes. Decoding it here is what makes the two sides agree: the node
+        // hashes the seed and uses the raw 32 bytes, so handing the ASCII of
+        // the hex to the KDF instead would make every mac mismatch.
         AuthMode::Token => record
-            .chain_end
+            .last_accepted
             .as_deref()
+            .or(record.chain_end.as_deref())
             .and_then(hex_decode)
             .unwrap_or_default(),
         AuthMode::NodeKey => Vec::new(),
@@ -602,6 +655,43 @@ fn hex_decode(text: &str) -> Option<Vec<u8>> {
         out.push((hi * 16 + lo) as u8);
     }
     Some(out)
+}
+
+/// Record the chain link a handshake just spent.
+///
+/// The stored value becomes what the next handshake must present the
+/// preimage of, which is what makes a spent link useless: resending it hashes
+/// to something the daemon no longer expects.
+///
+/// A row that is not a token row is left alone -- psk and node-key modes have
+/// no chain to advance, and writing a chain value into them would be a
+/// silent mode change.
+fn spend_chain_link(
+    paths: &box_foundation::BoxPaths,
+    node_id: &str,
+    link_hex: &str,
+) -> BoxResult<()> {
+    let collection = crate::node_keys::open_node_keys(paths)?;
+    let rows = collection.load_all()?;
+    let mut record = rows
+        .into_iter()
+        .find(|row| row.id == node_id)
+        .ok_or_else(|| format!("no node key row for {node_id}"))?;
+    if record.mode != box_node_link::node_keys::KeyMode::Token {
+        return Ok(());
+    }
+    record.last_accepted = Some(link_hex.to_owned());
+    collection.upsert(&[record])?;
+    Ok(())
+}
+
+/// Lowercase hex, for a link on its way into a store row.
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 /// Write a close frame carrying a reason. Best-effort: the peer is going

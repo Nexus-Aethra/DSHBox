@@ -35,6 +35,17 @@ pub struct HelloWire {
     /// node-key: an Ed25519 signature over t1, hex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_sig: Option<String>,
+    /// token: the chain link the node is spending, c_k, hex.
+    ///
+    /// Without it the control plane cannot spend the link -- it holds the
+    /// chain end and accepts a value only when H(value) equals it, so a
+    /// value it never receives is a link it never spends. An earlier
+    /// revision authenticated over the chain end instead, which meant the
+    /// same mac was reusable for the life of the row: any peer that had
+    /// once read a hello could mint a fresh one with a new nonce and be
+    /// handed a session as that node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 /// The control plane's reply, as it travels.
@@ -101,10 +112,27 @@ impl HelloWire {
             Some(hex) => Some(decode_vec(hex, "nodeSig")?),
             None => None,
         };
+        let link = match &self.link {
+            Some(hex) => Some(decode32(hex, "link")?),
+            None => None,
+        };
         match self.mode {
-            AuthMode::Psk | AuthMode::Token => {
+            AuthMode::Psk => {
                 if mac.is_none() {
                     return Err(WireError::MissingField { field: "mac" });
+                }
+                if node_pubkey.is_some() || node_sig.is_some() || link.is_some() {
+                    return Err(WireError::WrongModeField { mode: self.mode });
+                }
+            }
+            AuthMode::Token => {
+                if mac.is_none() {
+                    return Err(WireError::MissingField { field: "mac" });
+                }
+                // Without the link the control plane cannot spend it, and an
+                // unspent link is a reusable credential.
+                if link.is_none() {
+                    return Err(WireError::MissingField { field: "link" });
                 }
                 if node_pubkey.is_some() || node_sig.is_some() {
                     return Err(WireError::WrongModeField { mode: self.mode });
@@ -131,6 +159,7 @@ impl HelloWire {
             mac,
             node_pubkey,
             node_sig,
+            link,
         })
     }
 }
@@ -158,6 +187,7 @@ pub fn hello_wire(hello: &Hello) -> HelloWire {
         mac: hello.mac.map(|m| encode(&m)),
         node_pubkey: hello.node_pubkey.as_deref().map(encode),
         node_sig: hello.node_sig.as_deref().map(encode),
+        link: hello.link.map(|l| encode(&l)),
     }
 }
 
