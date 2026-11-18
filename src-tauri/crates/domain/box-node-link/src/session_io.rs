@@ -192,21 +192,6 @@ impl Session {
         Ok(self.s2c.open_at(seq, b"", ciphertext)?)
     }
 
-    /// Force a rekey if these keys are too old or too used.
-    ///
-    /// The two limits have separate errors because they mean different
-    /// things to a caller deciding whether to rekey or to drop: age is a
-    /// wall-clock deadline the peer also enforces, count is a property of
-    /// this direction alone.
-    fn check_key_age(&self) -> Result<(), SessionError> {
-        if self.key_installed_at.elapsed() >= MAX_KEY_AGE {
-            return Err(SessionError::KeyTooOld);
-        }
-        if self.c2s.send_seq() >= MAX_FRAMES_PER_KEY {
-            return Err(SessionError::KeyTooUsed);
-        }
-        Ok(())
-    }
     /// Mark the current keys as installed in the past.
     ///
     /// Test-only, and the only way to exercise the age gate without waiting

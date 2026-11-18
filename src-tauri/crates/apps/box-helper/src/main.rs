@@ -222,6 +222,56 @@ fn start_sse(host: String, port: u16, token: String, epoch: u64) {
     });
 }
 
+/// The seed, decoded once. It is the root of the chain walk, and a bad one
+/// is a configuration error rather than something to discover at handshake
+/// time.
+fn seed_bytes(config: &node_link::LinkConfig) -> Result<[u8; 32], String> {
+    let bytes = node_link::control_pubkey_hex_to_bytes(&config.seed)
+        .ok_or("the bootstrap seed is not valid hex")?;
+    bytes
+        .try_into()
+        .map_err(|_| "the bootstrap seed is not 32 bytes".to_owned())
+}
+
+/// Open the encrypted link from the bootstrap material, or say why not.
+///
+/// A separate function rather than a nested match in `main`: the failure
+/// paths are three deep, and nesting them inside the process entry point is
+/// how a helper that cannot start its link becomes a helper that cannot
+/// start.
+fn open_link(
+    config: &node_link::LinkConfig,
+    node_id: &str,
+    control_url: &str,
+) -> Option<node_link::Link> {
+    let seed = match seed_bytes(config) {
+        Ok(seed) => seed,
+        Err(error) => {
+            eprintln!("[helper] node link unavailable: {error}");
+            return None;
+        }
+    };
+
+    // The walk starts here and lives on the Link, so a reconnect spends the
+    // next link rather than the first one again. It is NOT rebuilt per
+    // process: a fresh walk starts at c_(n-1) again, and the control plane
+    // already holds that value, so a restart would be refused. Persisting
+    // the walk across processes is stage B.
+    let walker = box_node_link::chain::ChainNode::new(seed, config.chain_length);
+    match node_link::connect(config, node_id, control_url, walker) {
+        Ok(link) => {
+            println!("[helper] node link established");
+            Some(link)
+        }
+        Err(error) => {
+            // Not fatal. The HTTP path is the fallback and it works; saying
+            // why the link did not open is what lets an operator fix it.
+            eprintln!("[helper] node link unavailable: {error}");
+            None
+        }
+    }
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(args) => args,
@@ -230,6 +280,7 @@ fn main() {
             process::exit(2);
         }
     };
+
     let (host, port) = match split_url(&args.control_url) {
         Ok(v) => v,
         Err(error) => {
@@ -257,24 +308,10 @@ fn main() {
     // an upgrade rather than a replacement: the HTTP path above still works,
     // and a helper that cannot open the link keeps heartbeating over HTTP
     // exactly as it did before.
-    let mut link = match &args.link {
-        Some(config) => {
-            match node_link::connect(config, &args.node_id, &args.control_url) {
-                Ok(link) => {
-                    println!("[helper] node link established (node={})", args.node_id);
-                    Some(link)
-                }
-                Err(error) => {
-                    // Not fatal. The HTTP path is the fallback and it works;
-                    // saying why the link did not open is what lets an
-                    // operator fix it.
-                    eprintln!("[helper] node link unavailable: {error}");
-                    None
-                }
-            }
-        }
-        None => None,
-    };
+    let mut link = args
+        .link
+        .as_ref()
+        .and_then(|config| open_link(config, &args.node_id, &args.control_url));
 
     let mut backoff = 1u64;
     loop {
@@ -294,12 +331,38 @@ fn main() {
             }
             Err(error) => {
                 eprintln!("[helper] heartbeat failed: {error}");
-                // A link that stops working falls back to HTTP rather than
-                // giving up: the transport is the thing that broke, and the
-                // node is still alive.
-                if link.is_some() {
+                // A link that stops working is reconnected rather than
+                // abandoned: the transport is what broke, the node is still
+                // alive, and the chain still has links. Falling back to HTTP
+                // for the rest of the process life -- which is what this did
+                // A link that stops working is reconnected rather than
+                // abandoned: the transport is what broke, the node is still
+                // alive, and the chain still has links. Falling back to HTTP
+                // for the rest of the process life -- which is what this did
+                // before -- meant a node that looked healthy while its
+                // encrypted path was gone for good.
+                let reconnected = match link.as_mut() {
+                    Some(link) => match link.reconnect() {
+                        Ok(()) => {
+                            println!("[helper] node link reconnected");
+                            true
+                        }
+                        Err(error) => {
+                            // A chain that has run out needs a fresh enrol
+                            // grant, and that is an operator action. Saying so
+                            // is the difference between a limit and a silent
+                            // degradation.
+                            eprintln!("[helper] node link gone: {error}");
+                            false
+                        }
+                    },
+                    None => false,
+                };
+                if !reconnected {
                     link = None;
                     eprintln!("[helper] falling back to HTTP heartbeats");
+                } else {
+                    backoff = 1;
                 }
                 // A stale epoch or a rotated token means the daemon restarted.
                 // Stage A has no persisted enroll grant, so we cannot silently
