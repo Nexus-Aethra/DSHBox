@@ -258,7 +258,16 @@ fn open_link(
     // already holds that value, so a restart would be refused. Persisting
     // the walk across processes is stage B.
     let walker = box_node_link::chain::ChainNode::new(seed, config.chain_length);
-    match node_link::connect(config, node_id, control_url, walker) {
+    // Dial first, so a socket that cannot be opened is reported as such
+    // rather than surfacing as a handshake failure.
+    let stream = match node_link::dial(control_url) {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("[helper] node link unavailable: {error}");
+            return None;
+        }
+    };
+    match node_link::connect(config, node_id, control_url, walker, stream) {
         Ok(link) => {
             println!("[helper] node link established");
             Some(link)

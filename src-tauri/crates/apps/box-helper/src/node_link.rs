@@ -74,6 +74,16 @@ pub struct Link {
     control_url: String,
 }
 
+/// Open a socket to the control plane.
+///
+/// Separate from `connect` so a test can hand `connect` a socket it dialled
+/// itself, against a peer it controls -- which is what makes the handshake
+/// and its failure paths reachable at all.
+pub fn dial(control_url: &str) -> Result<TcpStream, String> {
+    let (host, port) = crate::split_url(control_url)?;
+    TcpStream::connect((host.as_str(), port)).map_err(|e| format!("connect: {e}"))
+}
+
 /// Open the link: handshake, then a session ready to carry frames.
 ///
 /// `control_url` is `http://host:port`; the link is the same host and port at
@@ -84,10 +94,12 @@ pub fn connect(
     node_id: &str,
     control_url: &str,
     walker: box_node_link::chain::ChainNode,
+    stream: TcpStream,
 ) -> Result<Link, String> {
-    let (host, port) = crate::split_url(control_url)?;
-    let stream = TcpStream::connect((host.as_str(), port)).map_err(|e| format!("connect: {e}"))?;
-
+    // The socket is dialled by the caller, not here. That is what makes the
+    // handshake testable: a fake peer on the other end of a listener is enough
+    // to drive connect to completion, and enough to drive it to a refusal.
+    //
     // The chain link this handshake spends. The daemon holds the chain end
     // and accepts a value only when H(value) equals it, so the first value is
     // c_(n-1): sending c_n itself would be a value whose hash nothing will
@@ -217,16 +229,18 @@ pub fn connect(
     })
 }
 
+/// Step the walk back after a failed attempt.
+///
+/// A free function rather than a method on `Link`, because a `Link` only
+/// exists after a *successful* handshake -- so the failure path that needs
+/// this is exactly the path a method could not be called from. That is what
+/// made the rewind untestable for one round, and why the reviewer deleting it
+/// left the suite green.
+pub fn rewind_after_failure(walker: &mut box_node_link::chain::ChainNode, offered_k: u32) {
+    walker.rewind_to(offered_k.saturating_sub(1).max(1));
+}
+
 impl Link {
-    /// Step the walk back after a failed attempt.
-    ///
-    /// Its own method rather than inline in `reconnect`, because the decision
-    /// is the part worth testing and the reconnect that triggers it needs a
-    /// socket. Deleting the call in `reconnect` would still leave this
-    /// untested, but at least the arithmetic is pinned somewhere.
-    fn rewind_after_failure(&mut self, offered_k: u32) {
-        self.walker.rewind_to(offered_k.saturating_sub(1).max(1));
-    }
 
     /// Open the link again after it dropped, spending the next chain link.
     ///
@@ -263,21 +277,41 @@ impl Link {
         // refusal, because H(c_k) is c_(k+1) and the daemon now expects c_k.
         // That is the design red line, and rewind is the repair it names.
         let offered_k = self.walker.remaining().max(1);
+        // Dial, then hand over the socket. A dial that fails rewinds too:
+        // the daemon never saw a hello, so nothing was spent, but the
+        // conservative direction is the same one and the budget cost is one
+        // link either way.
+        let stream = match dial(&self.control_url) {
+            Ok(stream) => stream,
+            Err(error) => {
+                rewind_after_failure(&mut self.walker, offered_k);
+                return Err(error);
+            }
+        };
         let reopened = connect(
             &self.config,
             &self.node_id,
             &self.control_url,
             self.walker.clone(),
+            stream,
         );
         let reopened = match reopened {
             Ok(link) => link,
             Err(error) => {
-                self.rewind_after_failure(offered_k);
+                rewind_after_failure(&mut self.walker, offered_k);
                 return Err(error);
             }
         };
         *self = reopened;
         Ok(())
+    }
+
+    /// Where the walk currently is, for tests and logs.
+    ///
+    /// A test needs this to assert that a failed reconnect stepped the walk
+    /// back, and a log line needs it to say how much chain is left.
+    pub fn walk_k(&self) -> u32 {
+        self.walker.remaining().max(1)
     }
 
     /// One encrypted request, and the decrypted response.

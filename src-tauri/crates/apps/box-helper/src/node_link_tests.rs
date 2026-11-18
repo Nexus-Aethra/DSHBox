@@ -148,6 +148,7 @@ fn a_helper_opens_a_session_and_exchanges_an_encrypted_request() {
         "node-peer-test",
         &format!("http://127.0.0.1:{}", peer.port),
         box_node_link::chain::ChainNode::new(seed, chain_length),
+        std::net::TcpStream::connect(("127.0.0.1", peer.port)).unwrap(),
     )
     .expect("the client opens a session against the peer");
     // The call carries an epoch, which is what a node heartbeat sends. If the
@@ -290,6 +291,7 @@ fn the_client_follows_a_rekey_that_arrives_before_the_response() {
         "node-follow-rekey",
         &format!("http://127.0.0.1:{port}"),
         box_node_link::chain::ChainNode::new(seed, chain_length),
+        std::net::TcpStream::connect(("127.0.0.1", port)).unwrap(),
     )
     .expect("the client opens a session");
 
@@ -411,5 +413,126 @@ fn a_rewind_cannot_move_the_walk_back_up() {
         walker.remaining(),
         after_first,
         "a rewind above the current k must not move the walk"
+    );
+}
+
+
+/// A reconnect that fails steps the walk back, through the real method.
+///
+/// rewind_after_failure is tested directly as a function, but that is not the
+/// same as the call inside reconnect being tested -- the reviewer deleted that
+/// call once and the suite stayed green. This one drives the method: a
+/// successful handshake to build the Link, then a peer that refuses.
+#[test]
+fn a_failed_reconnect_steps_the_walk_back_through_the_method() {
+    use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+    use box_node_link::handshake::{self, ControlHand};
+    use std::io::{BufReader, BufWriter, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let seed = [23u8; 32];
+    let chain_length = 64u32;
+    let (control_pubkey, control_seckey) = control_keypair();
+
+    // A peer that completes ONE handshake and then refuses the next.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted2 = accepted.clone();
+    let seckey2 = control_seckey.clone();
+    std::thread::spawn(move || {
+        loop {
+            let incoming = listener.accept();
+            let (stream, _) = match incoming {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let mut writer = BufWriter::new(stream.try_clone().unwrap());
+            let mut reader = BufReader::new(stream);
+            let frame = read_frame(&mut reader).unwrap();
+            let frame = match frame {
+                Some(frame) => frame,
+                None => return,
+            };
+            assert_eq!(frame.frame_type, FrameType::Hello);
+
+            let already = accepted2.fetch_add(1, Ordering::SeqCst);
+            if already > 0 {
+                let close = Frame::json(
+                    FrameType::Close,
+                    &serde_json::json!({ "reason": "handshake-refused" }),
+                )
+                .unwrap();
+                write_frame(&mut writer, &close).unwrap();
+                writer.flush().unwrap();
+                return;
+            }
+
+            let wire: box_node_link::wire::HelloWire =
+                serde_json::from_slice(&frame.payload).unwrap();
+            let hello = wire.to_hello().unwrap();
+            let offered = hello.link.expect("a token hello carries its link");
+            let signing = handshake::control_signing_key(&seckey2).unwrap();
+            let cert = serde_json::to_vec(&box_node_link::session::SessionCert {
+                node_id: hello.node_id.clone(),
+                control_fingerprint: "fp-test".to_owned(),
+                issued_at: 1,
+                expires_at: 2,
+            })
+            .unwrap();
+            let control = ControlHand::new(&box_node_link::SystemRandom::new()).unwrap();
+            let result = handshake::control_finish(
+                control,
+                &hello,
+                handshake::fresh_nonce().unwrap(),
+                &signing,
+                &cert,
+                &box_node_link::chain::hash_once(&offered),
+                None,
+                false,
+            );
+            let (keys, ack, _spent) = result.expect("the first handshake completes");
+
+            let payload = serde_json::to_vec(&box_node_link::wire::ack_wire(&ack)).unwrap();
+            let ack_frame = Frame {
+                frame_type: FrameType::HelloAck,
+                payload,
+            };
+            write_frame(&mut writer, &ack_frame).unwrap();
+            writer.flush().unwrap();
+            let _ = keys;
+        }
+    });
+
+    let config = LinkConfig {
+        seed: hex_of(&seed),
+        pinned_fingerprint: "fp-test".to_owned(),
+        control_pubkey: hex_of(&control_pubkey),
+        chain_length,
+    };
+    let started_at = box_node_link::chain::ChainNode::new(seed, chain_length).remaining();
+
+    let mut link = node_link::connect(
+        &config,
+        "node-method-rewind",
+        &format!("http://127.0.0.1:{port}"),
+        box_node_link::chain::ChainNode::new(seed, chain_length),
+        std::net::TcpStream::connect(("127.0.0.1", port)).unwrap(),
+    )
+    .expect("the first handshake completes");
+
+    assert!(link.walk_k() < started_at, "the first handshake spent a link");
+
+    let before_retry = link.walk_k();
+    let error = link
+        .reconnect()
+        .expect_err("the refusing peer must fail the reconnect");
+    assert!(error.contains("refused"), "the refusal reason travels: {error}");
+    assert_eq!(
+        link.walk_k(),
+        before_retry - 1,
+        "a failed reconnect must leave the walk one step lower"
     );
 }
