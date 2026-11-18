@@ -23,23 +23,38 @@ use std::{
 
 const VERSION: &str = "0.1.0";
 
+mod node_link;
+
 struct Args {
     enroll_token: String,
     control_url: String,
     node_id: String,
     kind: String,
     platform: String,
+    /// The material for the encrypted link, when the operator supplied it.
+    /// Without it the helper runs exactly as it did in stage A.
+    link: Option<node_link::LinkConfig>,
 }
 
+/// Read the arguments from the process.
 fn parse_args() -> Result<Args, String> {
+    parse_from(env::args().skip(1))
+}
+
+/// Parse the arguments from an iterator.
+///
+/// Split out from `parse_args` so it can be tested without a process to read
+/// from: the parsing is where a bad flag becomes a silently wrong
+/// configuration, and that is worth pinning.
+fn parse_from<I: Iterator<Item = String>>(mut iter: I) -> Result<Args, String> {
     let mut args = Args {
         enroll_token: String::new(),
         control_url: String::new(),
         node_id: String::new(),
         kind: "wsl2".to_owned(),
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        link: None,
     };
-    let mut iter = env::args().skip(1);
     while let Some(flag) = iter.next() {
         let value = iter.next().ok_or_else(|| format!("missing value for {flag}"))?;
         match flag.as_str() {
@@ -48,6 +63,23 @@ fn parse_args() -> Result<Args, String> {
             "--node-id" => args.node_id = value,
             "--kind" => args.kind = value,
             "--platform" => args.platform = value,
+            // The bootstrap material for the encrypted link. Three values
+            // that arrive together in the enrol reply, or not at all.
+            "--link-seed" => {
+                args.link.get_or_insert_with(Default::default).seed = value
+            }
+            "--link-fingerprint" => {
+                args.link.get_or_insert_with(Default::default).pinned_fingerprint = value
+            }
+            "--link-pubkey" => {
+                args.link.get_or_insert_with(Default::default).control_pubkey = value
+            }
+            "--link-chain-length" => {
+                let length = value
+                    .parse::<u32>()
+                    .map_err(|e| format!("bad chain length: {e}"))?;
+                args.link.get_or_insert_with(Default::default).chain_length = length
+            }
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -211,16 +243,55 @@ fn main() {
     let _ = echo(&session, &host, port, "stage-A hello");
     let _ = report(&session, &host, port, &format!("helper {VERSION} online"));
 
+    // The encrypted link, if the operator supplied the material for it. It is
+    // an upgrade rather than a replacement: the HTTP path above still works,
+    // and a helper that cannot open the link keeps heartbeating over HTTP
+    // exactly as it did before.
+    let mut link = match &args.link {
+        Some(config) => {
+            let pubkey = node_link::control_pubkey_hex_to_bytes(&config.control_pubkey);
+            match node_link::connect(config, &args.node_id, &args.control_url, pubkey) {
+                Ok(link) => {
+                    println!("[helper] node link established (node={})", args.node_id);
+                    Some(link)
+                }
+                Err(error) => {
+                    // Not fatal. The HTTP path is the fallback and it works;
+                    // saying why the link did not open is what lets an
+                    // operator fix it.
+                    eprintln!("[helper] node link unavailable: {error}");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
     let mut backoff = 1u64;
     loop {
         thread::sleep(Duration::from_secs(session.heartbeat_seconds));
-        match heartbeat(&session, &host, port) {
+        // Prefer the link: one encrypted frame instead of one HTTP POST, and
+        // the heartbeat is the highest-frequency call the helper makes.
+        let result = match link.as_mut() {
+            Some(link) => link
+                .call("node_heartbeat", serde_json::json!({ "epoch": session.epoch }))
+                .map(|_| ()),
+            None => heartbeat(&session, &host, port),
+        };
+        match result {
             Ok(()) => {
                 backoff = 1;
                 println!("[helper] heartbeat ok (epoch {})", session.epoch);
             }
             Err(error) => {
                 eprintln!("[helper] heartbeat failed: {error}");
+                // A link that stops working falls back to HTTP rather than
+                // giving up: the transport is the thing that broke, and the
+                // node is still alive.
+                if link.is_some() {
+                    link = None;
+                    eprintln!("[helper] falling back to HTTP heartbeats");
+                }
                 // A stale epoch or a rotated token means the daemon restarted.
                 // Stage A has no persisted enroll grant, so we cannot silently
                 // re-enroll; report it and retry with a bounded backoff.
@@ -233,3 +304,7 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "main_tests.rs"]
+mod tests;

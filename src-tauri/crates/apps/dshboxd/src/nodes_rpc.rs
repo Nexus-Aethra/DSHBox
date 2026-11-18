@@ -43,10 +43,19 @@ pub(crate) fn node_enroll(state: &DaemonState, request: &Value) -> Result<Value,
         // enrols and then cannot handshake because the identity was never
         // written is a failure the enrol should have surfaced.
         let identity = crate::node_keys::open_control_identity(&paths)
-            .and_then(|collection| crate::node_keys::ensure_control_identity(&collection));
-        if let Err(error) = identity {
-            return Err(format!("cannot establish the control plane identity: {error}"));
-        }
+            .and_then(|collection| {
+                let fingerprint = crate::node_keys::ensure_control_identity(&collection)?;
+                let record = crate::node_keys::find_identity(&collection)?
+                    .ok_or("the control plane identity is missing after being established")?;
+                Ok((fingerprint, record))
+            });
+        let (control_fingerprint, control_record) = match identity {
+            Ok(pair) => pair,
+            Err(error) => {
+                return Err(format!("cannot establish the control plane identity: {error}"));
+            }
+        };
+        let control_pubkey = control_record.pubkey;
         match crate::node_keys::open_node_keys(&paths)
             .and_then(|collection| {
                 crate::node_keys::issue_bootstrap(
@@ -55,7 +64,7 @@ pub(crate) fn node_enroll(state: &DaemonState, request: &Value) -> Result<Value,
                     request["helperVersion"].as_str(),
                 )
             }) {
-            Ok(issued) => Some(issued),
+            Ok(issued) => Some((issued, control_pubkey, control_fingerprint)),
             // A node that already has a key is refused rather than re-issued,
             // and that refusal is worth surfacing: silently handing out a
             // second secret would invalidate the one the running helper
@@ -71,7 +80,16 @@ pub(crate) fn node_enroll(state: &DaemonState, request: &Value) -> Result<Value,
         "epoch": epoch,
         "expiresAt": expires_at,
     });
-    if let Some(issued) = &bootstrap {
+    if let Some((issued, control_pubkey, control_fingerprint)) = &bootstrap {
+        // The control-plane identity travels with it. Without the public
+        // key the node cannot build the handshake, and without the
+        // fingerprint it cannot tell a rotated control plane from an
+        // impostor -- which is what makes the first connection mutually
+        // authenticated rather than trust-on-first-use.
+        reply["control"] = json!({
+            "pubkey": control_pubkey,
+            "fingerprint": control_fingerprint,
+        });
         reply["bootstrap"] = json!({
             "mode": "token",
             "seed": issued.seed,

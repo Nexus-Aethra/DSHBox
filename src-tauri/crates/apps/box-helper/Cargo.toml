@@ -10,3 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 serde_json = "1.0"
+
+# The node link: the same crate the daemon uses, so the two ends cannot
+# disagree about the protocol. It brings ring and serde, both already in the
+# offline cache and both dependency-light -- the helper still has no network
+# dependency and builds on any Linux target.
+box-node-link = { path = "../../domain/box-node-link" }
