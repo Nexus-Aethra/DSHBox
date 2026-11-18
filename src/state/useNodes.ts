@@ -11,6 +11,11 @@ import type { EnrollReply, NodeRecord } from '../shared/types/domain'
  */
 type NodeEvent = { event: 'node_status'; payload: { id: string; status: string } }
 
+/** Every status the daemon can put on the wire. The daemon spells them
+ *  lower case and a test pins that, so this list is the wire contract rather
+ *  than a local guess. */
+const NODE_STATUSES: NodeRecord['status'][] = ['registering', 'online', 'offline', 'draining', 'failed']
+
 /**
  * Node registry state, and the two actions the control plane may take on it.
  *
@@ -61,6 +66,12 @@ export function useNodes(onError: (message: string | null) => void) {
     const unlisten = boxApi.listenTask<NodeEvent>('daemon://event', (frame) => {
       if (frame.event !== 'node_status') return
       const { id, status } = frame.payload
+      // The daemon pins the wire spelling and NodeStatus lists exactly those
+      // five, so today the cast cannot fail. But a sixth daemon status would
+      // otherwise render as undefined rather than surface, so the value is
+      // checked against the known set and an unknown one leaves the row alone
+      // -- which keeps the last real status on screen instead of a blank.
+      if (!NODE_STATUSES.includes(status as NodeRecord['status'])) return
       setNodes((current) => current.map((node) => (node.id === id ? { ...node, status: status as NodeRecord['status'] } : node)))
     })
     return () => {
