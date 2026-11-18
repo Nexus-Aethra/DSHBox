@@ -19,6 +19,11 @@ pub mod chain;
 pub mod frame;
 pub mod handshake;
 pub mod kdf;
+
+/// The system random source, re-exported so a caller can build a handshake
+/// without depending on `ring` itself. The primitive and its only consumer
+/// stay in the same crate.
+pub use ring::rand::SystemRandom;
 pub mod node_keys;
 pub mod session;
 pub mod session_io;

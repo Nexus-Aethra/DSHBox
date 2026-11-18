@@ -326,7 +326,7 @@ pub fn control_finish(
     hand: ControlHand,
     hello: &Hello,
     server_nonce: [u8; 16],
-    signing_key: &signature::Ed25519KeyPair,
+    signing_key: &ControlKey,
     session_cert: &[u8],
     secret: &[u8],
     // The key registered for this nodeId in node-keys, if it has one.
@@ -531,10 +531,15 @@ pub fn generate_control_keypair() -> Result<ControlKeypair, HandshakeError> {
     })
 }
 
+/// The control-plane signing key.
+///
+/// An alias so callers outside this crate can name the type without
+/// depending on `ring` themselves. The key is a handle over bytes the
+/// store owns; nothing here exposes the private material.
+pub type ControlKey = ring::signature::Ed25519KeyPair;
+
 /// Rebuild a signing key from a stored PKCS#8 document.
-pub fn control_signing_key(
-    seckey_hex: &str,
-) -> Result<ring::signature::Ed25519KeyPair, HandshakeError> {
+pub fn control_signing_key(seckey_hex: &str) -> Result<ControlKey, HandshakeError> {
     let bytes = hex_decode(seckey_hex).ok_or(HandshakeError::ControlSignature)?;
     ring::signature::Ed25519KeyPair::from_pkcs8(&bytes)
         .map_err(|_| HandshakeError::ControlSignature)
@@ -553,4 +558,18 @@ fn hex_decode(text: &str) -> Option<Vec<u8>> {
         out.push((hi * 16 + lo) as u8);
     }
     Some(out)
+}
+
+/// A fresh random nonce for a hello.
+///
+/// Lives here rather than in the daemon so that `ring` stays a dependency of
+/// the crate that owns the crypto. A daemon that reached for `ring` itself to
+/// fill a nonce would need its own copy of the primitive and its own idea of
+/// what a nonce is, and the two would drift.
+pub fn fresh_nonce() -> Result<[u8; 16], HandshakeError> {
+    let mut nonce = [0u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| HandshakeError::ControlSignature)?;
+    Ok(nonce)
 }
