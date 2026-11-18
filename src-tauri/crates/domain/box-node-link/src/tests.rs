@@ -702,3 +702,91 @@ fn a_rekey_frame_moves_both_sides_onto_the_same_keys() {
     // retirement made observable.
     assert!(theirs.open_frame(&before).is_err());
 }
+
+
+/// Two rekeys from the same starting keys derive different pairs.
+///
+/// The convergence test proves the two ends agree, and a constant salt also
+/// satisfies that -- both sides would derive the same constant pair. This is
+/// the property a constant salt breaks: every session that ever starts from
+/// the same handshake keys would derive the same rotated keys, forever, so a
+/// compromise of one is a compromise of all of them.
+///
+/// The previous revision deleted this test when it replaced the rekey suite,
+/// and a review caught it by mutation: making the derivation ignore its salt
+/// passed the whole workspace. That is the failure mode this pins.
+#[test]
+fn two_rekeys_from_the_same_starting_keys_do_not_converge() {
+    use std::io::BufWriter;
+
+    // A helper that runs one rekey over a real socket pair and reports the
+    // ciphertext the sender produced under the new keys.
+    let rotate = || {
+        let (mut ours, mut theirs) = pair();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sender = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (receiver, _) = listener.accept().unwrap();
+
+        let mut writer = BufWriter::new(sender);
+        ours.send_rekey(&mut writer).unwrap();
+        let frame = crate::frame::read_frame(&mut std::io::BufReader::new(receiver))
+            .unwrap()
+            .expect("the rekey frame arrives");
+        theirs.recv_rekey(&frame).unwrap();
+
+        // Seal under the new keys, so the bytes depend on the salt.
+        theirs
+            .seal_frame(FrameType::Response, b"same plaintext")
+            .unwrap()
+            .payload
+    };
+
+    // Two independent runs, identical starting keys, different salts.
+    assert_ne!(rotate(), rotate());
+}
+
+
+/// A rekey frame is accepted after the keys have aged past their limit.
+///
+/// The age gate exists to stop a session using retired keys. A rekey frame is
+/// the repair for exactly that state, so gating it on age leaves a quiet
+/// session with no way to rotate -- and the only remaining path is a
+/// one-sided rotation the peer cannot follow.
+///
+/// A review proved this by setting MAX_KEY_AGE to a nanosecond: both halves
+/// refused, so a session older than five minutes could not be rekeyed by
+/// either side. This is the test that pins the exemption.
+#[test]
+fn a_rekey_frame_is_accepted_after_the_keys_have_aged() {
+    use crate::session_io::MAX_KEY_AGE;
+    use std::io::BufWriter;
+
+    let (mut ours, mut theirs) = pair();
+    // Both sides past the limit. A request sealed now is refused -- that is
+    // the age gate doing its job, and the baseline this test starts from.
+    ours.age_keys_for_test(MAX_KEY_AGE * 2);
+    theirs.age_keys_for_test(MAX_KEY_AGE * 2);
+    assert!(matches!(
+        ours.seal_frame(FrameType::Request, b"baseline"),
+        Err(crate::session_io::SessionError::KeyTooOld)
+    ));
+
+    // But the rekey still works, because it is the repair rather than a use of
+    // the aged keys.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let sender = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let (receiver, _) = listener.accept().unwrap();
+    let mut writer = BufWriter::new(sender);
+    ours.send_rekey(&mut writer).expect("a rekey must be sendable when aged");
+    let frame = crate::frame::read_frame(&mut std::io::BufReader::new(receiver))
+        .unwrap()
+        .expect("the rekey frame arrives");
+    theirs.recv_rekey(&frame).expect("a rekey must be receivable when aged");
+
+    // And the session works afterwards, in the other direction, under the
+    // fresh keys.
+    let after = theirs.seal_frame(FrameType::Response, b"after").unwrap();
+    assert_eq!(ours.open_frame(&after).unwrap(), b"after");
+}

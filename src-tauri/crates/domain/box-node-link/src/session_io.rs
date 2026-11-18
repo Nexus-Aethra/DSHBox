@@ -106,7 +106,12 @@ impl Session {
     /// The seq the record layer chose travels with the frame so the peer can
     /// enforce ordering, and so a log line can name the frame.
     pub fn seal_frame(&mut self, frame_type: FrameType, payload: &[u8]) -> Result<Frame, SessionError> {
-        self.check_key_age()?;
+        // A rekey frame is exempt: it is the repair for an aged key, so
+        // refusing it on age grounds leaves the session with no way to rotate.
+        // Every other frame type is gated.
+        if !matches!(frame_type, FrameType::Rekey) {
+            self.check_key_age()?;
+        }
         let (seq, sealed) = self.c2s.seal(b"", payload)?;
         // The seq travels in the clear, as an 8-byte prefix, and is also the
         // AEAD aad. The clear prefix is not a secret and not authenticated
@@ -127,7 +132,11 @@ impl Session {
         }
         // The receive direction ages too. A session that only reads still
         // has to rekey, or a long-lived subscriber would never rotate.
-        if self.key_installed_at.elapsed() >= MAX_KEY_AGE {
+        // A rekey frame is exempt for the same reason as on the send side:
+        // it is the repair, not a use of the aged keys.
+        if !matches!(frame.frame_type, FrameType::Rekey)
+            && self.key_installed_at.elapsed() >= MAX_KEY_AGE
+        {
             return Err(SessionError::KeyTooOld);
         }
         // The seq travels as a big-endian u64 in the first 8 bytes of the
@@ -163,40 +172,17 @@ impl Session {
         }
         Ok(())
     }
-    /// Derive the next set of keys from the current ones, and reset the counters.
+    /// Mark the current keys as installed in the past.
     ///
-    /// Design section 4: rekey at 2^32 frames or 5 minutes, whichever comes
-    /// first, and the rekey itself does not rerun the handshake. The new keys
-    /// come from the current ones plus a fresh salt -- no ephemeral exchange,
-    /// no bootstrap secret, and nothing that would let a peer who compromised
-    /// one key set walk backwards to the handshake material.
-    ///
-    /// Both directions advance together. A one-sided rekey would leave the two
-    /// peers on different key sets with nothing on the wire to say so, and
-    /// every subsequent frame would fail to open.
-    pub fn rekey(&mut self) -> Result<(), SessionError> {
-        let epoch = self.rekey_epoch;
-        self.rekey_epoch = epoch.wrapping_add(1);
-
-        // The salt is what makes each epoch's keys different. Without it every
-        // rekey would derive the same pair, and a compromised key would be
-        // compromised again on the next rotation.
-        let mut salt = [0u8; 16];
-        salt[..8].copy_from_slice(&epoch.to_be_bytes());
-        handshake::fill_random(&mut salt[8..])
-            .map_err(|_| SessionError::Seal(SealError::OpenFailed))?;
-
-        let next_c2s = crate::kdf::derive(self.c2s.material(), crate::kdf::REKEY_LABEL, &salt);
-        let next_s2c = crate::kdf::derive(self.s2c.material(), crate::kdf::REKEY_LABEL, &salt);
-
-        // Install, then drop the old pair. Both must happen here: a Session
-        // holding the previous keys after a rekey is the same as never having
-        // rotated.
-        self.c2s = RecordKey::new(&next_c2s);
-        self.s2c = RecordKey::new(&next_s2c);
-        self.key_installed_at = Instant::now();
-        Ok(())
+    /// Test-only, and the only way to exercise the age gate without waiting
+    /// five minutes. A review found the rekey halves refused to run once the
+    /// keys had aged, and the only way to see that was to make the age
+    /// observable.
+    #[cfg(test)]
+    pub fn age_keys_for_test(&mut self, age: std::time::Duration) {
+        self.key_installed_at = std::time::Instant::now() - age;
     }
+
     /// How many times this session has rekeyed. Exposed for tests and logs; a
     /// session that never rotates reports zero.
     pub fn rekey_count(&self) -> u64 {
