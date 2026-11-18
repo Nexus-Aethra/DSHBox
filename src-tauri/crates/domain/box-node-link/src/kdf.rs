@@ -24,6 +24,13 @@ use ring::hmac;
 /// makes a PSK and a token-chain value interchangeable at this step: both
 /// become "a 32-byte secret" and the mode only decides where it came from.
 pub const BOOTSTRAP_LABEL: &[u8] = b"bootstrap";
+/// The rekey derivation label.
+///
+/// Distinct from the handshake labels so a key derived for one purpose can
+/// never be mistaken for a key derived for another, even by a caller that
+/// passes the same salt.
+pub const REKEY_LABEL: &[u8] = b"node-link-rekey-v1";
+
 pub const WRAP_LABEL: &[u8] = b"wrap";
 pub const C2S_LABEL: &[u8] = b"c2s";
 pub const S2C_LABEL: &[u8] = b"s2c";

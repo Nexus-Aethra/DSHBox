@@ -977,6 +977,126 @@ fn control_pubkey_of(state: &Arc<DaemonState>) -> Vec<u8> {
             .pubkey,
     )
 }
+
+/// A node upgrades from its bootstrap mode to node-key mode.
+///
+/// This is the transition the design calls for (section 6): a node enrols
+/// with a token chain, and its first node-key handshake registers the
+/// long-term key every reconnect after that is checked against. Before this,
+/// `with_node_pubkey` existed with no production caller, so a node-key row
+/// was unreachable and NodeKey mode could never connect.
+#[test]
+fn a_token_node_upgrades_to_node_key_on_its_first_node_key_handshake() {
+    use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+    use box_node_link::handshake::{self, AuthMode, Hello, NodeHand};
+    use box_node_link::session_io::Session;
+    use box_node_link::wire;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_runtime(dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = "main-token".to_owned();
+    let server_state = state.clone();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        node_link::handle_link(stream, Vec::new(), server_state, &token);
+    });
+
+    let (_, enrol_reply) = rpc(
+        state.clone(),
+        "main-token",
+        json!({
+            "method": "node_enroll",
+            "token": "main-token",
+            "kind": "helper",
+            "platform": "windows-x86_64",
+            "nodeId": "node-upgrade",
+        }),
+    );
+    let seed = enrol_reply["result"]["bootstrap"]["seed"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let seed_bytes: [u8; 32] = hex_to_bytes(&seed).try_into().unwrap();
+    let chain_length = enrol_reply["result"]["bootstrap"]["chainLength"]
+        .as_u64()
+        .unwrap() as u32;
+    // The link is still spent on the upgrade: the node proves it holds the
+    // bootstrap secret with its mac, and the long-term key is registered on
+    // top of that. Skipping the mac would let a stranger register a key for a
+    // node it never enrolled as.
+    let link = box_node_link::chain::hash_n(&seed_bytes, chain_length - 1);
+    let control_pubkey = control_pubkey_of(&state);
+
+    // The node long-term key. The daemon has never seen it.
+    let node_key = handshake::generate_control_keypair().unwrap();
+    let node_pubkey = hex_to_bytes(&node_key.pubkey_hex);
+    let node_signing = handshake::control_signing_key(&node_key.seckey_hex).unwrap();
+
+    let rng = box_node_link::SystemRandom::new();
+    let node_hand = NodeHand::new(&rng, control_pubkey).unwrap();
+    let eph_a = node_hand.public_key().unwrap();
+    // Node-key mode carries no mac and no link, and the wire decoder refuses
+    // it if either is present -- the modes are exclusive.
+    let mut hello = Hello {
+        node_id: "node-upgrade".to_owned(),
+        mode: AuthMode::NodeKey,
+        version: handshake::VERSION,
+        suite: handshake::SUITE,
+        client_nonce: handshake::fresh_nonce().unwrap(),
+        eph_a,
+        mac: None,
+        node_pubkey: Some(node_pubkey.clone()),
+        node_sig: None,
+        link: None,
+    };
+    // Signed over t1, the client half, which the node can compute before it
+    // has heard anything back. That is why the signature can travel in the
+    // hello at all.
+    let t1 = handshake::transcript_client(&hello);
+    hello.node_sig = Some(node_signing.sign(&t1).as_ref().to_vec());
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let payload = serde_json::to_vec(&wire::hello_wire(&hello)).unwrap();
+    write_frame(&mut client, &Frame { frame_type: FrameType::Hello, payload }).unwrap();
+    client.flush().unwrap();
+    let mut reader = BufReader::new(client.try_clone().unwrap());
+    let ack = read_frame(&mut reader)
+        .unwrap()
+        .expect("the handshake completes");
+    assert_eq!(
+        ack.frame_type,
+        FrameType::HelloAck,
+        "a validly signed node-key hello must be accepted: {:?}",
+        ack.value().ok()
+    );
+
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(reader);
+    handle.join().unwrap();
+
+    // And the row is upgraded: node-key mode, the key registered, and the
+    // chain retired with it.
+    let paths = state.paths.read().unwrap().clone();
+    let collection = crate::node_keys::open_node_keys(&paths).unwrap();
+    let row = collection
+        .load_all()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == "node-upgrade")
+        .expect("the enrol wrote a row");
+    assert_eq!(row.mode, box_node_link::node_keys::KeyMode::NodeKey);
+    assert_eq!(row.node_pubkey.as_deref(), Some(node_key.pubkey_hex.as_str()));
+    assert!(row.chain_end.is_none(), "the chain is retired with the mode");
+
+    // And the session really works, which is the part that makes the upgrade
+    // worth anything.
+    let ack_wire: wire::HelloAckWire = serde_json::from_slice(&ack.payload).unwrap();
+    let ack = ack_wire.to_ack().unwrap();
+    let outcome = handshake::node_finish(node_hand, &hello, &ack, &link).unwrap();
+    let _ = outcome;
+}
 /// A request whose payload is not JSON closes the link. There is no
 /// method to dispatch, and guessing one would mean acting on bytes we
 /// could not read.

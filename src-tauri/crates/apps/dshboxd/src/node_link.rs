@@ -308,7 +308,14 @@ fn handle_secure(
     // does not populate. Today an empty field makes that fail closed by
     // accident -- and an accident is one refactor away from being wrong.
     let offered = box_node_link::node_keys::KeyMode::from(hello.mode);
-    if mode_of(&record) != offered {
+    // Node-key offered against a token row is not a mismatch, it is the
+    // upgrade: the node proves it holds a long-term key, the control plane
+    // registers it, and every reconnect after that is checked against it.
+    // Anything else is a real mismatch and stays a refusal.
+    let upgrading =
+        offered == box_node_link::node_keys::KeyMode::NodeKey
+            && mode_of(&record) == box_node_link::node_keys::KeyMode::Token;
+    if mode_of(&record) != offered && !upgrading {
         tracing::debug!(
             target: "node_link",
             node_id = %hello.node_id,
@@ -359,7 +366,7 @@ fn handle_secure(
     let registered = record
         .node_pubkey
         .as_deref()
-        .and_then(|hex| hex_decode(hex));
+        .and_then(box_node_link::handshake::hex_decode);
     let (keys, ack, spent_link) = match handshake::control_finish(
         control,
         &hello,
@@ -375,6 +382,7 @@ fn handle_secure(
         &cert,
         &bootstrap_secret(&hello, &record),
         registered.as_deref(),
+        upgrading,
     ) {
         Ok(pair) => pair,
         Err(error) => {
@@ -398,6 +406,32 @@ fn handle_secure(
     // succeeded, so the node believes it is connected, and letting it talk
     // while the daemon has lost track of the link would make the next
     // handshake a coin flip.
+    // A node-key hello against a token row is the upgrade. The signature is
+    // verified inside upgrade_to_node_key, before anything is written.
+    if upgrading {
+        let pubkey = hello
+            .node_pubkey
+            .as_ref()
+            .map(|bytes| box_node_link::handshake::hex_encode(bytes))
+            .unwrap_or_default();
+        let signature = hello.node_sig.clone().unwrap_or_default();
+        // The transcript the signature is over: t1, the client half, which
+        // the node can compute before it has heard anything back. That is
+        // why the signature can travel in the hello at all -- signing t2
+        // would need the ack first, and the protocol is one frame.
+        let transcript = handshake::transcript_client(&hello).to_vec();
+        if let Err(error) = register_node_key(&paths, &hello.node_id, &pubkey, &signature, &transcript) {
+            tracing::warn!(
+                target: "node_link",
+                %error,
+                node_id = %hello.node_id,
+                "cannot register the node long-term key; closing link"
+            );
+            let _ = send_close(&mut writer, "key-not-registered");
+            return;
+        }
+    }
+
     if let Some(link) = spent_link {
         let stored = hex(&link);
         if let Err(error) = spend_chain_link(&paths, &hello.node_id, &stored) {
@@ -513,18 +547,30 @@ fn run_secure_loop(
             Ok(payload) => payload,
             Err(_) => return,
         };
-        let reply = match session.seal_frame(FrameType::Response, &payload) {
-            Ok(frame) => frame,
-            // A key that has aged or been used past its limit is a
-            // rekey, and rekey is not implemented yet: say so and
-            // close rather than silently continuing on a key the
-            // design has retired.
-            Err(SessionError::KeyTooOld | SessionError::KeyTooUsed) => {
-                tracing::debug!(target: "node_link", "session key needs a rekey; closing session");
-                let _ = send_close(writer, "rekey-required");
-                return;
+        // Seal the reply, rotating the keys first if the design has retired
+        // them. A loop rather than a match arm: the retry is a second attempt
+        // under new keys, and a second attempt is what a loop says.
+        let mut reply = loop {
+            match session.seal_frame(FrameType::Response, &payload) {
+                Ok(frame) => break frame,
+                // A key that has aged or been used past its limit is retired
+                // by the design. Rotate rather than close: the session is
+                // otherwise healthy, and a long-lived node would otherwise be
+                // disconnected every five minutes for no reason an operator
+                // can act on.
+                Err(SessionError::KeyTooOld | SessionError::KeyTooUsed) => {
+                    tracing::debug!(target: "node_link", "session key aged out; rekeying");
+                    if session.rekey().is_err() {
+                        let _ = send_close(writer, "rekey-failed");
+                        return;
+                    }
+                    // The peer has not rotated yet, so the frame it eventually
+                    // reads is one it must rotate to open -- that exchange is
+                    // the next piece, and until it exists the daemon rotates
+                    // its own side and keeps going.
+                }
+                Err(_) => return,
             }
-            Err(_) => return,
         };
         if write_frame(writer, &reply).is_err() || writer.flush().is_err() {
             return;
@@ -632,30 +678,12 @@ fn bootstrap_secret(hello: &Hello, record: &NodeKeyRecord) -> Vec<u8> {
             .last_accepted
             .as_deref()
             .or(record.chain_end.as_deref())
-            .and_then(hex_decode)
+            .and_then(box_node_link::handshake::hex_decode)
             .unwrap_or_default(),
         AuthMode::NodeKey => Vec::new(),
     }
 }
 
-/// Decode a hex field from the store, or None if it is not hex.
-///
-/// The node public key is stored hex because the store is JSON and a key is
-/// bytes; the handshake wants the bytes. A malformed row is treated as absent
-/// rather than as an error, so a corrupted row refuses the handshake instead
-/// of crashing the connection.
-fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(text.len() / 2);
-    for pair in text.as_bytes().chunks(2) {
-        let hi = (pair[0] as char).to_digit(16)?;
-        let lo = (pair[1] as char).to_digit(16)?;
-        out.push((hi * 16 + lo) as u8);
-    }
-    Some(out)
-}
 
 /// Record the chain link a handshake just spent.
 ///
@@ -683,6 +711,28 @@ fn spend_chain_link(
     record.last_accepted = Some(link_hex.to_owned());
     collection.upsert(&[record])?;
     Ok(())
+}
+
+/// Register the long-term key a node just proved it holds.
+///
+/// Only on the upgrade path: a node arriving in node-key mode against a token
+/// row. Every later reconnect is checked against the key this writes, which is
+/// what makes the signature mean something.
+///
+/// The signature is over t2 -- the whole transcript, including the control
+/// plane signature -- so a key lifted off one handshake cannot be registered
+/// by replaying it into another.
+fn register_node_key(
+    paths: &box_foundation::BoxPaths,
+    node_id: &str,
+    pubkey_hex: &str,
+    signature: &[u8],
+    transcript: &[u8],
+) -> Result<(), String> {
+    let collection = crate::node_keys::open_node_keys(paths).map_err(|e| e.to_string())?;
+    crate::node_keys::upgrade_to_node_key(&collection, node_id, pubkey_hex, signature, transcript)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Lowercase hex, for a link on its way into a store row.

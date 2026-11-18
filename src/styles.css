@@ -755,3 +755,20 @@ dialog .resource-panel { max-height: 70vh; overflow-y: auto; }
 .tool-groups dt { color: #1f2a33; font-size: 13px; font-weight: 600; }
 .tool-groups dd { margin: 0; }
 .tool-names { color: #6b7580; font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace; font-size: 12px; line-height: 1.7; }
+
+/* ---- nodes ---- */
+.node-list { overflow: visible; }
+.node-summary { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.node-meta { color: #737a83; font-size: 12px; margin: 0; }
+.node-actions { align-items: center; display: flex; gap: 4px; }
+.remove-icon { font-size: 19px; font-weight: 500; line-height: 1; }
+.section-note { color: #626973; font-size: 13px; margin: 0; }
+.empty-note { color: #8a939c; font-size: 13px; margin: 0; padding: 20px 16px; text-align: center; }
+/* The one-time secret is the only thing on this page that cannot be
+   recovered, so it gets a card that reads as an interruption rather than
+   another row. */
+.enroll-secret-card { border-color: #2864dc; }
+.enroll-secret-actions { align-items: center; display: flex; gap: 10px; }
+.node-live { align-items: center; color: #29734d; display: flex; font-size: 12px; gap: 7px; margin: 0 0 14px; }
+.node-live-dot { background: #29734d; border-radius: 50%; display: block; height: 7px; width: 7px; }
+.node-live-note { color: #8a939c; }

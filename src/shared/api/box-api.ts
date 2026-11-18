@@ -5,7 +5,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { ask, open, save } from '@tauri-apps/plugin-dialog'
 import type { BoxConfig, ContainerExtensions, ContainerPathListing, ContainerResources, DataEntry, DshContainer, DshVersion, ExtensionBundle, GraphSourceKind, Language, PluginGraph, PreviewScriptResult, RepositoryReferenceRow, ResourceSnapshot, InstalledPlugin, UpdatePolicy, UpdateReleaseSummary, UpdateState,
-  ResourceState, ResourceTree, ResourceTypeSummary, ResourceView, ServerServiceStatus, StoredResource, TaskRecord, TaskStatus, TemplateInfo, ToolchainStatus, WorkspaceExtension } from '../types/domain'
+  ResourceState, ResourceTree, ResourceTypeSummary, ResourceView, ServerServiceStatus, StoredResource, TaskRecord, TaskStatus, TemplateInfo, ToolchainStatus, WorkspaceExtension,
+  NodeRecord, EnrollReply } from '../types/domain'
 
 type ToolchainPayload = { id: string; name: string; managedVersion: string | null }
 
@@ -145,6 +146,16 @@ export const boxApi = {
 
     removeTemplate: (name: string) => ipc<string>('remove_template', { request: { name } }),
     createContainerFromTemplate: (name: string, template: string, profile: string | null) => ipc<TaskRecord>('enqueue_template_container', { request: { name, template, profile } }),
+  // ---- nodes ----
+  // Thin forwarders to the daemon node RPC. The daemon owns the registry;
+  // nothing here shapes or filters it, so the two cannot disagree about what
+  // a node is.
+  listNodes: () => ipc<NodeRecord[]>('list_nodes'),
+  getNode: (id: string) => ipc<NodeRecord>('get_node', { id }),
+  deregisterNode: (id: string) => ipc<{ removed: boolean }>('deregister_node', { id }),
+  // Returns the bootstrap seed exactly once, in this reply. The daemon keeps
+  // only the chain end, so a caller that drops this reply cannot recover it.
+  enrollNode: (kind: string, platform: string, nodeId: string | null) => ipc<EnrollReply>('enroll_node', { kind, platform, nodeId }),
   listContainers: () => ipc<DshContainer[]>('list_dsh_containers'),
   getContainerDetails: (id: string) => ipc<ContainerExtensions | null>('get_container_details', { id }),
   addContainerProfile: (id: string, profile: string) => ipc<DshContainer>('add_dsh_container_profile', { id, profile }),

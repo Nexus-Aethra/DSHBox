@@ -311,6 +311,22 @@ const COPY = {
     // so "nobody provides this" is only knowable about the scanned plugins.
     pluginGraphBlocked: (plugin: string, service: string) => `${plugin} waits for ${service}; no plugin in this graph provides it`,
     pluginGraphBlockedInactive: (plugin: string, service: string) => `${plugin} waits for ${service}, whose provider is installed but not activated`,
+    // ---- nodes ----
+    nodeLive: 'Live', nodeLiveNote: 'Status updates arrive as they happen; the daemon broadcasts every transition.',
+    nodes: 'Nodes', nodesTitle: 'Nodes', nodesNote: 'Machines this box can run work on. The host is always here and is not listed.',
+    noNodes: 'No nodes enrolled yet.',
+    nodeKind: 'Kind', nodePlatform: 'Platform', nodeStatus: 'Status', nodeLastSeen: 'Last seen', nodeCapabilities: 'Capabilities',
+    nodeStatusRegistering: 'Registering', nodeStatusOnline: 'Online', nodeStatusOffline: 'Offline', nodeStatusDraining: 'Draining', nodeStatusFailed: 'Failed',
+    enrollNode: 'Enrol a node', enrolling: 'Enrolling…', nodeKindPlaceholder: 'wsl2', nodePlatformPlaceholder: 'windows-x86_64',
+    nodeIdOptional: 'Node id (optional)', nodeIdPlaceholder: 'generated if empty',
+    enrollFailed: 'Could not enrol the node.', nodeRemove: 'Remove node', nodeRemoving: 'Removing…',
+    nodeRemoveConfirm: (id: string) => `Remove node ${id}? Its bootstrap key stops working and it must be enrolled again.`,
+    // The seed is shown once. After this reply is dismissed it exists nowhere
+    // the daemon can reproduce, which is why the copy button is the point.
+    enrollSecretTitle: 'Bootstrap secret', enrollSecretNote: 'Shown once. The daemon keeps only what it takes to verify it, so a copy you do not take now cannot be recovered.',
+    enrollSecretCopy: 'Copy secret', enrollSecretCopied: 'Copied', enrollSecretSeed: 'Seed', enrollChainLength: 'Chain length', enrollEnrollToken: 'Enrol token',
+    enrollDone: 'Done', enrollTokenNote: 'The node exchanges this for a session token on its first call.',
+    hostNode: 'This machine', hostNodeNote: 'The daemon runs here. Built in, and never removed.',
   },
   'zh-CN': {
     versions: 'DSH 版本代码', container: 'DSH 容器', settings: '设置',
@@ -604,6 +620,22 @@ const COPY = {
     pluginGraphRequiresEdge: (plugin: string, service: string) => `${plugin} 依赖 ${service}`,
     pluginGraphBlocked: (plugin: string, service: string) => `${plugin} 等待 ${service}，但图中没有插件提供它`,
     pluginGraphBlockedInactive: (plugin: string, service: string) => `${plugin} 等待 ${service}，其提供者已安装但未激活`,
+    // ---- 节点 ----
+    nodeLive: '实时', nodeLiveNote: '状态变化即时到达；daemon 会广播每一次状态迁移。',
+    nodes: '节点', nodesTitle: '节点管理', nodesNote: '本 Box 可在其上运行任务的机器。本机始终在列，不在此处显示。',
+    noNodes: '尚未登记任何节点。',
+    nodeKind: '类型', nodePlatform: '平台', nodeStatus: '状态', nodeLastSeen: '最近心跳', nodeCapabilities: '能力',
+    nodeStatusRegistering: '登记中', nodeStatusOnline: '在线', nodeStatusOffline: '离线', nodeStatusDraining: '排水', nodeStatusFailed: '失败',
+    enrollNode: '登记节点', enrolling: '登记中…', nodeKindPlaceholder: 'wsl2', nodePlatformPlaceholder: 'windows-x86_64',
+    nodeIdOptional: '节点 id（可选）', nodeIdPlaceholder: '留空则自动生成',
+    enrollFailed: '登记节点失败。', nodeRemove: '移除节点', nodeRemoving: '移除中…',
+    nodeRemoveConfirm: (id: string) => `移除节点 ${id}？其引导密钥将失效，需要重新登记。`,
+    // 引导密钥只显示一次。此回复关闭后，daemon 无法再次生成它——所以复制按钮
+    // 是保住它的唯一机会。
+    enrollSecretTitle: '引导密钥', enrollSecretNote: '只显示一次。daemon 只保存验证所需的部分，现在不复制就无法找回。',
+    enrollSecretCopy: '复制密钥', enrollSecretCopied: '已复制', enrollSecretSeed: '种子', enrollChainLength: '链长度', enrollEnrollToken: '登记令牌',
+    enrollDone: '完成', enrollTokenNote: '节点首次调用时用它换取会话令牌。',
+    hostNode: '本机', hostNodeNote: 'daemon 运行于此。内置，永不移除。',
   },
 } as const
 

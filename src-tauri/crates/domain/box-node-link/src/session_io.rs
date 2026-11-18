@@ -40,6 +40,9 @@ pub struct Session {
     c2s: RecordKey,
     s2c: RecordKey,
     key_installed_at: Instant,
+    /// How many times this session has rotated its keys. Zero after the
+    /// handshake, and the salt for the next derivation.
+    rekey_epoch: u64,
 }
 
 impl std::fmt::Debug for Session {
@@ -85,6 +88,7 @@ impl Session {
             node_id,
             mode,
             key_installed_at: Instant::now(),
+            rekey_epoch: 0,
         }
     }
 
@@ -159,7 +163,48 @@ impl Session {
         }
         Ok(())
     }
+    /// Derive the next set of keys from the current ones, and reset the counters.
+    ///
+    /// Design section 4: rekey at 2^32 frames or 5 minutes, whichever comes
+    /// first, and the rekey itself does not rerun the handshake. The new keys
+    /// come from the current ones plus a fresh salt -- no ephemeral exchange,
+    /// no bootstrap secret, and nothing that would let a peer who compromised
+    /// one key set walk backwards to the handshake material.
+    ///
+    /// Both directions advance together. A one-sided rekey would leave the two
+    /// peers on different key sets with nothing on the wire to say so, and
+    /// every subsequent frame would fail to open.
+    pub fn rekey(&mut self) -> Result<(), SessionError> {
+        let epoch = self.rekey_epoch;
+        self.rekey_epoch = epoch.wrapping_add(1);
+
+        // The salt is what makes each epoch's keys different. Without it every
+        // rekey would derive the same pair, and a compromised key would be
+        // compromised again on the next rotation.
+        let mut salt = [0u8; 16];
+        salt[..8].copy_from_slice(&epoch.to_be_bytes());
+        handshake::fill_random(&mut salt[8..])
+            .map_err(|_| SessionError::Seal(SealError::OpenFailed))?;
+
+        let next_c2s = crate::kdf::derive(self.c2s.material(), crate::kdf::REKEY_LABEL, &salt);
+        let next_s2c = crate::kdf::derive(self.s2c.material(), crate::kdf::REKEY_LABEL, &salt);
+
+        // Install, then drop the old pair. Both must happen here: a Session
+        // holding the previous keys after a rekey is the same as never having
+        // rotated.
+        self.c2s = RecordKey::new(&next_c2s);
+        self.s2c = RecordKey::new(&next_s2c);
+        self.key_installed_at = Instant::now();
+        Ok(())
+    }
+    /// How many times this session has rekeyed. Exposed for tests and logs; a
+    /// session that never rotates reports zero.
+    pub fn rekey_count(&self) -> u64 {
+        self.rekey_epoch
+    }
 }
+
+
 
 // ---------- the node side of the socket handshake ----------
 

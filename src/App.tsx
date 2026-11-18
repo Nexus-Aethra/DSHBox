@@ -5,9 +5,11 @@ import type { Language } from './shared/types/domain'
 import { pickText } from './i18n'
 import { NPM_REGISTRY_PRESETS, useSettings } from './state/useSettings'
 import { useContainers } from './state/useContainers'
+import { useNodes } from './state/useNodes'
 import { useResources } from './state/useResources'
 import { useTasks } from './state/useTasks'
 import { ContainerDetails } from './features/container-details/ContainerDetails'
+import { NodesPage } from './features/nodes/NodesPage'
 import { ResourcesPage } from './features/resources-page/ResourcesPage'
 import { TaskPanel } from './features/tasks/TaskPanel'
 import { ToolchainRow } from './features/toolchains/ToolchainRow'
@@ -24,7 +26,7 @@ import { Input } from './ui/Input'
 import { Select } from './ui/Select'
 import { Toolbar } from './ui/Toolbar'
 import { Stack } from './ui/Stack'
-type Section = 'container' | 'resources' | 'settings'
+type Section = 'container' | 'nodes' | 'resources' | 'settings'
 type SettingsPane = 'general' | 'toolchains' | 'resources' | 'agent' | 'updates'
 
 /**
@@ -161,6 +163,7 @@ export function MainApp() {
     setError,
     (items) => resources.setPlugins(items),
   )
+  const nodes = useNodes(setError)
   const tasks = useTasks(
     {
       onVersionsChanged: () => { void settings.loadDshVersions(); void settings.loadInstalledDshVersions() },
@@ -238,6 +241,9 @@ export function MainApp() {
     if (target === 'settings') {
       void settings.refreshToolchains()
     }
+    if (target === 'nodes') {
+      nodes.enter()
+    }
   }
 
   // Load the default section once the startup gate clears (config loaded and
@@ -247,6 +253,16 @@ export function MainApp() {
     if (onboardingDone) loadSection(section)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onboardingDone])
+
+  // Leaving the Nodes page tears down its event subscription. Central rather
+  // than at each call site, because there are three ways to change section --
+  // the nav, the update badge and the settings button -- and a fourth would
+  // forget it. A listener that outlives its page patches state nobody is
+  // looking at.
+  useEffect(() => {
+    if (section !== 'nodes') nodes.leave()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [section])
 
   if (settings.loading) {
     return (
@@ -293,7 +309,7 @@ export function MainApp() {
           </p>
         )}
         <nav className="navigation" aria-label="Workspace sections">
-          {(['resources', 'container'] as const).map((item) => (
+          {(['resources', 'container', 'nodes'] as const).map((item) => (
             <Button
               key={item}
               variant="ghost"
@@ -316,6 +332,17 @@ export function MainApp() {
         </div>
       </TitleBar>
       <main className="app-shell">
+        {section === 'nodes' && <NodesPage
+          nodes={nodes.nodes}
+          loading={nodes.loading}
+          removingId={nodes.removingId}
+          enrolled={nodes.enrolled}
+          enrolling={nodes.enrolling}
+          onEnroll={(kind, platform, nodeId) => { void nodes.enroll(kind, platform, nodeId) }}
+          onRemove={(id) => { void nodes.removeNode(id) }}
+          onDismissEnrolled={nodes.dismissEnrolled}
+          text={text}
+        />}
         {section === 'container' && containers.selectedContainer !== null && <ContainerDetails container={containers.selectedContainer} details={containers.containerDetails} repository={resources.plugins} bundles={resources.bundles} workspaceExtensions={containers.workspaceExtensions} text={text} onBack={() => { containers.setSelectedContainer(null); containers.setContainerDetails(null); containers.setWorkspaceExtensions([]) }} onAddProfile={containers.addContainerProfile} onSelectProfile={containers.setContainerProfile} onAddExtension={containers.addContainerExtension} onAddBundle={async (profile, bundleId, conflict) => { if (containers.selectedContainer !== null) await resources.installBundle(containers.selectedContainer.id, profile, bundleId, conflict) }} onDeletePlugin={containers.deleteContainerPlugin} onScanWorkspace={containers.scanWorkspaceExtensions} onImportWorkspace={containers.importWorkspaceExtension} onReadLog={containers.readContainerLog} onOpenInBrowser={containers.openContainerInBrowser} />}
         {section === 'container' && containers.selectedContainer === null && !containers.creatingContainerView && (
           <section className="workspace">
