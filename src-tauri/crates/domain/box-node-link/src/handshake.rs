@@ -573,3 +573,16 @@ pub fn fresh_nonce() -> Result<[u8; 16], HandshakeError> {
         .map_err(|_| HandshakeError::ControlSignature)?;
     Ok(nonce)
 }
+
+/// Fill a buffer with random bytes.
+///
+/// Same reason as `fresh_nonce`: the daemon needs entropy and should not need
+/// `ring` itself to get it. `SecureRandom` is a trait, so re-exporting the type
+/// alone is not enough -- the method would not resolve -- and making every
+/// caller import the trait is how a second copy of the primitive arrives.
+pub fn fill_random(dest: &mut [u8]) -> Result<(), HandshakeError> {
+    ring::rand::SystemRandom::new()
+        .fill(dest)
+        .map_err(|_| HandshakeError::ControlSignature)
+}
+

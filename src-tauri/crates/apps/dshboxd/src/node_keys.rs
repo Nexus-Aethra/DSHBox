@@ -203,3 +203,95 @@ pub fn find_identity(
 #[cfg(test)]
 #[path = "node_keys_tests.rs"]
 mod tests;
+
+/// A bootstrap secret, minted and ready to hand to a node exactly once.
+///
+/// Deliberately not `Debug`, and the `seed` field is the reason: a derived
+/// `Debug` would make `{:?}` on this struct a way to leak the one value that
+/// must never reach a log line. The summary the RPC returns is a different
+/// type without the field at all.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuedBootstrap {
+    pub node_id: String,
+    /// The seed, hex. Hand it to the node once, over a channel the operator
+    /// controls, and never log it.
+    pub seed: String,
+    /// How many links the chain has, so the node knows when it runs out.
+    pub chain_length: u32,
+    /// H^n(seed): the value the first link must be the preimage of. This is
+    /// what the daemon stores.
+    pub chain_end: String,
+    pub issued_at: u64,
+}
+
+/// How many links a fresh chain has.
+///
+/// 64 is the design default: long enough that a node reconnects for months
+/// before it must be re-enrolled, short enough that the node can compute the
+/// whole chain in memory if it wants to.
+pub const BOOTSTRAP_CHAIN_LENGTH: u32 = 64;
+
+/// Mint a bootstrap secret for a node and store only what verification needs.
+///
+/// The seed goes to the node and nowhere else. The daemon keeps the chain end,
+/// which is the value the first link must be the preimage of -- so a stolen
+/// row cannot regenerate the chain, which is the property design section 3 is
+/// built on.
+///
+/// The default mode is a token chain rather than a PSK. A PSK is one shared
+/// value, so every handshake replays the same bytes on the wire; a chain
+/// presents a fresh link each time, and a spent link is refused.
+///
+/// A node that already has a row is refused rather than re-issued. Re-issuing
+/// silently would invalidate the secret the running helper is holding, and a
+/// helper that suddenly cannot authenticate is a support call nobody can
+/// diagnose from this side.
+pub fn issue_bootstrap(
+    collection: &Collection<NodeKeyRecord>,
+    node_id: &str,
+    helper_version: Option<&str>,
+) -> BoxResult<IssuedBootstrap> {
+    if !is_node_id(node_id) {
+        return Err(format!("invalid node id {node_id:?}"));
+    }
+    if collection
+        .load_all()?
+        .iter()
+        .any(|row| row.id == node_id)
+    {
+        return Err(format!(
+            "node {node_id} already has a bootstrap key; revoke it first"
+        ));
+    }
+
+    let chain_length = BOOTSTRAP_CHAIN_LENGTH;
+    let mut seed = [0u8; 32];
+    box_node_link::handshake::fill_random(&mut seed)
+        .map_err(|_| "cannot generate a bootstrap seed".to_owned())?;
+    let chain_end = hex(&box_node_link::chain::hash_n(&seed, chain_length));
+
+    let issued_at = now_seconds();
+    let record = NodeKeyRecord::token(node_id, &chain_end, issued_at);
+    collection.upsert(&[NodeKeyRecord {
+        helper_version: helper_version.map(str::to_owned),
+        ..record
+    }])?;
+
+    Ok(IssuedBootstrap {
+        node_id: node_id.to_owned(),
+        seed: hex(&seed),
+        chain_length,
+        chain_end,
+        issued_at,
+    })
+}
+
+/// Lowercase hex, for a seed or a chain value.
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}

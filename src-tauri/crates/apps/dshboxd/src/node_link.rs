@@ -386,7 +386,22 @@ fn handle_secure(
         return;
     }
 
-    let mut session = Session::from_keys(keys, hello.node_id.clone(), hello.mode);
+    // The keys are swapped for this side. The handshake produces one
+    // pair of directional keys; a session seals under c2s and opens under
+    // s2c, so the peer that receives our frames must hold them the other
+    // way round. The node does that in node_finish; without the same swap
+    // here both sides would seal under c2s and neither could open the
+    // other -- which is exactly the failure the first end-to-end test
+    // produced.
+    let mut session = Session::from_keys(
+        box_node_link::handshake::SessionKeys {
+            c2s: keys.s2c,
+            s2c: keys.c2s,
+            transcript: keys.transcript,
+        },
+        hello.node_id.clone(),
+        hello.mode,
+    );
     run_secure_loop(&mut reader, &mut writer, &mut session, state, main_token);
 }
 
@@ -430,36 +445,43 @@ fn run_secure_loop(
                 return;
             }
         };
-        match Gate::resolve(state, main_token, &request) {
-            Ok(gate) => {
-                let mut bound = request;
-                crate::bind_request_node(&mut bound, gate.node_id.as_deref());
-                let response = crate::dispatch::dispatch(state, &bound);
-                let payload = match serde_json::to_vec(&response) {
-                    Ok(payload) => payload,
-                    Err(_) => return,
-                };
-                let reply = match session.seal_frame(FrameType::Response, &payload) {
-                    Ok(frame) => frame,
-                    // A key that has aged or been used past its limit is a
-                    // rekey, and rekey is not implemented yet: say so and
-                    // close rather than silently continuing on a key the
-                    // design has retired.
-                    Err(SessionError::KeyTooOld | SessionError::KeyTooUsed) => {
-                        tracing::debug!(target: "node_link", "session key needs a rekey; closing session");
-                        let _ = send_close(writer, "rekey-required");
-                        return;
-                    }
-                    Err(_) => return,
-                };
-                if write_frame(writer, &reply).is_err() || writer.flush().is_err() {
-                    return;
-                }
-            }
-            Err(denied) => {
-                let _ = send_close(writer, denied.reason());
+        // The handshake is the credential. A session that came through
+        // control_finish has already proved it holds the bootstrap secret
+        // for this node id, so the request is dispatched under that identity
+        // rather than being asked for a second token -- which would mean the
+        // encrypted path is no stronger than the plaintext one it replaces.
+        //
+        // `__nodeId` is still server-owned: the value bound here comes from
+        // the session, and anything the payload supplied is dropped.
+        let mut bound = request;
+        crate::bind_request_node(&mut bound, Some(session.node_id()));
+        // The method whitelist still applies. It is the one thing the
+        // handshake does not establish: a node session may only ask for
+        // what a node session may do.
+        if !crate::nodes::NodeManager::is_node_method(bound["method"].as_str().unwrap_or("")) {
+            let _ = send_close(writer, "forbidden-method");
+            return;
+        }
+        let response = crate::dispatch::dispatch(state, &bound);
+        let payload = match serde_json::to_vec(&response) {
+            Ok(payload) => payload,
+            Err(_) => return,
+        };
+        let reply = match session.seal_frame(FrameType::Response, &payload) {
+            Ok(frame) => frame,
+            // A key that has aged or been used past its limit is a
+            // rekey, and rekey is not implemented yet: say so and
+            // close rather than silently continuing on a key the
+            // design has retired.
+            Err(SessionError::KeyTooOld | SessionError::KeyTooUsed) => {
+                tracing::debug!(target: "node_link", "session key needs a rekey; closing session");
+                let _ = send_close(writer, "rekey-required");
                 return;
             }
+            Err(_) => return,
+        };
+        if write_frame(writer, &reply).is_err() || writer.flush().is_err() {
+            return;
         }
     }
 }
@@ -547,11 +569,18 @@ fn node_record(
 fn bootstrap_secret(hello: &Hello, record: &NodeKeyRecord) -> Vec<u8> {
     match hello.mode {
         AuthMode::Psk => record.secret.clone().into_bytes(),
+        // The chain end is stored as hex because the store is JSON and the
+        // value is bytes. Decoding it here is what makes the two sides
+        // derive the same bootstrap key: the node hashes the seed it was
+        // given, while the daemon holds only the hex of the result. Handing
+        // the ASCII of that hex to the KDF instead would make every mac
+        // mismatch, and the mismatch would look like an authentication
+        // failure rather than the encoding bug it is.
         AuthMode::Token => record
             .chain_end
-            .clone()
-            .unwrap_or_default()
-            .into_bytes(),
+            .as_deref()
+            .and_then(hex_decode)
+            .unwrap_or_default(),
         AuthMode::NodeKey => Vec::new(),
     }
 }
