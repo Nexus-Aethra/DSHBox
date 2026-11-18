@@ -78,6 +78,16 @@ fn parse_from<I: Iterator<Item = String>>(mut iter: I) -> Result<Args, String> {
                 let length = value
                     .parse::<u32>()
                     .map_err(|e| format!("bad chain length: {e}"))?;
+                // A chain of fewer than two links has no spendable link
+                // that is not the seed, and a one-link chain would send the
+                // seed itself -- the one value the node must never put on
+                // the wire. Refusing it here is better than the silent floor
+                // the client would otherwise apply.
+                if length < 2 {
+                    return Err(format!(
+                        "chain length must be at least 2, got {length}"
+                    ));
+                }
                 args.link.get_or_insert_with(Default::default).chain_length = length
             }
             other => return Err(format!("unknown flag {other}")),
@@ -249,8 +259,7 @@ fn main() {
     // exactly as it did before.
     let mut link = match &args.link {
         Some(config) => {
-            let pubkey = node_link::control_pubkey_hex_to_bytes(&config.control_pubkey);
-            match node_link::connect(config, &args.node_id, &args.control_url, pubkey) {
+            match node_link::connect(config, &args.node_id, &args.control_url) {
                 Ok(link) => {
                     println!("[helper] node link established (node={})", args.node_id);
                     Some(link)
@@ -308,3 +317,7 @@ fn main() {
 #[cfg(test)]
 #[path = "main_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "node_link_tests.rs"]
+mod node_link_tests;

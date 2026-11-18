@@ -30,12 +30,6 @@ use box_node_link::wire;
 use std::io::{BufReader, BufWriter, Write};
 use std::net::TcpStream;
 
-/// What the helper needs to open a session, and where it came from.
-///
-/// The seed and the pinned fingerprint both arrive with the enrol reply and
-/// exist nowhere else afterwards -- the daemon keeps only the chain end, by
-/// design, so a helper that drops them cannot reconnect. That is why they are
-/// fields on a struct the caller holds rather than something re-fetched.
 /// The bootstrap material for the link.
 ///
 /// Deliberately does not carry the node id: that comes from the args the
@@ -71,7 +65,6 @@ pub fn connect(
     config: &LinkConfig,
     node_id: &str,
     control_url: &str,
-    control_pubkey: Vec<u8>,
 ) -> Result<Link, String> {
     let (host, port) = crate::split_url(control_url)?;
     let stream = TcpStream::connect((host.as_str(), port)).map_err(|e| format!("connect: {e}"))?;
@@ -85,37 +78,43 @@ pub fn connect(
     let seed: [u8; 32] = seed.try_into().map_err(|_| "the seed is not 32 bytes")?;
     let link = box_node_link::chain::hash_n(&seed, config.chain_length.saturating_sub(1).max(1));
 
-    // The node long-term key, generated here rather than loaded: this build
-    // has no key file. The first handshake registers it with the daemon and
-    // every one after is checked against it.
-    let node_key = handshake::generate_control_keypair()
-        .map_err(|e| format!("cannot generate a node key: {e}"))?;
-    let node_pubkey = box_node_link::handshake::hex_decode(&node_key.pubkey_hex)
-        .ok_or("the generated node key is not valid hex")?;
-    let node_signing = handshake::control_signing_key(&node_key.seckey_hex)
-        .map_err(|e| format!("cannot load the generated node key: {e}"))?;
+    // Token mode, not node-key. The chain is the reconnect credential: every
+    // handshake spends one link, and the row holds 64 of them, so a restart
+    // reconnects until the chain runs out.
+    //
+    // Node-key mode would need the long-term key to survive a restart, and
+    // this build has no key file -- the key is generated per process, so a
+    // restart offers a key the daemon has never seen and the handshake is
+    // refused forever. Persisting the key is stage B and needs a 0600 file
+    // the helper can write on every target it runs on. Until then the chain
+    // is what reconnects, which is exactly what it is for.
+    // The control-plane key comes from the config, which is where the enrol
+    // reply puts it. A bad hex here is a typo in the flag, and saying so is
+    // better than a signature-shaped error three steps later.
+    let control_pubkey = control_pubkey_hex_to_bytes(&config.control_pubkey)
+        .ok_or_else(|| "the control-plane public key is not valid hex".to_owned())?;
 
     let rng = box_node_link::SystemRandom::new();
     let node_hand =
         NodeHand::new(&rng, control_pubkey).map_err(|e| format!("handshake: {e}"))?;
 
-    // Node-key mode. The signature is over t1, the client half, which is why
-    // it can travel in the hello at all -- signing t2 would need the ack
-    // first, and the protocol is one frame.
     let mut hello = Hello {
         node_id: node_id.to_owned(),
-        mode: AuthMode::NodeKey,
+        mode: AuthMode::Token,
         version: handshake::VERSION,
         suite: handshake::SUITE,
         client_nonce: handshake::fresh_nonce().map_err(|e| format!("entropy: {e}"))?,
         eph_a: node_hand.public_key().map_err(|e| format!("handshake: {e}"))?,
         mac: None,
-        node_pubkey: Some(node_pubkey),
+        node_pubkey: None,
         node_sig: None,
-        link: None,
+        link: Some(link),
     };
+    // The mac proves the node holds the bootstrap secret: HMAC over t1 with
+    // the key derived from the link being spent.
     let t1 = handshake::transcript_client(&hello);
-    hello.node_sig = Some(node_signing.sign(&t1).as_ref().to_vec());
+    let mac = box_node_link::kdf::hmac_sha256(&box_node_link::kdf::bootstrap_key(&link), &t1);
+    hello.mac = Some(mac);
 
     let mut writer = BufWriter::new(stream.try_clone().map_err(|e| format!("socket: {e}"))?);
     let mut reader = BufReader::new(stream);
@@ -143,12 +142,10 @@ pub fn connect(
         None => return Err("the control plane hung up before answering".to_owned()),
     };
     if frame.frame_type != FrameType::HelloAck {
-        let reason = frame
-            .value()
-            .ok()
-            .and_then(|v| v["reason"].as_str().map(str::to_owned))
-            .unwrap_or_else(|| format!("{:?}", frame.frame_type));
-        return Err(format!("the control plane refused the handshake: {reason}"));
+        return Err(format!(
+            "the control plane refused the handshake: {}",
+            refusal_reason(&frame)
+        ));
     }
     let ack_wire: wire::HelloAckWire = serde_json::from_slice(&frame.payload)
         .map_err(|e| format!("the ack is not the wire shape: {e}"))?;
@@ -176,7 +173,7 @@ pub fn connect(
     let session = Session::from_keys(
         outcome.keys,
         node_id.to_owned(),
-        AuthMode::NodeKey,
+        AuthMode::Token,
     );
     Ok(Link {
         session,
@@ -192,7 +189,20 @@ impl Link {
     /// encrypted path exactly as it does on the HTTP one, and a method outside
     /// the list closes the link rather than answering it.
     pub fn call(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
-        let request = serde_json::json!({ "method": method, "params": params });
+        // Flat, not nested under `params`. Every node handler reads its
+        // arguments off the request root -- `node_heartbeat` reads
+        // `request["epoch"]` -- so an envelope that puts them under a key
+        // the handler never looks at makes every field null and every call
+        // fail. A nested shape is what the generic task route expects, which
+        // is how the two came to differ.
+        let mut request = serde_json::json!({ "method": method });
+        if let Some(object) = request.as_object_mut() {
+            if let Some(fields) = params.as_object() {
+                for (key, value) in fields {
+                    object.insert(key.clone(), value.clone());
+                }
+            }
+        }
         let payload = serde_json::to_vec(&request).map_err(|e| format!("encode: {e}"))?;
         let frame = self
             .session
@@ -207,12 +217,7 @@ impl Link {
             None => return Err("the control plane closed the link".to_owned()),
         };
         if reply.frame_type != FrameType::Response {
-            let reason = reply
-                .value()
-                .ok()
-                .and_then(|v| v["reason"].as_str().map(str::to_owned))
-                .unwrap_or_else(|| format!("{:?}", reply.frame_type));
-            return Err(format!("the control plane refused: {reason}"));
+            return Err(format!("the control plane refused: {}", refusal_reason(&reply)));
         }
         let opened = self
             .session
@@ -223,6 +228,22 @@ impl Link {
 }
 
 /// Decode the control-plane public key from the hex the enrol reply carries.
-pub fn control_pubkey_hex_to_bytes(hex: &str) -> Vec<u8> {
-    box_node_link::handshake::hex_decode(hex).unwrap_or_default()
+///
+/// Returns None on bad hex rather than an empty vector: an empty key is
+/// accepted by `NodeHand::new` and then fails as a signature mismatch, which
+/// is a hex typo wearing a crypto error costume.
+pub fn control_pubkey_hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
+    box_node_link::handshake::hex_decode(hex)
+}
+
+/// The reason a close frame carries, or its frame type if it carries none.
+///
+/// Shared by the handshake and the call path: two copies of "read the reason
+/// out of a close frame" is two places for the extraction to drift.
+fn refusal_reason(frame: &Frame) -> String {
+    frame
+        .value()
+        .ok()
+        .and_then(|v| v["reason"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{:?}", frame.frame_type))
 }
