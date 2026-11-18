@@ -88,6 +88,15 @@ impl Session {
         }
     }
 
+    /// The node this session belongs to.
+    ///
+    /// Established by the handshake and read-only after it: the daemon binds
+    /// every request on this session to this id, so a caller cannot change
+    /// it mid-session.
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
     /// Seal one payload into a frame, picking the seq from the send counter.
     ///
     /// The seq the record layer chose travels with the frame so the peer can

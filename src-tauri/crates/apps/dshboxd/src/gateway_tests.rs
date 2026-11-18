@@ -550,6 +550,7 @@ fn a_hello_reaches_the_handshake_and_is_refused_for_its_node() {
         mac: Some([0u8; 32]),
         node_pubkey: None,
         node_sig: None,
+        link: None,
     };
     // The node is not enrolled with a key yet, so this hello is refused --
     // but refused by the handshake, with a reason that names it, which is
@@ -571,6 +572,411 @@ fn a_hello_reaches_the_handshake_and_is_refused_for_its_node() {
     assert_eq!(reply.value().unwrap()["reason"], "not-enrolled");
 }
 
+
+/// The whole L4c claim, end to end: a node enrols, gets a bootstrap secret,
+/// completes the handshake over the socket, and exchanges an encrypted request
+/// and response.
+///
+/// This is the test L4b could not write. It stopped at `not-enrolled` because
+/// nothing wrote a `node-keys` row; now `node_enroll` mints one, so the
+/// handshake has a secret to check and the session has keys to use.
+///
+/// What it pins that the unit tests cannot: the whole path through the real
+/// socket and the real store -- `handle_link` -> `handle_secure` ->
+/// `control_finish` -> `run_secure_loop` -> `Gate::resolve` -> `dispatch`.
+#[test]
+fn an_enrolled_node_completes_the_handshake_and_exchanges_an_encrypted_request() {
+    use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+    use box_node_link::handshake::{self, AuthMode, Hello, NodeHand};
+    use box_node_link::session_io::Session;
+    use box_node_link::wire;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_runtime(dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = "main-token".to_owned();
+    let server_state = state.clone();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        node_link::handle_link(stream, Vec::new(), server_state, &token);
+    });
+
+    // Enrol through the real RPC, so the bootstrap secret is minted the way a
+    // caller would get one.
+    let (_, enrol_reply) = rpc(
+        state.clone(),
+        "main-token",
+        json!({
+            "method": "node_enroll",
+            "token": "main-token",
+            "kind": "helper",
+            "platform": "windows-x86_64",
+            "nodeId": "node-handshake",
+        }),
+    );
+    let seed = enrol_reply["result"]["bootstrap"]["seed"]
+        .as_str()
+        .expect("the enrol reply carries a bootstrap secret")
+        .to_owned();
+    let seed_bytes: [u8; 32] = hex_to_bytes(&seed)
+        .try_into()
+        .expect("a seed is 32 bytes");
+
+    // The control-plane fingerprint the node pins offline. It comes from the
+    // identity the daemon just generated, read out of the same store the
+    // handshake will use.
+    let control_pubkey_hex = {
+        let paths = state.paths.read().unwrap().clone();
+        let collection = crate::node_keys::open_control_identity(&paths).unwrap();
+        let record = crate::node_keys::find_identity(&collection)
+            .unwrap()
+            .expect("the daemon has an identity now");
+        record.pubkey
+    };
+    // The fingerprint the node pins, computed before the key is moved into
+    // the handshake.
+    let pinned = box_node_link::node_keys::fingerprint_of(&control_pubkey_hex);
+    let control_pubkey = hex_to_bytes(&control_pubkey_hex);
+
+    // The link the node spends: c_(n-1).
+    //
+    // The control plane stores c_n = H^n(seed) and accepts a value only when
+    // H(value) equals it, so the first value a node may send is c_(n-1).
+    // Sending c_n itself would be a value whose hash nothing will ever
+    // accept -- the same off-by-one the L2 review caught in the chain walk.
+    //
+    // The link travels in the hello and is bound into the transcript, which
+    // is what lets the daemon spend it: once accepted, the daemon expects
+    // the preimage of what it just saw, so the same link cannot buy a
+    // second session.
+    let chain_length = enrol_reply["result"]["bootstrap"]["chainLength"]
+        .as_u64()
+        .unwrap() as u32;
+    let link = box_node_link::chain::hash_n(&seed_bytes, chain_length - 1);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let rng = box_node_link::SystemRandom::new();
+    let node_hand = NodeHand::new(&rng, control_pubkey).unwrap();
+    let eph_a = node_hand.public_key().unwrap();
+
+    // The mac proves the node holds the bootstrap secret: HMAC over the
+    // transcript with the key derived from the first link.
+    let hello = Hello {
+        node_id: "node-handshake".to_owned(),
+        mode: AuthMode::Token,
+        version: handshake::VERSION,
+        suite: handshake::SUITE,
+        client_nonce: handshake::fresh_nonce().unwrap(),
+        eph_a,
+        mac: None,
+        node_pubkey: None,
+        node_sig: None,
+        link: Some(link),
+    };
+    let t1 = handshake::transcript_client(&hello);
+    let bootstrap_key = box_node_link::kdf::bootstrap_key(&link);
+    let mac = box_node_link::kdf::hmac_sha256(&bootstrap_key, &t1);
+    let hello = Hello { mac: Some(mac), ..hello };
+
+    let payload = serde_json::to_vec(&wire::hello_wire(&hello)).unwrap();
+    let frame = Frame {
+        frame_type: FrameType::Hello,
+        payload,
+    };
+    write_frame(&mut client, &frame).unwrap();
+    client.flush().unwrap();
+
+    // The handshake answer. This is the frame L4b never reached.
+    let mut reader = BufReader::new(client.try_clone().unwrap());
+    let ack = read_frame(&mut reader)
+        .unwrap()
+        .expect("the daemon answered the hello");
+    assert_eq!(
+        ack.frame_type,
+        FrameType::HelloAck,
+        "the handshake must complete, not close: {:?}",
+        ack.value().ok()
+    );
+
+    // Now the encrypted round trip, through the same connection.
+    let ack_wire: wire::HelloAckWire = serde_json::from_slice(&ack.payload).unwrap();
+    let ack = ack_wire.to_ack().unwrap();
+    let outcome = handshake::node_finish(node_hand, &hello, &ack, &link).unwrap();
+    handshake::node_unseal(
+        &outcome.keys,
+        &hello,
+        &ack,
+        &link,
+        &outcome.ecdh,
+        &pinned,
+    )
+    .expect("the certificate must unseal against the pinned fingerprint");
+
+    let mut session = Session::from_keys(
+        outcome.keys,
+        "node-handshake".to_owned(),
+        AuthMode::Token,
+    );
+    // node_echo, a method on the NODE_METHODS whitelist. The whitelist is
+    // the one thing the handshake does not establish, so the request has to
+    // be one a node session may make -- ping is not, and asking for it is
+    // refused, which is the behaviour a different test pins.
+    let request = json!({ "method": "node_echo", "params": { "value": 42 } });
+    let sealed = session
+        .seal_frame(FrameType::Request, &serde_json::to_vec(&request).unwrap())
+        .unwrap();
+    // A separate writer, not reader.get_mut(): a BufReader may have read
+    // ahead, and writing through it interleaves with its buffer. The
+    // connection is a TcpStream, so a clone is the same socket.
+    let mut writer = client;
+    write_frame(&mut writer, &sealed).unwrap();
+    writer.flush().unwrap();
+
+    let reply = read_frame(&mut reader)
+        .unwrap()
+        .expect("the daemon answered the request");
+
+    let opened = session
+        .open_frame(&reply)
+        .expect("the response must open under the session key");
+    let parsed: serde_json::Value = serde_json::from_slice(&opened).unwrap();
+    assert_eq!(parsed["ok"], true, "an encrypted request must be answered");
+
+    // Close the write half so the daemon sees a clean EOF and its loop
+    // returns. Without this the test hangs on join: the daemon is still
+    // blocking on the next frame, and a closed read half is what tells it
+    // the peer is gone.
+    writer.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(reader);
+    handle.join().unwrap();
+}
+
+
+/// The method whitelist on the encrypted path.
+///
+/// The end-to-end test uses `node_echo`, which is allowed, so it passes
+/// whether or not the check exists. This one asks for a method a node session
+/// may not have, and the link must close rather than answer it. A review found
+/// the gap: the plaintext path is pinned by
+/// `a_frame_session_cannot_call_a_control_plane_method`, but that goes through
+/// `handle_plaintext` -- a different code path.
+#[test]
+fn an_encrypted_session_cannot_call_a_control_plane_method() {
+    use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+    use box_node_link::handshake::{self, AuthMode, NodeHand};
+    use box_node_link::session_io::Session;
+    use box_node_link::wire;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_runtime(dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = "main-token".to_owned();
+    let server_state = state.clone();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        node_link::handle_link(stream, Vec::new(), server_state, &token);
+    });
+
+    let (_, enrol_reply) = rpc(
+        state.clone(),
+        "main-token",
+        json!({
+            "method": "node_enroll",
+            "token": "main-token",
+            "kind": "helper",
+            "platform": "windows-x86_64",
+            "nodeId": "node-whitelist",
+        }),
+    );
+    let seed = enrol_reply["result"]["bootstrap"]["seed"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let seed_bytes: [u8; 32] = hex_to_bytes(&seed).try_into().unwrap();
+    let chain_length = enrol_reply["result"]["bootstrap"]["chainLength"]
+        .as_u64()
+        .unwrap() as u32;
+    let link = box_node_link::chain::hash_n(&seed_bytes, chain_length - 1);
+    let control_pubkey = control_pubkey_of(&state);
+
+    let rng = box_node_link::SystemRandom::new();
+    let node_hand = NodeHand::new(&rng, control_pubkey).unwrap();
+    let hello = handshake::Hello {
+        node_id: "node-whitelist".to_owned(),
+        mode: AuthMode::Token,
+        version: handshake::VERSION,
+        suite: handshake::SUITE,
+        client_nonce: handshake::fresh_nonce().unwrap(),
+        eph_a: node_hand.public_key().unwrap(),
+        mac: None,
+        node_pubkey: None,
+        node_sig: None,
+        link: Some(link),
+    };
+    let t1 = handshake::transcript_client(&hello);
+    let mac = box_node_link::kdf::hmac_sha256(&box_node_link::kdf::bootstrap_key(&link), &t1);
+    let hello = handshake::Hello { mac: Some(mac), ..hello };
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let payload = serde_json::to_vec(&wire::hello_wire(&hello)).unwrap();
+    write_frame(&mut client, &Frame { frame_type: FrameType::Hello, payload }).unwrap();
+    client.flush().unwrap();
+    let mut reader = BufReader::new(client.try_clone().unwrap());
+    let ack = read_frame(&mut reader).unwrap().expect("the handshake completes");
+    assert_eq!(ack.frame_type, FrameType::HelloAck);
+
+    let ack_wire: wire::HelloAckWire = serde_json::from_slice(&ack.payload).unwrap();
+    let ack = ack_wire.to_ack().unwrap();
+    let outcome = handshake::node_finish(node_hand, &hello, &ack, &link).unwrap();
+    let mut session = Session::from_keys(
+        outcome.keys,
+        "node-whitelist".to_owned(),
+        AuthMode::Token,
+    );
+
+    let request = json!({ "method": "list_containers" });
+    let sealed = session
+        .seal_frame(FrameType::Request, &serde_json::to_vec(&request).unwrap())
+        .unwrap();
+    write_frame(&mut client, &sealed).unwrap();
+    client.flush().unwrap();
+    let reply = read_frame(&mut reader)
+        .unwrap()
+        .expect("the daemon answered");
+    assert_eq!(reply.frame_type, FrameType::Close);
+    assert_eq!(reply.value().unwrap()["reason"], "forbidden-method");
+
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(reader);
+    handle.join().unwrap();
+}
+
+/// A spent chain link buys exactly one session.
+///
+/// The property Blocker 1 was about. An earlier revision authenticated over
+/// the stored chain end, which never changed, so the same mac was reusable for
+/// the life of the row: any peer that had once read a hello could mint a fresh
+/// one with a new nonce and be handed a session as that node. The link is
+/// spent now, and this is the test that says so.
+#[test]
+fn a_spent_chain_link_cannot_buy_a_second_session() {
+    use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+    use box_node_link::handshake::{self, AuthMode, NodeHand};
+    use box_node_link::wire;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_runtime(dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = "main-token".to_owned();
+    let server_state = state.clone();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        node_link::handle_link(stream, Vec::new(), server_state, &token);
+    });
+
+    let (_, enrol_reply) = rpc(
+        state.clone(),
+        "main-token",
+        json!({
+            "method": "node_enroll",
+            "token": "main-token",
+            "kind": "helper",
+            "platform": "windows-x86_64",
+            "nodeId": "node-replay",
+        }),
+    );
+    let seed = enrol_reply["result"]["bootstrap"]["seed"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let seed_bytes: [u8; 32] = hex_to_bytes(&seed).try_into().unwrap();
+    let chain_length = enrol_reply["result"]["bootstrap"]["chainLength"]
+        .as_u64()
+        .unwrap() as u32;
+    let link = box_node_link::chain::hash_n(&seed_bytes, chain_length - 1);
+    let control_pubkey = control_pubkey_of(&state);
+
+    // A fresh hello on the same link, over a fresh connection. A new nonce
+    // and a new ephemeral key, so the transcript is different -- which is
+    // exactly what made the old behaviour exploitable: nothing about the
+    // reuse was visible.
+    //
+    // Each attempt takes its own listener, because a daemon thread serves
+    // one connection and then returns, dropping the listener it was given.
+    let attempt = |port: u16| {
+        let rng = box_node_link::SystemRandom::new();
+        let hand = NodeHand::new(&rng, control_pubkey.clone()).unwrap();
+        let hello = handshake::Hello {
+            node_id: "node-replay".to_owned(),
+            mode: AuthMode::Token,
+            version: handshake::VERSION,
+            suite: handshake::SUITE,
+            client_nonce: handshake::fresh_nonce().unwrap(),
+            eph_a: hand.public_key().unwrap(),
+            mac: None,
+            node_pubkey: None,
+            node_sig: None,
+            link: Some(link),
+        };
+        let t1 = handshake::transcript_client(&hello);
+        let mac = box_node_link::kdf::hmac_sha256(&box_node_link::kdf::bootstrap_key(&link), &t1);
+        let hello = handshake::Hello { mac: Some(mac), ..hello };
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let payload = serde_json::to_vec(&wire::hello_wire(&hello)).unwrap();
+        write_frame(&mut client, &Frame { frame_type: FrameType::Hello, payload }).unwrap();
+        client.flush().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let reply = read_frame(&mut reader).unwrap().expect("the daemon answered");
+        (reply, reader, client)
+    };
+
+    let (first, reader, client) = attempt(port);
+    assert_eq!(
+        first.frame_type,
+        FrameType::HelloAck,
+        "the first use of the link buys a session"
+    );
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(reader);
+    // Reaped at the end, beside the second thread.
+
+    // A second daemon, over a second listener, presented with the same link.
+    let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port2 = listener2.local_addr().unwrap().port();
+    let state2 = state.clone();
+    let token2 = "main-token".to_owned();
+    let handle2 = std::thread::spawn(move || {
+        let (stream, _) = listener2.accept().unwrap();
+        node_link::handle_link(stream, Vec::new(), state2, &token2);
+    });
+
+    let (second, reader2, client2) = attempt(port2);
+    assert_eq!(
+        second.frame_type,
+        FrameType::Close,
+        "a spent link must not buy a second session: {:?}",
+        second.value().ok()
+    );
+    client2.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(reader2);
+    handle.join().unwrap();
+}
+
+/// The control-plane public key, read out of the daemon own store.
+fn control_pubkey_of(state: &Arc<DaemonState>) -> Vec<u8> {
+    let paths = state.paths.read().unwrap().clone();
+    let collection = crate::node_keys::open_control_identity(&paths).unwrap();
+    hex_to_bytes(
+        &crate::node_keys::find_identity(&collection)
+            .unwrap()
+            .expect("the daemon has an identity now")
+            .pubkey,
+    )
+}
 /// A request whose payload is not JSON closes the link. There is no
 /// method to dispatch, and guessing one would mean acting on bytes we
 /// could not read.

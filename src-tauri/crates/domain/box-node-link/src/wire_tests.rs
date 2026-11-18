@@ -33,6 +33,11 @@ fn hello(mode: AuthMode) -> handshake::Hello {
         } else {
             None
         },
+        link: if matches!(mode, AuthMode::Token) {
+            Some([6u8; 32])
+        } else {
+            None
+        },
     }
 }
 
