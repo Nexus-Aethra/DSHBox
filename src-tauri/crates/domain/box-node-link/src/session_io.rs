@@ -106,11 +106,28 @@ impl Session {
     /// The seq the record layer chose travels with the frame so the peer can
     /// enforce ordering, and so a log line can name the frame.
     pub fn seal_frame(&mut self, frame_type: FrameType, payload: &[u8]) -> Result<Frame, SessionError> {
-        // A rekey frame is exempt: it is the repair for an aged key, so
-        // refusing it on age grounds leaves the session with no way to rotate.
-        // Every other frame type is gated.
-        if !matches!(frame_type, FrameType::Rekey) {
-            self.check_key_age()?;
+        // A rekey frame is exempt from the AGE limit only. It is the repair
+        // for an aged key, so refusing it on age grounds leaves the session
+        // with no way to rotate -- and the only remaining path is a
+        // one-sided rotation the peer cannot follow.
+        //
+        // The frame-count limit is not exempted. A rekey at exactly the
+        // frame limit would consume the last seq on a retired key, and the
+        // whole point of the limit is that no such frame exists. In practice
+        // install_rekey resets the counter to zero immediately afterwards, so
+        // no seq is ever reused under one key either way -- but the narrower
+        // exemption says what it means.
+        if !matches!(frame_type, FrameType::Rekey)
+            && self.key_installed_at.elapsed() >= MAX_KEY_AGE
+        {
+            return Err(SessionError::KeyTooOld);
+        }
+        // The frame-count half of the gate, which a rekey frame is NOT exempt
+        // from: a rekey at exactly the limit would consume the last seq on a
+        // retired key, and the whole point of the limit is that no such frame
+        // exists.
+        if self.c2s.send_seq() >= MAX_FRAMES_PER_KEY {
+            return Err(SessionError::KeyTooUsed);
         }
         let (seq, sealed) = self.c2s.seal(b"", payload)?;
         // The seq travels in the clear, as an 8-byte prefix, and is also the
@@ -236,6 +253,21 @@ pub fn recv_rekey(&mut self, frame: &Frame) -> Result<(), SessionError> {
 }
 
 /// Install a key set derived from the given salt, and reset the counters.
+///
+/// **Where this departs from the design doc.** Section 4 says a rekey has
+/// "both sides contribute a fresh ephemeral public key". This does not: the
+/// new keys are HKDF(current keys, peer-chosen salt), with no ephemeral
+/// contribution from either side. The doc describes the stronger design and
+/// this is the weaker one that shipped.
+///
+/// The consequence is that the peer controls the whole key ladder's
+/// trajectory. It cannot choose a weak key -- HKDF output is not controllable
+/// -- but it does choose every intermediate key, and a peer that sends N
+/// rekeys drives N derivations and leaves this side on the Nth. That is
+/// inherent to a peer-driven exchange with no ephemeral input, and it is why
+/// the rate limit exists. Recorded here rather than left for someone to
+/// discover from the code, because the design doc reads as though this were
+/// implemented.
 ///
 /// Shared by the send and receive halves so the two cannot drift: a rekey is
 /// one derivation, and two copies of it is how peers end up on different keys

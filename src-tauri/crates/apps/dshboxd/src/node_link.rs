@@ -601,8 +601,13 @@ fn run_secure_loop(
                         let _ = send_close(writer, "rekey-failed");
                         return;
                     }
-                    // The peer rotates on seeing that frame, so the reply is
-                    // sealed under the new pair -- which it can open.
+                    // The reply is sealed under the new pair. A peer that
+                    // understands rekey frames rotates on seeing the one we
+                    // just sent and can open it; the current helper does not
+                    // read Rekey frames yet, so for that peer the reply is
+                    // unreadable and it reconnects -- which is still better
+                    // than the one-sided rotation this replaced, where the
+                    // daemon silently moved to keys the peer never learns.
                 }
                 Err(_) => return,
             }
