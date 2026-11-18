@@ -133,6 +133,13 @@ pub enum FrameError {
     BadPayload(String),
     /// The stream failed underneath us.
     Io(String),
+    /// Nothing arrived within the read timeout the caller set.
+    ///
+    /// A distinct variant rather than a string inside `Io`, because it is
+    /// not a failure: it is the wake-up that lets a quiet session rotate its
+    /// keys. A caller checking for it should not have to match on a
+    /// formatted message.
+    TimedOut,
 }
 
 impl fmt::Display for FrameError {
@@ -147,6 +154,7 @@ impl fmt::Display for FrameError {
             Self::UnknownType(value) => write!(f, "unknown frame type {value}"),
             Self::BadPayload(detail) => write!(f, "frame payload is not valid JSON: {detail}"),
             Self::Io(detail) => write!(f, "frame transport error: {detail}"),
+            Self::TimedOut => write!(f, "no frame arrived within the read timeout"),
         }
     }
 }
@@ -239,6 +247,14 @@ fn read_full<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<usize, FrameE
             Ok(0) => break,
             Ok(n) => filled += n,
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A timeout is its own variant, not a message: it is the wake-up
+            // a caller rotates on, and matching on a formatted string is how
+            // that check breaks silently.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(FrameError::TimedOut);
+            }
             Err(e) => return Err(io(e)),
         }
     }

@@ -225,10 +225,33 @@ impl Link {
         write_frame(&mut self.writer, &frame).map_err(|e| format!("write: {e}"))?;
         self.writer.flush().map_err(|e| format!("flush: {e}"))?;
 
-        let reply = read_frame(&mut self.reader).map_err(|e| format!("read: {e}"))?;
-        let reply = match reply {
-            Some(frame) => frame,
-            None => return Err("the control plane closed the link".to_owned()),
+        // Read until the response, consuming rekeys on the way.
+        //
+        // This is also what makes a *quiet* session follow a proactive
+        // rotation. The daemon rotates when its keys near their limit, with
+        // no request outstanding, so the frame sits in the socket buffer
+        // until something reads it -- and something does: the heartbeat is
+        // periodic, so the frame is consumed on the next tick rather than
+        // never. Without that cadence a quiet session would rotate and
+        // never find out.
+        //
+        // A rekey frame can arrive here, and not only in reply to something:
+        // the daemon rotates proactively when its keys near their limit, so a
+        // quiet session gets one with no request outstanding. Treating it as a
+        // refusal -- which is what this did at first -- drops the link to HTTP
+        // exactly when the daemon was trying to keep the session alive.
+        let reply = loop {
+            let frame = read_frame(&mut self.reader).map_err(|e| format!("read: {e}"))?;
+            let Some(frame) = frame else {
+                return Err("the control plane closed the link".to_owned());
+            };
+            if frame.frame_type == FrameType::Rekey {
+                self.session
+                    .recv_rekey(&frame)
+                    .map_err(|e| format!("the rekey was refused: {e}"))?;
+                continue;
+            }
+            break frame;
         };
         if reply.frame_type != FrameType::Response {
             return Err(format!("the control plane refused: {}", refusal_reason(&reply)));

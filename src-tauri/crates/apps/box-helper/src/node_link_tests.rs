@@ -172,3 +172,119 @@ fn control_keypair() -> (Vec<u8>, String) {
     let pubkey = box_node_link::handshake::hex_decode(&generated.pubkey_hex).unwrap();
     (pubkey, generated.seckey_hex)
 }
+
+
+/// The client follows a rekey the peer sent with no request outstanding.
+///
+/// This is the case a proactive rotation produces: the daemon rotates when its
+/// keys near their limit, so the frame arrives between requests and sits in the
+/// socket buffer until the next one. A client that treats any non-response frame
+/// as a refusal -- which is what `Link::call` did at first -- drops the link to
+/// HTTP exactly when the daemon was trying to keep the session alive.
+#[test]
+fn the_client_follows_a_rekey_that_arrives_before_the_response() {
+    use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+    use box_node_link::handshake::{self, AuthMode, ControlHand};
+    use std::io::{BufReader, BufWriter, Write};
+    use std::net::TcpListener;
+
+    let seed = [11u8; 32];
+    let chain_length = 64u32;
+    let (control_pubkey, control_seckey) = control_keypair();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = BufWriter::new(stream.try_clone().unwrap());
+        let mut reader = BufReader::new(stream);
+
+        let Some(frame) = read_frame(&mut reader).unwrap() else { return };
+        assert_eq!(frame.frame_type, FrameType::Hello);
+        let wire: box_node_link::wire::HelloWire =
+            serde_json::from_slice(&frame.payload).unwrap();
+        let hello = wire.to_hello().unwrap();
+
+        let link = box_node_link::chain::hash_n(&seed, chain_length - 1);
+        let signing = handshake::control_signing_key(&control_seckey).unwrap();
+        let cert = serde_json::to_vec(&box_node_link::session::SessionCert {
+            node_id: hello.node_id.clone(),
+            control_fingerprint: "fp-test".to_owned(),
+            issued_at: 1,
+            expires_at: 2,
+        })
+        .unwrap();
+        let control = ControlHand::new(&box_node_link::SystemRandom::new()).unwrap();
+        let (keys, ack, _spent) = handshake::control_finish(
+            control,
+            &hello,
+            handshake::fresh_nonce().unwrap(),
+            &signing,
+            &cert,
+            &box_node_link::chain::hash_once(&link),
+            None,
+            false,
+        )
+        .expect("the peer accepts the handshake");
+
+        let payload = serde_json::to_vec(&box_node_link::wire::ack_wire(&ack)).unwrap();
+        write_frame(&mut writer, &Frame { frame_type: FrameType::HelloAck, payload }).unwrap();
+        writer.flush().unwrap();
+
+        let mut session = box_node_link::session_io::Session::from_keys(
+            box_node_link::handshake::SessionKeys {
+                c2s: keys.s2c,
+                s2c: keys.c2s,
+                transcript: keys.transcript,
+            },
+            hello.node_id.clone(),
+            AuthMode::Token,
+        );
+
+        // The request. Opened under the pre-rotation keys, which is the pair
+        // the peer sealed it with.
+        let Some(frame) = read_frame(&mut reader).unwrap() else { return };
+        let payload = session.open_frame(&frame).expect("the peer opens the request");
+        let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(request["epoch"].as_u64(), Some(7));
+
+        // The rekey FIRST, then the response. This is the ordering a
+        // proactive rotation produces: the frame arrives with no request
+        // outstanding, and a client that is not looking for it mistakes it
+        // for a refusal.
+        //
+        // send_rekey, not seal-plus-recv: the peer is the sender here, and
+        // send_rekey already installs the new pair on its own side. Calling
+        // recv_rekey on a frame it just wrote would consume a second seq and
+        // desynchronise the counters.
+        session
+            .send_rekey(&mut writer)
+            .expect("the peer rotates and tells the client");
+
+        // And the response, sealed under the NEW pair -- which is the whole
+        // point: the client must have rotated to open it.
+        let reply = serde_json::json!({ "ok": true, "after": "rekey" });
+        let sealed = session
+            .seal_frame(FrameType::Response, &serde_json::to_vec(&reply).unwrap())
+            .unwrap();
+        write_frame(&mut writer, &sealed).unwrap();
+        writer.flush().unwrap();
+    });
+
+    let config = LinkConfig {
+        seed: hex_of(&seed),
+        pinned_fingerprint: "fp-test".to_owned(),
+        control_pubkey: hex_of(&control_pubkey),
+        chain_length,
+    };
+    let mut link = node_link::connect(&config, "node-follow-rekey", &format!("http://127.0.0.1:{port}"))
+        .expect("the client opens a session");
+
+    // One call. If the client does not follow the rekey, this fails at the
+    // "the control plane refused" branch -- the rekey read as a refusal.
+    let reply = link
+        .call("node_heartbeat", serde_json::json!({ "epoch": 7 }))
+        .expect("the client follows the rekey and reads the response");
+    assert_eq!(reply["ok"], true);
+    assert_eq!(reply["after"], "rekey");
+}
