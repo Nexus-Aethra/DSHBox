@@ -106,7 +106,29 @@ impl Session {
     /// The seq the record layer chose travels with the frame so the peer can
     /// enforce ordering, and so a log line can name the frame.
     pub fn seal_frame(&mut self, frame_type: FrameType, payload: &[u8]) -> Result<Frame, SessionError> {
-        self.check_key_age()?;
+        // A rekey frame is exempt from the AGE limit only. It is the repair
+        // for an aged key, so refusing it on age grounds leaves the session
+        // with no way to rotate -- and the only remaining path is a
+        // one-sided rotation the peer cannot follow.
+        //
+        // The frame-count limit is not exempted. A rekey at exactly the
+        // frame limit would consume the last seq on a retired key, and the
+        // whole point of the limit is that no such frame exists. In practice
+        // install_rekey resets the counter to zero immediately afterwards, so
+        // no seq is ever reused under one key either way -- but the narrower
+        // exemption says what it means.
+        if !matches!(frame_type, FrameType::Rekey)
+            && self.key_installed_at.elapsed() >= MAX_KEY_AGE
+        {
+            return Err(SessionError::KeyTooOld);
+        }
+        // The frame-count half of the gate, which a rekey frame is NOT exempt
+        // from: a rekey at exactly the limit would consume the last seq on a
+        // retired key, and the whole point of the limit is that no such frame
+        // exists.
+        if self.c2s.send_seq() >= MAX_FRAMES_PER_KEY {
+            return Err(SessionError::KeyTooUsed);
+        }
         let (seq, sealed) = self.c2s.seal(b"", payload)?;
         // The seq travels in the clear, as an 8-byte prefix, and is also the
         // AEAD aad. The clear prefix is not a secret and not authenticated
@@ -127,7 +149,11 @@ impl Session {
         }
         // The receive direction ages too. A session that only reads still
         // has to rekey, or a long-lived subscriber would never rotate.
-        if self.key_installed_at.elapsed() >= MAX_KEY_AGE {
+        // A rekey frame is exempt for the same reason as on the send side:
+        // it is the repair, not a use of the aged keys.
+        if !matches!(frame.frame_type, FrameType::Rekey)
+            && self.key_installed_at.elapsed() >= MAX_KEY_AGE
+        {
             return Err(SessionError::KeyTooOld);
         }
         // The seq travels as a big-endian u64 in the first 8 bytes of the
@@ -163,45 +189,99 @@ impl Session {
         }
         Ok(())
     }
-    /// Derive the next set of keys from the current ones, and reset the counters.
+    /// Mark the current keys as installed in the past.
     ///
-    /// Design section 4: rekey at 2^32 frames or 5 minutes, whichever comes
-    /// first, and the rekey itself does not rerun the handshake. The new keys
-    /// come from the current ones plus a fresh salt -- no ephemeral exchange,
-    /// no bootstrap secret, and nothing that would let a peer who compromised
-    /// one key set walk backwards to the handshake material.
-    ///
-    /// Both directions advance together. A one-sided rekey would leave the two
-    /// peers on different key sets with nothing on the wire to say so, and
-    /// every subsequent frame would fail to open.
-    pub fn rekey(&mut self) -> Result<(), SessionError> {
-        let epoch = self.rekey_epoch;
-        self.rekey_epoch = epoch.wrapping_add(1);
-
-        // The salt is what makes each epoch's keys different. Without it every
-        // rekey would derive the same pair, and a compromised key would be
-        // compromised again on the next rotation.
-        let mut salt = [0u8; 16];
-        salt[..8].copy_from_slice(&epoch.to_be_bytes());
-        handshake::fill_random(&mut salt[8..])
-            .map_err(|_| SessionError::Seal(SealError::OpenFailed))?;
-
-        let next_c2s = crate::kdf::derive(self.c2s.material(), crate::kdf::REKEY_LABEL, &salt);
-        let next_s2c = crate::kdf::derive(self.s2c.material(), crate::kdf::REKEY_LABEL, &salt);
-
-        // Install, then drop the old pair. Both must happen here: a Session
-        // holding the previous keys after a rekey is the same as never having
-        // rotated.
-        self.c2s = RecordKey::new(&next_c2s);
-        self.s2c = RecordKey::new(&next_s2c);
-        self.key_installed_at = Instant::now();
-        Ok(())
+    /// Test-only, and the only way to exercise the age gate without waiting
+    /// five minutes. A review found the rekey halves refused to run once the
+    /// keys had aged, and the only way to see that was to make the age
+    /// observable.
+    #[cfg(test)]
+    pub fn age_keys_for_test(&mut self, age: std::time::Duration) {
+        self.key_installed_at = std::time::Instant::now() - age;
     }
+
     /// How many times this session has rekeyed. Exposed for tests and logs; a
     /// session that never rotates reports zero.
     pub fn rekey_count(&self) -> u64 {
         self.rekey_epoch
     }
+
+/// Send a rekey frame and install the keys it names.
+///
+/// The frame is sealed under the *current* keys -- a rekey that announced
+/// itself under the keys it was replacing would be indistinguishable from a
+/// forged one -- and its payload is the salt the next keys derive from. The
+/// peer derives the same pair from the same salt, which is why the salt has to
+/// travel: the epoch alone would leave the two sides guessing.
+///
+/// Design section 4: no rerun of the handshake, and the bootstrap secret never
+/// comes back. Both hold, because the derivation is HKDF(current keys, salt)
+/// and the current keys are all it needs.
+///
+/// A failure leaves the session on its current keys rather than half-rotated:
+/// the peer has not acknowledged, so it is still on the old pair, and a
+/// one-sided rotation is the state where every subsequent frame fails to open.
+pub fn send_rekey(&mut self, writer: &mut BufWriter<TcpStream>) -> Result<(), SessionError> {
+    let mut salt = [0u8; 16];
+    handshake::fill_random(&mut salt)
+        .map_err(|_| SessionError::Seal(SealError::OpenFailed))?;
+
+    // Sealed under the current keys, before the rotation. After this the old
+    // pair is gone, so the frame has to be built first.
+    let frame = self.seal_frame(FrameType::Rekey, &salt)?;
+    write_frame(writer, &frame)?;
+    writer.flush()?;
+
+    self.install_rekey(&salt);
+    Ok(())
+}
+
+/// Receive a rekey frame and install the keys it names.
+///
+/// Opened under the current keys -- the same pair the peer sealed it with --
+/// and the salt it carries is the salt the peer derived the next keys from.
+/// This side derives the same pair, so the two converge without either having
+/// sent key material.
+pub fn recv_rekey(&mut self, frame: &Frame) -> Result<(), SessionError> {
+    let salt = self.open_frame(frame)?;
+    let salt: [u8; 16] = salt
+        .as_slice()
+        .try_into()
+        .map_err(|_| SessionError::Seal(SealError::OpenFailed))?;
+    self.install_rekey(&salt);
+    Ok(())
+}
+
+/// Install a key set derived from the given salt, and reset the counters.
+///
+/// **Where this departs from the design doc.** Section 4 says a rekey has
+/// "both sides contribute a fresh ephemeral public key". This does not: the
+/// new keys are HKDF(current keys, peer-chosen salt), with no ephemeral
+/// contribution from either side. The doc describes the stronger design and
+/// this is the weaker one that shipped.
+///
+/// The consequence is that the peer controls the whole key ladder's
+/// trajectory. It cannot choose a weak key -- HKDF output is not controllable
+/// -- but it does choose every intermediate key, and a peer that sends N
+/// rekeys drives N derivations and leaves this side on the Nth. That is
+/// inherent to a peer-driven exchange with no ephemeral input, and it is why
+/// the rate limit exists. Recorded here rather than left for someone to
+/// discover from the code, because the design doc reads as though this were
+/// implemented.
+///
+/// Shared by the send and receive halves so the two cannot drift: a rekey is
+/// one derivation, and two copies of it is how peers end up on different keys
+/// with nothing on the wire to say so.
+fn install_rekey(&mut self, salt: &[u8; 16]) {
+    let next_c2s = crate::kdf::derive(self.c2s.material(), crate::kdf::REKEY_LABEL, salt);
+    let next_s2c = crate::kdf::derive(self.s2c.material(), crate::kdf::REKEY_LABEL, salt);
+    self.c2s = RecordKey::new(&next_c2s);
+    self.s2c = RecordKey::new(&next_s2c);
+    // The counters reset with the keys: the seq restarts at zero, which is
+    // what the record layer documents and what the frame limit counts from.
+    self.key_installed_at = Instant::now();
+    self.rekey_epoch = self.rekey_epoch.wrapping_add(1);
+}
 }
 
 

@@ -490,6 +490,13 @@ fn handle_secure(
 /// The gate and the dispatch are the same ones the plaintext path uses. Only
 /// the encoding differs, which is the whole claim of this stage: the transport
 /// changed and the permission model did not.
+/// How many rekey frames one link will accept.
+///
+/// A legitimate node rekeys every five minutes, so this is thousands of
+/// sessions' worth. The number exists to bound the work a peer can make
+/// this daemon do, not to limit legitimate rotation.
+const MAX_REKEYS_PER_LINK: u32 = 256;
+
 fn run_secure_loop(
     reader: &mut BufReader<std::io::Chain<std::io::Cursor<Vec<u8>>, TcpStream>>,
     writer: &mut BufWriter<TcpStream>,
@@ -497,6 +504,7 @@ fn run_secure_loop(
     state: &Arc<DaemonState>,
     main_token: &str,
 ) {
+    let mut rekeys_seen: u32 = 0;
     loop {
         let frame = match read_frame(reader) {
             Ok(Some(frame)) => frame,
@@ -506,6 +514,31 @@ fn run_secure_loop(
                 return;
             }
         };
+        // A rekey frame is the one frame that is not a request. It is opened
+        // under the current keys -- the pair the peer sealed it with -- and the
+        // keys it names are installed, after which the loop continues. The
+        // request that follows is sealed under the new pair by the peer, so the
+        // two sides converge without either having sent key material.
+        if frame.frame_type == FrameType::Rekey {
+            // A rekey costs two HKDF extractions and two key allocations, so
+            // an unbounded stream of them is a CPU amplification vector on a
+            // long-lived connection. The cap is per connection rather than
+            // per interval because the connection is the budget holder: a
+            // legitimate node rekeys every five minutes, so a few hundred is
+            // already generous and a thousand is abuse.
+            rekeys_seen += 1;
+            if rekeys_seen > MAX_REKEYS_PER_LINK {
+                tracing::warn!(target: "node_link", rekeys_seen, "too many rekeys on one link; closing");
+                let _ = send_close(writer, "too-many-rekeys");
+                return;
+            }
+            if session.recv_rekey(&frame).is_err() {
+                let _ = send_close(writer, "rekey-rejected");
+                return;
+            }
+            continue;
+        }
+
         let payload = match session.open_frame(&frame) {
             Ok(payload) => payload,
             // A frame that will not open is either tampered with or out of
@@ -559,15 +592,22 @@ fn run_secure_loop(
                 // disconnected every five minutes for no reason an operator
                 // can act on.
                 Err(SessionError::KeyTooOld | SessionError::KeyTooUsed) => {
-                    tracing::debug!(target: "node_link", "session key aged out; rekeying");
-                    if session.rekey().is_err() {
+                    // The keys are retired by the design. Rotate by telling
+                    // the peer, rather than rotating this side alone: a
+                    // one-sided rotation is the state where every subsequent
+                    // frame fails to open, and the peer has no way to notice.
+                    tracing::debug!(target: "node_link", "session key aged out; asking the peer to rotate");
+                    if session.send_rekey(writer).is_err() {
                         let _ = send_close(writer, "rekey-failed");
                         return;
                     }
-                    // The peer has not rotated yet, so the frame it eventually
-                    // reads is one it must rotate to open -- that exchange is
-                    // the next piece, and until it exists the daemon rotates
-                    // its own side and keeps going.
+                    // The reply is sealed under the new pair. A peer that
+                    // understands rekey frames rotates on seeing the one we
+                    // just sent and can open it; the current helper does not
+                    // read Rekey frames yet, so for that peer the reply is
+                    // unreadable and it reconnects -- which is still better
+                    // than the one-sided rotation this replaced, where the
+                    // daemon silently moved to keys the peer never learns.
                 }
                 Err(_) => return,
             }

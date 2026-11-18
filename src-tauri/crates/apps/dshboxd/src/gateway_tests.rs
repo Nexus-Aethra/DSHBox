@@ -1097,6 +1097,119 @@ fn a_token_node_upgrades_to_node_key_on_its_first_node_key_handshake() {
     let outcome = handshake::node_finish(node_hand, &hello, &ack, &link).unwrap();
     let _ = outcome;
 }
+
+/// A peer-initiated rekey is accepted and the session stays in step.
+///
+/// The daemon gained an arm for incoming rekey frames with no test at all --
+/// the arm was reachable only through the handshake tests, which never send
+/// one. This drives the real socket: the node sends a rekey frame, the daemon
+/// accepts it, and the request that follows crosses in the new direction.
+#[test]
+fn a_peer_initiated_rekey_keeps_the_session_in_step() {
+    use box_node_link::frame::{read_frame, write_frame, Frame, FrameType};
+    use box_node_link::handshake::{self, AuthMode, Hello, NodeHand};
+    use box_node_link::session_io::Session;
+    use box_node_link::wire;
+    use std::io::BufWriter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_runtime(dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = "main-token".to_owned();
+    let server_state = state.clone();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        node_link::handle_link(stream, Vec::new(), server_state, &token);
+    });
+
+    let (_, enrol_reply) = rpc(
+        state.clone(),
+        "main-token",
+        json!({
+            "method": "node_enroll",
+            "token": "main-token",
+            "kind": "helper",
+            "platform": "windows-x86_64",
+            "nodeId": "node-rekey",
+        }),
+    );
+    let seed = enrol_reply["result"]["bootstrap"]["seed"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let seed_bytes: [u8; 32] = hex_to_bytes(&seed).try_into().unwrap();
+    let chain_length = enrol_reply["result"]["bootstrap"]["chainLength"]
+        .as_u64()
+        .unwrap() as u32;
+    let link = box_node_link::chain::hash_n(&seed_bytes, chain_length - 1);
+    let control_pubkey = control_pubkey_of(&state);
+
+    let rng = box_node_link::SystemRandom::new();
+    let node_hand = NodeHand::new(&rng, control_pubkey).unwrap();
+    let eph_a = node_hand.public_key().unwrap();
+    let hello = Hello {
+        node_id: "node-rekey".to_owned(),
+        mode: AuthMode::Token,
+        version: handshake::VERSION,
+        suite: handshake::SUITE,
+        client_nonce: handshake::fresh_nonce().unwrap(),
+        eph_a,
+        mac: None,
+        node_pubkey: None,
+        node_sig: None,
+        link: Some(link),
+    };
+    let t1 = handshake::transcript_client(&hello);
+    let mac = box_node_link::kdf::hmac_sha256(&box_node_link::kdf::bootstrap_key(&link), &t1);
+    let hello = Hello { mac: Some(mac), ..hello };
+
+    let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut writer = BufWriter::new(client.try_clone().unwrap());
+    let mut reader = BufReader::new(client.try_clone().unwrap());
+
+    let payload = serde_json::to_vec(&wire::hello_wire(&hello)).unwrap();
+    write_frame(&mut writer, &Frame { frame_type: FrameType::Hello, payload }).unwrap();
+    writer.flush().unwrap();
+    let ack = read_frame(&mut reader).unwrap().expect("the handshake completes");
+    assert_eq!(ack.frame_type, FrameType::HelloAck);
+
+    let ack_wire: wire::HelloAckWire = serde_json::from_slice(&ack.payload).unwrap();
+    let ack = ack_wire.to_ack().unwrap();
+    let outcome = handshake::node_finish(node_hand, &hello, &ack, &link).unwrap();
+    // The node holds the keys the way the protocol builds them: its send key
+    // is the daemon receive key, and the daemon swapped its own pair when it
+    // built its session.
+    let mut session = Session::from_keys(outcome.keys, "node-rekey".to_owned(), AuthMode::Token);
+
+    // The node asks for a rekey. The frame is sealed under the current pair,
+    // which is why the daemon can open it.
+    session.send_rekey(&mut writer).expect("the rekey goes out");
+
+    // The daemon accepted it: it did not close, and the next request is
+    // answered. The daemon sealed that reply under the rotated pair, which
+    // the node can now open -- the convergence, observed end to end.
+    let request = json!({ "method": "node_echo", "params": { "value": 1 } });
+    let sealed = session
+        .seal_frame(FrameType::Request, &serde_json::to_vec(&request).unwrap())
+        .unwrap();
+    write_frame(&mut writer, &sealed).unwrap();
+    writer.flush().unwrap();
+
+    let reply = read_frame(&mut reader)
+        .unwrap()
+        .expect("the daemon answered after the rekey");
+    assert_eq!(reply.frame_type, FrameType::Response);
+    let opened = session
+        .open_frame(&reply)
+        .expect("the reply opens under the rotated keys");
+    let parsed: serde_json::Value = serde_json::from_slice(&opened).unwrap();
+    assert_eq!(parsed["ok"], true, "the session still works after a peer rekey");
+
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(reader);
+    handle.join().unwrap();
+}
 /// A request whose payload is not JSON closes the link. There is no
 /// method to dispatch, and guessing one would mean acting on bytes we
 /// could not read.
