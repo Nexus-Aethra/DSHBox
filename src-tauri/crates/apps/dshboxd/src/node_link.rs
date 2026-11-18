@@ -506,6 +506,19 @@ fn run_secure_loop(
                 return;
             }
         };
+        // A rekey frame is the one frame that is not a request. It is opened
+        // under the current keys -- the pair the peer sealed it with -- and the
+        // keys it names are installed, after which the loop continues. The
+        // request that follows is sealed under the new pair by the peer, so the
+        // two sides converge without either having sent key material.
+        if frame.frame_type == FrameType::Rekey {
+            if session.recv_rekey(&frame).is_err() {
+                let _ = send_close(writer, "rekey-rejected");
+                return;
+            }
+            continue;
+        }
+
         let payload = match session.open_frame(&frame) {
             Ok(payload) => payload,
             // A frame that will not open is either tampered with or out of

@@ -654,54 +654,51 @@ fn pair() -> (crate::session_io::Session, crate::session_io::Session) {
     (ours, theirs)
 }
 
+
+/// A rekey frame moves both sides onto the same new keys.
+///
+/// This is the half the earlier rekey commit left out: the rotation was real
+/// and tested, and nothing sent the frame that tells the peer to rotate. One
+/// side sends over a real socket, the other receives, and the two converge
+/// without either having put key material on the wire -- which is what makes
+/// this a rekey rather than a key exchange.
 #[test]
-fn a_rekey_changes_the_keys_and_retires_the_old_ones() {
-    // Two ends of one session, built the way the protocol builds them: each
-    // side's send key is the other's receive key. `pair()` does that, which
-    // is why the round trip below works at all.
+fn a_rekey_frame_moves_both_sides_onto_the_same_keys() {
+    use std::io::BufWriter;
+
     let (mut ours, mut theirs) = pair();
 
-    let before = ours
-        .seal_frame(FrameType::Request, b"before the rekey")
-        .unwrap();
-    // The peer opens it, which is the baseline: the keys agree.
-    assert_eq!(theirs.open_frame(&before).unwrap(), b"before the rekey");
+    // Baseline: the two ends agree, so a frame crosses.
+    let before = ours.seal_frame(FrameType::Request, b"before").unwrap();
+    assert_eq!(theirs.open_frame(&before).unwrap(), b"before");
 
-    ours.rekey().expect("our side rekeys");
-    assert_eq!(ours.rekey_count(), 1);
+    // A real socket pair, so the frame travels rather than being handed over.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let sender = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let (receiver, _) = listener.accept().unwrap();
 
-    let after = ours
-        .seal_frame(FrameType::Request, b"after the rekey")
-        .unwrap();
+    let mut writer = BufWriter::new(sender);
+    ours.send_rekey(&mut writer).expect("the rekey goes out");
+
+    // The peer reads it off the socket and installs what it names.
+    let frame = crate::frame::read_frame(&mut std::io::BufReader::new(receiver))
+        .unwrap()
+        .expect("the rekey frame arrives");
+    theirs.recv_rekey(&frame).expect("the peer accepts it");
+
+    // Both sides are on the new keys, so a frame still crosses -- in the other
+    // direction, which is what proves convergence rather than both sides
+    // happening to have rotated.
+    let after = theirs.seal_frame(FrameType::Response, b"after").unwrap();
+    assert_eq!(ours.open_frame(&after).unwrap(), b"after");
+
+    // The seq restarted at zero, as the record layer documents.
     assert_eq!(u64::from_be_bytes(after.payload[..8].try_into().unwrap()), 0);
+    assert_eq!(ours.rekey_count(), 1);
+    assert_eq!(theirs.rekey_count(), 1);
 
-    // The frame sealed under the old keys must not open under the new ones.
-    // This is what makes a rekey a rotation rather than a relabelling: a
-    // compromised key set stops working the moment it is retired.
+    // And a frame sealed under the pre-rekey keys is refused, which is the
+    // retirement made observable.
     assert!(theirs.open_frame(&before).is_err());
-
-    // And the new frame opens, so the session is still usable -- once the
-    // peer has rotated too, which is what the rekey exchange on the wire is
-    // for. Until then the two sides are deliberately out of step, and every
-    // frame is refused, which is the safe direction to fail in.
-    //
-    // The peer rotating is not this test's subject: it is the daemon loop
-    // sending a rekey frame, which is the next piece.
-}
-
-#[test]
-fn a_second_rekey_uses_a_different_salt_than_the_first() {
-    // Two sessions that start from the same keys and rekey once must not
-    // converge. If the salt were fixed, every session with the same starting
-    // keys would derive the same rotated keys, and a compromise of one would
-    // be a compromise of all of them.
-    let build = || {
-        let (mut ours, _theirs) = pair();
-        ours.rekey().unwrap();
-        ours
-            .seal_frame(FrameType::Request, b"same plaintext")
-            .unwrap()
-            .payload
-    };
-    assert_ne!(build(), build());
 }

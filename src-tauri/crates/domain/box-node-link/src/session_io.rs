@@ -202,6 +202,68 @@ impl Session {
     pub fn rekey_count(&self) -> u64 {
         self.rekey_epoch
     }
+
+/// Send a rekey frame and install the keys it names.
+///
+/// The frame is sealed under the *current* keys -- a rekey that announced
+/// itself under the keys it was replacing would be indistinguishable from a
+/// forged one -- and its payload is the salt the next keys derive from. The
+/// peer derives the same pair from the same salt, which is why the salt has to
+/// travel: the epoch alone would leave the two sides guessing.
+///
+/// Design section 4: no rerun of the handshake, and the bootstrap secret never
+/// comes back. Both hold, because the derivation is HKDF(current keys, salt)
+/// and the current keys are all it needs.
+///
+/// A failure leaves the session on its current keys rather than half-rotated:
+/// the peer has not acknowledged, so it is still on the old pair, and a
+/// one-sided rotation is the state where every subsequent frame fails to open.
+pub fn send_rekey(&mut self, writer: &mut BufWriter<TcpStream>) -> Result<(), SessionError> {
+    let mut salt = [0u8; 16];
+    handshake::fill_random(&mut salt)
+        .map_err(|_| SessionError::Seal(SealError::OpenFailed))?;
+
+    // Sealed under the current keys, before the rotation. After this the old
+    // pair is gone, so the frame has to be built first.
+    let frame = self.seal_frame(FrameType::Rekey, &salt)?;
+    write_frame(writer, &frame)?;
+    writer.flush()?;
+
+    self.install_rekey(&salt);
+    Ok(())
+}
+
+/// Receive a rekey frame and install the keys it names.
+///
+/// Opened under the current keys -- the same pair the peer sealed it with --
+/// and the salt it carries is the salt the peer derived the next keys from.
+/// This side derives the same pair, so the two converge without either having
+/// sent key material.
+pub fn recv_rekey(&mut self, frame: &Frame) -> Result<(), SessionError> {
+    let salt = self.open_frame(frame)?;
+    let salt: [u8; 16] = salt
+        .as_slice()
+        .try_into()
+        .map_err(|_| SessionError::Seal(SealError::OpenFailed))?;
+    self.install_rekey(&salt);
+    Ok(())
+}
+
+/// Install a key set derived from the given salt, and reset the counters.
+///
+/// Shared by the send and receive halves so the two cannot drift: a rekey is
+/// one derivation, and two copies of it is how peers end up on different keys
+/// with nothing on the wire to say so.
+fn install_rekey(&mut self, salt: &[u8; 16]) {
+    let next_c2s = crate::kdf::derive(self.c2s.material(), crate::kdf::REKEY_LABEL, salt);
+    let next_s2c = crate::kdf::derive(self.s2c.material(), crate::kdf::REKEY_LABEL, salt);
+    self.c2s = RecordKey::new(&next_c2s);
+    self.s2c = RecordKey::new(&next_s2c);
+    // The counters reset with the keys: the seq restarts at zero, which is
+    // what the record layer documents and what the frame limit counts from.
+    self.key_installed_at = Instant::now();
+    self.rekey_epoch = self.rekey_epoch.wrapping_add(1);
+}
 }
 
 
