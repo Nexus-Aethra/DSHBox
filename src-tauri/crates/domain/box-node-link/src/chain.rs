@@ -91,6 +91,27 @@ impl ChainNode {
         }
     }
 
+    /// Resume a walk at a specific k.
+    ///
+    /// The design red line (section 3) needs this: the node persists which
+    /// ring it has used *before* sending the hello, so a restart continues
+    /// from where it got to rather than starting at c_(n-1) again -- which
+    /// the control plane already holds, and which it therefore refuses.
+    ///
+    /// `rewind_to` is the other half: it can only move the walk down, for a
+    /// failure inside one process. This one can move it either way, because
+    /// the persisted position is a fact about the world rather than a
+    /// correction to this process.
+    pub fn at(seed: [u8; 32], k: u32, length: u32) -> Self {
+        let length = length.max(2);
+        // A persisted k that is out of range means the chain length changed
+        // under us. Clamping rather than refusing, because the alternative
+        // is a helper that cannot start over a stale file, and the walk is
+        // still safe: it starts somewhere inside the chain.
+        let next_k = k.clamp(1, length.saturating_sub(1).max(1));
+        Self { seed, next_k }
+    }
+
     /// How many more handshakes this node can do before re-enrolment.
     pub fn remaining(&self) -> u32 {
         self.next_k
