@@ -43,11 +43,11 @@ mod prepared_base_index;
 mod dsh_catalog;
 
 // prepared_base_index is the storage, dsh_catalog is the remote catalogue, and
-// this file is the orchestration that turns one into the other. `pub use` keeps
-// every existing `crate::versions::x` path working.
-pub use prepared_base_index::*;
+// this file is the orchestration that turns one into the other. The globs
+// below keep every existing `crate::versions::x` path working.
+pub(crate) use prepared_base_index::*;
 use prepared_base_index::{read_prepared_base_index, write_prepared_base_index};
-pub use dsh_catalog::*;
+pub(crate) use dsh_catalog::*;
 
 
 

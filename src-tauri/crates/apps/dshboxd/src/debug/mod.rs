@@ -27,10 +27,10 @@ mod debug_dom;
 mod debug_shot;
 
 // This file is the session table and the session lifecycle; debug_dom is the
-// CDP operation family and debug_shot is the screenshot path. pub use keeps
-// every existing crate::debug::x path working.
-pub use debug_dom::*;
-pub use debug_shot::*;
+// CDP operation family and debug_shot is the screenshot path. The globs
+// below keep every existing crate::debug::x path working.
+pub(crate) use debug_dom::*;
+pub(crate) use debug_shot::*;
 
 /// Hard cap on how many elements one query returns.
 ///

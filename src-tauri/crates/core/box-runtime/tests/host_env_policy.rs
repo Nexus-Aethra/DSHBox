@@ -4,11 +4,20 @@
 //! spawns an actual child (`/usr/bin/env`) with the policy applied, so the
 //! environment the host process would really receive is what gets asserted.
 
+// Read by the Unix-only tests below, so on Windows it is an unused import.
+#[cfg(unix)]
 use box_runtime::process::dsh_host_policy;
+// The imports below are read only by the Unix-only tests: on Windows the test
+// bodies are compiled out and each of these would be an unused import.
+#[cfg(unix)]
 use std::{collections::BTreeMap, env, ffi::OsString, path::Path, process::Command};
 
 /// Variables the test seeds in its own process to imitate a daemon that
 /// was started from an agent sandbox, and restores afterwards.
+///
+/// Unix-only, like the tests that read it: on Windows the test bodies are
+/// compiled out and this would be an unused constant.
+#[cfg(unix)]
 const SEEDED: &[&str] = &[
     "LANG",
     "LC_ALL",
@@ -23,6 +32,7 @@ const SEEDED: &[&str] = &[
     "SHELL",
 ];
 
+#[cfg(unix)]
 fn spawn_with_host_policy() -> String {
     // Values the whitelist must pass through (with the C-family LC_ALL /
     // LC_CTYPE shadowing a real UTF-8 LANG, which must be dropped).

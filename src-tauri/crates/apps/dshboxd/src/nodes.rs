@@ -399,24 +399,6 @@ impl NodeManager {
         Ok((grant.node_id, session, epoch, HEARTBEAT_SECONDS))
     }
 
-    /// True when a bearer is a live session token for `node_id`, with the
-    /// current epoch. Used by both /rpc and /events.
-    pub fn validate_session(&self, bearer: Option<&str>, node_id: Option<&str>, epoch: u64) -> bool {
-        let Some(bearer) = bearer else { return false };
-        if epoch != self.current_epoch() {
-            return false;
-        }
-        let sessions = self.sessions.lock().unwrap();
-        match node_id {
-            Some(id) => sessions
-                .get(id)
-                .is_some_and(|s| s.epoch == epoch && constant_time_eq(&s.token, bearer)),
-            None => sessions
-                .values()
-                .any(|s| s.epoch == epoch && constant_time_eq(&s.token, bearer)),
-        }
-    }
-
     pub fn is_node_method(method: &str) -> bool {
         NODE_METHODS.contains(&method)
     }
@@ -488,17 +470,13 @@ impl NodeManager {
         Ok(())
     }
 
-    /// Whether a live session exists for this node in *this* daemon process.
-    ///
-    /// Sessions are memory-only, so after a restart nothing has one. An
-    /// already-open SSE stream uses this to notice that its credential was
-    /// revoked (deregistered) or invalidated (daemon restarted).
     /// Whether this exact bearer is still the live session for `node_id`.
     ///
-    /// Stricter than `has_session`, and the difference is load-bearing: a second
-    /// `register` for the same node id replaces the session under it, so "a
-    /// session exists for this node" stays true after the first credential dies.
-    /// An open stream must check the credential it was opened with.
+    /// Stricter than asking whether *any* session exists for the node, and the
+    /// difference is load-bearing: a second `register` for the same node id
+    /// replaces the session under it, so "a session exists for this node" stays
+    /// true after the first credential dies. An open stream must check the
+    /// credential it was opened with.
     pub fn session_still_matches(&self, node_id: &str, bearer: &str) -> bool {
         // Read the epoch before taking the sessions lock: `current_epoch` takes
         // the epoch lock, and one fixed order is what keeps this deadlock-free.
@@ -513,12 +491,6 @@ impl NodeManager {
             .unwrap_or(false)
     }
 
-    pub fn has_session(&self, node_id: &str) -> bool {
-        self.sessions
-            .lock()
-            .map(|sessions| sessions.contains_key(node_id))
-            .unwrap_or(false)
-    }
 
     /// Mark online nodes whose last heartbeat is older than the threshold as
     /// offline. Records are kept (their artifacts/backend refs remain), so a
