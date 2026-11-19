@@ -519,6 +519,30 @@ code.missing { color: #b42318; }
 .plugin-graph-node text { fill: var(--color-text); font-family: var(--font-mono); font-size: 11px; pointer-events: none; }
 .plugin-graph-node.inactive rect { fill: var(--color-bg-soft); stroke-dasharray: 4 3; }
 .plugin-graph-node.inactive text { fill: var(--color-text-muted); }
+/* The Box itself, as the hub of the node fleet. Filled rather than outlined,
+   because it is the one node that is not optional: a diagram whose hub looks
+   like a peer reads as a mesh, and the protocol is a star. */
+/* Uses the app's own primary tokens rather than a new palette: the hub is
+   distinguished by being filled where every peer is outlined, and the
+   colour is the one the rest of the UI already uses for "the thing you act
+   on". A blue that appears nowhere else would make it a foreign object. */
+.plugin-graph-node.control rect { fill: var(--color-primary-soft); stroke: var(--color-primary); stroke-width: 2; }
+.plugin-graph-node.control text { fill: var(--color-primary); font-weight: 600; }
+/* A registered node. Square-cornered and outlined, so the hub stays distinct
+   at a glance even when every node is online. */
+.plugin-graph-node.node rect { stroke: var(--color-border-strong); }
+
+/* The fleet: the diagram and the detail card beside it. */
+.node-fleet { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 16px; align-items: start; }
+.node-fleet > .plugin-graph { min-width: 0; }
+.node-detail { position: sticky; top: 76px; }
+/* The view switch sits with the heading, right-aligned, and keeps the page
+   from growing a second toolbar. */
+.node-view-switch { display: flex; gap: 4px; }
+@media (max-width: 900px) {
+  .node-fleet { grid-template-columns: minmax(0, 1fr); }
+  .node-detail { position: static; }
+}
 /* A folded depth: one box standing for a whole layer. Dashed, because it is a
    summary and not a plugin, and clickable, because that is how it comes back. */
 /* An edge the drawing cannot lay out forwards — two halves merged onto one node

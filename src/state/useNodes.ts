@@ -23,9 +23,10 @@ const NODE_STATUSES: NodeRecord['status'][] = ['registering', 'online', 'offline
  * asks for its own data when the user opens it, so the daemon is never queried
  * for a page nobody is looking at.
  *
- * The host node is filtered out of `nodes` and exposed separately. It is
- * built in, never heartbeats, and cannot be deregistered, so offering it a
- * remove button would be offering an action that always fails.
+ * The host node is part of `nodes`. It is built in, never heartbeats, and
+ * cannot be deregistered, so the page must not offer it a remove button --
+ * which is a reason to guard the action, not to hide the node. The fleet
+ * diagram is built around it.
  */
 export function useNodes(onError: (message: string | null) => void) {
   const [nodes, setNodes] = useState<NodeRecord[]>([])
@@ -47,7 +48,12 @@ export function useNodes(onError: (message: string | null) => void) {
     setLoading(true)
     try {
       const all = await boxApi.listNodes()
-      setNodes(all.filter((node) => !node.hostNode))
+      // The host node is kept. It used to be filtered out here, on the
+      // grounds that it cannot be deregistered -- but that is a reason not
+      // to offer it a remove button, not a reason to hide it. The fleet
+      // diagram needs it: the Box is the hub every other node hangs off,
+      // and a diagram without its hub is a list with extra steps.
+      setNodes(all)
       onError(null)
     } catch (reason) {
       onError(String(reason))
