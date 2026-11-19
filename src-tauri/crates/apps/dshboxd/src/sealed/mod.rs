@@ -31,11 +31,15 @@ mod sealed_index;
 
 // sealed_index is the storage, pnpm_approval is the supply-chain gate,
 // client_artifacts is the platform marker, and this file is the build / export /
-// import orchestration over all three. pub use keeps every existing
+// import orchestration over all three. The globs below keep every existing
 // `crate::sealed::x` path working.
-pub use client_artifacts::*;
-pub use pnpm_approval::*;
-pub use sealed_index::*;
+pub(crate) use client_artifacts::*;
+// Same shape as the dispatch globs: the items are `pub(self)`, so this
+// re-exports nothing (the warning) while being the only import that puts
+// them in scope and the only path that makes them reachable from outside.
+#[allow(unused_imports)]
+pub(crate) use pnpm_approval::*;
+pub(crate) use sealed_index::*;
 
 /// Build a sealed template through DSH's own plugin command. The Boxfile
 /// source is converted only where its grammar needs normalization; package

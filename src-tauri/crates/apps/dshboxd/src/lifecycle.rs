@@ -172,8 +172,9 @@ pub(crate) fn start_dsh_container_inner(
     }
     repair_known_profile_template(&directory, profile)?;
     let _workspace = ensure_container_workspace(&directory)?;
-    let dshbox_home =
-        crate::state::dshbox_install_directory().unwrap_or_else(|_| PathBuf::from("."));
+    // The install directory used to be read here and passed down; nothing
+    // reads it now. The call itself is pure, so there is nothing to keep --
+    // the whole statement goes rather than being prefixed.
     // Every container gets the sandbox plugin at start; see materialize_bundled_sandbox_plugin.
     // DSH's Cordis loader imports loader entries through Node's ESM
     // machinery, which never consults NODE_PATH; expose the vendored

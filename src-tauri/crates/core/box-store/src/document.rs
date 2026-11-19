@@ -523,7 +523,11 @@ fn restrict_to_owner(path: &Path) -> Result<(), u32> {
 ///
 /// An empty DACL is rendered as "D:" with nothing after it, which the caller
 /// treats as no grants rather than as a pass.
+// Not dead: used by the Windows ACL tests below, which `cargo build` on other
+// platforms does not compile. Deleting this on the strength of the warning is
+// how the ACL tests lose their readback.
 #[cfg(windows)]
+#[allow(dead_code)]
 fn dacl_sddl(path: &Path) -> Result<String, u32> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
@@ -594,7 +598,10 @@ fn dacl_sddl(path: &Path) -> Result<String, u32> {
 /// abbreviation for a well-known account. Checking the SID is how the first
 /// version of this list passed against a mutant that had left the grant in
 /// place: the string was "AU" and the test looked for "S-1-5-11".
+// Same shape as dacl_sddl: the Windows ACL tests use it, and a non-Windows
+// build does not compile them.
 #[cfg(windows)]
+#[allow(dead_code)]
 const FORBIDDEN_SDDL: &[(&str, &str)] = &[
     ("AU", "Authenticated Users"),
     ("BU", "BUILTIN\\Users"),

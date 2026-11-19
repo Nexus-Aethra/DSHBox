@@ -294,7 +294,9 @@ fn retarget_parts(
     if !recorded.iter().any(|part| part.slot.is_some()) {
         return recorded;
     }
-    let version = discover::harness_version(target);
+    // The version used to be discovered here and is now resolved inside
+    // resolve_kind on the next line. Discovering it twice was redundant, not
+    // merely unused.
     let Ok(resolved) = resolve_kind(target, profile, None, kind_id, None, None) else {
         return recorded;
     };

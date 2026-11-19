@@ -380,10 +380,14 @@ impl Link {
         Ok(())
     }
 
-    /// Where the walk currently is, for tests and logs.
+    /// Where the walk currently is.
     ///
-    /// A test needs this to assert that a failed reconnect stepped the walk
-    /// back, and a log line needs it to say how much chain is left.
+    /// Only the tests read it: they assert that a failed reconnect stepped the
+    /// walk back, which is otherwise unobservable from outside. Marked
+    /// `allow(dead_code)` because a `cargo build` does not compile the tests,
+    /// so it reads as unused -- and deleting it on that evidence is how the
+    /// rewind lost its only witness.
+    #[allow(dead_code)]
     pub fn walk_k(&self) -> u32 {
         self.walker.remaining().max(1)
     }

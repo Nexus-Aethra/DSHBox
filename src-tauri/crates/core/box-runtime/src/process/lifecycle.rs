@@ -3,8 +3,13 @@
 //! guarantees that any child spawned through this module will be reaped or
 //! terminated, preventing zombies/orphans on both Windows and Unix.
 
+// Read by the #[cfg(unix)] body in probe_pid below, so a Windows build does
+// not compile the call and reports it unused. It is not dead: deleting it
+// breaks the Unix build, which is the same trap AGENTS.md records for the
+// WSL invocation.
+#[cfg(unix)]
+use std::io::Read;
 use std::{
-    io::Read,
     process::{Child, ExitStatus},
     sync::OnceLock,
     thread,

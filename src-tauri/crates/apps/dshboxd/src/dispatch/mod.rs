@@ -47,12 +47,21 @@ mod rpc_settings;
 mod rpc_templates;
 
 // This file is the routing table and the task-enqueue primitives; the four
-// rpc_* modules are the handlers it routes to. pub use keeps every existing
-// crate::dispatch::x path working.
-pub use rpc_containers::*;
-pub use rpc_extensions::*;
-pub use rpc_settings::*;
-pub use rpc_templates::*;
+// rpc_* modules are the handlers it routes to. The globs below keep every
+// existing crate::dispatch::x path working.
+pub(crate) use rpc_containers::*;
+// These three are dual-purpose and cannot be narrowed. The items are
+// `pub(self)`, so the glob does not re-export anything -- that is the warning --
+// but it is the only thing that puts them in this file's scope for the
+// dispatch table below, and `pub(crate)` is what makes the same names reachable
+// as `crate::dispatch::x` from the rest of the crate. Deleting it breaks the
+// table; narrowing it to `use` breaks the paths. Tried both.
+#[allow(unused_imports)]
+pub(crate) use rpc_extensions::*;
+#[allow(unused_imports)]
+pub(crate) use rpc_settings::*;
+#[allow(unused_imports)]
+pub(crate) use rpc_templates::*;
 
 
 /// Set when a client asks the daemon to stop (build-batch mismatch during

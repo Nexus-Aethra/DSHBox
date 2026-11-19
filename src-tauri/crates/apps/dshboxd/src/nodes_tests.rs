@@ -102,7 +102,10 @@ use super::*;
     fn enroll_register_and_scoped_session() {
         let m = manager();
         let (grant, id, epoch, _) = m.enroll("wsl2", "linux-x86_64", vec!["exec".to_owned()], None).unwrap();
-        assert!(m.enroll("wsl2", "linux-x86_64", vec![], None).is_ok());
+        // A second node, so the bearer can be shown not to resolve for it.
+        let (other_grant, other_id, _, _) =
+            m.enroll("wsl2", "linux-x86_64", vec![], None).unwrap();
+        assert!(m.register(&other_grant, None, None).is_ok());
         let (session, hb) = {
             let (rid, token, ep, hb) = m.register(&grant, Some("0.1.0".to_owned()), None).unwrap();
             assert_eq!(rid, id);
@@ -112,12 +115,21 @@ use super::*;
         assert_eq!(hb, HEARTBEAT_SECONDS);
         // A second use of the same one-shot grant must fail.
         assert!(m.register(&grant, None, None).is_err());
-        // The session is valid for its own node and current epoch…
-        assert!(m.validate_session(Some(&session), Some(&id), epoch));
-        // …but not for another node, a stale epoch, or as a global token.
-        assert!(!m.validate_session(Some(&session), Some("other"), epoch));
-        assert!(!m.validate_session(Some(&session), Some(&id), epoch + 1));
-        assert!(!m.validate_session(None, Some(&id), epoch));
+        // The session resolves to its own node at the current epoch…
+        // session_node_for is what /rpc and /events actually gate on: the
+        // identity has to travel with the scope, not just a yes/no.
+        assert_eq!(m.session_node_for(Some(&session), epoch).as_deref(), Some(id.as_str()));
+        // …but not for a stale epoch, not without a bearer, and not for a
+        // different node. The last one is unreachable by construction today
+        // -- the lookup is keyed by bearer -- so this is insurance against a
+        // refactor that keys it some other way.
+        assert_eq!(m.session_node_for(Some(&session), epoch + 1), None);
+        assert_eq!(m.session_node_for(None, epoch), None);
+        assert_ne!(
+            m.session_node_for(Some(&session), epoch).as_deref(),
+            Some(other_id.as_str()),
+            "a bearer must not resolve to another node"
+        );
         // Whitelist: a session token cannot reach control-plane methods.
         assert!(NodeManager::is_node_method("node_heartbeat"));
         // B1: a helper must be able to report a base it built, or its very
@@ -276,9 +288,12 @@ use super::*;
         // the intermediate state has to be real and settled on success.
         let m = manager();
         let (grant, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("promo".into())).unwrap();
-        m.register(&grant, None, None).unwrap();
+        let (_rid, bearer, _ep, _hb) = m.register(&grant, None, None).unwrap();
         assert_eq!(m.get(&id).unwrap().unwrap().status, NodeStatus::Online);
-        assert!(m.has_session(&id), "a successful register leaves a live session");
+        // session_still_matches is what an open stream re-checks, so a live
+        // session must satisfy it -- and the bearer is the one register
+        // handed back, not a second registration of the one-shot grant.
+        assert!(m.session_still_matches(&id, &bearer), "a successful register leaves a live session");
     }
 
     #[test]
@@ -286,10 +301,10 @@ use super::*;
         // An open SSE stream asks exactly this to notice a revocation.
         let m = manager();
         let (grant, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("revoked".into())).unwrap();
-        m.register(&grant, None, None).unwrap();
-        assert!(m.has_session(&id));
+        let (_rid, bearer, _ep, _hb) = m.register(&grant, None, None).unwrap();
+        assert!(m.session_still_matches(&id, &bearer));
         m.deregister(&id).unwrap();
-        assert!(!m.has_session(&id), "revocation must revoke");
+        assert!(!m.session_still_matches(&id, &bearer), "revocation must revoke");
     }
 
     #[test]
@@ -325,13 +340,15 @@ use super::*;
         assert!(m.session_still_matches(&id, &first));
         let (g2, id2, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("dup".into())).unwrap();
         assert_eq!(id, id2);
-        let (_, second, _, _) = m.register(&g2, None, None).unwrap();
+        let (_, second, ep2, _) = m.register(&g2, None, None).unwrap();
         assert_ne!(first, second);
         assert!(m.session_still_matches(&id, &second), "the new bearer is live");
         assert!(!m.session_still_matches(&id, &first), "the replaced bearer is not");
-        // The per-node shortcut still says yes, which is why a stream must not
-        // use it.
-        assert!(m.has_session(&id));
+        // And the per-node shortcut would still say yes for the OLD bearer's
+        // node, which is why a stream must resolve per credential instead.
+        assert!(m.session_node_for(Some(&second), ep2).is_some());
+        // The old bearer resolves to nothing, which is what a stream needs.
+        assert!(m.session_node_for(Some(&first), ep2).is_none());
     }
 
     #[test]

@@ -586,7 +586,7 @@ pub fn remote_has_revision(
         })?;
         let mut proxy = git2::ProxyOptions::new();
         proxy.auto();
-        let mut connection = remote
+        let connection = remote
             .connect_auth(git2::Direction::Fetch, None, Some(proxy))
             .map_err(|error| classify_listing_error(remote_url, &error))?;
         let heads = connection
@@ -600,7 +600,7 @@ pub fn remote_has_revision(
     })?;
     let mut proxy = git2::ProxyOptions::new();
     proxy.auto();
-    let mut connection = remote
+    let connection = remote
         .connect_auth(git2::Direction::Fetch, None, Some(proxy))
         .map_err(|error| classify_listing_error(remote_url, &error))?;
     let heads = connection

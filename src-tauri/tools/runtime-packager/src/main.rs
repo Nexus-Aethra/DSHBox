@@ -177,7 +177,6 @@ fn args() -> Result<Option<String>, String> {
 /// without a system Node/npm/pnpm install. The desktop app prepends these
 /// directories to PATH when spawning tools.
 fn install_command_shims(output: &Path, windows: bool) -> Result<(), String> {
-    let node_entry = if windows { "node.exe" } else { "bin/node" };
     if windows {
         fs::write(
             output.join("pnpm/pnpm.cmd"),
