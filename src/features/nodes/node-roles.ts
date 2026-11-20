@@ -18,9 +18,13 @@ export function rolesOf(node: {
   hostNode: boolean
 }): NodeRole[] {
   const roles: NodeRole[] = []
-  // `dsh-host` is the daemon own grant and only the control plane has it;
-  // `hostNode` is the same fact from the other side, for a row the daemon
-  // wrote about itself. Either one means control.
+  // `dsh-host` is what the daemon writes on the host row and nowhere else, so
+  // in every row that exists it means control. It is a reading of what the
+  // daemon writes, not a guarantee it gives: an enrol accepts any capability
+  // string, and `register` is what keeps this true by filtering it out of
+  // anything a helper reports. `hostNode` is the same fact from the other
+  // side, for the row the daemon wrote about itself -- either one means
+  // control, and the redundancy is deliberate.
   if (node.capabilities.includes('dsh-host') || node.hostNode) roles.push('control')
   // `exec` is granted to anything that runs work, including the control
   // plane -- which is why the Box shows both and a helper shows one.

@@ -72,7 +72,15 @@ export function NodesPage(props: Props) {
       </p>
 
       <div className="version-list node-list">
-        {nodes.map((node) => {
+        {/* The control plane first, then the rest in the daemon's own order.
+            The daemon sorts by id, and a UUID sorts before "host", so without
+            this the Box lands last -- which is the one row an operator looks
+            for first. Sorting here does not change the daemon's order; it
+            changes what the list leads with. */}
+        {[...nodes].sort((left, right) => {
+          if (left.hostNode !== right.hostNode) return left.hostNode ? -1 : 1
+          return 0
+        }).map((node) => {
           // What this node does, derived from what the daemon granted it. A
           // node can hold both roles -- the Box itself always does.
           const roles = rolesOf(node)

@@ -313,7 +313,7 @@ const COPY = {
     pluginGraphBlockedInactive: (plugin: string, service: string) => `${plugin} waits for ${service}, whose provider is installed but not activated`,
     // ---- nodes ----
     nodeLive: 'Live', nodeLiveNote: 'Status updates arrive as they happen; the daemon broadcasts every transition.',
-    nodes: 'Nodes', nodesTitle: 'Nodes', nodesNote: 'Machines this box can run work on. The host is the control plane and the executor, so it is listed first.',
+    nodes: 'Nodes', nodesTitle: 'Nodes', nodesNote: 'Machines this box can run work on. The host is both the control plane and an executor, so it carries both roles.',
     noNodes: 'No nodes enrolled yet.',
   nodeRoleControl: 'Control',
   nodeRoleExecutor: 'Executor',
@@ -626,7 +626,7 @@ const COPY = {
     nodeLive: '实时', nodeLiveNote: '状态变化即时到达；daemon 会广播每一次状态迁移。',
   nodeRoleControl: '控制',
   nodeRoleExecutor: '执行',
-    nodes: '节点', nodesTitle: '节点管理', nodesNote: '本 Box 可在其上运行任务的机器。本机既是控制面也是执行体，因此列在最前。',
+    nodes: '节点', nodesTitle: '节点管理', nodesNote: '本 Box 可在其上运行任务的机器。本机既是控制面也是执行体，因此同时具有两种角色。',
     noNodes: '尚未登记任何节点。',
     nodeKind: '类型', nodePlatform: '平台', nodeStatus: '状态', nodeLastSeen: '最近心跳', nodeCapabilities: '能力',
     nodeStatusRegistering: '登记中', nodeStatusOnline: '在线', nodeStatusOffline: '离线', nodeStatusDraining: '排水', nodeStatusFailed: '失败',
