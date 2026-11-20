@@ -51,7 +51,7 @@ use super::*;
         let m = manager();
         let (grant, id, _, _) = m.enroll("wsl2", "windows-x86_64", vec![], None).unwrap();
         let (_, _, _, _) = m
-            .register(&grant, None, Some("linux-x86_64".to_owned()))
+            .register(&grant, None, Some("linux-x86_64".to_owned()), None)
             .unwrap();
         assert_eq!(m.get(&id).unwrap().unwrap().platform, "linux-x86_64");
     }
@@ -63,7 +63,7 @@ use super::*;
         let m = manager();
         let (grant, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], None).unwrap();
         let error = m
-            .register(&grant, None, Some("banana".to_owned()))
+            .register(&grant, None, Some("banana".to_owned()), None)
             .unwrap_err();
         assert!(error.contains("platform"), "{error}");
         assert!(
@@ -78,7 +78,7 @@ use super::*;
     fn register_without_a_helper_platform_keeps_the_grants_value() {
         let m = manager();
         let (grant, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], None).unwrap();
-        m.register(&grant, None, None).unwrap();
+        m.register(&grant, None, None, None).unwrap();
         assert_eq!(m.get(&id).unwrap().unwrap().platform, "linux-x86_64");
     }
 
@@ -105,16 +105,16 @@ use super::*;
         // A second node, so the bearer can be shown not to resolve for it.
         let (other_grant, other_id, _, _) =
             m.enroll("wsl2", "linux-x86_64", vec![], None).unwrap();
-        assert!(m.register(&other_grant, None, None).is_ok());
+        assert!(m.register(&other_grant, None, None, None).is_ok());
         let (session, hb) = {
-            let (rid, token, ep, hb) = m.register(&grant, Some("0.1.0".to_owned()), None).unwrap();
+            let (rid, token, ep, hb) = m.register(&grant, Some("0.1.0".to_owned()), None, None).unwrap();
             assert_eq!(rid, id);
             assert_eq!(ep, epoch);
             (token, hb)
         };
         assert_eq!(hb, HEARTBEAT_SECONDS);
         // A second use of the same one-shot grant must fail.
-        assert!(m.register(&grant, None, None).is_err());
+        assert!(m.register(&grant, None, None, None).is_err());
         // The session resolves to its own node at the current epoch…
         // session_node_for is what /rpc and /events actually gate on: the
         // identity has to travel with the scope, not just a yes/no.
@@ -149,7 +149,7 @@ use super::*;
     fn heartbeat_updates_last_seen_and_stale_epoch_is_rejected() {
         let m = manager();
         let (grant, id, epoch, _) = m.enroll("libkrun", "linux-x86_64", vec![], None).unwrap();
-        let (session, _, _, _) = m.register(&grant, None, None).unwrap();
+        let (session, _, _, _) = m.register(&grant, None, None, None).unwrap();
         let _ = session;
         assert_eq!(m.heartbeat(&id, epoch).unwrap(), NodeStatus::Online);
         assert!(m.heartbeat(&id, epoch + 1).is_err());
@@ -159,7 +159,7 @@ use super::*;
     fn sweep_marks_only_stale_non_host_nodes_offline() {
         let m = manager();
         let (grant, id, _, _) = m.enroll("docker", "linux-x86_64", vec![], None).unwrap();
-        m.register(&grant, None, None).unwrap();
+        m.register(&grant, None, None, None).unwrap();
         // Force the record into the past without sleeping.
         let mut node = m.get(&id).unwrap().unwrap();
         node.last_seen = Some(now_seconds() - OFFLINE_AFTER_SECONDS - 1);
@@ -196,7 +196,7 @@ use super::*;
         {
             let first = NodeManager::load(&paths, "http://127.0.0.1:1".to_owned(), Arc::new(DaemonEvents::new()));
             let (grant, id, _, _) = first.enroll("wsl2", "linux-x86_64", vec![], Some("survivor".to_owned())).unwrap();
-            first.register(&grant, None, None).unwrap();
+            first.register(&grant, None, None, None).unwrap();
             assert_eq!(first.get(&id).unwrap().unwrap().status, NodeStatus::Online);
 
             let reloaded = NodeManager::load(&paths, "http://127.0.0.1:2".to_owned(), Arc::new(DaemonEvents::new()));
@@ -263,11 +263,11 @@ use super::*;
         // register path is reachable without a credential, so telling them
         // apart tells a stranger which guesses were closer.
         let m = manager();
-        let unknown = m.register("no-such-grant", None, None).unwrap_err();
+        let unknown = m.register("no-such-grant", None, None, None).unwrap_err();
         let used = {
             let grant = m.enroll("wsl2", "linux-x86_64", vec![], Some("g2".into())).unwrap().0;
-            m.register(&grant, None, None).unwrap();
-            m.register(&grant, None, None).unwrap_err()
+            m.register(&grant, None, None, None).unwrap();
+            m.register(&grant, None, None, None).unwrap_err()
         };
         let expired = {
             let grant = m.enroll("wsl2", "linux-x86_64", vec![], Some("g3".into())).unwrap().0;
@@ -276,7 +276,7 @@ use super::*;
                     g.expires_at = now_seconds() - 1;
                 }
             }
-            m.register(&grant, None, None).unwrap_err()
+            m.register(&grant, None, None, None).unwrap_err()
         };
         assert_eq!(unknown, used);
         assert_eq!(used, expired);
@@ -288,7 +288,7 @@ use super::*;
         // the intermediate state has to be real and settled on success.
         let m = manager();
         let (grant, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("promo".into())).unwrap();
-        let (_rid, bearer, _ep, _hb) = m.register(&grant, None, None).unwrap();
+        let (_rid, bearer, _ep, _hb) = m.register(&grant, None, None, None).unwrap();
         assert_eq!(m.get(&id).unwrap().unwrap().status, NodeStatus::Online);
         // session_still_matches is what an open stream re-checks, so a live
         // session must satisfy it -- and the bearer is the one register
@@ -301,7 +301,7 @@ use super::*;
         // An open SSE stream asks exactly this to notice a revocation.
         let m = manager();
         let (grant, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("revoked".into())).unwrap();
-        let (_rid, bearer, _ep, _hb) = m.register(&grant, None, None).unwrap();
+        let (_rid, bearer, _ep, _hb) = m.register(&grant, None, None, None).unwrap();
         assert!(m.session_still_matches(&id, &bearer));
         m.deregister(&id).unwrap();
         assert!(!m.session_still_matches(&id, &bearer), "revocation must revoke");
@@ -311,7 +311,7 @@ use super::*;
     fn sweep_expires_registering_and_purges_grants() {
         let m = manager();
         let (grant, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("stuck".into())).unwrap();
-        m.register(&grant, None, None).unwrap();
+        m.register(&grant, None, None, None).unwrap();
         let mut rec = m.get(&id).unwrap().unwrap();
         rec.status = NodeStatus::Registering;
         rec.last_seen = Some(now_seconds() - OFFLINE_AFTER_SECONDS - 1);
@@ -336,11 +336,11 @@ use super::*;
         // node" would keep saying yes forever.
         let m = manager();
         let (g1, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("dup".into())).unwrap();
-        let (_, first, _, _) = m.register(&g1, None, None).unwrap();
+        let (_, first, _, _) = m.register(&g1, None, None, None).unwrap();
         assert!(m.session_still_matches(&id, &first));
         let (g2, id2, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("dup".into())).unwrap();
         assert_eq!(id, id2);
-        let (_, second, ep2, _) = m.register(&g2, None, None).unwrap();
+        let (_, second, ep2, _) = m.register(&g2, None, None, None).unwrap();
         assert_ne!(first, second);
         assert!(m.session_still_matches(&id, &second), "the new bearer is live");
         assert!(!m.session_still_matches(&id, &first), "the replaced bearer is not");
@@ -357,7 +357,7 @@ use super::*;
         // deregister landing inside it must not be undone by the promote.
         let m = manager();
         let (grant, id, _, _) = m.enroll("wsl2", "linux-x86_64", vec![], Some("win".into())).unwrap();
-        m.register(&grant, None, None).unwrap();
+        m.register(&grant, None, None, None).unwrap();
         m.deregister(&id).unwrap();
         assert!(m.get(&id).unwrap().is_none(), "a promote must not resurrect a deleted node");
     }
@@ -368,9 +368,70 @@ use super::*;
         let (grant, id, epoch, _) = m
             .enroll("wsl2", "linux-x86_64", vec![], Some("meta".into()))
             .unwrap();
-        m.register(&grant, None, None).unwrap();
+        m.register(&grant, None, None, None).unwrap();
         let node = m.get(&id).unwrap().unwrap();
         assert_eq!(node.status, NodeStatus::Online);
         assert_eq!(node.session_epoch, epoch);
         assert!(node.enrolled_at.is_some(), "the promote needs this to identify its own record");
     }
+
+
+/// A helper cannot promote itself to the control plane by reporting it.
+#[test]
+fn a_helper_cannot_report_the_control_capability() {
+    // A grant with nothing, and a helper that claims everything. The control
+    // capability must not survive the merge -- it is the one string that would
+    // make the UI draw this node as the Box, and anything that trusts the
+    // capability would treat it as one.
+    let merged = merge_capabilities(
+        vec![],
+        Some(vec!["exec".to_owned(), "dsh-host".to_owned(), "heartbeat".to_owned()]),
+        CONTROL_CAPABILITY,
+    );
+    assert!(!merged.iter().any(|c| c == CONTROL_CAPABILITY));
+    assert!(merged.contains(&"exec".to_owned()), "the honest capability survives");
+    assert!(merged.contains(&"heartbeat".to_owned()));
+}
+
+/// A report does not erase what the grant allowed.
+#[test]
+fn a_report_does_not_erase_the_grant() {
+    // The grant carries exec and build; the helper reports only heartbeat.
+    // Replacement would silently drop the grant, and a node that can build
+    // would stop being able to.
+    let merged = merge_capabilities(
+        vec!["exec".to_owned(), "build".to_owned()],
+        Some(vec!["heartbeat".to_owned()]),
+        CONTROL_CAPABILITY,
+    );
+    for (capability, present) in [("exec", true), ("build", true), ("heartbeat", true)] {
+        assert_eq!(merged.contains(&capability.to_owned()), present, "{capability}");
+    }
+}
+
+/// An absent or empty report keeps the grant, which is the UI enrol path.
+#[test]
+fn an_absent_report_keeps_the_grant() {
+    let grant = vec!["exec".to_owned()];
+    assert_eq!(
+        merge_capabilities(grant.clone(), None, CONTROL_CAPABILITY),
+        grant,
+        "no report keeps the grant"
+    );
+    assert_eq!(
+        merge_capabilities(grant.clone(), Some(vec![]), CONTROL_CAPABILITY),
+        grant,
+        "an empty report keeps the grant too"
+    );
+}
+
+/// The merged list is sorted and deduplicated, so the stored row is stable.
+#[test]
+fn the_merged_list_is_sorted_and_deduplicated() {
+    let merged = merge_capabilities(
+        vec!["exec".to_owned(), "build".to_owned()],
+        Some(vec!["exec".to_owned(), "copy".to_owned()]),
+        CONTROL_CAPABILITY,
+    );
+    assert_eq!(merged, vec!["build".to_owned(), "copy".to_owned(), "exec".to_owned()]);
+}

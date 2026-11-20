@@ -85,6 +85,13 @@ pub const HEARTBEAT_SECONDS: u64 = 30;
 pub const OFFLINE_AFTER_SECONDS: u64 = HEARTBEAT_SECONDS * 3;
 pub const ENROLL_TTL_SECONDS: u64 = 300;
 
+/// The capability that marks the control plane. A helper can never hold it:
+/// `register` filters it out of anything a helper reports, because a node
+/// that could grant itself this would be able to draw and treat itself as
+/// the control plane. It is written in exactly one place -- the host row
+/// the daemon writes about itself.
+pub const CONTROL_CAPABILITY: &str = "dsh-host";
+
 /// Methods a session token may call. The global discovery token keeps every
 /// other RPC; a helper that leaks its session token cannot drive the box.
 pub const NODE_METHODS: &[&str] = &[
@@ -139,6 +146,34 @@ pub struct NodeManager {
     events: Arc<crate::events::DaemonEvents>,
 }
 
+/// Combine what the enrol grant allowed with what the helper reports it can do.
+///
+/// Union, not replacement, and `control_capability` is dropped from the
+/// helper's side. The grant is the authority on who a node is allowed to be;
+/// the helper is the authority on what it can run. A helper that reported only
+/// `heartbeat` would otherwise lose the `exec` its grant carried, and a helper
+/// that reported `dsh-host` would otherwise acquire a capability that makes it
+/// the control plane.
+///
+/// Sorted and deduplicated so the stored list is stable: two helpers with the
+/// same abilities produce the same row, and a diff of the store is readable.
+fn merge_capabilities(
+    granted: Vec<String>,
+    reported: Option<Vec<String>>,
+    control_capability: &str,
+) -> Vec<String> {
+    let mut merged = granted;
+    if let Some(reported) = reported {
+        merged.extend(
+            reported
+                .into_iter()
+                .filter(|capability| capability != control_capability),
+        );
+    }
+    merged.sort();
+    merged.dedup();
+    merged
+}
 impl NodeManager {
     /// Build the manager. Uses the SQLite document store when a runtime is
     /// configured, and an in-memory collection otherwise (fresh install or
@@ -307,6 +342,7 @@ impl NodeManager {
         enroll_token: &str,
         helper_version: Option<String>,
         helper_platform: Option<String>,
+        helper_capabilities: Option<Vec<String>>,
     ) -> Result<(String, String, u64, u64), String> {
         let grant = {
             let mut grants = self.grants.lock().unwrap();
@@ -336,6 +372,22 @@ impl NodeManager {
             }
             None => grant.platform.clone(),
         };
+        // The helper reports what it can do. It is MERGED with the grant
+        // rather than replacing it, and the control-plane capability is
+        // filtered out, because this is the one field a helper could use to
+        // promote itself: a helper that claims `dsh-host` would be drawn as
+        // the control plane and, anywhere that capability is trusted, treated
+        // as it. The grant decides who controls; the helper decides what it
+        // can run.
+        //
+        // An empty or absent report keeps the grant list, which is what an
+        // enroll through the UI produces -- the UI sends no capabilities, so
+        // the row is honest about being empty rather than invented.
+        let capabilities = merge_capabilities(
+            grant.capabilities,
+            helper_capabilities,
+            CONTROL_CAPABILITY,
+        );
         let epoch = self.current_epoch();
         let session = uuid::Uuid::new_v4().to_string();
         let now = now_seconds();
@@ -348,7 +400,7 @@ impl NodeManager {
             // in that window leaves `registering`, which `sweep` expires — the
             // state machine row is exercised rather than decorative.
             status: NodeStatus::Registering,
-            capabilities: grant.capabilities,
+            capabilities,
             control_url: Some(self.control_url()),
             session_epoch: epoch,
             enrolled_at: Some(now),
