@@ -6,6 +6,7 @@ import { Card } from '../../ui/Card'
 import { Field } from '../../ui/Field'
 import { Input } from '../../ui/Input'
 import { Stack } from '../../ui/Stack'
+import { rolesOf } from './node-roles'
 
 type Props = {
   nodes: NodeRecord[]
@@ -71,34 +72,72 @@ export function NodesPage(props: Props) {
       </p>
 
       <div className="version-list node-list">
-        {nodes.map((node) => (
+        {/* The control plane first, then the rest in the daemon's own order.
+            The daemon sorts by id, and a UUID sorts before "host", so without
+            this the Box lands last -- which is the one row an operator looks
+            for first. Sorting here does not change the daemon's order; it
+            changes what the list leads with. */}
+        {[...nodes].sort((left, right) => {
+          if (left.hostNode !== right.hostNode) return left.hostNode ? -1 : 1
+          return 0
+        }).map((node) => {
+          // What this node does, derived from what the daemon granted it. A
+          // node can hold both roles -- the Box itself always does.
+          const roles = rolesOf(node)
+          return (
           <section key={node.id} className="version-row">
             <div className="node-summary">
               <strong>{node.id}</strong>
               <p className="node-meta">
                 {node.kind} · {node.platform} · {statusLabel(node.status)}
-                {node.lastSeen !== null && ` · ${text.nodeLastSeen} ${new Date(node.lastSeen * 1000).toLocaleString()}`}
+                {/* The Box never heartbeats, so its timestamp is the enrol time
+                    and would sit unchanged forever. Calling that "last seen" is
+                    a lie about the one row that matters most. */}
+                {node.hostNode !== true &&
+                  node.lastSeen !== null &&
+                  ` · ${text.nodeLastSeen} ${new Date(node.lastSeen * 1000).toLocaleString()}`}
               </p>
-              {node.capabilities.length > 0 && <p className="node-meta">{node.capabilities.join(', ')}</p>}
+              {/* Roles before capabilities: the role is what the operator is
+                  looking for, the capability list is the detail. */}
+              <p className="node-roles">
+                {roles.map((role) => (
+                  <span key={role} className={`node-role node-role-${role}`}>
+                    {role === 'control' ? text.nodeRoleControl : text.nodeRoleExecutor}
+                  </span>
+                ))}
+                {node.capabilities.length > 0 && (
+                  <span className="node-capabilities">{node.capabilities.join(', ')}</span>
+                )}
+              </p>
             </div>
             <div className="node-actions">
-              <Button
-                shape="icon"
-                variant="ghost"
-                className="icon-action"
-                aria-label={text.nodeRemove}
-                title={text.nodeRemove}
-                disabled={removingId === node.id}
-                onClick={() => {
-                  if (window.confirm(text.nodeRemoveConfirm(node.id))) onRemove(node.id)
-                }}
-              >
-                <span aria-hidden="true" className="remove-icon">×</span>
-              </Button>
+              {/* The control plane cannot be deregistered -- the daemon refuses
+                  it -- so the row does not offer the action. A confirm dialog
+                  that always ends in an error is worse than no button. */}
+              {node.hostNode === true ? null : (
+                <Button
+                  shape="icon"
+                  variant="ghost"
+                  className="icon-action"
+                  aria-label={text.nodeRemove}
+                  title={text.nodeRemove}
+                  disabled={removingId === node.id}
+                  onClick={() => {
+                    if (window.confirm(text.nodeRemoveConfirm(node.id))) onRemove(node.id)
+                  }}
+                >
+                  <span aria-hidden="true" className="remove-icon">×</span>
+                </Button>
+              )}
             </div>
           </section>
-        ))}
-        {!loading && nodes.length === 0 && <p className="empty-note">{text.noNodes}</p>}
+          )
+        })}
+        {/* "No nodes" means no nodes besides the Box. The Box is always in
+            the list now, so counting every row would make this note dead. */}
+        {!loading && nodes.filter((node) => node.hostNode !== true).length === 0 && (
+          <p className="empty-note">{text.noNodes}</p>
+        )}
       </div>
 
       <Card>

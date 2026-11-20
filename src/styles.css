@@ -760,6 +760,18 @@ dialog .resource-panel { max-height: 70vh; overflow-y: auto; }
 .node-list { overflow: visible; }
 .node-summary { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .node-meta { color: #737a83; font-size: 12px; margin: 0; }
+/* Roles, then capabilities, on one line under the node name. The role is the
+   answer to "what does this machine do"; the capability list is the detail,
+   so it is quieter and comes second. */
+.node-roles { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.node-role { border: 1px solid var(--color-border-strong); border-radius: 999px;
+  font-size: 11px; letter-spacing: .02em; padding: 1px 8px; text-transform: uppercase; }
+/* The control role is filled because it is the rarer and more consequential
+   one: a fleet has one controller and many executors, and the controller is
+   the node an operator looks for first. */
+.node-role-control { background: var(--color-primary-soft); border-color: var(--color-primary);
+  color: var(--color-primary); font-weight: 600; }
+.node-capabilities { color: var(--color-text-muted); font-size: 12px; }
 .node-actions { align-items: center; display: flex; gap: 4px; }
 .remove-icon { font-size: 19px; font-weight: 500; line-height: 1; }
 .section-note { color: #626973; font-size: 13px; margin: 0; }

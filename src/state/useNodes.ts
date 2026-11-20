@@ -23,9 +23,9 @@ const NODE_STATUSES: NodeRecord['status'][] = ['registering', 'online', 'offline
  * asks for its own data when the user opens it, so the daemon is never queried
  * for a page nobody is looking at.
  *
- * The host node is filtered out of `nodes` and exposed separately. It is
- * built in, never heartbeats, and cannot be deregistered, so offering it a
- * remove button would be offering an action that always fails.
+ * The host node is part of `nodes`. It is built in, never heartbeats, and
+ * cannot be deregistered, so the page must not offer it a remove button --
+ * which is a reason to guard the action, not to hide the node.
  */
 export function useNodes(onError: (message: string | null) => void) {
   const [nodes, setNodes] = useState<NodeRecord[]>([])
@@ -47,7 +47,11 @@ export function useNodes(onError: (message: string | null) => void) {
     setLoading(true)
     try {
       const all = await boxApi.listNodes()
-      setNodes(all.filter((node) => !node.hostNode))
+      // The host node is kept. It was filtered out on the grounds that it
+      // cannot be deregistered -- which is a reason not to offer it a remove
+      // button, not a reason to hide it. It is the control plane, and a fleet
+      // list that hides its own controller is missing the most important row.
+      setNodes(all)
       onError(null)
     } catch (reason) {
       onError(String(reason))

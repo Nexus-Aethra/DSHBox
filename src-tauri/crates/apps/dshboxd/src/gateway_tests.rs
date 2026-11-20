@@ -108,7 +108,7 @@ fn a_main_token_cannot_forge_a_node_identity_in_the_body() {
         .nodes
         .enroll("wsl2", "linux-x86_64", vec![], Some("node-a".to_owned()))
         .unwrap();
-    state.nodes.register(&grant, None, None).unwrap();
+    state.nodes.register(&grant, None, None, None).unwrap();
 
     let mut body = report_body(&id);
     body["token"] = json!(main);
@@ -131,12 +131,12 @@ fn a_session_callers_forged_node_identity_is_replaced() {
         .nodes
         .enroll("wsl2", "linux-x86_64", vec![], Some("node-a".to_owned()))
         .unwrap();
-    let (_, session, epoch, _) = state.nodes.register(&g1, None, None).unwrap();
+    let (_, session, epoch, _) = state.nodes.register(&g1, None, None, None).unwrap();
     let (g2, b, _, _) = state
         .nodes
         .enroll("wsl2", "linux-x86_64", vec![], Some("node-b".to_owned()))
         .unwrap();
-    state.nodes.register(&g2, None, None).unwrap();
+    state.nodes.register(&g2, None, None, None).unwrap();
 
     let mut body = report_body(&b); // claims the OTHER node
     body["token"] = json!(session);

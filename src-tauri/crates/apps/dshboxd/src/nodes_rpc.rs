@@ -112,10 +112,15 @@ pub(crate) fn node_register(state: &DaemonState, request: &Value) -> Result<Valu
     // The helper reports the platform it compiled for; the daemon validates and
     // stores that, not the string the supply adapter typed at enroll (§2.7).
     let helper_platform = request["platform"].as_str().map(str::to_owned);
+    // What the helper reports it can do. Merged with the grant inside
+    // `register`, which drops the control-plane capability from it.
+    let helper_capabilities = request["capabilities"].as_array().map(|list| {
+        list.iter().filter_map(|item| item.as_str().map(str::to_owned)).collect()
+    });
     let (node_id, session_token, epoch, heartbeat_seconds) =
         state
             .nodes
-            .register(&enroll_token, helper_version, helper_platform)?;
+            .register(&enroll_token, helper_version, helper_platform, helper_capabilities)?;
     Ok(json!({
         "nodeId": node_id,
         "sessionToken": session_token,
@@ -281,7 +286,7 @@ mod tests {
             .nodes
             .enroll("wsl2", "linux-x86_64", vec!["build".to_owned()], None)
             .unwrap();
-        state.nodes.register(&grant, None, None).unwrap();
+        state.nodes.register(&grant, None, None, None).unwrap();
 
         let mut request = report_body("base-9c1f00d4a1b2c3d4", "linux-x86_64");
         request["__nodeId"] = json!(id);
@@ -305,7 +310,7 @@ mod tests {
             .nodes
             .enroll("wsl2", "linux-x86_64", vec!["build".to_owned()], None)
             .unwrap();
-        state.nodes.register(&grant, None, None).unwrap();
+        state.nodes.register(&grant, None, None, None).unwrap();
 
         let mut request = report_body("base-9c1f00d4a1b2c3d4", "windows-x86_64");
         request["__nodeId"] = json!(id);
