@@ -6,10 +6,7 @@ export type GraphNodeMeta = {
   label: string
   /** Full name for the tooltip; the box label is elided to fit. */
   title?: string
-  // 'control' and 'node' are the node fleet's two kinds: the Box itself, and
-  // a registered node hanging off it. The renderer only picks a colour and a
-  // shape from it, so a diagram that is not about plugins can add its own.
-  kind: 'plugin' | 'service' | 'layer' | 'control' | 'node'
+  kind: 'plugin' | 'service' | 'layer'
   // A plugin outside the profile's activation closure is installed but never
   // loaded, which is why it is drawn muted rather than as a normal node.
   activated?: boolean

@@ -25,8 +25,7 @@ const NODE_STATUSES: NodeRecord['status'][] = ['registering', 'online', 'offline
  *
  * The host node is part of `nodes`. It is built in, never heartbeats, and
  * cannot be deregistered, so the page must not offer it a remove button --
- * which is a reason to guard the action, not to hide the node. The fleet
- * diagram is built around it.
+ * which is a reason to guard the action, not to hide the node.
  */
 export function useNodes(onError: (message: string | null) => void) {
   const [nodes, setNodes] = useState<NodeRecord[]>([])
@@ -48,11 +47,10 @@ export function useNodes(onError: (message: string | null) => void) {
     setLoading(true)
     try {
       const all = await boxApi.listNodes()
-      // The host node is kept. It used to be filtered out here, on the
-      // grounds that it cannot be deregistered -- but that is a reason not
-      // to offer it a remove button, not a reason to hide it. The fleet
-      // diagram needs it: the Box is the hub every other node hangs off,
-      // and a diagram without its hub is a list with extra steps.
+      // The host node is kept. It was filtered out on the grounds that it
+      // cannot be deregistered -- which is a reason not to offer it a remove
+      // button, not a reason to hide it. It is the control plane, and a fleet
+      // list that hides its own controller is missing the most important row.
       setNodes(all)
       onError(null)
     } catch (reason) {
